@@ -1,0 +1,17 @@
+__pycache__/
+.venv/
+datasets/
+experiments/
+mlruns/
+*.db
+.env
+infer.py 
+
+kubeconfig*
+medmnist*
+pick_best.py
+train_accelerator.py
+upload*
+utils.py
+
+*.bento
