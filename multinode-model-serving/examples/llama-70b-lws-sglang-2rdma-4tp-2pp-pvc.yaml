@@ -1,0 +1,152 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: llama-70b-2rdma-4tp-2pp-pvc
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        annotations:
+          k8s.v1.cni.cncf.io/networks: nvidia-network-operator/nv-ipam-macvlannetwork-a, nvidia-network-operator/nv-ipam-macvlannetwork-b
+          sidecar.istio.io/inject: "false"
+        labels:
+          role: llama-70b-2rdma-4tp-2pp-pvc
+      spec:
+        containers:
+          - name: sglang-leader-ib
+            image: lmsysorg/sglang:v0.5.6.post2
+            securityContext:
+              capabilities:
+                add: ["IPC_LOCK"]            
+            env:
+              - name: HF_TOKEN
+                value: '<your HF Token>'
+              - name: HF_HOME
+                value: '/models'
+              - name: NCCL_DEBUG
+                value: "INFO"
+              - name: NCCL_IB_ADDR_FAMILY
+                value: "AF_INET6"     
+            command:
+              - python3
+              - -m
+              - sglang.launch_server
+              - --model-path
+              - "meta-llama/Llama-3.3-70B-Instruct"
+              - --tp
+              - "4" # Size of Tensor Parallelism
+              - --pipeline-parallel-size
+              - "2"
+              - --dist-init-addr
+              - $(LWS_LEADER_ADDRESS):31001
+              - --nnodes
+              - $(LWS_GROUP_SIZE)
+              - --node-rank
+              - $(LWS_WORKER_INDEX)
+              - --trust-remote-code
+              - --host
+              - "0.0.0.0"
+              - --port
+              - "31000"
+              - --max-running-requests
+              - '500'              
+            resources:
+              limits:
+                nvidia.com/gpu: "4"
+                rdma/rdma_shared_device_a: 1
+                rdma/rdma_shared_device_b: 1
+            ports:
+              - containerPort: 31000
+            readinessProbe:
+              tcpSocket:
+                port: 31000
+              initialDelaySeconds: 15
+              periodSeconds: 30
+              failureThreshold: 300
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - name: model-storage
+                mountPath: /models                
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: models-pvc              
+    workerTemplate:
+      metadata:
+        annotations:
+          k8s.v1.cni.cncf.io/networks: nvidia-network-operator/nv-ipam-macvlannetwork-a, nvidia-network-operator/nv-ipam-macvlannetwork-b
+          sidecar.istio.io/inject: "false"
+      spec:
+        containers:
+          - name: llama-worker-2rdma
+            image: lmsysorg/sglang:v0.5.6.post2
+            securityContext:
+              capabilities:
+                add: ["IPC_LOCK"]            
+            env:
+              - name: HF_TOKEN
+                value: '<your HF Token>'
+              - name: HF_HOME
+                value: '/models'            
+              - name: NCCL_DEBUG
+                value: "INFO"
+              - name: NCCL_IB_ADDR_FAMILY
+                value: "AF_INET6"
+            command:
+              - python3
+              - -m
+              - sglang.launch_server
+              - --model-path
+              - "meta-llama/Llama-3.3-70B-Instruct"              
+              - --tp
+              - "4" # Size of Tensor Parallelism
+              - --pipeline-parallel-size
+              - "2"
+              - --dist-init-addr
+              - $(LWS_LEADER_ADDRESS):31001
+              - --nnodes
+              - $(LWS_GROUP_SIZE)
+              - --node-rank
+              - $(LWS_WORKER_INDEX)
+              - --trust-remote-code
+              - --log-level
+              - 'debug'
+              - --max-running-requests
+              - '500'
+            resources:
+              limits:
+                nvidia.com/gpu: "4"
+                rdma/rdma_shared_device_a: 1
+                rdma/rdma_shared_device_b: 1                
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - name: model-storage
+                mountPath: /models                
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: models-pvc              
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-leader-2rdma-4tp-2pp-pvc
+spec:
+  selector:
+    leaderworkerset.sigs.k8s.io/name: llama-70b-2rdma-4tp-2pp-pvc
+    role: llama-70b-2rdma-4tp-2pp-pvc
+  ports:
+    - protocol: TCP
+      port: 31000
+      targetPort: 31000

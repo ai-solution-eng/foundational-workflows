@@ -1,0 +1,89 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: download-hf-model
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: hf-model-downloader
+      annotations:
+        sidecar.istio.io/inject: "false"        
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: model-downloader
+        image: python:3.11-slim
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -e
+            echo "Installing dependencies..."
+            pip install --no-cache-dir huggingface_hub
+            echo "Starting model download..."
+            python3 << 'EOF'
+            from huggingface_hub import snapshot_download
+            import os
+            # Configuration
+            model_id = os.getenv("MODEL_ID", "bert-base-uncased")
+            cache_dir = os.getenv("CACHE_DIR", "/models/hub")
+            hf_token = os.getenv("HF_TOKEN", None)
+            print(f"Downloading model: {model_id}")
+            print(f"Target directory: {cache_dir}")
+            # Create cache directory if it doesn't exist
+            if not os.path.exists(cache_dir):
+                print(f"Creating cache directory: {cache_dir}")
+                os.makedirs(cache_dir, exist_ok=True)
+            else:
+                print("Cache directory already exists")
+            try:
+                # Download the model
+                local_path = snapshot_download(
+                    repo_id=model_id,
+                    cache_dir=cache_dir,
+                    token=hf_token,
+                    resume_download=True
+                )
+                print(f"\n✓ Model download completed successfully!")
+                print(f"✓ Model saved to: {local_path}")
+                # List downloaded files
+                print("\nDownloaded files:")
+                total_size = 0
+                file_count = 0
+                for root, dirs, files in os.walk(cache_dir):
+                    for file in files:
+                        filepath = os.path.join(root, file)
+                        size = os.path.getsize(filepath)
+                        total_size += size
+                        file_count += 1
+                        # Show relative path for readability
+                        rel_path = os.path.relpath(filepath, cache_dir)
+                        print(f"  {rel_path} ({size:,} bytes)")
+                print(f"\nTotal: {file_count} files, {total_size:,} bytes ({total_size / (1024**3):.2f} GB)")
+            except Exception as e:
+                print(f"\n✗ Error during download: {e}")
+                exit(1)
+            EOF
+            echo "Job completed successfully!"
+        env:
+        - name: MODEL_ID
+          value: "meta-llama/Llama-3.3-70B-Instruct"  # Change to your desired model
+        - name: CACHE_DIR
+          value: "/models/hub"
+        - name: HF_TOKEN
+          value: "<your HF Token>"
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: models-pvc

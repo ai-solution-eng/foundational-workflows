@@ -1,0 +1,118 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: vllm-llama-70b-2rdma-pvc
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        annotations:
+          k8s.v1.cni.cncf.io/networks: nvidia-network-operator/nv-ipam-macvlannetwork-a, nvidia-network-operator/nv-ipam-macvlannetwork-b
+          sidecar.istio.io/inject: "false"
+        labels:
+          role: vllm-llama-70b-2rdma-pvc
+      spec:
+        containers:
+          - name: vllm-leader-ib
+            image: vllm/vllm-openai:v0.10.2
+            securityContext:
+              capabilities:
+                add: ["IPC_LOCK"]            
+            env:
+              - name: HF_TOKEN
+                value: '<your HF token>'
+              - name: HF_HOME
+                value: '/models'
+              - name: NCCL_DEBUG
+                value: "INFO"
+              - name: NCCL_IB_ADDR_FAMILY
+                value: "AF_INET6"   
+            command:
+              - sh
+              - -c
+              - "bash /vllm-workspace/examples/online_serving/multi-node-serving.sh leader --ray_cluster_size=$(LWS_GROUP_SIZE); 
+                 python3 -m vllm.entrypoints.openai.api_server --port 8080 --model meta-llama/Llama-3.3-70B-Instruct --tensor-parallel-size 4 --pipeline_parallel_size 2"
+            resources:
+              limits:
+                nvidia.com/gpu: "4"
+                rdma/rdma_shared_device_a: 1
+                rdma/rdma_shared_device_b: 1
+            ports:
+              - containerPort: 8080
+            readinessProbe:
+              tcpSocket:
+                port: 8080
+              initialDelaySeconds: 15
+              periodSeconds: 10
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - name: model-storage
+                mountPath: /models                
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: models-pvc              
+    workerTemplate:
+      metadata:
+        annotations:
+          k8s.v1.cni.cncf.io/networks: nvidia-network-operator/nv-ipam-macvlannetwork-a, nvidia-network-operator/nv-ipam-macvlannetwork-b
+          sidecar.istio.io/inject: "false"
+      spec:
+        containers:
+          - name: vllm-worker-ib
+            image: vllm/vllm-openai:v0.10.2
+            securityContext:
+              capabilities:
+                add: ["IPC_LOCK"]            
+            env:
+              - name: HF_TOKEN
+                value: '<your HF token>'
+              - name: HF_HOME
+                value: '/models'
+              - name: NCCL_DEBUG
+                value: "INFO"
+              - name: NCCL_IB_ADDR_FAMILY
+                value: "AF_INET6"
+            command:
+              - sh
+              - -c
+              - "bash /vllm-workspace/examples/online_serving/multi-node-serving.sh worker --ray_address=$(LWS_LEADER_ADDRESS)"
+            resources:
+              limits:
+                nvidia.com/gpu: "4"
+                rdma/rdma_shared_device_a: 1
+                rdma/rdma_shared_device_b: 1                
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - name: model-storage
+                mountPath: /models                
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: models-pvc              
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-leader-ib
+spec:
+  ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      targetPort: 8080
+  selector:
+    leaderworkerset.sigs.k8s.io/name: vllm-llama-70b-2rdma-pvc
+    role: vllm-llama-70b-2rdma-pvc
+  type: ClusterIP
