@@ -1,0 +1,14 @@
+# model training dependencies
+torch>=2.0
+torchvision
+mlflow<=2.22.0
+medmnist>=2.2.0
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+numpy
+scikit-learn
+accelerate
+bentoml
+boto3

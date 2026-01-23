@@ -1,0 +1,12 @@
+service: "service.py:MedmnistCNNModel"
+labels:
+  owner: "califra"
+  project: "medmnist-cnn-mlflow-demo"
+python:
+  requirements_txt: ./requirements.txt  
+include:
+  - "download_medmnist.py"
+  - "service.py"
+  - "bentofile.yaml"
+  - "model.py"
+  - "env"
