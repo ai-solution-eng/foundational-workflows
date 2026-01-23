@@ -1,0 +1,181 @@
+ezua:
+  #Use next options in order to configure the application endpoint.
+  virtualService:
+    endpoint: "mcp-s3-server.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+
+replicaCount: 1
+
+image:
+  repository: alemor/mcp-s3-server
+  pullPolicy: IfNotPresent
+  tag: "1.0.0"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  fsGroup: 1000
+  runAsNonRoot: true
+  runAsUser: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRoots3: false
+  runAsNonRoot: true
+  runAsUser: 1000
+
+service:
+  type: ClusterIP
+  port: 9097
+  targetPort: 9097
+  annotations: {}
+  # For LoadBalancer:
+  # type: LoadBalancer
+  # loadBalancerIP: ""
+
+ingress:
+  enabled: false
+  className: "nginx"
+  annotations: {}
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+    # nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+  hosts:
+    - host: mcp-s3.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: mcp-s3-tls
+  #    hosts:
+  #      - mcp-s3.example.com
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+  requests:
+    cpu: 250m
+    memory: 256Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# Additional volumes for multiple allowed directories
+additionalVolumes: []
+  # - name: projects
+  #   persistentVolumeClaim:
+  #     claimName: projects-pvc
+  #   mountPath: /projects
+  # - name: shared
+  #   configMap:
+  #     name: shared-config
+  #   mountPath: /config
+
+# MCP Server Configuration
+config:
+  # Comma-separated list of allowed directories
+  allowedDirectories: "/data"
+  # Server port (FastMCP default is 8000)
+  port: "9097"
+  # Host to bind to
+  host: "0.0.0.0"
+  # Number of uvicorn workers (for production)
+  workers: 4
+
+# Additional allowed hosts
+extraAllowedHosts: []
+
+# Environment variables
+env:
+  - name: MAX_OBJECT_SIZE_MB
+    value: 50
+
+# Secrets mounted as environment variables
+envFrom: []
+  # - secretRef:
+  #     name: mcp-secrets
+  # - configMapRef:
+  #     name: mcp-config
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+  # Example: spread pods across nodes
+  # podAntiAffinity:
+  #   preferredDuringSchedulingIgnoredDuringExecution:
+  #   - weight: 100
+  #     podAffinityTerm:
+  #       labelSelector:
+  #         matchExpressions:
+  #         - key: app.kubernetes.io/name
+  #           operator: In
+  #           values:
+  #           - mcp-s3-server
+  #       topologyKey: kubernetes.io/hostname
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# Pod Disruption Budget
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # maxUnavailable: 1
+
+# Network Policy
+networkPolicy:
+  enabled: false
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            name: default
+  egress:
+    - to:
+      - namespaceSelector: {}
+
+# Monitoring (Prometheus)
+metrics:
+  enabled: false
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+

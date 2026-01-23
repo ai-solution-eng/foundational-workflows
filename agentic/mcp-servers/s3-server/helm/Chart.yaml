@@ -1,0 +1,14 @@
+apiVersion: v2
+name: mcp-s3-server
+description: A Helm chart for MCP S3 Server with FastMCP and Streamable HTTP
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - mcp
+  - s3
+  - fastmcp
+maintainers:
+  - name: Alejandro Morales Martinez
+    email: alemor@hpe.com
+

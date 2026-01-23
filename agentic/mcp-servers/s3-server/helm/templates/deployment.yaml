@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mcp-s3-server.fullname" . }}
+  labels:
+    {{- include "mcp-s3-server.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "mcp-s3-server.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "mcp-s3-server.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "mcp-s3-server.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+      - name: {{ .Chart.Name }}
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 12 }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        ports:
+        - name: http
+          containerPort: {{ .Values.config.port }}
+          protocol: TCP
+        env:
+        - name: ALLOWED_DIRECTORIES
+          valueFrom:
+            configMapKeyRef:
+              name: {{ include "mcp-s3-server.fullname" . }}
+              key: allowed-directories
+        - name: PORT
+          value: {{ .Values.config.port | quote }}
+        - name: HOST
+          value: {{ .Values.config.host | quote }}
+        - name: WORKERS
+          value: {{ .Values.config.workers | quote }}
+        - name: ALLOWED_HOSTS
+          value: {{ include "mcp-s3-server.allowedHosts" . | quote }}
+        {{- with .Values.env }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.envFrom }}
+        envFrom:
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        livenessProbe:
+          {{- toYaml .Values.livenessProbe | nindent 10 }}
+        readinessProbe:
+          {{- toYaml .Values.readinessProbe | nindent 10 }}
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+        volumeMounts:
+        {{- range .Values.additionalVolumes }}
+        - name: {{ .name }}
+          mountPath: {{ .mountPath }}
+          {{- if .subPath }}
+          subPath: {{ .subPath }}
+          {{- end }}
+          {{- if .readOnly }}
+          readOnly: {{ .readOnly }}
+          {{- end }}
+        {{- end }}
+      volumes:
+      {{- if .Values.persistence.enabled }}
+      - name: data
+        {{- if .Values.persistence.existingClaim }}
+        persistentVolumeClaim:
+          claimName: {{ .Values.persistence.existingClaim }}
+        {{- else }}
+        persistentVolumeClaim:
+          claimName: {{ include "mcp-s3-server.fullname" . }}
+        {{- end }}
+      {{- end }}
+      {{- range .Values.additionalVolumes }}
+      - name: {{ .name }}
+        {{- if .persistentVolumeClaim }}
+        persistentVolumeClaim:
+          claimName: {{ .persistentVolumeClaim.claimName }}
+        {{- else if .configMap }}
+        configMap:
+          name: {{ .configMap.name }}
+        {{- else if .secret }}
+        secret:
+          secretName: {{ .secret.secretName }}
+        {{- else if .emptyDir }}
+        emptyDir: {}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
