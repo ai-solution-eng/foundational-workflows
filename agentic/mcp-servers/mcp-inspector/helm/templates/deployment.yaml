@@ -42,8 +42,9 @@ spec:
           containerPort: {{ .Values.config.serverPort }}
           protocol: TCP
         env:
-        {{- with .Values.env }}
-        {{- toYaml . | nindent 8 }}
+        {{- range .Values.env }}
+        - name: {{ .name }}
+          value: {{ .value | quote }}
         {{- end }}
         {{- if .Values.config.mcpServers }}
         - name: MCP_CONFIG

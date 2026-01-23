@@ -96,9 +96,9 @@ env:
   - name: HOST
     value: "0.0.0.0"
   - name: WORKERS
-    value: 4
+    value: "4"
   - name: MAX_OBJECT_SIZE_MB
-    value: 50
+    value: "50"
   - name: S3_ENDPOINT 
     value: "https://minio-api.${DOMAIN_NAME}"
   - name: S3_ACCESS_KEY 

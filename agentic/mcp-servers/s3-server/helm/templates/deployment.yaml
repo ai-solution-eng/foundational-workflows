@@ -40,8 +40,9 @@ spec:
         env:
         - name: ALLOWED_HOSTS
           value: {{ include "mcp-s3-server.allowedHosts" . | quote }}
-        {{- with .Values.env }}
-        {{- toYaml . | nindent 8 }}
+        {{- range .Values.env }}
+        - name: {{ .name }}
+          value: {{ .value | quote }}
         {{- end }}
         {{- with .Values.envFrom }}
         envFrom:

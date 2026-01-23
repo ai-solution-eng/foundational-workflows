@@ -52,8 +52,9 @@ spec:
           value: {{ .Values.config.workers | quote }}
         - name: ALLOWED_HOSTS
           value: {{ include "mcp-filesystem-server.allowedHosts" . | quote }}
-        {{- with .Values.env }}
-        {{- toYaml . | nindent 8 }}
+        {{- range .Values.env }}
+        - name: {{ .name }}
+          value: {{ .value | quote }}
         {{- end }}
         {{- with .Values.envFrom }}
         envFrom:

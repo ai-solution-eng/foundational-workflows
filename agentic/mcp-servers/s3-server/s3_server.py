@@ -228,6 +228,15 @@ async def delete_object(key: str, bucket: str = S3_BUCKET) -> StatusResponse | E
         return {"error": str(e), "code": "S3_DELETE_FAILED"}
 
 
+# Add health check endpoint using custom_route decorator
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    """Health check endpoint for Kubernetes probes"""
+    from starlette.responses import JSONResponse
+    return JSONResponse({
+        "status": "healthy"
+    })
+
 # =========================
 # Entrypoint
 # =========================
