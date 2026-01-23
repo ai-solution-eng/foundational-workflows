@@ -1,9 +1,0 @@
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ include "mcp-s3-server.fullname" . }}
-  labels:
-    {{- include "mcp-s3-server.labels" . | nindent 4 }}
-data:
-  allowed-directories: {{ .Values.config.allowedDirectories | quote }}
-
