@@ -1,0 +1,15 @@
+service: "service.py:svc"
+python:
+  requirements_txt: ./requirements.txt
+models:
+  - "medmnist_cnn:NONE" # UPDATE WITH YOUR MODEL NAME
+labels:
+  owner: "califra"
+  project: "medmnist-cnn-mlflow-demo"
+include:
+  - "bentofile.yaml"
+  - "download_medmnist.py"
+  - "service.py"
+  - "bentofile.yaml"
+  - "env"
+  - "model.py"

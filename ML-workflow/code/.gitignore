@@ -1,0 +1,13 @@
+../.DS_Store/
+../code_bentoml_v.1.1.11_backput/
+maybe_delme/
+__pycache__/
+experiments/
+datasets/
+mlruns/
+.env
+.venv/
+*.db
+.DS_Store/
+*.bento
+s3_connector_tests.ipynb
