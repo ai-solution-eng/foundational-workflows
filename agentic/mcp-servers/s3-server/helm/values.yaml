@@ -88,22 +88,15 @@ additionalVolumes: []
   #     name: shared-config
   #   mountPath: /config
 
-# MCP Server Configuration
-config:
-  # Comma-separated list of allowed directories
-  allowedDirectories: "/data"
-  # Server port (FastMCP default is 8000)
-  port: "9097"
-  # Host to bind to
-  host: "0.0.0.0"
-  # Number of uvicorn workers (for production)
-  workers: 4
-
 # Additional allowed hosts
 extraAllowedHosts: []
 
 # Environment variables
 env:
+  - name: HOST
+    value: "0.0.0.0"
+  - name: WORKERS
+    value: 4
   - name: MAX_OBJECT_SIZE_MB
     value: 50
 

@@ -39,17 +39,6 @@ spec:
           containerPort: {{ .Values.config.port }}
           protocol: TCP
         env:
-        - name: ALLOWED_DIRECTORIES
-          valueFrom:
-            configMapKeyRef:
-              name: {{ include "mcp-s3-server.fullname" . }}
-              key: allowed-directories
-        - name: PORT
-          value: {{ .Values.config.port | quote }}
-        - name: HOST
-          value: {{ .Values.config.host | quote }}
-        - name: WORKERS
-          value: {{ .Values.config.workers | quote }}
         - name: ALLOWED_HOSTS
           value: {{ include "mcp-s3-server.allowedHosts" . | quote }}
         {{- with .Values.env }}
