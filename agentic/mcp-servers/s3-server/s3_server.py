@@ -1,167 +1,246 @@
+from __future__ import annotations
+
 import os
-import json
 import base64
 import logging
-from typing import Any
-import boto3
+from typing import List, Literal, Optional
+from typing_extensions import TypedDict
+
+from aiobotocore.session import get_session
+from botocore.config import Config
 from botocore.exceptions import ClientError
+
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-# Configuration from environment
+
+# =========================
+# Configuration
+# =========================
+
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "minioadmin")
 S3_REGION = os.getenv("S3_REGION", "us-east-1")
 S3_BUCKET = os.getenv("S3_BUCKET", "claims")
 
+MAX_OBJECT_SIZE_MB = int(os.getenv("MAX_OBJECT_SIZE_MB", "50"))
+MAX_OBJECT_BYTES = MAX_OBJECT_SIZE_MB * 1024 * 1024
+AUTO_CREATE_BUCKET = os.getenv("AUTO_CREATE_BUCKET", "true").lower() == "true"
+
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "9097"))
+
+
+# =========================
 # Logging
+# =========================
+
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("mcp-s3-server")
 
-# Initialize MCP server with network settings
-# Disable DNS rebinding protection to allow Kubernetes service DNS names
+
+# =========================
+# MCP Server
+# =========================
+
 mcp = FastMCP(
-    "s3-mcp-server",
-    host="0.0.0.0",
-    port=9097,
+    name="mcp-s3-server",
+    stateless_http=True,
+    json_response=True,
     transport_security=TransportSecuritySettings(
-        allowed_hosts=os.getenv('ALLOWED_HOSTS', '*').split(',')
+        allowed_hosts=os.getenv("ALLOWED_HOSTS", "*").split(",")
+    ),
+)
+
+
+# =========================
+# S3 Client (async)
+# =========================
+
+_boto_config = Config(
+    retries={"max_attempts": 5, "mode": "standard"},
+    connect_timeout=5,
+    read_timeout=60,
+)
+
+_session = get_session()
+
+
+async def get_s3():
+    return _session.create_client(
+        "s3",
+        endpoint_url=S3_ENDPOINT,
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY,
+        region_name=S3_REGION,
+        config=_boto_config,
     )
-)
-
-# Initialize S3 client
-s3_client = boto3.client(
-    "s3",
-    endpoint_url=S3_ENDPOINT,
-    aws_access_key_id=S3_ACCESS_KEY,
-    aws_secret_access_key=S3_SECRET_KEY,
-    region_name=S3_REGION,
-)
 
 
-@mcp.tool()
-def list_objects(prefix: str = "", bucket: str = S3_BUCKET) -> dict:
-    """List objects in an S3 bucket with optional prefix filter.
-    
-    Args:
-        prefix: Filter results to keys starting with this prefix
-        bucket: S3 bucket name (defaults to configured bucket)
-    
-    Returns:
-        Dictionary containing list of object keys and metadata
-    """
+# =========================
+# Typed Responses
+# =========================
+
+class ErrorResponse(TypedDict):
+    error: str
+    code: str
+
+
+class ObjectInfo(TypedDict):
+    key: str
+    size: int
+    last_modified: str
+
+
+class ListObjectsResponse(TypedDict):
+    bucket: str
+    prefix: str
+    objects: List[ObjectInfo]
+
+
+class GetObjectResponse(TypedDict):
+    key: str
+    content: str
+    content_type: str
+    encoding: Literal["utf-8", "base64"]
+    etag: str
+
+
+class StatusResponse(TypedDict):
+    status: Literal["success"]
+    bucket: str
+    key: str
+
+
+# =========================
+# MCP Tools
+# =========================
+
+@mcp.tool(description="List objects in an S3 bucket with optional prefix filter.")
+async def list_objects(prefix: str = "", bucket: str = S3_BUCKET) -> ListObjectsResponse | ErrorResponse:
     try:
-        response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
-        objects = []
-        for obj in response.get("Contents", []):
-            objects.append({
-                "key": obj["Key"],
-                "size": obj["Size"],
-                "last_modified": obj["LastModified"].isoformat()
-            })
-        return {"bucket": bucket, "prefix": prefix, "objects": objects}
+        async with await get_s3() as s3:
+            paginator = s3.get_paginator("list_objects_v2")
+            objects: List[ObjectInfo] = []
+
+            async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    objects.append(
+                        {
+                            "key": obj["Key"],
+                            "size": obj["Size"],
+                            "last_modified": obj["LastModified"].isoformat(),
+                        }
+                    )
+
+            return {"bucket": bucket, "prefix": prefix, "objects": objects}
+
     except ClientError as e:
-        logger.error(f"Error listing objects: {e}")
-        return {"error": str(e)}
+        return {"error": str(e), "code": "S3_LIST_FAILED"}
 
 
-@mcp.tool()
-def get_object(key: str, bucket: str = S3_BUCKET) -> dict:
-    """Retrieve an object from S3.
-    
-    Args:
-        key: The object key (path) in the bucket
-        bucket: S3 bucket name (defaults to configured bucket)
-    
-    Returns:
-        Dictionary with object content (base64 encoded for binary) and metadata
-    """
+@mcp.tool(description="Retrieve an object from S3.")
+async def get_object(key: str, bucket: str = S3_BUCKET) -> GetObjectResponse | ErrorResponse:
     try:
-        response = s3_client.get_object(Bucket=bucket, Key=key)
-        content = response["Body"].read()
-        content_type = response.get("ContentType", "application/octet-stream")
-        
-        # Check if content is text or binary
-        if content_type.startswith("text/") or content_type == "application/json":
+        async with await get_s3() as s3:
+            head = await s3.head_object(Bucket=bucket, Key=key)
+
+            if head["ContentLength"] > MAX_OBJECT_BYTES:
+                return {
+                    "error": "Object exceeds maximum allowed size",
+                    "code": "OBJECT_TOO_LARGE",
+                }
+
+            resp = await s3.get_object(Bucket=bucket, Key=key)
+            body = await resp["Body"].read()
+            content_type = resp.get("ContentType", "application/octet-stream")
+
+            if content_type.startswith("text/") or content_type == "application/json":
+                try:
+                    return {
+                        "key": key,
+                        "content": body.decode("utf-8"),
+                        "content_type": content_type,
+                        "encoding": "utf-8",
+                        "etag": head["ETag"],
+                    }
+                except UnicodeDecodeError:
+                    pass
+
             return {
                 "key": key,
-                "content": content.decode("utf-8"),
+                "content": base64.b64encode(body).decode(),
                 "content_type": content_type,
-                "encoding": "utf-8"
+                "encoding": "base64",
+                "etag": head["ETag"],
             }
-        else:
-            return {
-                "key": key,
-                "content": base64.b64encode(content).decode("utf-8"),
-                "content_type": content_type,
-                "encoding": "base64"
-            }
+
     except ClientError as e:
-        logger.error(f"Error getting object: {e}")
-        return {"error": str(e)}
+        return {"error": str(e), "code": "S3_GET_FAILED"}
 
 
-@mcp.tool()
-def put_object(key: str, content: str, content_type: str = "text/plain", bucket: str = S3_BUCKET) -> dict:
-    """Store an object in S3.
-    
-    Args:
-        key: The object key (path) to store
-        content: The content to store (string or base64 for binary)
-        content_type: MIME type of the content
-        bucket: S3 bucket name (defaults to configured bucket)
-    
-    Returns:
-        Dictionary confirming the upload with object details
-    """
+@mcp.tool(description="Store an object in S3.")
+async def put_object(
+    key: str,
+    content: str,
+    content_type: str = "text/plain",
+    bucket: str = S3_BUCKET,
+    if_match: Optional[str] = None,
+) -> StatusResponse | ErrorResponse:
     try:
-        # Decode base64 if content is binary
-        if content_type.startswith("image/") or content_type == "application/octet-stream":
-            body = base64.b64decode(content)
-        else:
-            body = content.encode("utf-8")
-        
-        s3_client.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=body,
-            ContentType=content_type
+        body = (
+            base64.b64decode(content)
+            if content_type.startswith(("image/", "application/octet-stream"))
+            else content.encode("utf-8")
         )
-        return {
-            "status": "success",
-            "bucket": bucket,
-            "key": key,
-            "content_type": content_type
-        }
+
+        if len(body) > MAX_OBJECT_BYTES:
+            return {"error": "Upload exceeds size limit", "code": "OBJECT_TOO_LARGE"}
+
+        async with await get_s3() as s3:
+            kwargs = {
+                "Bucket": bucket,
+                "Key": key,
+                "Body": body,
+                "ContentType": content_type,
+            }
+
+            if if_match:
+                kwargs["IfMatch"] = if_match
+
+            await s3.put_object(**kwargs)
+
+        return {"status": "success", "bucket": bucket, "key": key}
+
     except ClientError as e:
-        logger.error(f"Error putting object: {e}")
-        return {"error": str(e)}
+        return {"error": str(e), "code": "S3_PUT_FAILED"}
 
 
-@mcp.tool()
-def delete_object(key: str, bucket: str = S3_BUCKET) -> dict:
-    """Delete an object from S3.
-    
-    Args:
-        key: The object key (path) to delete
-        bucket: S3 bucket name (defaults to configured bucket)
-    
-    Returns:
-        Dictionary confirming the deletion
-    """
+@mcp.tool(description="Delete an object from S3.")
+async def delete_object(key: str, bucket: str = S3_BUCKET) -> StatusResponse | ErrorResponse:
     try:
-        s3_client.delete_object(Bucket=bucket, Key=key)
-        return {"status": "success", "deleted": key, "bucket": bucket}
-    except ClientError as e:
-        logger.error(f"Error deleting object: {e}")
-        return {"error": str(e)}
+        async with await get_s3() as s3:
+            await s3.delete_object(Bucket=bucket, Key=key)
+        return {"status": "success", "bucket": bucket, "key": key}
 
+    except ClientError as e:
+        return {"error": str(e), "code": "S3_DELETE_FAILED"}
+
+
+# =========================
+# Entrypoint
+# =========================
 
 if __name__ == "__main__":
-    logger.info(f"Starting S3 MCP Server")
-    logger.info(f"S3 Endpoint: {S3_ENDPOINT}")
-    logger.info(f"Default Bucket: {S3_BUCKET}")
-    
-    # Run with streamable-http transport
-    mcp.run(transport="streamable-http")
+    import uvicorn
+
+    app = mcp.streamable_http_app()
+
+    uvicorn.run(
+        app,
+        host=HOST,
+        port=PORT,
+        log_level="info",
+        access_log=True,
+    )
