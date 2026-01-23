@@ -65,16 +65,6 @@ spec:
           {{- end }}
         {{- end }}
       volumes:
-      {{- if .Values.persistence.enabled }}
-      - name: data
-        {{- if .Values.persistence.existingClaim }}
-        persistentVolumeClaim:
-          claimName: {{ .Values.persistence.existingClaim }}
-        {{- else }}
-        persistentVolumeClaim:
-          claimName: {{ include "mcp-s3-server.fullname" . }}
-        {{- end }}
-      {{- end }}
       {{- range .Values.additionalVolumes }}
       - name: {{ .name }}
         {{- if .persistentVolumeClaim }}
