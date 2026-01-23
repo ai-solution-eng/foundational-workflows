@@ -1,0 +1,14 @@
+apiVersion: v2
+name: mcp-fs-server
+description: A Helm chart for MCP Filesystem Server with FastMCP and Streamable HTTP
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - mcp
+  - filesystem
+  - fastmcp
+maintainers:
+  - name: Alejandro Morales Martinez
+    email: alemor@hpe.com
+

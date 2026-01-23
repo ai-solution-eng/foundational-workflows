@@ -1,0 +1,32 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: {{ include "mcp-inspector.name" . }}
+spec:
+  gateways:
+    - {{ .Values.ezua.virtualService.istioGateway | required ".Values.ezua.virtualService.istioGateway is required !\n" }}
+  hosts:
+    - {{ .Values.ezua.virtualService.endpoint | required ".Values.ezua.virtualService.endpoint is required !\n" }}
+  http:
+    - match:
+      - uri:
+          prefix: /proxy/
+      rewrite:
+        uri: /
+      route:
+      - destination:
+          host: mcp-inspector-proxy.mcp-inspector.svc.cluster.local
+          port:
+            number: 6277
+    - match:
+        - uri:
+            prefix: /
+      rewrite:
+        uri: /
+      route:
+        - destination:
+            # Insert target service name here
+            host: {{ include "mcp-inspector.fullname" . }}-client.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              # Insert target service port number here
+              number: {{ .Values.service.client.port }}

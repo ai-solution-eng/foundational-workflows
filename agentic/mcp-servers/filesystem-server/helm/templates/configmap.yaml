@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mcp-filesystem-server.fullname" . }}
+  labels:
+    {{- include "mcp-filesystem-server.labels" . | nindent 4 }}
+data:
+  allowed-directories: {{ .Values.config.allowedDirectories | quote }}
+

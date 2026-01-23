@@ -1,0 +1,49 @@
+{{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ include "mcp-filesystem-server.fullname" . }}
+  labels:
+    {{- include "mcp-filesystem-server.labels" . | nindent 4 }}
+  {{- with .Values.persistence.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    - {{ .Values.persistence.accessMode }}
+  capacity:
+    storage: {{ .Values.persistence.size }}
+  claimRef:
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    name: {{ include "mcp-filesystem-server.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+  csi:
+    controllerExpandSecretRef:
+      name: gl4f-mgmt
+      namespace: gl4f-csi
+    controllerPublishSecretRef:
+      name: gl4f-mgmt
+      namespace: gl4f-csi
+    driver: csi.vastdata.com
+    nodePublishSecretRef:
+      name: gl4f-mgmt
+      namespace: gl4f-csi
+    volumeAttributes:
+      mount_options: nfsvers=4.1
+      protocol: NFS4
+      root_export: /aiessentials
+      view_policy: nfspolicy
+      vip_pool_name: pcai
+    volumeHandle: {{ .Values.persistence.volumeHandle }}
+  persistentVolumeReclaimPolicy: Retain
+  {{- if .Values.persistence.storageClass }}
+  {{- if (eq "-" .Values.persistence.storageClass) }}
+  storageClassName: ""
+  {{- else }}
+  storageClassName: {{ .Values.persistence.storageClass }}
+  {{- end }}
+  {{- end }}
+  volumeMode: Filesystem
+{{- end }}
