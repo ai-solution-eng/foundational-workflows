@@ -36,20 +36,9 @@ spec:
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         ports:
         - name: http
-          containerPort: {{ .Values.config.port }}
+          containerPort: {{ .Values.service.port }}
           protocol: TCP
         env:
-        - name: ALLOWED_DIRECTORIES
-          valueFrom:
-            configMapKeyRef:
-              name: {{ include "mcp-filesystem-server.fullname" . }}
-              key: allowed-directories
-        - name: PORT
-          value: {{ .Values.config.port | quote }}
-        - name: HOST
-          value: {{ .Values.config.host | quote }}
-        - name: WORKERS
-          value: {{ .Values.config.workers | quote }}
         - name: ALLOWED_HOSTS
           value: {{ include "mcp-filesystem-server.allowedHosts" . | quote }}
         {{- range .Values.env }}

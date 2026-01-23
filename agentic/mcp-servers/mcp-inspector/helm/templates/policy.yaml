@@ -1,0 +1,51 @@
+{{- if .Values.certificatesPolicy.enabled -}}
+apiVersion: kyverno.io/v1
+kind: Policy
+metadata:
+  annotations:
+    policies.kyverno.io/category: Sample
+    policies.kyverno.io/description: >-
+      Injects custom CA certificates into containers via volumes and env vars 
+      when requested via annotations.
+    policies.kyverno.io/minversion: 1.5.0
+    policies.kyverno.io/title: Add Certificates as a Volume
+  name: add-certificates-volume
+spec:
+  admission: true
+  background: false
+  rules:
+  - name: add-ssl-certs
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    preconditions:
+      all:
+      - key: "{{ '{{' }} request.operation || 'BACKGROUND' {{ '}}' }}"
+        operator: AnyIn
+        value:
+        - CREATE
+        - UPDATE
+    mutate:
+      foreach:
+      - list: request.object.spec.containers
+        patchStrategicMerge:
+          spec:
+            containers:
+            - name: "{{ '{{' }} element.name {{ '}}' }}"
+              {{- if .Values.certificatesPolicy.env }}
+              env:
+                {{- toYaml .Values.certificatesPolicy.env | nindent 14 }}
+              {{- end }}
+              {{- if .Values.certificatesPolicy.volumeMounts }}
+              volumeMounts:
+                {{- toYaml .Values.certificatesPolicy.volumeMounts | nindent 14 }}
+              {{- end }}
+            {{- if .Values.certificatesPolicy.volumes }}
+            volumes:
+              {{- toYaml .Values.certificatesPolicy.volumes | nindent 12 }}
+            {{- end }}
+    skipBackgroundRequests: true
+  validationFailureAction: Audit
+{{- end -}}

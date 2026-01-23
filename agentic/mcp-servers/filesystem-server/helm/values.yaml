@@ -24,6 +24,45 @@ image:
   pullPolicy: IfNotPresent
   tag: "1.0.0"
 
+# Environment variables
+env:
+  - name: HOST
+    value: "0.0.0.0"
+  - name: WORKERS
+    value: "4"
+  - name: ALLOWED_DIRECTORIES
+    value: "/data"
+
+# Whether to add AIE self-signed certificates to root CAs
+# Requires a trust-manager bundle with useDefaultCAs set to true
+# More details here https://gist.github.hpe.com/jeff-oxenberg/70462e0777bf02c38be9823324de9f6d
+certificatesPolicy:
+  enabled: false
+  # The list of environment variables to inject
+  env:
+    - name: SSL_CERT_DIR
+      value: /etc/ssl/certs
+    - name: REQUESTS_CA_BUNDLE
+      value: /etc/ssl/certs/ca-certificates.crt
+    - name: SSL_CERT_FILE
+      value: /etc/ssl/certs/ca-certificates.crt
+    - name: AIOHTTP_CLIENT_SESSION_SSL
+      value: /etc/ssl/certs/ca-certificates.crt
+  # The list of volume mounts for the containers
+  volumeMounts:
+    - mountPath: /etc/ssl/certs/ca-certificates.crt
+      name: etc-ssl-certs
+      readOnly: true
+      subPath: ca-certificates.crt
+  # The volume definition (at the pod level)
+  volumes:
+    - name: etc-ssl-certs
+      configMap:
+        name: ca-bundle
+        items:
+          - key: ezaf-root-ca.crt
+            path: ca-certificates.crt
+
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
@@ -101,24 +140,8 @@ additionalVolumes: []
   #     name: shared-config
   #   mountPath: /config
 
-# MCP Server Configuration
-config:
-  # Comma-separated list of allowed directories
-  allowedDirectories: "/data"
-  # Server port (FastMCP default is 8000)
-  port: "8000"
-  # Host to bind to
-  host: "0.0.0.0"
-  # Number of uvicorn workers (for production)
-  workers: 4
-
 # Additional allowed hosts
 extraAllowedHosts: []
-
-# Environment variables
-env: []
-  # - name: LOG_LEVEL
-  #   value: "info"
 
 # Secrets mounted as environment variables
 envFrom: []
