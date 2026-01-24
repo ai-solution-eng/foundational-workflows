@@ -1,12 +1,16 @@
+{{- /* Pre-flight validation */ -}}
+{{- $gateway := required "A valid istio gateway main is required in values.yaml" .Values.ezua.virtualService.istioGateway -}}
+{{- $endpoint := required "The EZUA endpoint is required in values.yaml" .Values.ezua.virtualService.endpoint -}}
+
 apiVersion: networking.istio.io/v1alpha3
 kind: VirtualService
 metadata:
   name: {{ include "mcp-inspector.name" . }}
 spec:
   gateways:
-    - {{ .Values.ezua.virtualService.istioGateway | required ".Values.ezua.virtualService.istioGateway is required !\n" }}
+    - "{{ $gateway | trim }}"
   hosts:
-    - {{ .Values.ezua.virtualService.endpoint | required ".Values.ezua.virtualService.endpoint is required !\n" }}
+    - "{{ regexReplaceAll "[/?].*" $endpoint "" | trim }}"
   http:
     - match:
       - uri:

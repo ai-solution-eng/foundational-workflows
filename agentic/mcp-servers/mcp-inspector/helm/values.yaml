@@ -1,7 +1,7 @@
 ezua:
   #Use next options in order to configure the application endpoint.
   virtualService:
-    endpoint: "mcp-inspector.${DOMAIN_NAME}"
+    endpoint: "mcp-inspector.${DOMAIN_NAME}/?MCP_PROXY_FULL_ADDRESS=https://mcp-inspector.${DOMAIN_NAME}/proxy&MCP_PROXY_AUTH_TOKEN=test_token"
     istioGateway: "istio-system/ezaf-gateway"
 
 replicaCount: 1
@@ -21,10 +21,6 @@ env:
     value: "6274"
   - name: SERVER_PORT
     value: "6277"
-  - name: MCP_PROXY_AUTH_TOKEN
-    value: ""
-  - name: MCP_PROXY_FULL_ADDRESS
-    value: "https://mcp-inspector.${DOMAIN_NAME}/proxy"
   - name: ALLOWED_ORIGINS
     value: "http://localhost:6274,https://mcp-inspector.${DOMAIN_NAME}"
 
@@ -42,6 +38,8 @@ certificatesPolicy:
     - name: SSL_CERT_FILE
       value: /etc/ssl/certs/ca-certificates.crt
     - name: AIOHTTP_CLIENT_SESSION_SSL
+      value: /etc/ssl/certs/ca-certificates.crt
+    - name: NODE_EXTRA_CA_CERTS
       value: /etc/ssl/certs/ca-certificates.crt
   # The list of volume mounts for the containers
   volumeMounts:
