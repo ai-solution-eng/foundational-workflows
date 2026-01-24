@@ -65,6 +65,7 @@ Create a list of allowed hosts
 {{/* Define the full list of allowed hosts */}}
 {{- define "mcp-s3-server.allowedHosts" -}}
 {{- $hosts := .Values.extraAllowedHosts | default (list "localhost" "127.0.0.1") -}}
+{{- $istio := .Values.ezua.virtualService.endpoint | required ".Values.ezua.virtualService.endpoint is required !\n" -}}
 {{- $internal := printf "%s.%s.svc.cluster.local:*" (include "mcp-s3-server.fullname" .) .Release.Namespace -}}
-{{- join "," (append $hosts $internal) -}}
+{{- join "," (append $hosts $istio $internal) -}}
 {{- end -}}
