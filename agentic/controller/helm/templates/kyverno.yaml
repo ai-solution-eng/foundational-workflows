@@ -1,0 +1,29 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: inject-model-api-keys
+spec:
+  background: true
+  rules:
+  - name: inject-secret-envfrom
+    match:
+      any:
+      - resources:
+          kinds:
+          - Deployment
+          namespaces:
+          - nemo-microservices
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: guardrails
+    mutate:
+      patchStrategicMerge:
+        spec:
+          template:
+            spec:
+              containers:
+              - (name): "*"
+                envFrom:
+                - secretRef:
+                    name: model-api-keys
+                    optional: false

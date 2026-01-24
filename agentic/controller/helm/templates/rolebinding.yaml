@@ -1,0 +1,17 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "configmap-secret-operator.fullname" . }}-secrets
+  namespace: {{ .Values.targetNamespace }}
+  labels:
+    {{- include "configmap-secret-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "configmap-secret-operator.fullname" . }}-secrets
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Values.operatorNamespace }}
+{{- end }}

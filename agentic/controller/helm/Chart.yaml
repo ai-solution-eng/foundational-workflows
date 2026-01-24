@@ -1,0 +1,15 @@
+apiVersion: v2
+name: model-key-controller
+description: A Helm chart for MCP Inspector - Visual testing tool for MCP servers
+type: application
+version: 1.0.0
+appVersion: "latest"
+keywords:
+  - nim-proxy
+  - controller
+  - testing
+  - debugging
+maintainers:
+  - name: Alejandro Morales
+    email: alemor@hpe.com
+

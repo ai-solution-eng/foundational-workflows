@@ -1,0 +1,25 @@
+# Operator resources deployed here
+operatorNamespace: model-key-controller
+
+# Secret created here
+targetNamespace: nemo-microservices
+
+operator:
+  replicas: 1
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "200m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+  config:
+    secretName: model-api-keys
+    configmapPattern: "^deploymentconfig-(.+)$"
+    labelSelector: "app.nvidia.com/config-type=deploymentConfig"
+
+secret:
+  create: true
+  name: model-api-keys
+  # Optionally provide initial values (will be overwritten by operator)
+  data: {}

@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "configmap-secret-operator.fullname" . }}
+  namespace: {{ .Values.operatorNamespace }}
+  labels:
+    {{- include "configmap-secret-operator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.operator.replicas }}
+  selector:
+    matchLabels:
+      {{- include "configmap-secret-operator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-operator-code.yaml") . | sha256sum }}
+      labels:
+        {{- include "configmap-secret-operator.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      containers:
+      - name: operator
+        image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
+        imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+        command:
+          - /bin/sh
+          - -c
+          - |
+            pip install --no-cache-dir kubernetes==31.0.0 && python /app/operator.py
+        volumeMounts:
+        - name: operator-code
+          mountPath: /app
+        env:
+        - name: TARGET_NAMESPACE
+          value: {{ .Values.targetNamespace | quote }}
+        - name: SECRET_NAME
+          value: {{ .Values.operator.config.secretName | quote }}
+        - name: CONFIGMAP_PATTERN
+          value: {{ .Values.operator.config.configmapPattern | quote }}
+        - name: LABEL_SELECTOR
+          value: {{ .Values.operator.config.labelSelector | quote }}
+        resources:
+          {{- toYaml .Values.operator.resources | nindent 10 }}
+      volumes:
+      - name: operator-code
+        configMap:
+          name: {{ include "configmap-secret-operator.fullname" . }}-code
