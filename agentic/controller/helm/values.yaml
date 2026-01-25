@@ -5,6 +5,11 @@ operatorNamespace: model-key-controller
 targetNamespace: nemo-microservices
 
 operator:
+  image: 
+    repository: "alemor/model-key-controller"
+    tag: "dev"
+    pullPolicy: "IfNotPresent"
+    
   replicas: 1
   resources:
     requests:
@@ -17,6 +22,16 @@ operator:
     secretName: model-api-keys
     configmapPattern: "^deploymentconfig-(.+)$"
     labelSelector: "app.nvidia.com/config-type=deploymentConfig"
+    deploymentLabelSelector: "app.kubernetes.io/name=guardrails"
+    injectIntoDeployments: true
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+rbac:
+  create: true
 
 secret:
   create: true

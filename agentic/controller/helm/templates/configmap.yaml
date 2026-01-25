@@ -6,5 +6,363 @@ metadata:
   labels:
     {{- include "configmap-secret-operator.labels" . | nindent 4 }}
 data:
-  operator.py: |
-{{ .Files.Get "model-key-controller.py" | indent 4 }}
+  model-key-controller.py: |
+    #!/usr/bin/env python3
+    """
+    Kubernetes Operator to sync API keys from deploymentconfig-* ConfigMaps to a Secret
+    Watches for ConfigMaps with name pattern 'deploymentconfig-*' and extracts API keys
+    to create/update a consolidated Secret that can be mounted into pods.
+    Also triggers deployment rollouts when the secret changes.
+    """
+
+    import json
+    import re
+    import logging
+    import base64
+    import hashlib
+    import os
+    from typing import Dict, Optional
+    from kubernetes import client, config, watch
+    from kubernetes.client.rest import ApiException
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+
+
+    class ConfigMapSecretOperator:
+        """Operator to sync ConfigMap data to Secret and inject into deployments"""
+        
+        def __init__(
+            self,
+            target_namespace: str = "nemo-microservices",
+            secret_name: str = "model-api-keys",
+            configmap_pattern: str = r"^deploymentconfig-(.+)$",
+            label_selector: Optional[str] = "app.nvidia.com/config-type=deploymentConfig",
+            inject_into_deployments: bool = True,
+            deployment_label_selector: str = "app.kubernetes.io/name=guardrails"
+        ):
+            self.target_namespace = target_namespace
+            self.secret_name = secret_name
+            self.configmap_pattern = re.compile(configmap_pattern)
+            self.label_selector = label_selector
+            self.inject_into_deployments = inject_into_deployments
+            self.deployment_label_selector = deployment_label_selector
+            
+            # Initialize Kubernetes clients
+            try:
+                config.load_incluster_config()
+            except config.ConfigException:
+                config.load_kube_config()
+            
+            self.v1 = client.CoreV1Api()
+            self.apps_v1 = client.AppsV1Api()
+            
+        def extract_api_key_from_configmap(self, configmap) -> Optional[tuple]:
+            """
+            Extract API key and model name from ConfigMap
+            Returns: (model_name, api_key) or None
+            """
+            cm_name = configmap.metadata.name
+            
+            # Check if ConfigMap name matches pattern
+            match = self.configmap_pattern.match(cm_name)
+            if not match:
+                return None
+            
+            model_name = match.group(1)
+            
+            # Parse deploymentConfig JSON
+            if not configmap.data or 'deploymentConfig' not in configmap.data:
+                logger.warning(f"ConfigMap {cm_name} missing deploymentConfig data")
+                return None
+            
+            try:
+                config_data = json.loads(configmap.data['deploymentConfig'])
+                api_key = config_data.get('ExternalEndpoint', {}).get('ApiKey')
+                
+                if not api_key or api_key == "REDACTED":
+                    logger.warning(f"No valid API key found in {cm_name}")
+                    return None
+                
+                logger.info(f"Extracted API key for model: {model_name}")
+                return (model_name, api_key)
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse deploymentConfig in {cm_name}: {e}")
+                return None
+        
+        def get_all_api_keys(self) -> Dict[str, str]:
+            """
+            Scan all namespaces for matching ConfigMaps and extract API keys
+            Returns: Dict mapping model names to API keys
+            """
+            api_keys = {}
+            
+            try:
+                # List all ConfigMaps across all namespaces with label selector
+                if self.label_selector:
+                    configmaps = self.v1.list_config_map_for_all_namespaces(
+                        label_selector=self.label_selector
+                    )
+                else:
+                    configmaps = self.v1.list_config_map_for_all_namespaces()
+                
+                for cm in configmaps.items:
+                    result = self.extract_api_key_from_configmap(cm)
+                    if result:
+                        model_name, api_key = result
+                        # Use uppercase env var style: MLIS_QWEN3_8B
+                        env_var_name = model_name.upper().replace('-', '_')
+                        api_keys[env_var_name] = api_key
+                
+                logger.info(f"Found {len(api_keys)} API keys across all namespaces")
+                return api_keys
+                
+            except ApiException as e:
+                logger.error(f"Error listing ConfigMaps: {e}")
+                return {}
+        
+        def create_or_update_secret(self, api_keys: Dict[str, str]) -> bool:
+            """
+            Create or update the consolidated Secret with API keys
+            """
+            if not api_keys:
+                logger.info("No API keys to store, skipping secret creation")
+                return False
+            
+            # Kubernetes expects base64-encoded strings in the data field
+            import base64
+            secret_data = {k: base64.b64encode(v.encode()).decode() for k, v in api_keys.items()}
+            
+            secret = client.V1Secret(
+                metadata=client.V1ObjectMeta(
+                    name=self.secret_name,
+                    namespace=self.target_namespace,
+                    labels={
+                        "app": "model-api-keys",
+                        "managed-by": "configmap-secret-operator"
+                    }
+                ),
+                data=secret_data,
+                type="Opaque"
+            )
+            
+            try:
+                # Try to get existing secret
+                existing_secret = self.v1.read_namespaced_secret(
+                    name=self.secret_name,
+                    namespace=self.target_namespace
+                )
+                
+                # Update existing secret
+                self.v1.replace_namespaced_secret(
+                    name=self.secret_name,
+                    namespace=self.target_namespace,
+                    body=secret
+                )
+                logger.info(f"Updated Secret {self.secret_name} in {self.target_namespace}")
+                
+                # Inject secret into deployments and trigger rollout
+                if self.inject_into_deployments:
+                    self.inject_and_rollout_deployments(api_keys)
+                
+                return True
+                
+            except ApiException as e:
+                if e.status == 404:
+                    # Secret doesn't exist, create it
+                    self.v1.create_namespaced_secret(
+                        namespace=self.target_namespace,
+                        body=secret
+                    )
+                    logger.info(f"Created Secret {self.secret_name} in {self.target_namespace}")
+                    
+                    # Inject secret into deployments
+                    if self.inject_into_deployments:
+                        self.inject_and_rollout_deployments(api_keys)
+                    
+                    return True
+                else:
+                    logger.error(f"Error managing secret: {e}")
+                    return False
+        
+        def inject_secret_into_deployment(self, deployment) -> bool:
+            """
+            Ensure deployment has envFrom configured to use the secret
+            Returns True if deployment was modified, False otherwise
+            """
+            modified = False
+            dep_name = deployment.metadata.name
+            
+            # Ensure spec.template.spec exists
+            if not deployment.spec.template.spec:
+                logger.warning(f"Deployment {dep_name} has no pod spec")
+                return False
+            
+            # Process each container
+            for container in deployment.spec.template.spec.containers:
+                # Initialize envFrom if it doesn't exist
+                if container.env_from is None:
+                    container.env_from = []
+                
+                # Check if our secret is already referenced
+                has_secret = any(
+                    env_from.secret_ref and 
+                    env_from.secret_ref.name == self.secret_name
+                    for env_from in container.env_from
+                )
+                
+                if not has_secret:
+                    # Add the secret reference
+                    secret_ref = client.V1EnvFromSource(
+                        secret_ref=client.V1SecretEnvSource(
+                            name=self.secret_name,
+                            optional=False
+                        )
+                    )
+                    container.env_from.append(secret_ref)
+                    logger.info(f"Added secret reference to container {container.name} in {dep_name}")
+                    modified = True
+            
+            return modified
+        
+        def inject_and_rollout_deployments(self, api_keys: Dict[str, str]):
+            """
+            Inject secret into deployments and trigger rollout by updating annotation
+            """
+            try:
+                # Calculate checksum of secret data for annotation
+                secret_hash = hashlib.sha256(
+                    json.dumps(api_keys, sort_keys=True).encode()
+                ).hexdigest()[:8]
+                
+                # Find deployments that should be updated
+                deployments = self.apps_v1.list_namespaced_deployment(
+                    namespace=self.target_namespace,
+                    label_selector=self.deployment_label_selector
+                )
+                
+                for deployment in deployments.items:
+                    dep_name = deployment.metadata.name
+                    
+                    # Inject secret reference into containers
+                    secret_injected = self.inject_secret_into_deployment(deployment)
+                    
+                    # Initialize annotations if needed
+                    if not deployment.spec.template.metadata:
+                        deployment.spec.template.metadata = client.V1ObjectMeta()
+                    if not deployment.spec.template.metadata.annotations:
+                        deployment.spec.template.metadata.annotations = {}
+                    
+                    # Update hash annotation to trigger rollout
+                    old_hash = deployment.spec.template.metadata.annotations.get(
+                        'configmap-secret-operator/secret-hash'
+                    )
+                    
+                    if old_hash != secret_hash or secret_injected:
+                        deployment.spec.template.metadata.annotations[
+                            'configmap-secret-operator/secret-hash'
+                        ] = secret_hash
+                        
+                        # Patch the deployment
+                        self.apps_v1.patch_namespaced_deployment(
+                            name=dep_name,
+                            namespace=self.target_namespace,
+                            body=deployment
+                        )
+                        
+                        if secret_injected:
+                            logger.info(f"Injected secret and triggered rollout for {dep_name} (hash: {secret_hash})")
+                        else:
+                            logger.info(f"Triggered rollout for {dep_name} (hash: {secret_hash})")
+                    else:
+                        logger.info(f"Deployment {dep_name} already up-to-date (hash: {secret_hash})")
+                    
+            except ApiException as e:
+                logger.error(f"Error injecting secret into deployments: {e}")
+        
+        def handle_configmap_event(self, event_type: str, configmap):
+            """Handle ConfigMap add/modify/delete events"""
+            cm_name = configmap.metadata.name
+            cm_namespace = configmap.metadata.namespace
+            
+            logger.info(f"Event {event_type} for ConfigMap {cm_name} in {cm_namespace}")
+            
+            # Rescan all ConfigMaps and update secret
+            api_keys = self.get_all_api_keys()
+            self.create_or_update_secret(api_keys)
+        
+        def run(self):
+            """Main operator loop - watches for ConfigMap events"""
+            logger.info("Starting ConfigMap Secret Operator...")
+            
+            # Initial sync
+            logger.info("Performing initial sync...")
+            api_keys = self.get_all_api_keys()
+            self.create_or_update_secret(api_keys)
+            
+            # Watch for changes
+            w = watch.Watch()
+            logger.info("Watching for ConfigMap changes...")
+            
+            while True:
+                try:
+                    if self.label_selector:
+                        stream = w.stream(
+                            self.v1.list_config_map_for_all_namespaces,
+                            label_selector=self.label_selector,
+                            timeout_seconds=300
+                        )
+                    else:
+                        stream = w.stream(
+                            self.v1.list_config_map_for_all_namespaces,
+                            timeout_seconds=300
+                        )
+                    
+                    for event in stream:
+                        event_type = event['type']
+                        configmap = event['object']
+                        
+                        # Only process if matches our pattern
+                        if self.configmap_pattern.match(configmap.metadata.name):
+                            self.handle_configmap_event(event_type, configmap)
+                            
+                except ApiException as e:
+                    logger.error(f"API exception in watch loop: {e}")
+                except Exception as e:
+                    logger.error(f"Unexpected error in watch loop: {e}")
+                
+                # Brief pause before restarting watch
+                import time
+                time.sleep(5)
+
+
+    if __name__ == "__main__":
+        # Read configuration from environment variables
+        target_namespace = os.getenv("TARGET_NAMESPACE", "nemo-microservices")
+        secret_name = os.getenv("SECRET_NAME", "model-api-keys")
+        configmap_pattern = os.getenv("CONFIGMAP_PATTERN", r"^deploymentconfig-(.+)$")
+        label_selector = os.getenv("LABEL_SELECTOR", "app.nvidia.com/config-type=deploymentConfig")
+        inject_into_deployments = os.getenv("INJECT_INTO_DEPLOYMENTS", "true").lower() == "true"
+        deployment_label_selector = os.getenv("DEPLOYMENT_LABEL_SELECTOR", "app.kubernetes.io/name=guardrails")
+        
+        logger.info(f"Starting operator with configuration:")
+        logger.info(f"  Target Namespace: {target_namespace}")
+        logger.info(f"  Secret Name: {secret_name}")
+        logger.info(f"  ConfigMap Pattern: {configmap_pattern}")
+        logger.info(f"  Label Selector: {label_selector}")
+        logger.info(f"  Inject Into Deployments: {inject_into_deployments}")
+        logger.info(f"  Deployment Label Selector: {deployment_label_selector}")
+        
+        operator = ConfigMapSecretOperator(
+            target_namespace=target_namespace,
+            secret_name=secret_name,
+            configmap_pattern=configmap_pattern,
+            label_selector=label_selector,
+            inject_into_deployments=inject_into_deployments,
+            deployment_label_selector=deployment_label_selector
+        )
+        operator.run()

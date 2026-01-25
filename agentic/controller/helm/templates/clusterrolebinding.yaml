@@ -11,6 +11,6 @@ roleRef:
   name: {{ include "configmap-secret-operator.fullname" . }}
 subjects:
   - kind: ServiceAccount
-    name: {{ .Values.serviceAccount.name }}
+    name: {{ include "configmap-secret-operator.fullname" . }}
     namespace: {{ .Values.operatorNamespace }}
 {{- end }}

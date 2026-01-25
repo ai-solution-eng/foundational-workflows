@@ -13,20 +13,20 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap-operator-code.yaml") . | sha256sum }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
       labels:
         {{- include "configmap-secret-operator.selectorLabels" . | nindent 8 }}
     spec:
-      serviceAccountName: {{ .Values.serviceAccount.name }}
+      serviceAccountName: {{ include "configmap-secret-operator.fullname" . }}
       containers:
       - name: operator
         image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
         imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
-        command:
+        args:
           - /bin/sh
           - -c
           - |
-            pip install --no-cache-dir kubernetes==31.0.0 && python /app/operator.py
+            pip install --no-cache-dir kubernetes==31.0.0 && python /app/model-key-controller.py
         volumeMounts:
         - name: operator-code
           mountPath: /app
@@ -39,6 +39,10 @@ spec:
           value: {{ .Values.operator.config.configmapPattern | quote }}
         - name: LABEL_SELECTOR
           value: {{ .Values.operator.config.labelSelector | quote }}
+        - name: INJECT_INTO_DEPLOYMENTS
+          value: {{ .Values.operator.config.injectIntoDeployments | quote }}
+        - name: DEPLOYMENT_LABEL_SELECTOR
+          value: {{ .Values.operator.config.deploymentLabelSelector | quote }}
         resources:
           {{- toYaml .Values.operator.resources | nindent 10 }}
       volumes:

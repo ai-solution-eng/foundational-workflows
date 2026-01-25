@@ -3,12 +3,15 @@
 Kubernetes Operator to sync API keys from deploymentconfig-* ConfigMaps to a Secret
 Watches for ConfigMaps with name pattern 'deploymentconfig-*' and extracts API keys
 to create/update a consolidated Secret that can be mounted into pods.
+Also triggers deployment rollouts when the secret changes.
 """
 
 import json
 import re
 import logging
 import base64
+import hashlib
+import os
 from typing import Dict, Optional
 from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
@@ -21,19 +24,23 @@ logger = logging.getLogger(__name__)
 
 
 class ConfigMapSecretOperator:
-    """Operator to sync ConfigMap data to Secret"""
+    """Operator to sync ConfigMap data to Secret and inject into deployments"""
     
     def __init__(
         self,
         target_namespace: str = "nemo-microservices",
         secret_name: str = "model-api-keys",
         configmap_pattern: str = r"^deploymentconfig-(.+)$",
-        label_selector: Optional[str] = "app.nvidia.com/config-type=deploymentConfig"
+        label_selector: Optional[str] = "app.nvidia.com/config-type=deploymentConfig",
+        inject_into_deployments: bool = True,
+        deployment_label_selector: str = "app.kubernetes.io/name=guardrails"
     ):
         self.target_namespace = target_namespace
         self.secret_name = secret_name
         self.configmap_pattern = re.compile(configmap_pattern)
         self.label_selector = label_selector
+        self.inject_into_deployments = inject_into_deployments
+        self.deployment_label_selector = deployment_label_selector
         
         # Initialize Kubernetes clients
         try:
@@ -42,6 +49,7 @@ class ConfigMapSecretOperator:
             config.load_kube_config()
         
         self.v1 = client.CoreV1Api()
+        self.apps_v1 = client.AppsV1Api()
         
     def extract_api_key_from_configmap(self, configmap) -> Optional[tuple]:
         """
@@ -147,6 +155,11 @@ class ConfigMapSecretOperator:
                 body=secret
             )
             logger.info(f"Updated Secret {self.secret_name} in {self.target_namespace}")
+            
+            # Inject secret into deployments and trigger rollout
+            if self.inject_into_deployments:
+                self.inject_and_rollout_deployments(api_keys)
+            
             return True
             
         except ApiException as e:
@@ -157,10 +170,110 @@ class ConfigMapSecretOperator:
                     body=secret
                 )
                 logger.info(f"Created Secret {self.secret_name} in {self.target_namespace}")
+                
+                # Inject secret into deployments
+                if self.inject_into_deployments:
+                    self.inject_and_rollout_deployments(api_keys)
+                
                 return True
             else:
                 logger.error(f"Error managing secret: {e}")
                 return False
+    
+    def inject_secret_into_deployment(self, deployment) -> bool:
+        """
+        Ensure deployment has envFrom configured to use the secret
+        Returns True if deployment was modified, False otherwise
+        """
+        modified = False
+        dep_name = deployment.metadata.name
+        
+        # Ensure spec.template.spec exists
+        if not deployment.spec.template.spec:
+            logger.warning(f"Deployment {dep_name} has no pod spec")
+            return False
+        
+        # Process each container
+        for container in deployment.spec.template.spec.containers:
+            # Initialize envFrom if it doesn't exist
+            if container.env_from is None:
+                container.env_from = []
+            
+            # Check if our secret is already referenced
+            has_secret = any(
+                env_from.secret_ref and 
+                env_from.secret_ref.name == self.secret_name
+                for env_from in container.env_from
+            )
+            
+            if not has_secret:
+                # Add the secret reference
+                secret_ref = client.V1EnvFromSource(
+                    secret_ref=client.V1SecretEnvSource(
+                        name=self.secret_name,
+                        optional=False
+                    )
+                )
+                container.env_from.append(secret_ref)
+                logger.info(f"Added secret reference to container {container.name} in {dep_name}")
+                modified = True
+        
+        return modified
+    
+    def inject_and_rollout_deployments(self, api_keys: Dict[str, str]):
+        """
+        Inject secret into deployments and trigger rollout by updating annotation
+        """
+        try:
+            # Calculate checksum of secret data for annotation
+            secret_hash = hashlib.sha256(
+                json.dumps(api_keys, sort_keys=True).encode()
+            ).hexdigest()[:8]
+            
+            # Find deployments that should be updated
+            deployments = self.apps_v1.list_namespaced_deployment(
+                namespace=self.target_namespace,
+                label_selector=self.deployment_label_selector
+            )
+            
+            for deployment in deployments.items:
+                dep_name = deployment.metadata.name
+                
+                # Inject secret reference into containers
+                secret_injected = self.inject_secret_into_deployment(deployment)
+                
+                # Initialize annotations if needed
+                if not deployment.spec.template.metadata:
+                    deployment.spec.template.metadata = client.V1ObjectMeta()
+                if not deployment.spec.template.metadata.annotations:
+                    deployment.spec.template.metadata.annotations = {}
+                
+                # Update hash annotation to trigger rollout
+                old_hash = deployment.spec.template.metadata.annotations.get(
+                    'configmap-secret-operator/secret-hash'
+                )
+                
+                if old_hash != secret_hash or secret_injected:
+                    deployment.spec.template.metadata.annotations[
+                        'configmap-secret-operator/secret-hash'
+                    ] = secret_hash
+                    
+                    # Patch the deployment
+                    self.apps_v1.patch_namespaced_deployment(
+                        name=dep_name,
+                        namespace=self.target_namespace,
+                        body=deployment
+                    )
+                    
+                    if secret_injected:
+                        logger.info(f"Injected secret and triggered rollout for {dep_name} (hash: {secret_hash})")
+                    else:
+                        logger.info(f"Triggered rollout for {dep_name} (hash: {secret_hash})")
+                else:
+                    logger.info(f"Deployment {dep_name} already up-to-date (hash: {secret_hash})")
+                
+        except ApiException as e:
+            logger.error(f"Error injecting secret into deployments: {e}")
     
     def handle_configmap_event(self, event_type: str, configmap):
         """Handle ConfigMap add/modify/delete events"""
@@ -219,10 +332,28 @@ class ConfigMapSecretOperator:
 
 
 if __name__ == "__main__":
+    # Read configuration from environment variables
+    target_namespace = os.getenv("TARGET_NAMESPACE", "nemo-microservices")
+    secret_name = os.getenv("SECRET_NAME", "model-api-keys")
+    configmap_pattern = os.getenv("CONFIGMAP_PATTERN", r"^deploymentconfig-(.+)$")
+    label_selector = os.getenv("LABEL_SELECTOR", "app.nvidia.com/config-type=deploymentConfig")
+    inject_into_deployments = os.getenv("INJECT_INTO_DEPLOYMENTS", "true").lower() == "true"
+    deployment_label_selector = os.getenv("DEPLOYMENT_LABEL_SELECTOR", "app.kubernetes.io/name=guardrails")
+    
+    logger.info(f"Starting operator with configuration:")
+    logger.info(f"  Target Namespace: {target_namespace}")
+    logger.info(f"  Secret Name: {secret_name}")
+    logger.info(f"  ConfigMap Pattern: {configmap_pattern}")
+    logger.info(f"  Label Selector: {label_selector}")
+    logger.info(f"  Inject Into Deployments: {inject_into_deployments}")
+    logger.info(f"  Deployment Label Selector: {deployment_label_selector}")
+    
     operator = ConfigMapSecretOperator(
-        target_namespace="nemo-microservices",
-        secret_name="model-api-keys",
-        configmap_pattern=r"^deploymentconfig-(.+)$",
-        label_selector="app.nvidia.com/config-type=deploymentConfig"
+        target_namespace=target_namespace,
+        secret_name=secret_name,
+        configmap_pattern=configmap_pattern,
+        label_selector=label_selector,
+        inject_into_deployments=inject_into_deployments,
+        deployment_label_selector=deployment_label_selector
     )
     operator.run()
