@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mcp-ezpresto.fullname" . }}
+  labels:
+    {{- include "mcp-ezpresto.labels" . | nindent 4 }}
+  {{- with .Values.service.client.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.client.type }}
+  ports:
+    - port: {{ .Values.service.client.port }}
+      targetPort: {{ .Values.service.client.targetPort }}
+      protocol: TCP
+      name: mcpport
+  selector:
+    {{- include "mcp-ezpresto.selectorLabels" . | nindent 4 }}
+

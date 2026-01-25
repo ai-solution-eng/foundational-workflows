@@ -1,0 +1,88 @@
+ezua:
+  #Use next options in order to configure the application endpoint.
+  virtualService:
+    endpoint: "mcp-ezpresto.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+
+replicaCount: 1
+
+image:
+  pullPolicy: Always
+  repository: prakashmirjihpe/presto-mcp
+  tag: httpstremable
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  fsGroup: 1000
+  runAsNonRoot: true
+  runAsUser: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: false
+  runAsNonRoot: true
+  runAsUser: 1000
+
+# Service for Client UI (MCPI)
+service:
+  type: ClusterIP
+  port: 9097
+  targetPort: 9097
+  annotations: {}
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+
+# Environment variables
+env: []
+
+# Additional environment from secrets/configmaps
+envFrom: []
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+livenessProbe:
+  httpGet:
+    path: /
+    port: mcpport
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /
+    port: mcpport
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
