@@ -4,15 +4,15 @@ metadata:
   name: {{ include "mcp-ezpresto.fullname" . }}
   labels:
     {{- include "mcp-ezpresto.labels" . | nindent 4 }}
-  {{- with .Values.service.client.annotations }}
+  {{- with .Values.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  type: {{ .Values.service.client.type }}
+  type: {{ .Values.service.type }}
   ports:
-    - port: {{ .Values.service.client.port }}
-      targetPort: {{ .Values.service.client.targetPort }}
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
       protocol: TCP
       name: mcpport
   selector:

@@ -6,8 +6,8 @@ targetNamespace: nemo-microservices
 
 operator:
   image: 
-    repository: "alemor/model-key-controller"
-    tag: "dev"
+    repository: "python"
+    tag: "3.11-slim"
     pullPolicy: "IfNotPresent"
     
   replicas: 1
