@@ -63,8 +63,6 @@ class ConfigMapSecretOperator:
         if not match:
             return None
         
-        model_name = match.group(1)
-        
         # Parse deploymentConfig JSON
         if not configmap.data or 'deploymentConfig' not in configmap.data:
             logger.warning(f"ConfigMap {cm_name} missing deploymentConfig data")
@@ -72,9 +70,10 @@ class ConfigMapSecretOperator:
         
         try:
             config_data = json.loads(configmap.data['deploymentConfig'])
+            model_name = config_data.get('Namespace') + '_' + config_data.get('Name')
             api_key = config_data.get('ExternalEndpoint', {}).get('ApiKey')
             
-            if not api_key or api_key == "REDACTED":
+            if not api_key:
                 logger.warning(f"No valid API key found in {cm_name}")
                 return None
             

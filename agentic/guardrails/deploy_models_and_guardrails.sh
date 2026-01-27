@@ -4,18 +4,20 @@ curl -X POST \
   --cacert ${EZUA_DOMAIN_CA_CERT_PATH} \
   -H 'accept: application/json' \
   -H 'Content-Type: application/json' \
-  -d '{
-        "name": "${NEMO_MAIN_MODEL_NAME}",
-        "namespace": "${NEMO_MODEL_NAMESPACE}",
-        "description": "Main model for guardrails configuration",
-        "external_endpoint": {
-            "host_url": "${NIM_ENDPOINT_URL}",
-            "api_key": "${NEMO_MAIN_MODEL_TOKEN}",
-            "enabled_models": [
-                "${NEMO_MAIN_MODEL_NAME}"
-            ]
-        }
-    }'
+  -d @- <<EOF
+{
+"name": "${NEMO_MAIN_MODEL_NAME}",
+"namespace": "${NEMO_MODEL_NAMESPACE}",
+"description": "Main model for guardrails configuration",
+"external_endpoint": {
+    "host_url": "${NIM_ENDPOINT_URL}",
+    "api_key": "${NEMO_MAIN_MODEL_TOKEN}",
+    "enabled_models": [
+    "${NEMO_MAIN_MODEL_NAME}"
+    ]
+}
+}
+EOF
 
 # Deploy guardrails model to NIM Proxy
 curl -X POST \
@@ -24,14 +26,14 @@ curl -X POST \
   -H 'accept: application/json' \
   -H 'Content-Type: application/json' \
   -d '{
-        "name": "${NEMO_GUARDRAIL_MODEL_NAME}",
-        "namespace": "${NEMO_MODEL_NAMESPACE}",
+        "name": \"${NEMO_GUARDRAIL_MODEL_NAME}\",
+        "namespace": \"${NEMO_MODEL_NAMESPACE}\",
         "description": "Guardrails model for guardrails configuration",
         "external_endpoint": {
-            "host_url": "${NIM_ENDPOINT_URL}",
-            "api_key": "${NEMO_GUARDRAIL_MODEL_TOKEN}",
+            "host_url": \"${NIM_ENDPOINT_URL}\",
+            "api_key": \"${NEMO_GUARDRAIL_MODEL_TOKEN}\",
             "enabled_models": [
-                "${NEMO_GUARDRAIL_MODEL_ID}"
+                \"${NEMO_GUARDRAIL_MODEL_ID}\"
             ]
         }
     }'
@@ -41,8 +43,8 @@ curl -X POST "${GUARDRAILS_BASE_URL}/configs" \
   -H "Accept: application/json" \
   -H "Content-Type: application/json" \
   -d '{
-        "name": "${GUARDRAIL_CONFIG_NAME}",
-        "namespace": "${NEMO_MODEL_NAMESPACE}",
+        "name": \"${GUARDRAIL_CONFIG_NAME}\",
+        "namespace": \"${NEMO_MODEL_NAMESPACE}\",
         "description": "demo streaming self-check input and output",
         "data": {
             "prompts": [
@@ -68,7 +70,7 @@ curl -X POST "${GUARDRAILS_BASE_URL}/configs" \
             {
                 "type": "main",
                 "engine": "nim",
-                "model": "${NEMO_MAIN_MODEL_ID}",
+                "model": \"${NEMO_MAIN_MODEL_ID}\",
                 "reasoning_config": {
                 "remove_reasoning_traces": true,
                 "start_token": "<think>",
@@ -79,40 +81,40 @@ curl -X POST "${GUARDRAILS_BASE_URL}/configs" \
             {
                 "type": "self_check_input",
                 "engine": "nim",
-                "model": "${NEMO_GUARDRAIL_MODEL_NAME}",
-                "api_key_env_var": "${DEPLOYMENT_CONFIG_GUARDRAIL_MODEL}",
+                "model": \"${NEMO_GUARDRAIL_MODEL_NAME}\",
+                "api_key_env_var": \"${DEPLOYMENT_CONFIG_GUARDRAIL_MODEL}\",
                 "parameters": {
-                "base_url": "${NIM_ENDPOINT_URL}"
+                "base_url": \"${NIM_ENDPOINT_URL}\"
                 },
                 "mode": "chat"
             },
             {
                 "type": "self_check_output",
                 "engine": "nim",
-                "model": "meta/llama-3.1-8b-instruct",
-                "api_key_env_var": "${DEPLOYMENT_CONFIG_GUARDRAIL_MODEL}",
+                "model": \"${NEMO_GUARDRAIL_MODEL_NAME}\",
+                "api_key_env_var": \"${DEPLOYMENT_CONFIG_GUARDRAIL_MODEL}\",
                 "parameters": {
-                "base_url": "${NIM_ENDPOINT_URL}"
+                "base_url": \"${NIM_ENDPOINT_URL}\"
                 },
                 "mode": "chat"
             },
             {
                 "type": "generate_next_steps",
                 "engine": "nim",
-                "model": "meta/llama-3.1-8b-instruct",
-                "api_key_env_var": "${DEPLOYMENT_CONFIG_GUARDRAIL_MODEL}",
+                "model": \"${NEMO_GUARDRAIL_MODEL_NAME}\",
+                "api_key_env_var": \"${DEPLOYMENT_CONFIG_GUARDRAIL_MODEL}\",
                 "parameters": {
-                "base_url": "${NIM_ENDPOINT_URL}"
+                "base_url": \"${NIM_ENDPOINT_URL}\"
                 },
                 "mode": "chat"
             },
             {
                 "type": "generate_intent_steps_message",
                 "engine": "nim",
-                "model": "meta/llama-3.1-8b-instruct",
-                "api_key_env_var": "${DEPLOYMENT_CONFIG_GUARDRAIL_MODEL}",
+                "model": \"${NEMO_GUARDRAIL_MODEL_NAME}\",
+                "api_key_env_var": \"${DEPLOYMENT_CONFIG_GUARDRAIL_MODEL}\",
                 "parameters": {
-                "base_url": "${NIM_ENDPOINT_URL}"
+                "base_url": \"${NIM_ENDPOINT_URL}\"
                 },
                 "mode": "chat"
             }
