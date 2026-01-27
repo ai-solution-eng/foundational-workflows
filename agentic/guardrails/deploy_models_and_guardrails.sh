@@ -73,7 +73,7 @@ curl -X POST "${GUARDRAILS_BASE_URL}/configs" \
     "models": [
     {
         "type": "main",
-        "engine": "nim",
+        "engine": "${NEMO_MAIN_MODEL_ENGINE}",
         "model": "${NEMO_MAIN_MODEL_ID}",
         "reasoning_config": {
         "remove_reasoning_traces": true,
@@ -84,8 +84,8 @@ curl -X POST "${GUARDRAILS_BASE_URL}/configs" \
     },
     {
         "type": "self_check_input",
-        "engine": "nim",
-        "model": "${NEMO_GUARDRAIL_MODEL_NAME}",
+        "engine": "${NEMO_GUARDRAIL_MODEL_ENGINE}",
+        "model": "${NEMO_GUARDRAIL_MODEL_ID}",
         "api_key_env_var": "${DEPLOYMENT_CONFIG_GUARDRAIL_MODEL}",
         "parameters": {
         "base_url": "${NIM_ENDPOINT_URL}"
@@ -94,8 +94,8 @@ curl -X POST "${GUARDRAILS_BASE_URL}/configs" \
     },
     {
         "type": "self_check_output",
-        "engine": "nim",
-        "model": "${NEMO_GUARDRAIL_MODEL_NAME}",
+        "engine": "${NEMO_GUARDRAIL_MODEL_ENGINE}",
+        "model": "${NEMO_GUARDRAIL_MODEL_ID}",
         "api_key_env_var": "${DEPLOYMENT_CONFIG_GUARDRAIL_MODEL}",
         "parameters": {
         "base_url": "${NIM_ENDPOINT_URL}"
@@ -104,8 +104,8 @@ curl -X POST "${GUARDRAILS_BASE_URL}/configs" \
     },
     {
         "type": "generate_next_steps",
-        "engine": "nim",
-        "model": "${NEMO_GUARDRAIL_MODEL_NAME}",
+        "engine": "${NEMO_GUARDRAIL_MODEL_ENGINE}",
+        "model": "${NEMO_GUARDRAIL_MODEL_ID}",
         "api_key_env_var": "${DEPLOYMENT_CONFIG_GUARDRAIL_MODEL}",
         "parameters": {
         "base_url": "${NIM_ENDPOINT_URL}"
@@ -114,8 +114,8 @@ curl -X POST "${GUARDRAILS_BASE_URL}/configs" \
     },
     {
         "type": "generate_intent_steps_message",
-        "engine": "nim",
-        "model": "${NEMO_GUARDRAIL_MODEL_NAME}",
+        "engine": "${NEMO_GUARDRAIL_MODEL_ENGINE}",
+        "model": "${NEMO_GUARDRAIL_MODEL_ID}",
         "api_key_env_var": "${DEPLOYMENT_CONFIG_GUARDRAIL_MODEL}",
         "parameters": {
         "base_url": "${NIM_ENDPOINT_URL}"
