@@ -27,8 +27,6 @@ env:
     value: "minioadmin"
   - name: S3_REGION 
     value: "us-east-1"
-  - name: S3_BUCKET 
-    value: "miniobucket"
 
 # Whether to add AIE self-signed certificates to root CAs
 # Requires a trust-manager bundle with useDefaultCAs set to true

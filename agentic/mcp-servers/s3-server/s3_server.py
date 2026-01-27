@@ -22,7 +22,6 @@ S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "minioadmin")
 S3_REGION = os.getenv("S3_REGION", "us-east-1")
-S3_BUCKET = os.getenv("S3_BUCKET", "claims")
 
 MAX_OBJECT_SIZE_MB = int(os.getenv("MAX_OBJECT_SIZE_MB", "50"))
 MAX_OBJECT_BYTES = MAX_OBJECT_SIZE_MB * 1024 * 1024
@@ -113,12 +112,43 @@ class StatusResponse(TypedDict):
     key: str
 
 
+class BucketInfo(TypedDict):
+    name: str
+    creation_date: str
+
+
+class ListBucketsResponse(TypedDict):
+    buckets: List[BucketInfo]
+
+
 # =========================
 # MCP Tools
 # =========================
 
+@mcp.tool(description="List all available S3 buckets.")
+async def list_buckets() -> ListBucketsResponse | ErrorResponse:
+    try:
+        async with await get_s3() as s3:
+            response = await s3.list_buckets()
+            buckets: List[BucketInfo] = []
+            
+            for bucket in response.get("Buckets", []):
+                buckets.append(
+                    {
+                        "name": bucket["Name"],
+                        "creation_date": bucket["CreationDate"].isoformat(),
+                    }
+                )
+            
+            return {"buckets": buckets}
+    
+    except ClientError as e:
+        return {"error": str(e), "code": "S3_LIST_BUCKETS_FAILED"}
+
+
 @mcp.tool(description="List objects in an S3 bucket with optional prefix filter.")
-async def list_objects(prefix: str = "", bucket: str = S3_BUCKET) -> ListObjectsResponse | ErrorResponse:
+async def list_objects(prefix: str = "", bucket: str = "") -> ListObjectsResponse | ErrorResponse:
+    bucket = bucket
     try:
         async with await get_s3() as s3:
             paginator = s3.get_paginator("list_objects_v2")
@@ -141,7 +171,8 @@ async def list_objects(prefix: str = "", bucket: str = S3_BUCKET) -> ListObjects
 
 
 @mcp.tool(description="Retrieve an object from S3.")
-async def get_object(key: str, bucket: str = S3_BUCKET) -> GetObjectResponse | ErrorResponse:
+async def get_object(key: str, bucket: str = "") -> GetObjectResponse | ErrorResponse:
+    bucket = bucket
     try:
         async with await get_s3() as s3:
             head = await s3.head_object(Bucket=bucket, Key=key)
@@ -185,9 +216,10 @@ async def put_object(
     key: str,
     content: str,
     content_type: str = "text/plain",
-    bucket: str = S3_BUCKET,
+    bucket: str = "",
     if_match: Optional[str] = None,
 ) -> StatusResponse | ErrorResponse:
+    bucket = bucket
     try:
         body = (
             base64.b64decode(content)
@@ -218,7 +250,8 @@ async def put_object(
 
 
 @mcp.tool(description="Delete an object from S3.")
-async def delete_object(key: str, bucket: str = S3_BUCKET) -> StatusResponse | ErrorResponse:
+async def delete_object(key: str, bucket: str = "") -> StatusResponse | ErrorResponse:
+    bucket = bucket
     try:
         async with await get_s3() as s3:
             await s3.delete_object(Bucket=bucket, Key=key)
