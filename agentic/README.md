@@ -2,9 +2,9 @@
 ## Walkthrough
 ### Setup
 - Install the following frameworks:
-    - [NeMo Microservices Guardrails](https://github.com/ai-solution-eng/frameworks/tree/main/nemo-microservices/guardrails-only)
-    - [Arize Phoenix](https://github.com/ai-solution-eng/frameworks/tree/main/arize-phoenix)
-    - [Minio](https://github.com/ai-solution-eng/frameworks/tree/main/minio)
+    - [NeMo Microservices Guardrails `v25.12.0`](https://github.com/ai-solution-eng/frameworks/tree/main/nemo-microservices/guardrails-only)
+    - [Arize Phoenix `v4.0.17`](https://github.com/ai-solution-eng/frameworks/tree/main/arize-phoenix)
+    - [Minio `v5.4.0`](https://github.com/ai-solution-eng/frameworks/tree/main/minio)
 - Install the following MCP Servers:
     - [EzPresto MCP Server](mcp-servers/ezpresto-server/)
     - [Filesystem MCP Server](mcp-servers/filesystem-server/)
