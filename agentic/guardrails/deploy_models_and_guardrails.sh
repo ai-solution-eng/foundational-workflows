@@ -14,7 +14,7 @@ curl -X POST \
                 "${NEMO_MAIN_MODEL_NAME}"
             ]
         }
-    }' | jq
+    }'
 
 # Deploy guardrails model to NIM Proxy
 curl -X POST \
@@ -32,7 +32,7 @@ curl -X POST \
                 "${NEMO_GUARDRAIL_MODEL_ID}"
             ]
         }
-    }' | jq
+    }'
 
 # Create guardrails configuration
 curl -X POST "${GUARDRAILS_BASE_URL}/configs" \
@@ -141,4 +141,4 @@ curl -X POST "${GUARDRAILS_BASE_URL}/configs" \
                 }
             }
         }
-    }' | jq .
+    }'

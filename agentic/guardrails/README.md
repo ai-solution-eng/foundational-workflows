@@ -22,6 +22,6 @@
         - `NEMO_MAIN_MODEL_TOKEN`
         - `NEMO_GUARDRAIL_MODEL_TOKEN`
 - In a JupyterLab/VSCode terminal within AIE, run the following commands:
-    - `chmod +x deploy_models_and_guardrails.sh`
     - `source ../.env`
+    - `chmod +x deploy_models_and_guardrails.sh`
     - `./deploy_models_and_guardrails.sh`
