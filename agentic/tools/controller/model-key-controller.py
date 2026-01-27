@@ -90,7 +90,14 @@ class ConfigMapSecretOperator:
         Returns: Dict mapping model names to API keys
         """
         api_keys = {}
-        
+
+        def env_name_safe(s: str) -> str:
+            s = s.upper()
+            s = re.sub(r'[^A-Z0-9_]', '_', s)
+            if s and s[0].isdigit():
+                s = '_' + s
+            return s
+
         try:
             # List all ConfigMaps across all namespaces with label selector
             if self.label_selector:
@@ -105,7 +112,7 @@ class ConfigMapSecretOperator:
                 if result:
                     model_name, api_key = result
                     # Use uppercase env var style: MLIS_QWEN3_8B
-                    env_var_name = model_name.upper().replace('-', '_')
+                    env_var_name = env_name_safe(model_name)
                     api_keys[env_var_name] = api_key
             
             logger.info(f"Found {len(api_keys)} API keys across all namespaces")
