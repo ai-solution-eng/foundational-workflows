@@ -32,9 +32,3 @@ serviceAccount:
 
 rbac:
   create: true
-
-secret:
-  create: true
-  name: model-api-keys
-  # Optionally provide initial values (will be overwritten by operator)
-  data: {}
