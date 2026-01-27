@@ -1,6 +1,7 @@
 # Deploy main model to NIM Proxy
 curl -X POST \
   "${DEPLOYMENT_BASE_URL}/configs" \
+  --cacert ${EZUA_DOMAIN_CA_CERT_PATH} \
   -H 'accept: application/json' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -19,6 +20,7 @@ curl -X POST \
 # Deploy guardrails model to NIM Proxy
 curl -X POST \
   "${DEPLOYMENT_BASE_URL}/configs" \
+  --cacert ${EZUA_DOMAIN_CA_CERT_PATH} \
   -H 'accept: application/json' \
   -H 'Content-Type: application/json' \
   -d '{
