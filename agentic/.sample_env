@@ -1,36 +1,36 @@
 #!/bin/bash
 
 # AIE domain for target environment
-AIE_DOMAIN=
+export AIE_DOMAIN=
 
 # Arize Phoenix specific variables
-PHOENIX_ISTIO_ENDPOINT=https://phoenix.${AIE_DOMAIN}
-PHOENIX_COLLECTOR_ENDPOINT=${PHOENIX_ISTIO_ENDPOINT}/grpc
-PHOENIX_API_KEY=
+export PHOENIX_ISTIO_ENDPOINT=https://phoenix.${AIE_DOMAIN}
+export PHOENIX_COLLECTOR_ENDPOINT=${PHOENIX_ISTIO_ENDPOINT}/grpc
+export PHOENIX_API_KEY=
 
 # Guardrail specific variables
-NEMO_GUARDRAILS_NAMESPACE=nemo-microservices
-GUARDRAIL_CONFIG_NAME=demo-self-check-input-output
-GUARDRAILS_BASE_URL=https://nemo-guardrails.${AIE_DOMAIN}/v1/guardrail
+export NEMO_GUARDRAILS_NAMESPACE=nemo-microservices
+export GUARDRAIL_CONFIG_NAME=demo-self-check-input-output
+export GUARDRAILS_BASE_URL=https://nemo-guardrails.${AIE_DOMAIN}/v1/guardrail
 
 # NeMo Deployment Manager variables for main model
-NEMO_MODEL_NAMESPACE=agentic
-NEMO_MAIN_MODEL_ID=nvidia/nemotron-3-nano
-NEMO_MAIN_MODEL_TOKEN=
-NEMO_MAIN_MODEL_NAME=$(echo ${NEMO_MAIN_MODEL_ID//[\/-]/_})
-DEPLOYMENT_CONFIG_MAIN_MODEL=$(echo ${NEMO_MODEL_NAMESPACE}_${NEMO_MAIN_MODEL_NAME} | tr a-z A-Z)
+export NEMO_MODEL_NAMESPACE=agentic
+export NEMO_MAIN_MODEL_ID=nvidia/nemotron-3-nano
+export NEMO_MAIN_MODEL_TOKEN=
+export NEMO_MAIN_MODEL_NAME=$(echo ${NEMO_MAIN_MODEL_ID//[\/-]/_})
+export DEPLOYMENT_CONFIG_MAIN_MODEL=$(echo ${NEMO_MODEL_NAMESPACE}_${NEMO_MAIN_MODEL_NAME} | tr a-z A-Z)
 
 # NeMo Deployment Manager variables for guardrail model
-NEMO_GUARDRAIL_MODEL_NAME=meta/llama-3.1-8b-instruct
-NEMO_GUARDRAIL_MODEL_TOKEN=
-NEMO_GUARDRAIL_MODEL_NAME=$(echo ${NEMO_GUARDRAIL_MODEL_ID//[\/-]/_})
-DEPLOYMENT_CONFIG_GUARDRAIL_MODEL=$(echo ${NEMO_MODEL_NAMESPACE}_${NEMO_GUARDRAIL_MODEL_NAME} | tr a-z A-Z)
+export NEMO_GUARDRAIL_MODEL_ID=meta/llama-3.1-8b-instruct
+export NEMO_GUARDRAIL_MODEL_TOKEN=
+export NEMO_GUARDRAIL_MODEL_NAME=$(echo ${NEMO_GUARDRAIL_MODEL_ID//[\/-]/_})
+export DEPLOYMENT_CONFIG_GUARDRAIL_MODEL=$(echo ${NEMO_MODEL_NAMESPACE}_${NEMO_GUARDRAIL_MODEL_NAME} | tr a-z A-Z)
 
 # Endpoints for NeMo Deployment Manager and NeMo NIM Proxy
-NIM_ENDPOINT_URL=https://nemo-nim-proxy.${AIE_DOMAIN}/v1/proxy
-DEPLOYMENT_BASE_URL=https://nemo-deployment-management.${AIE_DOMAIN}/v1/deployment
+export NIM_ENDPOINT_URL=https://nemo-nim-proxy.${AIE_DOMAIN}/v1/proxy
+export DEPLOYMENT_BASE_URL=https://nemo-deployment-management.${AIE_DOMAIN}/v1/deployment
 
 # MCP Servers configuration
-MCP_EZPRESTO_SERVER=https://mcp-ezpresto-server.${AIE_DOMAIN}/mcp
-MCP_FILESYSTEM_SERVER=https://mcp-filesystem-server.${AIE_DOMAIN}/mcp
-MCP_s3_SERVER=https://mcp-s3-server.${AIE_DOMAIN}/mcp
+export MCP_EZPRESTO_SERVER=https://mcp-ezpresto-server.${AIE_DOMAIN}/mcp
+export MCP_FILESYSTEM_SERVER=https://mcp-filesystem-server.${AIE_DOMAIN}/mcp
+export MCP_s3_SERVER=https://mcp-s3-server.${AIE_DOMAIN}/mcp
