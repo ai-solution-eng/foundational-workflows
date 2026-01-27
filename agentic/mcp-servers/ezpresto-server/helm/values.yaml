@@ -1,7 +1,7 @@
 ezua:
   #Use next options in order to configure the application endpoint.
   virtualService:
-    endpoint: "mcp-ezpresto.${DOMAIN_NAME}"
+    endpoint: "mcp-ezpresto-server.${DOMAIN_NAME}"
     istioGateway: "istio-system/ezaf-gateway"
 
 replicaCount: 1
