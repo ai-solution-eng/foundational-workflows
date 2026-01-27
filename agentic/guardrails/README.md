@@ -11,7 +11,7 @@
         - ![alt text](imgs/models.png)
     - Select `Add New Model`
         - ![alt text](imgs/addmodel.png)
-- Create the API Token for the deployed models
+- Create the API Token and get the endpoint URL for the deployed models
     - Go to the `Model Endpoints` page in the `Gen AI` tab within AIE
         - ![alt text](imgs/endpoints.png)
     - Select `Generate API Token`
@@ -21,6 +21,9 @@
     - Store the model API tokens in [`.env`](../.env):
         - `NEMO_MAIN_MODEL_TOKEN`
         - `NEMO_GUARDRAIL_MODEL_TOKEN`
+    - Store the model endpoint URL in [`.env`](../.env):
+        - `NEMO_MAIN_MODEL_URL`
+        - `NEMO_GUARDRAIL_MODEL_URL`
 - In a JupyterLab/VSCode terminal within AIE, run the following commands:
     - `source ../.env`
     - `chmod +x deploy_models_and_guardrails.sh`

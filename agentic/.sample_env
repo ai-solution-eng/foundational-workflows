@@ -16,14 +16,16 @@ export GUARDRAILS_BASE_URL=https://nemo-guardrails.${AIE_DOMAIN}/v1/guardrail
 # NeMo Deployment Manager variables for main model
 export NEMO_MODEL_NAMESPACE=agentic
 export NEMO_MAIN_MODEL_ID=nvidia/nemotron-3-nano
+export NEMO_MAIN_MODEL_URL=
 export NEMO_MAIN_MODEL_TOKEN=
-export NEMO_MAIN_MODEL_NAME=$(echo ${NEMO_MAIN_MODEL_ID//[\/-]/_})
+export NEMO_MAIN_MODEL_NAME=$(echo ${NEMO_MAIN_MODEL_ID//[^A-z0-9]/_})
 export DEPLOYMENT_CONFIG_MAIN_MODEL=$(echo ${NEMO_MODEL_NAMESPACE}_${NEMO_MAIN_MODEL_NAME} | tr a-z A-Z)
 
 # NeMo Deployment Manager variables for guardrail model
 export NEMO_GUARDRAIL_MODEL_ID=meta/llama-3.1-8b-instruct
+export NEMO_GUARDRAIL_MODEL_URL=
 export NEMO_GUARDRAIL_MODEL_TOKEN=
-export NEMO_GUARDRAIL_MODEL_NAME=$(echo ${NEMO_GUARDRAIL_MODEL_ID//[\/-]/_})
+export NEMO_GUARDRAIL_MODEL_NAME=$(echo ${NEMO_GUARDRAIL_MODEL_ID//[^A-z0-9]/_})
 export DEPLOYMENT_CONFIG_GUARDRAIL_MODEL=$(echo ${NEMO_MODEL_NAMESPACE}_${NEMO_GUARDRAIL_MODEL_NAME} | tr a-z A-Z)
 
 # Endpoints for NeMo Deployment Manager and NeMo NIM Proxy

@@ -10,7 +10,7 @@ curl -X POST \
 "namespace": "${NEMO_MODEL_NAMESPACE}",
 "description": "Main model for guardrails configuration",
 "external_endpoint": {
-    "host_url": "${NIM_ENDPOINT_URL}",
+    "host_url": "${NEMO_MAIN_MODEL_URL}",
     "api_key": "${NEMO_MAIN_MODEL_TOKEN}",
     "enabled_models": [
     "${NEMO_MAIN_MODEL_ID}"
@@ -31,7 +31,7 @@ curl -X POST \
 "namespace": "${NEMO_MODEL_NAMESPACE}",
 "description": "Guardrails model for guardrails configuration",
 "external_endpoint": {
-    "host_url": "${NIM_ENDPOINT_URL}",
+    "host_url": "${NEMO_GUARDRAIL_MODEL_URL}",
     "api_key": "${NEMO_GUARDRAIL_MODEL_TOKEN}",
     "enabled_models": [
         "${NEMO_GUARDRAIL_MODEL_ID}"
