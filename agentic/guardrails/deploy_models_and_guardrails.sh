@@ -1,3 +1,6 @@
+#! /bin/bash
+source .env
+
 # Deploy main model to NIM Proxy
 curl -X POST \
   "${DEPLOYMENT_BASE_URL}/configs" \
