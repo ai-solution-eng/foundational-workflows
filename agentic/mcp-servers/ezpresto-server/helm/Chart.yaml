@@ -1,5 +1,5 @@
 apiVersion: v2
-name: mcp-ezpresto
+name: mcp-ezpresto-server
 description: A Helm chart for MCP EzPresto Server - To query AIE databases using SQL 
 type: application
 version: 1.0.0
