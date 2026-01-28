@@ -29,7 +29,7 @@ llm = LLM(
 )
 
 logger = logging.getLogger(__name__)
-logging.basicCo
+logging.basicConfig(level=logging.INFO)
 
 
 def refresh_token():
