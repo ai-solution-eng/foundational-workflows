@@ -9,12 +9,12 @@ nemo:
 
   main_model:
     engine: nim
-    id: nvidia/nemotron-3-nano
+    id: ""
     url: ""
     token: ""
 
   guardrail_model:
     engine: nim
-    id: meta/llama-3.1-8b-instruct
+    id: ""
     url: ""
     token: ""
