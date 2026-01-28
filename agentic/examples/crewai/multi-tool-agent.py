@@ -4,11 +4,11 @@ import logging
 import asyncio
 from crewai_tools import MCPServerAdapter
 from crewai import Agent, Task, Crew, LLM
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from phoenix.otel import register
 from typing import Dict, Any
 
-load_dotenv()
+load_dotenv(find_dotenv())
 project_name = "crewai"
 tracer_provider = register(project_name=project_name, auto_instrument=True)
 
