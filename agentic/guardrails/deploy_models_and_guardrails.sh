@@ -7,7 +7,7 @@ curl -X POST \
   -d @- <<EOF
 {
 "name": "${NEMO_MAIN_MODEL_NAME}",
-"namespace": "${NEMO_MODEL_NAMESPACE}",
+"namespace": "${NEMO_NAMESPACE}",
 "description": "Main model for guardrails configuration",
 "external_endpoint": {
     "host_url": "${NEMO_MAIN_MODEL_URL}",
@@ -28,7 +28,7 @@ curl -X POST \
   -d @- <<EOF
 {
 "name": "${NEMO_GUARDRAIL_MODEL_NAME}",
-"namespace": "${NEMO_MODEL_NAMESPACE}",
+"namespace": "${NEMO_NAMESPACE}",
 "description": "Guardrails model for guardrails configuration",
 "external_endpoint": {
     "host_url": "${NEMO_GUARDRAIL_MODEL_URL}",
@@ -48,7 +48,7 @@ curl -X POST "${GUARDRAILS_BASE_URL}/configs" \
   -d @- <<EOF
 {
 "name": "${GUARDRAIL_CONFIG_NAME}",
-"namespace": "${NEMO_MODEL_NAMESPACE}",
+"namespace": "${NEMO_NAMESPACE}",
 "description": "demo streaming self-check input and output",
 "data": {
     "prompts": [

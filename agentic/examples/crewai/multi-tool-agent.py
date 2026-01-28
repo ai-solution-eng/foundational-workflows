@@ -13,7 +13,7 @@ project_name = "crewai"
 tracer_provider = register(project_name=project_name, auto_instrument=True)
 
 custom_headers = {"X-Model-Authorization": f"{os.getenv('NEMO_MAIN_MODEL_TOKEN')}"}
-guardrail_config_id = os.getenv("NEMO_GUARDRAILS_NAMESPACE") + '/' + os.getenv("GUARDRAIL_CONFIG_NAME")
+guardrail_config_id = os.getenv("NEMO_NAMESPACE") + '/' + os.getenv("GUARDRAIL_CONFIG_NAME")
 
 llm = LLM(
     provider="openai",
