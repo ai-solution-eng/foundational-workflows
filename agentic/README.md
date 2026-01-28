@@ -6,7 +6,7 @@
     - [Arize Phoenix `v4.0.17`](https://github.com/ai-solution-eng/frameworks/tree/main/arize-phoenix)
     - [Minio `v5.4.0`](https://github.com/ai-solution-eng/frameworks/tree/main/minio)
         - Use the values `rootUser` and `rootPassword` to log into the Minio UI
-        - Under the `User` menu in the left dashboard, go to `Access Keys`
+        - In the left dashboard tav nagivate to `User -> Access Keys`
         - Select `Create access key` and note the `Access Key` and `Secret Key` which will be needed for the S3 MCP Server installation
 - Install the following MCP Servers:
     - [EzPresto MCP Server](mcp-servers/ezpresto-server/)
@@ -22,7 +22,17 @@
 - After setting up the models, finish the Arize Phoenix configuration:
     - Create and store the Arize Phoenix API Key in the `PHOENIX_API_KEY` variable in the [`.env` file](../.env):
         - Navigate to Arize Phoenix UI ([show in `PHOENIX_ISTIO_ENDPOINT`](./.env) or in the Arize Phoenix frameworks tab)
-        - Settings -> General -> System Keys -> Create new System Key
-        - Settings -> Models -> Add Model -> Add model name (`Llama-3.1-8B-Instruct` for example)
+        - `Settings -> General -> System Keys -> Create new System Key`
+        - `Settings -> Models -> Add Model -> Add model name` (`Llama-3.1-8B-Instruct` for example)
+- Set up the [sample data sources](./examples/data/)
+    - In the AIE home page, navigate to `Data Engineering -> Data Sources -> Structured Data -> Add New Data Source`
+    - Select `Hive -> Create Connection`
+    - Use the following fields:
+        - Name: `flightdb`
+        - Hive Metastore: `discovery`
+        - Data Dir: `file:/data/shared/foundational-workflows/agentic/examples/data/hive`
+        - Hive Metastore Advanced Settings: `File Type`
+        - File Type: `CSV`
+    - Then select `Connect`
 - Go to the [examples folder](./examples/) and run through the different agentic framework examples:
     - [Crewai](./examples/crewai/README.MD)

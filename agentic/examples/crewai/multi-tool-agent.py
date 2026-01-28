@@ -165,5 +165,5 @@ async def main(topic):
 
 
 if __name__ == "__main__":
-    TOPIC = f"""My customer name is John and my flight is A105, what are my status and benefits?"""
+    TOPIC = f"""My customer name is John and my flight is A105, what is my status and benefits?"""
     asyncio.run(main(TOPIC))
