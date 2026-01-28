@@ -1,0 +1,20 @@
+aie_domain: ""
+
+phoenix:
+  api_key: ""
+
+nemo:
+  namespace: agentic
+  guardrail_config_name: demo-self-check-input-output
+
+  main_model:
+    engine: nim
+    id: nvidia/nemotron-3-nano
+    url: ""
+    token: ""
+
+  guardrail_model:
+    engine: nim
+    id: meta/llama-3.1-8b-instruct
+    url: ""
+    token: ""

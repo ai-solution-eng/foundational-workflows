@@ -1,9 +1,20 @@
 # Agentic Core Workflow
 ## Walkthrough
 ### Setup
+- Create an [`.env` file](./.env) by following these steps:
+    - Copy the provided [`sample_config.yaml`](./sample_config.yaml):
+        - `cp sample_config.yaml config.yaml`
+        - Fill in in the `aie_domain` field with the domain for the target AIE environment
+        - Run the python script:
+            - `chmod + ./create_env.py`
+            - `./create_env.py`
 - Install the following frameworks:
     - [NeMo Microservices Guardrails `v25.12.0`](https://github.com/ai-solution-eng/frameworks/tree/main/nemo-microservices/guardrails-only)
     - [Arize Phoenix `v4.0.17`](https://github.com/ai-solution-eng/frameworks/tree/main/arize-phoenix)
+        - Make sure the namespace is `phoenix` as it's expected in the `PHOENIX_COLLECTOR_ENDPOINT` variable in the [`.env` file](./.env)
+        - Create and store the Arize Phoenix API Key in the `PHOENIX_API_KEY` variable in the [`.env` file](./.env):
+            - Navigate to Arize Phoenix UI ([show in `PHOENIX_ISTIO_ENDPOINT`](./.env) or in the Arize Phoenix frameworks tab)
+            - `Settings -> General -> System Keys -> Create new System Key`
     - [Minio `v5.4.0`](https://github.com/ai-solution-eng/frameworks/tree/main/minio)
         - Use the values `rootUser` and `rootPassword` to log into the Minio UI
         - In the left dashboard tav nagivate to `User -> Access Keys`
@@ -15,15 +26,9 @@
 - Install the following tools:
     - [MCP Inspector](tools/mcp-inspector/)
     - [Guardrail Model Controller](tools/controller/)
-- Create an [`.env` file](../.env) by copying the provided [`sample.env`](../.sample_env):
-    - `cp .sample_env .env`
-    - Store the domain for the target AIE environment in the `AIE_DOMAIN` variable
-- [Follow the guardrail configuration](guardrails/README.md)
+- [Follow the guardrail configuration setup](guardrails/README.md)
 - After setting up the models, finish the Arize Phoenix configuration:
-    - Create and store the Arize Phoenix API Key in the `PHOENIX_API_KEY` variable in the [`.env` file](../.env):
-        - Navigate to Arize Phoenix UI ([show in `PHOENIX_ISTIO_ENDPOINT`](./.env) or in the Arize Phoenix frameworks tab)
-        - `Settings -> General -> System Keys -> Create new System Key`
-        - `Settings -> Models -> Add Model -> Add model name` (`Llama-3.1-8B-Instruct` for example)
+    - Navigate to the UI and then to `Settings -> Models -> Add Model -> Add model name` (models specified in the `NEMO_MAIN_MODEL_ID` and `NEMO_GUARDRAIL_MODEL_ID`)
 - Set up the [sample data sources](./examples/data/)
     - In the AIE home page, navigate to `Data Engineering -> Data Sources -> Structured Data -> Add New Data Source`
     - Select `Hive -> Create Connection`
