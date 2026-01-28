@@ -57,7 +57,7 @@ def auth_client_factory(
     )
 
 
-mpc_server_params = [
+mcp_server_params = [
     {
         "url": os.getenv("MCP_EZPRESTO_SERVER"),
         "transport": "streamable-http",
@@ -90,7 +90,7 @@ tools_selected = [
 
 
 def run_crew(topic: str):
-    with MCPServerAdapter(mpc_server_params, connect_timeout=120) as mcp_tools:
+    with MCPServerAdapter(mcp_server_params, connect_timeout=120) as mcp_tools:
         # Define tool-calling agents
         researcher = Agent(
             role="Researcher",

@@ -37,4 +37,4 @@ export DEPLOYMENT_BASE_URL=https://nemo-deployment-management.${AIE_DOMAIN}/v1/d
 # MCP Servers configuration
 export MCP_EZPRESTO_SERVER=https://mcp-ezpresto-server.${AIE_DOMAIN}/mcp
 export MCP_FILESYSTEM_SERVER=https://mcp-filesystem-server.${AIE_DOMAIN}/mcp
-export MCP_s3_SERVER=https://mcp-s3-server.${AIE_DOMAIN}/mcp
+export MCP_S3_SERVER=https://mcp-s3-server.${AIE_DOMAIN}/mcp
