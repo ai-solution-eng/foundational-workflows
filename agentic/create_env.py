@@ -83,7 +83,7 @@ def render_env(cfg: dict) -> dict:
 
 
 def write_env(env: dict, output: Path) -> None:
-    lines = [f"export {key}={value}" for key, value in env.items()]
+    lines = [f"{key}={value}" for key, value in env.items()]
     output.write_text("\n".join(lines) + "\n")
 
 
