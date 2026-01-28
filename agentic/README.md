@@ -8,8 +8,12 @@
         - Run the python script:
             - `chmod + ./create_env.py`
             - `./create_env.py`
+- **[Optional]**:
+    - For most of the helm charts below, there is a top-level option in the `values.yaml` called `certificatesPolicy` which can fix issues with AIE environments with self-signed certificates. You can turn it on after making sure the default `configMap` variable (`ezaf-root-ca`) matches the name of the `cert-manager` bundle with the value of `spec.sources.useDefaultCAs=true`:
+        - `kubectl describe bundles`
 - Install the following frameworks:
     - [NeMo Microservices Guardrails `v25.12.0`](https://github.com/ai-solution-eng/frameworks/tree/main/nemo-microservices/guardrails-only)
+        - Make sure the namespace is `nemo-microservices` as it's expected in some of the guardrail configuration steps
     - [Arize Phoenix `v4.0.17`](https://github.com/ai-solution-eng/frameworks/tree/main/arize-phoenix)
         - Make sure the namespace is `phoenix` as it's expected in the `PHOENIX_COLLECTOR_ENDPOINT` variable in the [`.env` file](./.env)
         - Create and store the Arize Phoenix API Key in the `PHOENIX_API_KEY` variable in the [`.env` file](./.env):
@@ -22,7 +26,10 @@
 - Install the following MCP Servers:
     - [EzPresto MCP Server](mcp-servers/ezpresto-server/)
     - [Filesystem MCP Server](mcp-servers/filesystem-server/)
+        - It requires a variable called `volumeName` that can be acquired with the following command:
+            - `kubectl get pvc shared-pvc -n ezprojects-system -o jsonpath='{ ..volumeName }'`
     - [S3 MCP Server](mcp-servers/s3-server/)
+        - Use the `Access Key` and `Secret Key` from earlier in the values
 - Install the following tools:
     - [MCP Inspector](tools/mcp-inspector/)
     - [Guardrail Model Controller](tools/controller/)
@@ -40,4 +47,4 @@
         - File Type: `CSV`
     - Then select `Connect`
 - Go to the [examples folder](./examples/) and run through the different agentic framework examples:
-    - [Crewai](./examples/crewai/README.MD)
+    - [Crewai](./examples/crewai/README.md)

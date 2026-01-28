@@ -279,7 +279,7 @@ def move_file(source: str, destination: str) -> str:
     return f'Successfully moved {source} to {destination}'
 
 
-@mcp.tool(description="Search for files and directories by name pattern")
+@mcp.tool(description="Search for files and directories by glob pattern (not regex). The exclusion patterns can be regex")
 def search_files(path: str, pattern: str, exclude_patterns: Optional[List[str]] = None) -> str:
     """Search for files matching pattern"""
     exclude_patterns = exclude_patterns or []

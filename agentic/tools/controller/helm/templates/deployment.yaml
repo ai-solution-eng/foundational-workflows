@@ -22,11 +22,13 @@ spec:
       - name: operator
         image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
         imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+        {{- if .Values.debug.enabled -}}
         args:
           - /bin/sh
           - -c
           - |
             pip install --no-cache-dir kubernetes==31.0.0 && python /app/model-key-controller.py
+        {{- end }}
         volumeMounts:
         - name: operator-code
           mountPath: /app

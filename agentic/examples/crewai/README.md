@@ -4,4 +4,4 @@
 2. `source $HOME/.local/bin/env`
 
 ### Run the agent
-- Run the tool-calling multi agent with `uv run src/multi-tool-agent.py`
+- Run the tool-calling multi agent with `uv run multi-tool-agent.py`

@@ -1,5 +1,5 @@
 #! /bin/bash
-source .env
+source ../.env
 
 # Deploy main model to NIM Proxy
 curl -X POST \

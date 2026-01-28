@@ -114,7 +114,7 @@ def run_crew(topic: str):
 
         research = Task(
             description=(
-                "Answer '{topic}' based on available local data only. "
+                "Answer '{topic}' based on available data only. "
                 "Look for any relevant files to answer the question."
             ),
             expected_output="A detailed, correct, and tool-based solution to '{topic}'.",

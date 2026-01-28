@@ -70,7 +70,7 @@ def render_env(cfg: dict) -> dict:
         ),
 
         # Endpoints
-        "NIM_ENDPOINT_URL": f"https://nemo-nim-proxy.{aie_domain}",
+        "NIM_ENDPOINT_URL": f"https://nemo-nim-proxy.{aie_domain}/v1",
         "DEPLOYMENT_BASE_URL": (
             f"https://nemo-deployment-management.{aie_domain}/v1/deployment"
         ),

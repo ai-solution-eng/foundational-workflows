@@ -3,7 +3,7 @@
 ### Setup
 - Deploy the following models on MLIS:
     - Main model:
-        - `nvidia/nemotron-3-nano`
+        - `Qwen/Qwen3-30B-A3B`
             - Alternatively, you can deploy `Qwen/Qwen3-8B` for a smaller option
     - Guardrail model:
         - `meta/llama-3.1-8b-instruct`
