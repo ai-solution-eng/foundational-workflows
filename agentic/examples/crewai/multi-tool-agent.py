@@ -15,6 +15,12 @@ tracer_provider = register(project_name=project_name, auto_instrument=True)
 custom_headers = {"X-Model-Authorization": f"{os.getenv('NEMO_MAIN_MODEL_TOKEN')}"}
 guardrail_config_id = os.getenv("NEMO_NAMESPACE") + '/' + os.getenv("GUARDRAIL_CONFIG_NAME")
 
+# AIE certs
+CA_CERT_PATH = "/etc/ezua-domain-ca-certs/ezua-domain-ca-cert.crt"
+SSL_CERT_FILE = "/etc/ezua-domain-ca-certs/ezua-domain-ca-cert.crt"
+os.environ["REQUESTS_CA_BUNDLE"] = SSL_CERT_FILE
+os.environ["SSL_CERT_FILE"] = SSL_CERT_FILE
+
 llm = LLM(
     provider="openai",
     model=os.getenv("NEMO_MAIN_MODEL_ID"),
@@ -37,13 +43,7 @@ def refresh_token():
         token = file.read().strip()
     return token
 
-
 BEARER = refresh_token()
-CA_CERT_PATH = "/etc/ezua-domain-ca-certs/ezua-domain-ca-cert.crt"
-SSL_CERT_FILE = "/etc/ezua-domain-ca-certs/ezua-domain-ca-cert.crt"
-os.environ["REQUESTS_CA_BUNDLE"] = SSL_CERT_FILE
-os.environ["SSL_CERT_FILE"] = SSL_CERT_FILE
-
 
 def auth_client_factory(
     headers: Dict[str, Any] | None = None,
