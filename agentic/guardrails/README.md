@@ -25,6 +25,5 @@
         - `NEMO_MAIN_MODEL_URL`
         - `NEMO_GUARDRAIL_MODEL_URL`
 - In a JupyterLab/VSCode terminal within AIE, run the following commands:
-    - `source ../.env`
     - `chmod +x deploy_models_and_guardrails.sh`
     - `./deploy_models_and_guardrails.sh`
