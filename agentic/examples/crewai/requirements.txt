@@ -1,0 +1,10 @@
+arize-phoenix-otel>=0.14.0
+crewai-tools[mcp]>=1.6.1
+fastapi>=0.124.2
+litellm[proxy]>=1.80.9
+mcp>=1.23.3
+openai>=2.9.0
+openinference-instrumentation-crewai>=0.1.17
+openinference-instrumentation-litellm>=0.1.28
+python-multipart>=0.0.18
+uvicorn>=0.31.1
