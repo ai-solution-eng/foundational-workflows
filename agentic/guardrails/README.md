@@ -2,9 +2,13 @@
 ## Walkthrough
 ### Setup
 - Deploy the following models on MLIS:
-    - Main model:
+    - Main model (either of these fit in 1x L40S):
         - `Qwen/Qwen3-30B-A3B`
-            - Alternatively, you can deploy `Qwen/Qwen3-8B` for a smaller option
+            - Image: `vllm/vllm-openai:latest`
+            - Arguments: `--model Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 --enable-auto-tool-choice --tool-call-parser hermes --port 8080`
+        - `NVIDIA-Nemotron-3-Nano-30B-A3B-FP8`
+            - Image: `vllm/vllm-openai:latest`
+            - Arguments: `--model nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 --max-model-len 32000 --trust-remote-code --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser deepseek_r1 --kv-cache-dtype fp8 --port 8080`
     - Guardrail model:
         - `meta/llama-3.1-8b-instruct`
     - Go to the `Model Catalog` page in the `Gen AI` tab within AIE
