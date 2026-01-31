@@ -106,13 +106,11 @@ llm = ChatOpenAI(
     base_url=os.getenv("GUARDRAILS_BASE_URL"),
     api_key="dummy",
     default_headers=custom_headers,
-    model_kwargs={
-        "extra_body": {
-            "guardrails": {
-                "config_id": guardrail_config_id,
-            }
+    extra_body={
+        "guardrails": {
+            "config_id": guardrail_config_id,
         }
-    },
+    }
 )
 
 
@@ -133,20 +131,21 @@ mcp_server_params = [
     },
 ]
 
+tools_selected = []
 # tools_selected = [
-    "create_directory",
-    "edit_file",
-    "get_file_info",
-    "list_allowed_directories",
-    "list_directory",
-    "list_directory_with_sizes",
-    "move_file",
-    "read_media_file",
-    "read_multiple_files",
-    "read_text_file",
-    "search_files",
-    "write_file",
-]
+#     "create_directory",
+#     "edit_file",
+#     "get_file_info",
+#     "list_allowed_directories",
+#     "list_directory",
+#     "list_directory_with_sizes",
+#     "move_file",
+#     "read_media_file",
+#     "read_multiple_files",
+#     "read_text_file",
+#     "search_files",
+#     "write_file",
+# ]
 
 
 async def load_mcp_tools():
