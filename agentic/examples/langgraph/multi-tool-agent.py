@@ -350,7 +350,7 @@ async def researcher_node(state: AgentState, tools: List[SimpleTool] = None, max
             "and data, both remote s3 object stores and local filesystems.\n"
             "When browsing filesystems, look for 'data' folders and then search\n"
             " for specific files with keywords that match the subject matter.\n"
-            "Exclude any hidden directories that start with '.'.\n"
+            "Exclude any hidden directories that start with '.' by using escaped regex period.\n"
             "Only make one tool call at a time, avoid multiple calls.\n"
             "Take into account the previous tool result before making a new tool call.\n"
             "Pay close attention to the bucket names when calling s3 resources.\n"
@@ -393,7 +393,7 @@ async def researcher_node(state: AgentState, tools: List[SimpleTool] = None, max
     final_text = final_response.content
     state.research_result = final_text
     state.messages.append(AIMessage(content=final_text, name="researcher_final"))
-    state.next_step = "sql_agent"
+    state.next_step = "summarizer"
     
     return state
 
@@ -470,7 +470,7 @@ async def sql_agent_node(state: AgentState, tools: List[SimpleTool] = None, max_
     final_text = final_response.content
     state.sql_result = final_text
     state.messages.append(AIMessage(content=response_text))
-    state.next_step = "summarizer"
+    state.next_step = "researcher"
     return state
 
 
@@ -553,17 +553,17 @@ def create_workflow(tools):
     #
     # Register nodes
     #
-    workflow.add_node("researcher", researcher_wrapper)
     workflow.add_node("sql_agent", sql_agent_wrapper)
+    workflow.add_node("researcher", researcher_wrapper)
     workflow.add_node("summarizer", summarizer_wrapper)
 
     #
     # Edges
     #
-    workflow.add_edge(START, "researcher")
+    workflow.add_edge(START, "sql_agent")
 
     workflow.add_conditional_edges(
-        "researcher",
+        "sql_agent",
         route_next,
         {
             "researcher": "researcher",
@@ -574,7 +574,7 @@ def create_workflow(tools):
     )
 
     workflow.add_conditional_edges(
-        "sql_agent",
+        "researcher",
         route_next,
         {
             "researcher": "researcher",
@@ -599,7 +599,7 @@ async def run_workflow(topic):
         - summarizer
 
     Edges are configured to follow:
-        researcher -> sql_agent -> summarizer -> END
+        sql_agent -> researcher -> summarizer -> END
         with conditional loops if necessary.
 
     Args:

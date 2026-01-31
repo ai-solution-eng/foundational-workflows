@@ -21,7 +21,7 @@
             - `Settings -> General -> System Keys -> Create new System Key`
     - [Minio `v5.4.0`](https://github.com/ai-solution-eng/frameworks/tree/main/minio)
         - Use the values `rootUser` and `rootPassword` to log into the Minio UI
-        - In the left dashboard tav nagivate to `User -> Access Keys`
+        - In the left dashboard tab nagivate to `User -> Access Keys`
         - Select `Create access key` and note the `Access Key` and `Secret Key` which will be needed for the S3 MCP Server installation
 - Install the following MCP Servers:
     - [EzPresto MCP Server](mcp-servers/ezpresto-server/)
@@ -37,15 +37,22 @@
 - After setting up the models, finish the Arize Phoenix configuration:
     - Navigate to the UI and then to `Settings -> Models -> Add Model -> Add model name` (models specified in the `NEMO_MAIN_MODEL_ID` and `NEMO_GUARDRAIL_MODEL_ID`)
 - Set up the [sample data sources](./examples/data/)
-    - In the AIE home page, navigate to `Data Engineering -> Data Sources -> Structured Data -> Add New Data Source`
-    - Select `Hive -> Create Connection`
-    - Use the following fields:
-        - Name: `flightdb`
-        - Hive Metastore: `discovery`
-        - Data Dir: `file:/data/shared/foundational-workflows/agentic/examples/data/hive`
-        - Hive Metastore Advanced Settings: `File Type`
-        - File Type: `CSV`
-    - Then select `Connect`
+    - Structured DB:
+        - In the AIE home page, navigate to `Data Engineering -> Data Sources -> Structured Data -> Add New Data Source`
+        - Select `Hive -> Create Connection`
+        - Use the following fields:
+            - Name: `flightdb`
+            - Hive Metastore: `discovery`
+            - Data Dir: `file:/data/shared/foundational-workflows/agentic/examples/data/hive`
+            - Hive Metastore Advanced Settings: `File Type`
+            - File Type: `CSV`
+        - Then select `Connect`
+    - S3 Object:
+        - Use the values `rootUser` and `rootPassword` to log into the Minio UI
+        - In the left dashboard tab nagivate to `Administrator -> Buckets -> Create Bucket`
+        - Create a new bucket called `flights`
+        - In the left dashboard tab nagivate to `Object Browser -> flights -> Upload`
+        - Upload the [`status-benefits.txt`](examples/data/status-benefits.txt)
 - Go to the [examples folder](./examples/) and run through the different agentic framework examples:
     - [Crewai](./examples/crewai/README.md)
     - [LangGraph](./examples/langgraph/README.md)
