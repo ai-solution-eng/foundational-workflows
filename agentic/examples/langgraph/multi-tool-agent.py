@@ -179,14 +179,11 @@ mcp_server_params = [
 
 async def load_mcp_tools():
     """
-        Executes the tool using the MCP client.
+    Connects to all configured MCP servers and loads available tools.
 
-        Args:
-            **kwargs: Tool-specific input arguments.
-
-        Returns:
-            str: Tool execution result or error string.
-        """
+    Returns:
+        Tuple[List[SimpleTool], List[Client]]: Loaded tools and active clients.
+    """
     tools = []
     clients = []
 
@@ -225,10 +222,10 @@ async def load_mcp_tools():
 
 async def cleanup_mcp_clients(clients):
     """
-    Connects to all configured MCP servers and loads available tools.
+    Gracefully disconnects all active MCP clients.
 
-    Returns:
-        Tuple[List[SimpleTool], List[Client]]: Loaded tools and active clients.
+    Args:
+        clients (List[Client]): MCP clients to disconnect.
     """
     """Disconnect from all MCP servers"""
     logger.info("Disconnecting from MCP servers...")
@@ -241,10 +238,13 @@ async def cleanup_mcp_clients(clients):
 
 def create_tool_descriptions(tools):
     """
-    Gracefully disconnects all active MCP clients.
+    Creates a textual description of all available MCP tools, including their input schema.
 
     Args:
-        clients (List[Client]): MCP clients to disconnect.
+        tools (List[SimpleTool]): Tools to describe.
+
+    Returns:
+        str: Formatted description of all tools for LLM prompts.
     """
     descriptions = ["Available tools:\n"]
 
@@ -272,13 +272,13 @@ def create_tool_descriptions(tools):
 
 def parse_tool_calls(response_text):
     """
-    Creates a textual description of all available MCP tools, including their input schema.
+    Parses tool calls from LLM response text.
 
     Args:
-        tools (List[SimpleTool]): Tools to describe.
+        response_text (str): LLM output potentially containing TOOL_CALLs.
 
     Returns:
-        str: Formatted description of all tools for LLM prompts.
+        List[dict]: List of tool call dictionaries with 'name' and 'args'.
     """
     pattern = r'TOOL_CALL:\s*(\w+)\((.*?)\)'
     matches = re.finditer(pattern, response_text, re.DOTALL)
@@ -300,13 +300,14 @@ def parse_tool_calls(response_text):
 
 async def execute_tools(response_text, tools):
     """
-    Parses tool calls from LLM response text.
+    Executes any tool calls found in LLM response text.
 
     Args:
-        response_text (str): LLM output potentially containing TOOL_CALLs.
+        response_text (str): LLM output containing TOOL_CALLs.
+        tools (List[SimpleTool]): List of available tools.
 
     Returns:
-        List[dict]: List of tool call dictionaries with 'name' and 'args'.
+        str: Combined results of all executed tools.
     """
     tool_calls = parse_tool_calls(response_text)
     results = []
@@ -329,16 +330,19 @@ async def execute_tools(response_text, tools):
 
 async def researcher_node(state: AgentState, tools: List[SimpleTool] = None, max_iterations: int = 3) -> AgentState:
     """
-    Executes any tool calls found in LLM response text.
+    Research agent node that searches and analyzes files/data.
+
+    Iteratively calls LLM and tools up to `max_iterations`.
+    Tracks short-term history to avoid repeating mistakes.
 
     Args:
-        response_text (str): LLM output containing TOOL_CALLs.
-        tools (List[SimpleTool]): List of available tools.
+        state (AgentState): Current workflow state.
+        tools (List[SimpleTool], optional): Tools available for research.
+        max_iterations (int, optional): Maximum LLM-tool cycles. Defaults to 3.
 
     Returns:
-        str: Combined results of all executed tools.
+        AgentState: Updated state including research_result and message history.
     """
-    """Research agent that analyzes files and data with multiple iterations."""
     logger.info("Researcher agent starting...")
 
     tools = [tool for tool in tools if tool.name not in ["execute_query", "get_table_schema", "list_catalogs", "list_schemas", "list_tables"]]
@@ -400,20 +404,19 @@ async def researcher_node(state: AgentState, tools: List[SimpleTool] = None, max
 
 async def sql_agent_node(state: AgentState, tools: List[SimpleTool] = None, max_iterations: int = 3) -> AgentState:
     """
-    Research agent node that searches and analyzes files/data.
+    SQL agent node that queries databases and processes results.
 
-    Iteratively calls LLM and tools up to `max_iterations`.
-    Tracks short-term history to avoid repeating mistakes.
+    Iteratively calls LLM and database tools up to `max_iterations`.
+    Uses previous tool results to refine queries and avoid repeated errors.
 
     Args:
         state (AgentState): Current workflow state.
-        tools (List[SimpleTool], optional): Tools available for research.
+        tools (List[SimpleTool], optional): Tools available for SQL queries.
         max_iterations (int, optional): Maximum LLM-tool cycles. Defaults to 3.
 
     Returns:
-        AgentState: Updated state including research_result and message history.
+        AgentState: Updated state including sql_result and message history.
     """
-    """SQL agent that queries databases"""
     logger.info("SQL agent starting...")
 
     tools = [tool for tool in tools if tool.name in ["execute_query", "get_table_schema", "list_catalogs", "list_schemas", "list_tables"]]
@@ -514,19 +517,6 @@ SQL findings:
 
 def route_next(state: AgentState):
     """
-    Summarizer agent node that compiles research and SQL results into a final report.
-
-    Args:
-        state (AgentState): Current workflow state containing research_result and sql_result.
-
-    Returns:
-        AgentState: Updated state including the summary.
-    """
-    return state.next_step
-
-
-def create_workflow(tools):
-    """
     Determines the next node in the workflow based on state.
 
     Args:
@@ -534,6 +524,28 @@ def create_workflow(tools):
 
     Returns:
         str: Name of next node.
+    """
+    return state.next_step
+
+
+def create_workflow(tools):
+    """
+    Builds and compiles the full workflow graph.
+
+    Nodes:
+        - researcher
+        - sql_agent
+        - summarizer
+
+    Edges are configured to follow:
+        sql_agent -> researcher -> summarizer -> END
+        with conditional loops if necessary.
+
+    Args:
+        tools (List[SimpleTool]): Available tools to pass to nodes.
+
+    Returns:
+        StateGraph: Compiled workflow ready for execution.
     """
 
     workflow = StateGraph(AgentState)
@@ -591,22 +603,13 @@ def create_workflow(tools):
 
 async def run_workflow(topic):
     """
-    Builds and compiles the full workflow graph.
-
-    Nodes:
-        - researcher
-        - sql_agent
-        - summarizer
-
-    Edges are configured to follow:
-        sql_agent -> researcher -> summarizer -> END
-        with conditional loops if necessary.
+    Executes the workflow for a given topic.
 
     Args:
-        tools (List[SimpleTool]): Available tools to pass to nodes.
+        topic (str): Main question or subject for the agents.
 
     Returns:
-        StateGraph: Compiled workflow ready for execution.
+        AgentState: Final state after workflow execution.
     """
     tools, clients = await load_mcp_tools()
     try:
@@ -619,15 +622,14 @@ async def run_workflow(topic):
 
 async def main(topic: str):
     """
-    Executes the workflow for a given topic.
+    Main entry point to execute the workflow and log the results.
 
     Args:
-        topic (str): Main question or subject for the agents.
+        topic (str): The primary question or task to analyze.
 
     Returns:
-        AgentState: Final state after workflow execution.
+        AgentState: Final agent state including summary.
     """
-    """Main entry point"""
     try:
         logger.info(f"Starting workflow for topic: {topic}")
         result = await run_workflow(topic)
@@ -646,14 +648,5 @@ async def main(topic: str):
 
 
 if __name__ == "__main__":
-    """
-    Main entry point to execute the workflow and log the results.
-
-    Args:
-        topic (str): The primary question or task to analyze.
-
-    Returns:
-        AgentState: Final agent state including summary.
-    """
     TOPIC = "My customer name is John and my flight is A105, what is my status and benefits?"
     asyncio.run(main(TOPIC))
