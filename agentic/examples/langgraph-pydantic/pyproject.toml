@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "arize-phoenix>=4.0.0",
+    "arize-phoenix-otel>=0.14.0",
     "fastmcp>=2.14.4",
     "httpx>=0.25.0",
     "langchain>=0.1.0",
