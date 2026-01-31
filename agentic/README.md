@@ -48,3 +48,4 @@
     - Then select `Connect`
 - Go to the [examples folder](./examples/) and run through the different agentic framework examples:
     - [Crewai](./examples/crewai/README.md)
+    - [LangGraph](./examples/langgraph/README.md)
