@@ -5,8 +5,8 @@
 | Use Case Owner        | Geun-Tak, Roh     | geun-tak.roh@hpe.com               |
 
 ## Abstract
-Currently, Multi-node Model serving is not available with PCAI’s out-of-the-box softwares. ( i.e kuberay, MLIS/kserve ). 
-So This demo demonstrates a **Custom Approach for Multi-node Model serving in PCAI** with **LeaderWorkerSet + vLLM/SGLang**. 
+Currently, Multi-node Model serving is not officially supported by AI Essentials with Kuberay, MLIS/Kserve
+So This demo demonstrates a **Custom Work-around for Multi-node Model serving in PCAI** with **LeaderWorkerSet + vLLM/SGLang**. 
 
 
 ## Steps
@@ -27,7 +27,19 @@ LeaderWorkerSet ([LWS](https://github.com/kubernetes-sigs/lws)) is an API for de
         - **Framework Icon**: Click Select File and select the icon you want to use, e.g. the logo file in the [repo](https://github.com/ai-solution-eng/frameworks/tree/main/LeaderWorkerSet).
         - **Helm Chart**: Choose the packaged .tgz chart file in the [repo](https://github.com/ai-solution-eng/frameworks/tree/main/LeaderWorkerSet).
         - **Namespace**: where you deploy the framework, for example **lws**
+3.	Create Role and Binding to the User’s service account
+    - Helm chart will install several Custom Resource Definitions.
+    - Admin should bind proper role with permission to enable the user handling LeaderWorkerSet custom resource in jupyter notebook.
+```bash
+$ kubectl create role lws-manager \
+  --verb=create,update,patch,delete,get,list,watch \
+  --resource=leaderworkersets \
+  -n [User Namespace]
 
+$ kubectl create rolebinding lws-manager-binding \
+  --role=lws-manager \
+  --serviceaccount=[User Namespace]:default-editor 
+```
 
 ### Step 2 — Deploy Model via LWS with Model Serving Frameworks.
 Following examples are tested in PCAI Gen 1 medium system ( with 8 * L40s ). So The configuration can be differ in another systems like Gen2 systems ( with 4 x 400Gb NIC ). 
@@ -315,7 +327,7 @@ spec:
 
 ## NOTEs
 ### ⚙️ Enabling GPUDirect RDMA
-GPUDirect RDMA is essential for the Performance of Cross-node workloads include Multi-node Model Serving. Following options are mandatory for GPUDirect RDMA in PCAI. if it’s not defined, deployment will face the issues or Deployment will not use GPUDirect RDMA.
+GPUDirect RDMA is essential for the Performance of Multi-node workloads include Multi-node Model Serving. Following options are mandatory for GPUDirect RDMA in PCAI. if it’s not defined, deployment will face the issues or Deployment will not use GPUDirect RDMA.
 - **IPC_LOCK** : capability for locking memory pages and prevent swapping to disk
 - **NCCL_IB_ADDR_FAMILY** : for enabling IPv6 in RDMA
 - **k8s.v1.cni.cncf.io/networks annotation** : for IPv6 address allocation
@@ -326,8 +338,8 @@ Please check the details in the [HPE AI Essential's manual](https://support.hpe.
 
 ---
 
-### ❌ Do Not Configure the name of K8s service for LWS leader Pod alinging with LWS's name
-Once LeaderWorkerSet custom resource is deployed, it will create k8s service which is leveraged for inter-pod communication and its name is same with LWS’ name. if the name is duplicated, pods can not resolve each leader/worker’s name
+### 🚫 Do Not Configure the name of K8s service for LWS leader Pod alinging with LWS's name
+Once LeaderWorkerSet custom resource is deployed, it will automatically create k8s service with LWS custom resource's name, and it’s leveraged for inter-pod communication. So if the name is duplicated, then the pods will not be able to resolve each leader/worker pod’s name. 
 ```bash
 $ k get lws
 NAME                          READY   DESIRED   UP-TO-DATE   AGE
@@ -352,28 +364,20 @@ $ k logs llama-70b-2rdma-4tp-2pp-pvc-0 | grep distributed_init_method
 [2025-12-24 16:00:53 PP0 TP3] world_size=8 rank=3 local_rank=3 distributed_init_method=tcp://llama-70b-2rdma-4tp-2pp-pvc-0.llama-70b-2rdma-4tp-2pp-pvc.project-user-geun-tak-roh:31001 backend=nccl
 ```
 ----
-### 🔑 Power-of-2 GPU allocation and utilize whole GPUs in each nodes.
-For multi-node model serving, We recommend allocating 2 ^ n ( power of 2 , 2,4,8… ) number of GPUs and utilize whole GPUs in each nodes. For example, even though the model’s size is fit into 6 GPUs, Using the 8 GPUs from 2 nodes. 
+### ❌ Don’t use multi-node model serving with Partial GPU Utilization
+Because it would not consider HW topology and it could cause:
+  - Significant performance degradation by Poor inter-node communication bandwidth.
+  - Potential service instability and unexpected errors.
+  - Hang in NCCL initialization phase
 
-This simplifies:
-- HW Topology consideration
-- Model architecture constraints (e.g., attention heads must be divisible by tensor parallel degree - [link](https://github.com/vllm-project/vllm/issues/4232) )
----
-### 🥇 Prioritize Single Node deployment
-If a model fits within a single node's GPU capacity, always deploy it there using tensor parallelism. Cross-node deployment with partial resource utilization should be avoided even when total idle GPUs are available across multiple nodes.
+If the model fits within a single node, Please deploy it using tensor parallelism only. Multi node model serving with partial GPU utilization should be avoided even though total # of available GPUs are enough across the cluster.
 
 **Example**: Llama 3.3-70B fits in 4× L40s
 - ✅ Deploy on 1 node with 4 GPUs
 - ❌ Don't split across 2 nodes (2 GPUs each) even those those GPUs are idle
-
-Cross-node deployment with partial resource utilization could suffers from:
-- NUMA topology issues not being considered. It could cause:
-    - Poor inter-node communication bandwidth.
-    - Significant performance degradation
-    - Potential service instability and unexpected errors
 ---
 ### ⬇️ Pre-download the model files in PVC
-Most of the model serving frameworks download the model artifacts, when the service is up and running. It will takes several mins/hours depends on the model size. To reduce start-up time, we highly recommend to use K8s Job to download the model into Persistent Volumes. ( In PCAI, **model-pvc** is created in every user's namespace and following K8s job uses **model-pvc** )
+Most of the model serving frameworks download the model artifacts, when the service is up and running. To reduce start-up time and deployment effort, we highly recommend to use K8s Job to download the model into Persistent Volumes. ( In PCAI, **model-pvc** is created in every user's namespace and following K8s job uses **model-pvc** )
 - Download the model under ./hub directory. then we can use HF_HOME environment variable to specify local path.
 - To launch K8s Job in user’s namespace in PCAI, Please disable Istio sidecar injection via annotation
 ```yaml
@@ -387,6 +391,7 @@ spec:
     metadata:
       labels:
         app: hf-model-downloader
+        add-ezua-proxy: "true"
       annotations:
         sidecar.istio.io/inject: "false"        
     spec:
@@ -406,21 +411,21 @@ spec:
             import os
             # Configuration
             model_id = os.getenv("MODEL_ID", "bert-base-uncased")
-            cache_dir = os.getenv("CACHE_DIR", "/models/hub")
+            local_dir = os.getenv("LOCAL_DIR", "/models/hub")
             hf_token = os.getenv("HF_TOKEN", None)
             print(f"Downloading model: {model_id}")
-            print(f"Target directory: {cache_dir}")
+            print(f"Target directory: {local_dir}")
             # Create cache directory if it doesn't exist
-            if not os.path.exists(cache_dir):
-                print(f"Creating cache directory: {cache_dir}")
-                os.makedirs(cache_dir, exist_ok=True)
+            if not os.path.exists(local_dir):
+                print(f"Creating cache directory: {local_dir}")
+                os.makedirs(local_dir, exist_ok=True)
             else:
                 print("Cache directory already exists")
             try:
                 # Download the model
                 local_path = snapshot_download(
                     repo_id=model_id,
-                    cache_dir=cache_dir,
+                    local_dir=local_dir,
                     token=hf_token,
                     resume_download=True
                 )
@@ -430,14 +435,14 @@ spec:
                 print("\nDownloaded files:")
                 total_size = 0
                 file_count = 0
-                for root, dirs, files in os.walk(cache_dir):
+                for root, dirs, files in os.walk(local_dir):
                     for file in files:
                         filepath = os.path.join(root, file)
                         size = os.path.getsize(filepath)
                         total_size += size
                         file_count += 1
                         # Show relative path for readability
-                        rel_path = os.path.relpath(filepath, cache_dir)
+                        rel_path = os.path.relpath(filepath, local_dir)
                         print(f"  {rel_path} ({size:,} bytes)")
                 print(f"\nTotal: {file_count} files, {total_size:,} bytes ({total_size / (1024**3):.2f} GB)")
             except Exception as e:
@@ -447,11 +452,11 @@ spec:
             echo "Job completed successfully!"
         env:
         - name: MODEL_ID
-          value: "meta-llama/Llama-3.3-70B-Instruct"  # Change to your desired model
-        - name: CACHE_DIR
-          value: "/models/hub"
-        - name: HF_TOKEN
-          value: "<your HF Token>"
+          value: "zai-org/GLM-4.7"  # Change to your desired model
+        - name: LOCAL_DIR
+          value: "/models/hub/GLM-47"
+        # - name: HF_TOKEN
+        #   value: "<your HF Token>"
         volumeMounts:
         - name: model-storage
           mountPath: /models

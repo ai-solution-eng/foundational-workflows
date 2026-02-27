@@ -8,6 +8,7 @@ spec:
     metadata:
       labels:
         app: hf-model-downloader
+        add-ezua-proxy: "true"
       annotations:
         sidecar.istio.io/inject: "false"        
     spec:
@@ -27,21 +28,21 @@ spec:
             import os
             # Configuration
             model_id = os.getenv("MODEL_ID", "bert-base-uncased")
-            cache_dir = os.getenv("CACHE_DIR", "/models/hub")
+            local_dir = os.getenv("LOCAL_DIR", "/models/hub")
             hf_token = os.getenv("HF_TOKEN", None)
             print(f"Downloading model: {model_id}")
-            print(f"Target directory: {cache_dir}")
+            print(f"Target directory: {local_dir}")
             # Create cache directory if it doesn't exist
-            if not os.path.exists(cache_dir):
-                print(f"Creating cache directory: {cache_dir}")
-                os.makedirs(cache_dir, exist_ok=True)
+            if not os.path.exists(local_dir):
+                print(f"Creating cache directory: {local_dir}")
+                os.makedirs(local_dir, exist_ok=True)
             else:
                 print("Cache directory already exists")
             try:
                 # Download the model
                 local_path = snapshot_download(
                     repo_id=model_id,
-                    cache_dir=cache_dir,
+                    local_dir=local_dir,
                     token=hf_token,
                     resume_download=True
                 )
@@ -51,14 +52,14 @@ spec:
                 print("\nDownloaded files:")
                 total_size = 0
                 file_count = 0
-                for root, dirs, files in os.walk(cache_dir):
+                for root, dirs, files in os.walk(local_dir):
                     for file in files:
                         filepath = os.path.join(root, file)
                         size = os.path.getsize(filepath)
                         total_size += size
                         file_count += 1
                         # Show relative path for readability
-                        rel_path = os.path.relpath(filepath, cache_dir)
+                        rel_path = os.path.relpath(filepath, local_dir)
                         print(f"  {rel_path} ({size:,} bytes)")
                 print(f"\nTotal: {file_count} files, {total_size:,} bytes ({total_size / (1024**3):.2f} GB)")
             except Exception as e:
@@ -68,11 +69,11 @@ spec:
             echo "Job completed successfully!"
         env:
         - name: MODEL_ID
-          value: "meta-llama/Llama-3.3-70B-Instruct"  # Change to your desired model
-        - name: CACHE_DIR
-          value: "/models/hub"
-        - name: HF_TOKEN
-          value: "<your HF Token>"
+          value: "zai-org/GLM-4.7"  # Change to your desired model
+        - name: LOCAL_DIR
+          value: "/models/hub/GLM-47"
+        # - name: HF_TOKEN
+        #   value: "<your HF Token>"
         volumeMounts:
         - name: model-storage
           mountPath: /models

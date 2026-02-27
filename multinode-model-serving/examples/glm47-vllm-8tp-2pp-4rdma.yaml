@@ -1,0 +1,121 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: vllm-glm47-8gpus-4rdma-pvc
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        annotations:   
+          k8s.v1.cni.cncf.io/networks: nvidia-network-operator/nv-ipam-macvlannetwork-a, nvidia-network-operator/nv-ipam-macvlannetwork-b, nvidia-network-operator/nv-ipam-macvlannetwork-c, nvidia-network-operator/nv-ipam-macvlannetwork-d
+          sidecar.istio.io/inject: "false"
+        labels:
+          role: vllm-glm47-8gpus-4rdma-pvc
+          # add-ezua-proxy: "true"
+      spec:
+        containers:
+          - name: vllm-leader-ib
+            image: vllm/vllm-openai:v0.15.1
+            securityContext:
+              capabilities:
+                add: ["IPC_LOCK"]            
+            env:  
+              - name: HF_HOME
+                value: '/models'
+              - name: NCCL_DEBUG
+                value: "INFO"
+              - name: NCCL_IB_ADDR_FAMILY
+                value: "AF_INET6"   
+            command:
+              - sh
+              - -c
+              - "bash /vllm-workspace/examples/online_serving/multi-node-serving.sh leader --ray_cluster_size=$(LWS_GROUP_SIZE); 
+                 python3 -m vllm.entrypoints.openai.api_server --port 8080 --model /models/hub/GLM-47 --served-model-name zai-org/GLM-4.7 --tensor-parallel-size 8 --pipeline_parallel_size 2 --distributed-executor-backend ray --tool-call-parser glm47 --reasoning-parser glm45 --enable-auto-tool-choice --max-num-seqs 150"
+            resources:
+              limits:
+                nvidia.com/gpu: "8"
+                rdma/rdma_shared_device_a: 1
+                rdma/rdma_shared_device_b: 1
+                rdma/rdma_shared_device_c: 1
+                rdma/rdma_shared_device_d: 1
+            ports:
+              - containerPort: 8080
+            readinessProbe:
+              tcpSocket:
+                port: 8080
+              initialDelaySeconds: 15
+              periodSeconds: 10
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - name: model-storage
+                mountPath: /models                
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: models-pvc              
+    workerTemplate:
+      metadata:
+        annotations:
+          k8s.v1.cni.cncf.io/networks: nvidia-network-operator/nv-ipam-macvlannetwork-a, nvidia-network-operator/nv-ipam-macvlannetwork-b, nvidia-network-operator/nv-ipam-macvlannetwork-c, nvidia-network-operator/nv-ipam-macvlannetwork-d
+          sidecar.istio.io/inject: "false"
+        labels:
+          # add-ezua-proxy: "true"
+      spec:
+        containers:
+          - name: vllm-worker-ib
+            image: vllm/vllm-openai:v0.15.1
+            securityContext:
+              capabilities:
+                add: ["IPC_LOCK"]            
+            env:
+              - name: HF_HOME
+                value: '/models'
+              - name: NCCL_DEBUG
+                value: "INFO"
+              - name: NCCL_IB_ADDR_FAMILY
+                value: "AF_INET6"
+            command:
+              - sh
+              - -c
+              - "bash /vllm-workspace/examples/online_serving/multi-node-serving.sh worker --ray_address=$(LWS_LEADER_ADDRESS)"
+            resources:
+              limits:
+                nvidia.com/gpu: "8"
+                rdma/rdma_shared_device_a: 1
+                rdma/rdma_shared_device_b: 1                
+                rdma/rdma_shared_device_c: 1
+                rdma/rdma_shared_device_d: 1                
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - name: model-storage
+                mountPath: /models                
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: models-pvc              
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-glm47-leader-4rdma
+spec:
+  ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      targetPort: 8080
+  selector:
+    leaderworkerset.sigs.k8s.io/name: vllm-glm47-8gpus-4rdma-pvc
+    role: vllm-glm47-8gpus-4rdma-pvc
+  type: ClusterIP
