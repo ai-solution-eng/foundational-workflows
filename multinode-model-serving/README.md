@@ -5,8 +5,8 @@
 | Use Case Owner        | Geun-Tak, Roh     | geun-tak.roh@hpe.com               |
 
 ## Abstract
-Currently, Multi-node Model serving is not available with PCAI’s out-of-the-box softwares. ( i.e kuberay, MLIS/kserve ). 
-So This demo demonstrates a **Custom Approach for Multi-node Model serving in PCAI** with **LeaderWorkerSet + vLLM/SGLang**. 
+Currently, Multi-node Model serving is not officially supported by AI Essentials with Kuberay, MLIS/Kserve
+So This demo demonstrates a **Custom Work-around for Multi-node Model serving in PCAI** with **LeaderWorkerSet + vLLM/SGLang**. 
 
 
 ## Steps
@@ -327,7 +327,7 @@ spec:
 
 ## NOTEs
 ### ⚙️ Enabling GPUDirect RDMA
-GPUDirect RDMA is essential for the Performance of Cross-node workloads include Multi-node Model Serving. Following options are mandatory for GPUDirect RDMA in PCAI. if it’s not defined, deployment will face the issues or Deployment will not use GPUDirect RDMA.
+GPUDirect RDMA is essential for the Performance of Multi-node workloads include Multi-node Model Serving. Following options are mandatory for GPUDirect RDMA in PCAI. if it’s not defined, deployment will face the issues or Deployment will not use GPUDirect RDMA.
 - **IPC_LOCK** : capability for locking memory pages and prevent swapping to disk
 - **NCCL_IB_ADDR_FAMILY** : for enabling IPv6 in RDMA
 - **k8s.v1.cni.cncf.io/networks annotation** : for IPv6 address allocation
@@ -338,8 +338,8 @@ Please check the details in the [HPE AI Essential's manual](https://support.hpe.
 
 ---
 
-### ❌ Do Not Configure the name of K8s service for LWS leader Pod alinging with LWS's name
-Once LeaderWorkerSet custom resource is deployed, it will create k8s service which is leveraged for inter-pod communication and its name is same with LWS’ name. if the name is duplicated, pods can not resolve each leader/worker’s name
+### 🚫 Do Not Configure the name of K8s service for LWS leader Pod alinging with LWS's name
+Once LeaderWorkerSet custom resource is deployed, it will automatically create k8s service with LWS custom resource's name, and it’s leveraged for inter-pod communication. So if the name is duplicated, then the pods will not be able to resolve each leader/worker pod’s name. 
 ```bash
 $ k get lws
 NAME                          READY   DESIRED   UP-TO-DATE   AGE
@@ -370,14 +370,14 @@ Because it would not consider HW topology and it could cause:
   - Potential service instability and unexpected errors.
   - Hang in NCCL initialization phase
 
+If the model fits within a single node, Please deploy it using tensor parallelism only. Multi node model serving with partial GPU utilization should be avoided even though total # of available GPUs are enough across the cluster.
+
 **Example**: Llama 3.3-70B fits in 4× L40s
 - ✅ Deploy on 1 node with 4 GPUs
 - ❌ Don't split across 2 nodes (2 GPUs each) even those those GPUs are idle
-
-If the model fits within a single node, Please deploy it using tensor parallelism only. Multi node model serving with partial GPU utilization should be avoided even though total # of available GPUs are enough across the cluster.
 ---
 ### ⬇️ Pre-download the model files in PVC
-Most of the model serving frameworks download the model artifacts, when the service is up and running. It will takes several mins/hours depends on the model size. To reduce start-up time, we highly recommend to use K8s Job to download the model into Persistent Volumes. ( In PCAI, **model-pvc** is created in every user's namespace and following K8s job uses **model-pvc** )
+Most of the model serving frameworks download the model artifacts, when the service is up and running. To reduce start-up time and deployment effort, we highly recommend to use K8s Job to download the model into Persistent Volumes. ( In PCAI, **model-pvc** is created in every user's namespace and following K8s job uses **model-pvc** )
 - Download the model under ./hub directory. then we can use HF_HOME environment variable to specify local path.
 - To launch K8s Job in user’s namespace in PCAI, Please disable Istio sidecar injection via annotation
 ```yaml
