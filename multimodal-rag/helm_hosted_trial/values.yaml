@@ -1,0 +1,144 @@
+# -- Global settings ----------------------------------------------------------
+replicaCount: 1
+image:
+  repository: andrewbydlon/rag-api-server
+  tag: v0.6.0
+  pullPolicy: IfNotPresent
+
+deployment:
+  name: rag-mcp-server
+  appName: rag-mcp-server
+
+
+# -- Persistence ---------------------------------------------------------------
+persistence:
+  data:
+    size: 50Gi
+    storageClass: "gl4f-filesystem"
+    accessMode: ReadWriteMany
+  qdrant:
+    size: 50Gi
+    storageClass: "gl4f-filesystem"
+    accessMode: ReadWriteMany
+
+
+# -- Model configuration ------------------------------------------------------
+# Each model role has a name, URL, optional className, and optional extra
+# kwargs (serialised as JSON into the ConfigMap).  API keys are set
+# separately via `modelSecrets` (Kubernetes Secret).
+# Set url to "" to disable a component.
+models:
+  embedder:
+    name: "Qwen/Qwen3-VL-Embedding-8B"
+    url: ""
+    className: "MultiModalEmbeddings"
+    extra:
+      embedding_dim: 4096
+      chunk_size: 2048
+      chunk_overlap: 256
+      code_chunk_size: 8192
+      code_chunk_overlap: 512
+      tokenizer_name: "Qwen/Qwen3-VL-Reranker-8B"
+      tokenizer_type: "HuggingFace"
+  reranker:
+    name: "Qwen/Qwen3-VL-Reranker-8B"
+    url: ""
+    className: "MultiModalReranker"
+    extra: {}
+  vlm:
+    name: "Gemma4-31B-FP8"
+    url: ""
+    extra: {}
+  asr:
+    name: ""
+    url: ""
+    extra: {}
+
+# -- Model API keys (sensitive) -----------------------------------------------
+# These are stored in a Kubernetes Secret, not the ConfigMap.
+# Provide via --set or a separate encrypted values file.
+modelSecrets:
+  embedderApiKey: ""
+  rerankerApiKey: ""
+  vlmApiKey: ""
+  asrApiKey: ""
+
+# -- S3 / MinIO configuration --------------------------------------------------
+# Endpoint URL is stored in the ConfigMap (not sensitive).
+# Access keys are stored in the Kubernetes Secret.
+s3:
+  endpointUrl: "http://minio.minio.svc.cluster.local:9000"
+  accessKeyId: ""
+  secretAccessKey: ""
+
+# -- RAG parameters -----------------------------------------------------------
+rag:
+  captionVideo: false  # Transcribe video audio tracks via ASR
+  remote: false         # Use remote model URLs (vs in-cluster .svc.cluster.local)
+  dedupThreshold: 0.995  # Cosine similarity above which a doc is considered a duplicate (0.0–1.0)
+
+# -- Qdrant configuration -----------------------------------------------------
+# Qdrant runs as a sidecar StatefulSet.  The API server connects to it
+# over the in-cluster DNS name.
+qdrant:
+  image:
+    repository: qdrant/qdrant
+    tag: latest
+    pullPolicy: IfNotPresent
+  grpcPort: 6334
+  httpPort: 6333
+
+
+# -- MCP server (optional sidecar) --------------------------------------------
+# Runs alongside the API server and exposes the same retrieval pipeline
+# as MCP tools over SSE transport.
+mcp:
+  enabled: true
+  port: 9090
+
+# -- Service configuration ----------------------------------------------------
+service:
+  api:
+    type: ClusterIP
+    port: 80
+    targetPort: 8000
+  mcp:
+    type: ClusterIP
+
+
+# -- Resource limits ----------------------------------------------------------
+resources:
+  app:
+    requests:
+      memory: "2Gi"
+      cpu: 2
+    limits:
+      memory: "8Gi"
+      cpu: 4
+  qdrant:
+    requests:
+      memory: "16Gi"
+      cpu: "4"
+    limits:
+      memory: "32Gi"
+      cpu: "8"
+
+# -- Environment variables (extra) --------------------------------------------
+extraEnv: {}
+
+# -- PCAI ---------------------------------------------------------------------
+ezua:
+  enabled: true
+  domainName: "${DOMAIN_NAME}"
+  # configure the application endpoint
+
+  virtualService:
+    endpoint: "rag-mcp-server.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 300s          # Default for normal API calls (search, list, read)
+    longTimeout: 3600s     # For batch uploads, SSE streams, and MCP
+
+  # configure the authorization policy
+  authorizationPolicy:
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"

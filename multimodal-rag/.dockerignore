@@ -1,0 +1,2 @@
+# Exclude hardcoded model definitions with PCAI internal API keys
+src/multimodal_rag/utils/pcai_models.py

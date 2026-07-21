@@ -1,0 +1,58 @@
+{
+  "dataset": "vidore/vidore_v3_physics",
+  "timestamp": "2026-06-29T17:16:55.663674",
+  "num_pdfs": 42,
+  "num_chunks": 1781,
+  "num_queries": 1812,
+  "num_qrels": 13746,
+  "metrics": {
+    "text_only": {
+      "ndcg_at_1": 0.0,
+      "recall_at_1": 0.0,
+      "map_at_1": 0.0,
+      "ndcg_at_3": 0.0,
+      "recall_at_3": 0.0,
+      "map_at_3": 0.0,
+      "ndcg_at_5": 0.160309976413977,
+      "recall_at_5": 0.13716852754532977,
+      "map_at_5": 0.07526146897862322,
+      "ndcg_at_10": 0.181938063713511,
+      "recall_at_10": 0.21827405732350713,
+      "map_at_10": 0.09521854598174505,
+      "ndcg_at_20": 0.21796077494270674,
+      "recall_at_20": 0.3203892658655909,
+      "map_at_20": 0.11519573244932917
+    },
+    "multimodal": {
+      "ndcg_at_1": 0.0,
+      "recall_at_1": 0.0,
+      "map_at_1": 0.0,
+      "ndcg_at_3": 0.0,
+      "recall_at_3": 0.0,
+      "map_at_3": 0.0,
+      "ndcg_at_5": 0.1388213985915357,
+      "recall_at_5": 0.11306703576999691,
+      "map_at_5": 0.06286068090509934,
+      "ndcg_at_10": 0.16341290098732678,
+      "recall_at_10": 0.1951378226009366,
+      "map_at_10": 0.08244258930766003,
+      "ndcg_at_20": 0.20352412363824854,
+      "recall_at_20": 0.309902753485125,
+      "map_at_20": 0.10297764492445556
+    }
+  },
+  "info": {
+    "corpus_embed_text": {
+      "corpus_embed_time_s": 92.71,
+      "num_corpus": 1781
+    },
+    "query_embed": {
+      "query_embed_time_s": 80.78,
+      "num_query": 1812
+    },
+    "corpus_embed_multimodal": {
+      "corpus_embed_time_s": 354.96,
+      "num_corpus": 1781
+    }
+  }
+}

@@ -1,0 +1,1321 @@
+"""
+MCP server exposing multimodal RAG retrieval as tools for LLM consumption.
+
+Run in stdio mode (for MCP client integration)::
+
+    python -m multimodal_rag.mcp_server
+
+Or with a specific transport::
+
+    python -m multimodal_rag.mcp_server --transport sse --port 8001
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import threading
+import time
+from datetime import datetime
+from typing import Any, Optional
+
+from multimodal_rag.dataset_manager import DatasetManager
+from multimodal_rag.rag_system import MultimodalRAG
+from multimodal_rag.utils.logging_utils import logging, setup_logger
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Configuration (same env vars as the API server)
+# ---------------------------------------------------------------------------
+
+DATA_PATH = os.environ.get("DATA_PATH", "/data")
+QDRANT_HOST = os.environ.get("QDRANT_HOST", "")
+QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
+RAG_REMOTE = os.environ.get("RAG_REMOTE", "true").lower() in ("true", "1", "yes")
+MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "")
+
+# ---------------------------------------------------------------------------
+# Unlock cache: dataset_name -> (expiry_timestamp, password)
+# Allows providing the password once and skipping it for subsequent
+# operations within the TTL window (default 30 minutes).
+# ---------------------------------------------------------------------------
+
+_unlocked: dict[str, tuple[float, str]] = {}
+_unlocked_lock = threading.Lock()
+
+_UNLOCK_TTL = int(os.environ.get("UNLOCK_TTL", "1800"))  # seconds, default 30 min
+
+
+def _is_unlocked(dataset_name: str) -> str | None:
+    """Return the cached password if *dataset_name* is still unlocked, else None."""
+    with _unlocked_lock:
+        entry = _unlocked.get(dataset_name)
+        if entry is None:
+            return None
+        expiry, pw = entry
+        if time.monotonic() >= expiry:
+            del _unlocked[dataset_name]
+            return None
+        return pw
+
+
+def _cache_unlock(dataset_name: str, password: str) -> None:
+    """Cache the password for *dataset_name* for _UNLOCK_TTL seconds."""
+    with _unlocked_lock:
+        _unlocked[dataset_name] = (time.monotonic() + _UNLOCK_TTL, password)
+
+
+def _check_unlocked_or_password(
+    dm: "DatasetManager",
+    dataset_name: str,
+    password: str | None,
+) -> str | None:
+    """Return the verified password or raise ToolError.
+
+    Priority:
+      1. If *password* is provided and correct, cache it and return it.
+      2. If the dataset is in the unlock cache, return the cached password.
+      3. Raise ToolError.
+    """
+    if password:
+        if dm.verify_password(dataset_name, password):
+            _cache_unlock(dataset_name, password)
+            return password
+        raise ToolError(f"Incorrect password for dataset '{dataset_name}'.")
+    cached = _is_unlocked(dataset_name)
+    if cached is not None:
+        return cached
+    if dm.has_password(dataset_name):
+        raise ToolError(
+            f"Dataset '{dataset_name}' is password protected. "
+            "Provide the correct 'password' parameter or use the "
+            "'unlock_dataset' tool to unlock it for your session."
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Shared DatasetManager (lazy initialised)
+# ---------------------------------------------------------------------------
+
+_dm: DatasetManager | None = None
+_dm_lock = threading.Lock()
+
+
+def get_manager() -> DatasetManager:
+    global _dm
+    if _dm is not None:
+        return _dm
+
+    with _dm_lock:
+        if _dm is not None:
+            return _dm
+
+        data_path = os.environ.get("DATA_PATH", "/data")
+        qdrant_host = os.environ.get("QDRANT_HOST", "")
+        qdrant_port = int(os.environ.get("QDRANT_PORT", "6333"))
+        rag_remote = os.environ.get("RAG_REMOTE", "true").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+        rag_dedup_threshold = float(os.environ.get("RAG_DEDUP_THRESHOLD", "0.995"))
+
+        from multimodal_rag.model_config import build_all
+
+        embedder, reranker, vlm, asr = build_all()
+
+        _dm = DatasetManager(
+            base_path=data_path,
+            qdrant_host=qdrant_host,
+            qdrant_port=qdrant_port,
+            embedder=embedder,
+            reranker=reranker,
+            vlm=vlm,
+            asr=asr,
+            remote=rag_remote,
+            dedup_threshold=rag_dedup_threshold,
+        )
+        logger.info(
+            "DatasetManager initialised: data=%s qdrant=%s:%s remote=%s",
+            data_path,
+            qdrant_host or "(local)",
+            qdrant_port,
+            rag_remote,
+        )
+        return _dm
+
+
+async def get_manager_async() -> DatasetManager:
+    """Async-safe wrapper — offloads get_manager() to a thread pool."""
+    if _dm is not None:
+        return _dm
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    _pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mcp-sync")
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_pool, get_manager)
+
+
+def _prefer_original_media(doc: Any) -> Any:
+    """Return a copy of *doc* where embedding-grade media keys are replaced
+    by their higher-quality ``original_*`` counterparts when available.
+
+    At ingest time ``image`` / ``video`` / ``audio`` hold the low-resolution
+    surrogate used for embedding (e.g. a 1 fps, ≤720×720 video segment).
+    The ``original_image`` / ``original_video`` / ``original_audio`` keys
+    (when present) point at the preprocessed, higher-quality file on the PVC
+    (e.g. the full video at ≤720p @ 24 fps).  Surfacing the higher-quality
+    reference in the primary ``image`` / ``video`` / ``audio`` keys ensures
+    the LLM cites and links the best available version rather than the
+    embedding-grade surrogate stored in Qdrant.
+    """
+    if not isinstance(doc, dict):
+        return doc
+    d = dict(doc)
+    for modality in ("image", "video", "audio"):
+        orig = d.get(f"original_{modality}")
+        if orig:
+            d[modality] = orig
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Query-embedding cache + dataset-vector lookup
+# ---------------------------------------------------------------------------
+#
+# Goal: never re-embed the same query media twice.  Two strategies:
+#
+#   1. If the query URL points to a file already in the target dataset,
+#      pull that point's stored vector from Qdrant — zero model calls.
+#      This covers the "find more like result #3" pattern where the LLM
+#      passes a result URL back as image=/video=/audio=.
+#
+#   2. Otherwise (staged upload, fresh file), hash the file content and
+#      remember the embedding in an in-process LRU keyed by
+#      hash + embedder model + query text.  Same file in a later turn —
+#      cache hit, no embedder call.
+#
+# Both paths return ``None`` on miss; the caller falls back to embedding
+# (and caches the result for next time).
+
+_query_emb_cache: dict[str, list[float]] = {}
+_query_emb_cache_lock = threading.Lock()
+
+_file_hash_cache: dict[str, str] = {}
+_file_hash_cache_lock = threading.Lock()
+
+
+def _hash_file(path: str) -> str:
+    """SHA-256 of *path* (cached per path so repeat calls are free)."""
+    with _file_hash_cache_lock:
+        cached = _file_hash_cache.get(path)
+    if cached is not None:
+        return cached
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    digest = h.hexdigest()
+    with _file_hash_cache_lock:
+        _file_hash_cache[path] = digest
+    return digest
+
+
+def _collect_cacheable_paths(query_dict: Any) -> list[tuple[str, str]]:
+    """Return ``[(media_key, file_path), ...]`` for cacheable media in *query_dict*."""
+    if not isinstance(query_dict, dict):
+        return []
+    paths: list[tuple[str, str]] = []
+    for k in ("image", "video", "audio"):
+        v = query_dict.get(k)
+        if not v:
+            continue
+        urls = v if isinstance(v, list) else [v]
+        for url in urls:
+            path: Optional[str] = None
+            if isinstance(url, str):
+                if url.startswith("file://"):
+                    path = url[7:]
+                elif url.startswith("/") and os.path.exists(url):
+                    path = url
+            if path and os.path.exists(path):
+                paths.append((k, path))
+    return paths
+
+
+def _compute_query_cache_key(query_dict: Any, model_name: str, paths: list[tuple[str, str]]) -> str:
+    """Build a deterministic cache key from query text + media hashes + model name."""
+    text_part = query_dict.get("text", "") if isinstance(query_dict, dict) else ""
+    parts = [f"text:{hashlib.sha256(text_part.encode()).hexdigest()}"]
+    for k, path in paths:
+        parts.append(f"{k}:{_hash_file(path)}")
+    parts.append(f"model:{model_name}")
+    return "|".join(parts)
+
+
+def _lookup_dataset_vector(
+    rag: MultimodalRAG,
+    dataset_name: str,
+    file_path: str,
+) -> Optional[list[float]]:
+    """If *file_path* belongs to *dataset_name*, return its stored Qdrant vector.
+
+    Returns ``None`` when the path is not under the dataset's files dir,
+    Qdrant is unreachable, or no point references this file.
+    """
+    vs = rag.vector_store
+    if vs is None or isinstance(vs, dict):
+        return None
+
+    data_path = os.environ.get("DATA_PATH", "/data")
+    files_prefix = f"{data_path}/datasets/{dataset_name}/files/"
+    if not file_path.startswith(files_prefix):
+        return None
+
+    client = vs._client  # type: ignore[attr-defined]
+    coll = vs.collection_name  # type: ignore[attr-defined]
+    vector_name = getattr(vs, "vector_name", None)
+
+    file_url = f"file://{file_path}"
+    possible_values = [file_path, file_url]
+
+    # Check every metadata field where the path or file:// URL might be stored.
+    fields_to_check = (
+        "metadata.source",
+        "metadata.image",
+        "metadata.video",
+        "metadata.audio",
+        "metadata.original_image",
+        "metadata.original_video",
+        "metadata.original_audio",
+    )
+
+    for field in fields_to_check:
+        try:
+            from qdrant_client.models import FieldCondition, Filter, MatchAny
+
+            results, _ = client.scroll(
+                coll,
+                limit=1,
+                with_payload=False,
+                with_vectors=True,
+                scroll_filter=Filter(must=[FieldCondition(key=field, match=MatchAny(any=possible_values))]),
+            )
+            if not results:
+                continue
+            vec = results[0].vector
+            if vec is None:
+                continue
+            # Named vectors come back as a dict; unnamed as a list.
+            if isinstance(vec, dict):
+                if vector_name and vector_name in vec:
+                    return vec[vector_name]
+                for v in vec.values():
+                    if isinstance(v, list):
+                        return v
+            elif isinstance(vec, list):
+                return vec
+        except Exception:
+            logger.debug("Qdrant vector lookup failed for field %s", field, exc_info=True)
+            return None
+
+    return None
+
+
+def _resolve_query_vector(
+    rag: MultimodalRAG,
+    dataset_name: str,
+    query_dict: Any,
+) -> Optional[list[float]]:
+    """Try to reuse a cached/stored embedding for *query_dict*.
+
+    Returns the vector on hit, ``None`` on miss (caller falls back to embedding).
+    """
+    paths = _collect_cacheable_paths(query_dict)
+    if not paths:
+        return None
+
+    # Single dataset-file query → use the stored Qdrant vector directly.
+    if len(paths) == 1:
+        _, path = paths[0]
+        vec = _lookup_dataset_vector(rag, dataset_name, path)
+        if vec is not None:
+            logger.info("query vector: reused existing Qdrant vector for %s", path[-60:])
+            return vec
+
+    # Otherwise: hash-based in-process cache.
+    model_name = rag.embedder.model_name
+    cache_key = _compute_query_cache_key(query_dict, model_name, paths)
+    with _query_emb_cache_lock:
+        cached = _query_emb_cache.get(cache_key)
+    if cached is not None:
+        logger.info("query vector: cache HIT (%d media file(s))", len(paths))
+        return cached
+
+    return None
+
+
+def _cache_query_vector(
+    rag: MultimodalRAG,
+    query_dict: Any,
+    vector: list[float],
+) -> None:
+    """Store a freshly-computed query vector so subsequent calls can skip embedding."""
+    paths = _collect_cacheable_paths(query_dict)
+    if not paths:
+        return
+    model_name = rag.embedder.model_name
+    cache_key = _compute_query_cache_key(query_dict, model_name, paths)
+    with _query_emb_cache_lock:
+        _query_emb_cache[cache_key] = vector
+    logger.info("query vector: cached for future reuse (%d media file(s))", len(paths))
+
+
+# ---------------------------------------------------------------------------
+# Audio query: ASR → text → embed  (embedder doesn't support audio natively)
+# ---------------------------------------------------------------------------
+
+_asr_transcript_cache: dict[str, str] = {}
+_asr_transcript_cache_lock = threading.Lock()
+
+_STAGING_AUDIO_PATH_PREFIX = f"{os.environ.get('DATA_PATH', '/data')}/staging/"
+
+
+def _resolve_audio_query_vector(
+    rag: MultimodalRAG,
+    dataset_name: str,
+    query_dict: dict[str, Any],
+) -> Optional[list[float]]:
+    """Handle audio queries by transcribing via ASR, then embedding the text.
+
+    The embedder (Qwen3-VL-Embedding) doesn't support audio, so a bare
+    ``audio=`` query would embed a useless ``[Audio media]`` placeholder.
+    Instead:
+
+    1. If the audio file is already in the dataset → return its stored
+       Qdrant vector (zero model calls — it was transcribed at ingest).
+    2. Check the hash-based embedding cache (same file → same vector).
+    3. On miss: ASR the (already-truncated-at-staging) audio file →
+       build a text query with the transcript → embed the text → cache.
+
+    Returns the query vector on success, ``None`` on failure (caller
+    falls back to regular embedding).
+    """
+    from multimodal_rag.utils.general_tools import sync_wrapper_safe
+
+    audio_val = query_dict.get("audio")
+    if not audio_val:
+        return None
+    audio_urls = audio_val if isinstance(audio_val, list) else [audio_val]
+
+    # Collect local file paths
+    audio_paths: list[str] = []
+    for url in audio_urls:
+        if not isinstance(url, str):
+            continue
+        if url.startswith("file://"):
+            path = url[7:]
+        elif url.startswith("/") and os.path.exists(url):
+            path = url
+        else:
+            continue
+        if os.path.exists(path):
+            audio_paths.append(path)
+
+    if not audio_paths:
+        return None
+
+    # 1. Dataset file → reuse stored vector (no ASR, no embed)
+    for path in audio_paths:
+        vec = _lookup_dataset_vector(rag, dataset_name, path)
+        if vec is not None:
+            logger.info("audio query: reused stored Qdrant vector for %s", path[-60:])
+            return vec
+
+    # 2. Hash-based embedding cache
+    model_name = rag.embedder.model_name
+    cache_key = _compute_query_cache_key(query_dict, model_name, [("audio", p) for p in audio_paths])
+    with _query_emb_cache_lock:
+        cached = _query_emb_cache.get(cache_key)
+    if cached is not None:
+        logger.info("audio query: embedding cache HIT (%d file(s))", len(audio_paths))
+        return cached
+
+    # 3. ASR → text → embed
+    if rag.asr is None:
+        logger.warning("audio query: ASR model unavailable — cannot transcribe")
+        return None
+
+    transcripts: list[str] = []
+    for path in audio_paths:
+        file_hash = _hash_file(path)
+        # Check transcript cache first
+        with _asr_transcript_cache_lock:
+            cached_transcript = _asr_transcript_cache.get(file_hash)
+        if cached_transcript is not None:
+            logger.info("audio query: ASR cache HIT for %s", path[-60:])
+            transcripts.append(cached_transcript)
+            continue
+
+        # ASR the file (already truncated to ≤60s at staging time)
+        try:
+            from multimodal_rag.rag_system import _transcribe_media
+
+            transcript = sync_wrapper_safe(_transcribe_media, {"url": f"file://{path}", "asr": rag.asr})
+            if transcript:
+                with _asr_transcript_cache_lock:
+                    _asr_transcript_cache[file_hash] = transcript
+                transcripts.append(transcript)
+                logger.info("audio query: ASR transcribed %s (%d chars)", path[-60:], len(transcript))
+        except Exception:
+            logger.warning("audio query: ASR failed for %s", path[-60:], exc_info=True)
+
+    if not transcripts:
+        return None
+
+    # Build text-only query dict
+    text_query: dict[str, Any] = {}
+    original_text = query_dict.get("text", "")
+    combined = original_text
+    if combined:
+        combined += "\n"
+    combined += "[Audio transcription]: " + " ".join(transcripts)
+    text_query["text"] = combined
+
+    # Embed the text-only query
+    try:
+        vec = rag.embed_query(text_query)
+        _cache_query_vector(rag, query_dict, vec)
+        logger.info("audio query: embedded transcript text, cached vector")
+        return vec
+    except Exception:
+        logger.warning("audio query: text embedding failed after ASR", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# MCP tools
+# ---------------------------------------------------------------------------
+
+try:
+    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp.exceptions import ToolError
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    mcp = FastMCP(
+        "multimodal-rag",
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
+
+    @mcp.tool()
+    def list_datasets() -> str:
+        """List all available datasets with their metadata."""
+        datasets = get_manager().list_datasets()
+        if not datasets:
+            return "No datasets found."
+        lines = ["Available datasets:"]
+        for ds in datasets:
+            desc = ds.get("description", "")
+            caption = " [caption_video]" if ds.get("caption_video") else ""
+            lock = " [password]" if ds.get("has_password") else ""
+            unlocked = " [unlocked]" if _is_unlocked(ds["name"]) else ""
+            lines.append(
+                f"  • {ds['name']}{caption}{lock}{unlocked} — {ds.get('document_count', 0)} documents"
+                f"{' — ' + desc if desc else ''}"
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    def unlock_dataset(
+        dataset_name: str,
+        password: str,
+        ttl: int = 1800,
+    ) -> str:
+        """Unlock a password-protected dataset for the current session.
+
+        Once unlocked, other tools (``search_dataset``, ``get_dataset_files``,
+        ``get_dataset_info``) will accept requests without the ``password``
+        parameter for the duration of the TTL (default 30 minutes).
+
+        Parameters
+        ----------
+        dataset_name:
+            Name of the dataset to unlock.
+        password:
+            The dataset password.
+        ttl:
+            Unlock duration in seconds (default 1800 = 30 min).
+        """
+        if ttl < 60 or ttl > 86400:
+            raise ToolError("TTL must be between 60 seconds and 86400 seconds (24 hours).")
+        dm = get_manager()
+        try:
+            dm.get_dataset(dataset_name)
+        except FileNotFoundError:
+            raise ToolError(f"Dataset '{dataset_name}' not found.")
+        if not dm.has_password(dataset_name):
+            return f"Dataset '{dataset_name}' is not password protected — nothing to unlock."
+        if not dm.verify_password(dataset_name, password):
+            raise ToolError(f"Incorrect password for dataset '{dataset_name}'.")
+        with _unlocked_lock:
+            _unlocked[dataset_name] = (time.monotonic() + ttl, password)
+        return (
+            f"Dataset '{dataset_name}' unlocked for {ttl // 60} minutes "
+            f"(until approximately "
+            f"{datetime.fromtimestamp(time.time() + ttl).strftime('%H:%M:%S')})."
+        )
+
+    @mcp.tool()
+    def search_dataset(
+        dataset_name: str,
+        query: str = "",
+        image: str | None = None,
+        video: str | None = None,
+        audio: str | None = None,
+        top_k: int = 10,
+        use_reranker: bool = False,
+        reranker_top_k: int = 3,
+        base_llm_modalities: list[str] | None = None,
+        password: str | None = None,
+        media_base_url: str | None = None,
+    ) -> str:
+        """Search a multimodal RAG dataset and return formatted context.
+
+        Parameters
+        ----------
+        dataset_name:
+            Name of the dataset to search.
+        query:
+            Search query text.
+        image:
+            Image data URL (base64) or remote URL to search with.
+        video:
+            Video data URL (base64) or remote URL to search with.
+        audio:
+            Audio data URL (base64) or remote URL to search with.
+        top_k:
+            Number of results to retrieve (max 100).
+        use_reranker:
+            Whether to re-rank results with the cross-encoder reranker.
+        reranker_top_k:
+            Number of results to keep after re-ranking.
+        base_llm_modalities:
+            Modalities the calling LLM supports natively, e.g.
+            ``["text"]`` or ``["text", "image"]``.
+            Unsupported modalities are automatically converted:
+            image/video → VLM description → text,
+            audio → ASR transcription → text.
+        password:
+            Optional if the dataset was previously unlocked with
+            ``unlock_dataset``; required otherwise.  When provided this
+            also acts as an implicit unlock for future calls.
+        media_base_url:
+            External base URL of the API server, e.g.
+            ``"https://rag-mcp-server.example.com"``.
+            When set, ``file://`` PVC paths in results are converted to
+            ``{media_base_url}/api/datasets/{name}/files/{path}`` HTTP URLs
+            so the frontend can fetch media directly without large inline
+            base64 payloads.
+        """
+        dm = get_manager()
+        try:
+            dm.get_dataset(dataset_name)
+        except FileNotFoundError:
+            raise ToolError(f"Dataset '{dataset_name}' not found.")
+        _check_unlocked_or_password(dm, dataset_name, password)
+        # Capture the verified password so we can append it as a query
+        # parameter to media URLs — the browser's <img>/<video>/<audio>
+        # tags can't set custom headers, so the file-serving endpoint
+        # accepts ?password= for password-protected datasets.
+        verified_password = _is_unlocked(dataset_name) or password
+
+        if base_llm_modalities is None:
+            base_llm_modalities = ["text"]
+        llm_modalities = set(base_llm_modalities)
+
+        # -- Build multimodal query dict --
+        query_dict: str | dict[str, Any] = query
+        if image or video or audio:
+            query_dict = {}
+            if query:
+                query_dict["text"] = query
+            if image:
+                query_dict["image"] = image
+            if video:
+                query_dict["video"] = video
+            if audio:
+                query_dict["audio"] = audio
+
+        # -- Run retrieval --
+        rag = dm._get_rag(dataset_name)
+
+        # Try to reuse a cached/stored query vector so we don't re-embed
+        # the same media twice (covers both "LLM passes back a result URL"
+        # and "user uploads the same file again").  On miss we embed
+        # up-front and cache the result for next time.
+        query_vector: Optional[list[float]] = None
+        if isinstance(query_dict, dict):
+            query_vector = _resolve_query_vector(rag, dataset_name, query_dict)
+
+            # Audio: embedder doesn't support audio natively.
+            # ASR the (already-truncated) audio → text → embed the text.
+            # Dataset audio files are caught by _resolve_query_vector
+            # above (stored vector reuse).  This handles new uploads only.
+            if query_vector is None and query_dict.get("audio"):
+                query_vector = _resolve_audio_query_vector(rag, dataset_name, query_dict)
+
+            # Non-audio media (or audio ASR failed): regular embedding.
+            # The embedder will skip audio it can't process and embed the
+            # text placeholder — better than nothing for a text search.
+            if query_vector is None and any(query_dict.get(k) for k in ("image", "video", "audio")):
+                try:
+                    query_vector = rag.embed_query(query_dict)
+                    _cache_query_vector(rag, query_dict, query_vector)
+                except Exception:
+                    logger.warning("query embedding failed; falling back to retrieve()", exc_info=True)
+                    query_vector = None
+
+        results = rag.retrieve(
+            query_dict,
+            top_k=top_k,
+            use_reranker=use_reranker,
+            reranker_top_k=reranker_top_k,
+            query_vector=query_vector,
+        )
+        if not results:
+            return "No results found."
+
+        retrieved_docs = [doc for doc, _ in results]
+        scores = [score for _, score in results]
+
+        # -- Post-process: convert unsupported modalities for the LLM --
+        needs_conversion = rag._postprocessor is not None and any(
+            isinstance(d, dict) and any(k in d for k in ("image", "video", "audio")) for d in retrieved_docs
+        )
+
+        if needs_conversion:
+            from multimodal_rag import Postprocessor
+
+            postproc = Postprocessor(
+                vlm=rag.vlm,
+                asr=rag.asr,
+                caption_video=rag.caption_video,
+            )
+            postprocessed = postproc(
+                retrieved_docs,
+                llm_modalities=llm_modalities,
+                query=query,
+            )
+        else:
+            postprocessed = retrieved_docs
+
+        # -- Format context for the LLM --
+        context_parts: list[str] = []
+        for i, doc in enumerate(postprocessed):
+            if isinstance(doc, str):
+                text = doc
+            elif isinstance(doc, dict):
+                text = doc.get("text", "")
+                src = doc.get("source", "")
+                page = doc.get("page", "")
+                if src or page:
+                    ref = f"[Source: {src}" + (f", Page: {page}" if page else "") + "]"
+                    text = f"{ref}\n{text}" if text else ref
+            else:
+                text = str(doc)
+
+            if text:
+                context_parts.append(f"[Result {i + 1}] (score: {scores[i]:.4f})\n{text}")
+
+        if not context_parts:
+            return "No textual content found in results."
+
+        context = "\n\n".join(context_parts)
+
+        # -- Also include raw results as JSON for clients that want structured data --
+        raw_results: list[dict[str, Any]] = []
+        for i, doc in enumerate(retrieved_docs):
+            entry: dict[str, Any] = {"score": scores[i]}
+            if isinstance(doc, str):
+                entry["text"] = doc
+            elif isinstance(doc, dict):
+                entry["embedding_score"] = doc.pop("_embedding_score", entry["score"])
+                entry["reranker_score"] = doc.pop("_reranker_score", None)
+                # Surface higher-quality original_* media (preprocessed
+                # files) as the primary image/video/audio keys so the LLM
+                # cites the best available version, not the embedding-grade
+                # surrogate stored in Qdrant.
+                entry.update(_prefer_original_media(doc))
+            raw_results.append(entry)
+
+        # -- Optionally convert PVC paths to HTTP URLs --
+        media_base_url = media_base_url or MEDIA_BASE_URL
+        if media_base_url:
+            data_path = os.environ.get("DATA_PATH", "/data")
+            pvc_prefix = f"{data_path}/datasets/{dataset_name}/files/"
+            file_prefix = f"file://{pvc_prefix}"
+            api_prefix = f"{media_base_url}/api/datasets/{dataset_name}/files/"
+            # For password-protected datasets, append ?password= so the
+            # browser can fetch media in <img>/<video>/<audio> tags (which
+            # can't set custom headers).  The file-serving endpoint accepts
+            # the password via this query parameter.
+            pw_suffix = f"?password={verified_password}" if verified_password else ""
+
+            def _convert(val: str) -> str:
+                if val.startswith(file_prefix):
+                    return api_prefix + val[len(file_prefix) :] + pw_suffix
+                if val.startswith(pvc_prefix):
+                    return api_prefix + val[len(pvc_prefix) :] + pw_suffix
+                return val
+
+            def _convert_dict(d: dict[str, Any]) -> dict[str, Any]:
+                return {k: _convert(v) if isinstance(v, str) else v for k, v in d.items()}
+
+            raw_results = [_convert_dict(r) for r in raw_results]
+            context = _convert(context)
+
+        # -- Append ready-to-paste markdown image links --
+        # For LLMs that don't natively accept image content (text-only
+        # models like DeepSeek), the Postprocessor above has already
+        # converted result images to VLM text descriptions and dropped the
+        # URL from ``context``.  Left alone, the LLM has to dig the URL out
+        # of the ``results`` JSON and format it as markdown itself — which
+        # it rarely does, so the user sees a plain link instead of an
+        # inline image.  Append the image URLs as ready-to-paste markdown
+        # so the LLM only has to echo the context verbatim.  Only HTTP(S)
+        # URLs are embedded (browsers can't fetch ``file://``).
+        image_md_lines: list[str] = []
+        for i, r in enumerate(raw_results):
+            img = r.get("image")
+            if not img:
+                continue
+            urls = img if isinstance(img, list) else [img]
+            for url in urls:
+                if isinstance(url, str) and url.startswith(("http://", "https://")):
+                    # Derive short alt text from the result's source/text so
+                    # the markdown is self-describing without being huge.
+                    src = r.get("source") or r.get("original_source") or ""
+                    alt = (src.split("/")[-1] if src else f"matched image {i + 1}")[:60]
+                    image_md_lines.append(f"![{alt}]({url})")
+        if image_md_lines:
+            context += (
+                "\n\nMatched images — include these markdown image links "
+                "verbatim in your response so the user sees them inline:\n" + "\n".join(image_md_lines)
+            )
+
+        # -- Append HTML5 audio players for matched audio --
+        # Markdown has no native audio syntax, so we use the HTML5
+        # ``<audio controls>`` tag.  Open WebUI's markdown renderer passes
+        # inline HTML through, so the user gets a play button in chat.
+        # A markdown link is appended as a fallback for renderers that
+        # strip HTML.
+        audio_md_lines: list[str] = []
+        for i, r in enumerate(raw_results):
+            aud = r.get("audio")
+            if not aud:
+                continue
+            urls = aud if isinstance(aud, list) else [aud]
+            for url in urls:
+                if isinstance(url, str) and url.startswith(("http://", "https://")):
+                    src = r.get("source") or r.get("original_source") or ""
+                    alt = (src.split("/")[-1] if src else f"matched audio {i + 1}")[:60]
+                    audio_md_lines.append(
+                        f'<audio controls preload="none" src="{url}" title="{alt}"></audio>' f"\n([🎧 {alt}]({url}))"
+                    )
+        if audio_md_lines:
+            context += (
+                "\n\nMatched audio — include these HTML5 audio players verbatim "
+                "in your response so the user can listen inline:\n" + "\n".join(audio_md_lines)
+            )
+
+        # -- Append markdown links for documents (PDFs, text, code, etc.) --
+        # Images get inline markdown, audio gets HTML5 players — documents
+        # (PDFs, code, text, etc.) get a clickable markdown link so the
+        # user can open the source file.  Only results whose source URL
+        # was converted to HTTP(S) are included.
+        doc_link_lines: list[str] = []
+        for i, r in enumerate(raw_results):
+            # Skip results that already have image/audio markdown blocks
+            if r.get("image") or r.get("audio"):
+                continue
+            src = r.get("source") or r.get("original_source") or ""
+            if not isinstance(src, str) or not src.startswith(("http://", "https://")):
+                continue
+            # Derive a readable label from the filename + page
+            label = src.split("/")[-1] if src else f"document {i + 1}"
+            # Strip the uuid prefix for readability
+            import re
+
+            label = re.sub(r"^[0-9a-f]{32}_", "", label)[:60]
+            page = r.get("page")
+            if page:
+                label += f" (p. {page})"
+            doc_link_lines.append(f"- [📄 {label}]({src})")
+        if doc_link_lines:
+            context += (
+                "\n\nMatched documents — include these links in your response "
+                "so the user can open the source files:\n" + "\n".join(doc_link_lines)
+            )
+
+        return json.dumps(
+            {
+                "context": context,
+                "results": raw_results,
+            },
+            indent=2,
+            default=str,
+        )
+
+    @mcp.tool()
+    def get_dataset_files(
+        dataset_name: str,
+        file_path: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        password: str | None = None,
+    ) -> str:
+        """List files in a dataset or retrieve a specific file's content.
+
+        Parameters
+        ----------
+        dataset_name:
+            Name of the dataset.
+        file_path:
+            Relative path of a specific file to retrieve.
+            If omitted, lists files in the dataset (paginated).
+            For text-based files (txt, md, json, xml, yaml, log, html, code)
+            the content is returned inline.  Binary files (images, video,
+            audio, PDF, office docs, etc.) return metadata plus a URL to
+            the REST API endpoint for download.
+        limit:
+            Maximum number of files to list (default 100, max 500).
+            Only applies when listing (``file_path`` is None).  Use
+            with ``offset`` for pagination.  Do NOT set a large limit
+            to list all files — datasets can contain tens of thousands
+            of files, which will produce a huge response and waste
+            context.  Use ``search_dataset`` to find specific files.
+        offset:
+            Number of files to skip for pagination (default 0).
+        password:
+            Optional if the dataset was previously unlocked with
+            ``unlock_dataset``; required otherwise.  When provided this
+            also acts as an implicit unlock for future calls.
+        """
+        dm = get_manager()
+        try:
+            dm.get_dataset(dataset_name)
+        except FileNotFoundError:
+            raise ToolError(f"Dataset '{dataset_name}' not found.")
+        _check_unlocked_or_password(dm, dataset_name, password)
+
+        files_dir = dm._dataset_dir(dataset_name) / "files"
+        if not files_dir.exists():
+            return json.dumps({"files": [], "message": "No files in dataset."})
+
+        # -- List files (paginated) --
+        if file_path is None:
+            limit = max(1, min(limit, 500))
+            offset = max(0, offset)
+            all_files = sorted(f for f in files_dir.iterdir() if f.is_file() and not f.name.startswith("."))
+            total = len(all_files)
+            page = all_files[offset : offset + limit]
+            entries: list[dict[str, Any]] = []
+            from multimodal_rag.dataset_manager import _classify_file
+
+            for f in page:
+                file_type = _classify_file(f.name)
+                stat = f.stat()
+                entries.append(
+                    {
+                        "name": f.name,
+                        "path": f.name,
+                        "size_bytes": stat.st_size,
+                        "type": file_type,
+                        "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                    }
+                )
+            return json.dumps(
+                {
+                    "dataset": dataset_name,
+                    "file_count": total,
+                    "returned": len(entries),
+                    "offset": offset,
+                    "limit": limit,
+                    "has_more": (offset + limit) < total,
+                    "files": entries,
+                },
+                indent=2,
+                default=str,
+            )
+
+        # -- Retrieve a specific file --
+        target = files_dir / file_path
+        # Resolve to prevent directory traversal
+        try:
+            target = target.resolve()
+            target.relative_to(files_dir.resolve())
+        except ValueError:
+            raise ToolError("Invalid file path.")
+
+        if not target.exists() or not target.is_file():
+            raise ToolError(f"File '{file_path}' not found in dataset '{dataset_name}'.")
+
+        stat = target.stat()
+        from multimodal_rag.dataset_manager import _classify_file
+
+        file_type = _classify_file(file_path)
+        import mimetypes
+
+        mime_type, _ = mimetypes.guess_type(file_path)
+
+        # Text-based types that can be returned inline
+        _TEXT_TYPES = frozenset(
+            {
+                "text",
+                "json",
+                "code",
+                "xml",
+                "yaml",
+                "log",
+                "html",
+                "notebook",
+            }
+        )
+        if file_type in _TEXT_TYPES:
+            try:
+                content = target.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                content = None
+            if content is not None:
+                return json.dumps(
+                    {
+                        "dataset": dataset_name,
+                        "file": file_path,
+                        "size_bytes": stat.st_size,
+                        "type": file_type,
+                        "mime_type": mime_type,
+                        "content": content,
+                    },
+                    indent=2,
+                    default=str,
+                )
+
+        # Binary or unreadable file — return metadata + API download URL
+        api_url = f"/api/datasets/{dataset_name}/files/{file_path}"
+        return json.dumps(
+            {
+                "dataset": dataset_name,
+                "file": file_path,
+                "size_bytes": stat.st_size,
+                "type": file_type,
+                "mime_type": mime_type,
+                "note": "Binary file — use the REST API to download.",
+                "download_url": api_url,
+            },
+            indent=2,
+            default=str,
+        )
+
+    @mcp.tool()
+    def get_dataset_info(dataset_name: str, password: str | None = None) -> str:
+        """Return metadata (including document count and password status) for a dataset.
+
+        Parameters
+        ----------
+        dataset_name:
+            Name of the dataset.
+        password:
+            Optional if the dataset was previously unlocked with
+            ``unlock_dataset``; required otherwise.  When provided this
+            also acts as an implicit unlock for future calls.
+        """
+        dm = get_manager()
+        try:
+            dm.get_dataset(dataset_name)
+        except FileNotFoundError:
+            raise ToolError(f"Dataset '{dataset_name}' not found.")
+        _check_unlocked_or_password(dm, dataset_name, password)
+        meta = dm.get_dataset(dataset_name)
+        return json.dumps(meta, indent=2, default=str)
+
+    # ------------------------------------------------------------------
+    # Standalone media understanding tools (no dataset required)
+    # ------------------------------------------------------------------
+
+    def _preprocess_media_url(media_url: str, dataset_manager) -> str:
+        """Preprocess local media files to model-friendly caps.
+
+        Applies the same resizing / truncation as the staging endpoint so
+        the VLM / ASR endpoints never receive oversized payloads.  Remote
+        and data URLs are returned unchanged (the model server fetches
+        them directly).  Returns the (possibly new) URL.
+        """
+        path: Optional[str] = None
+        if media_url.startswith("file://"):
+            path = media_url[7:]
+        elif media_url.startswith("/") and os.path.exists(media_url):
+            path = media_url
+        else:
+            return media_url  # http(s)://, data:, s3:// — can't preprocess
+
+        if not os.path.exists(path):
+            return media_url
+
+        from pathlib import Path
+
+        from multimodal_rag.dataset_manager import (
+            _classify_file,
+            _preprocess_image_file,
+            _preprocess_video_file,
+            _truncate_audio_file,
+        )
+
+        file_type = _classify_file(path)
+        mpk = dataset_manager.embedder.mm_processor_kwargs
+        max_pixels = mpk.get("max_pixels", 720 * 720)
+        fps = mpk.get("fps", 1.0)
+
+        src_path = Path(path)
+        try:
+            if file_type == "image":
+                result = _preprocess_image_file(src_path, max_pixels=max_pixels)
+            elif file_type == "video":
+                result = _preprocess_video_file(src_path, max_pixels=max_pixels, max_fps=fps)
+            elif file_type == "audio":
+                result = _truncate_audio_file(src_path, max_seconds=60.0)
+            else:
+                return media_url
+        except Exception:
+            logger.warning("media preprocess failed for %s", path[-60:], exc_info=True)
+            return media_url
+
+        if result == src_path:
+            return media_url  # no resize needed
+
+        logger.info("media preprocess: %s → %s", path[-60:], result.name)
+        return f"file://{result}"
+
+    @mcp.tool()
+    def describe_media(
+        media_url: str,
+        query: str = "",
+    ) -> str:
+        """Describe an image or video using the vision-language model (VLM).
+
+        Useful when the user wants a description of media **without**
+        searching a dataset — e.g. "what's in this image?" or "describe
+        this video".
+
+        Parameters
+        ----------
+        media_url:
+            URL or path to the image/video.  Accepts ``file://`` paths
+            (staged uploads, dataset files), ``http(s)://`` URLs, and
+            ``data:`` base64 URLs.
+        query:
+            Optional question about the media — the VLM will answer it
+            instead of giving a generic description.
+        """
+        from multimodal_rag.rag_system import _describe_doc, _media_url_to_displayable
+        from multimodal_rag.utils.general_tools import sync_wrapper_safe
+
+        dm = get_manager()
+        vlm = dm.vlm
+        if vlm is None:
+            raise ToolError("No VLM model configured on this server.")
+
+        # Preprocess local files (resize images, transcode video) so the
+        # VLM endpoint doesn't receive oversized payloads.
+        processed_url = _preprocess_media_url(media_url, dm)
+
+        # Build a doc dict in the format _describe_doc expects
+        path = processed_url
+        if path.startswith("file://"):
+            path = path[7:]
+
+        # Detect modality from URL/path.  When the URL has no
+        # recognisable extension (e.g. a bare OWUI file ID like
+        # ``file://74a2ab6c-…``), fall back to magic-byte detection
+        # via ``_detect_media_type``.
+        from multimodal_rag.dataset_manager import _classify_file
+        from multimodal_rag.utils.langchain_overrides import _detect_media_type
+
+        file_type: Optional[str] = None
+        if not path.startswith(("data:", "http")):
+            file_type = _classify_file(path)
+            # Extension-based classification failed → probe the bytes
+            if file_type not in ("image", "video") and os.path.exists(path):
+                try:
+                    detected_mime = _detect_media_type(path)
+                    if detected_mime.startswith("image/"):
+                        file_type = "image"
+                    elif detected_mime.startswith("video/"):
+                        file_type = "video"
+                except Exception:
+                    logger.debug("magic-byte detection failed for %s", path[-60:], exc_info=True)
+
+        if file_type == "image" or "image" in processed_url.lower():
+            doc_dict: dict[str, Any] = {"text": "", "image": processed_url}
+        elif file_type == "video" or "video" in processed_url.lower():
+            doc_dict = {"text": "", "video": processed_url}
+        else:
+            raise ToolError(
+                f"Could not determine if '{processed_url[:60]}' is an image or video. "
+                "Ensure the URL has a recognisable extension (.jpg, .png, .mp4, …) "
+                "or that the file is a supported image/video format."
+            )
+
+        system_prompt = (
+            "You are a detailed image and video captioning assistant. "
+            "Describe the media thoroughly: include visible text, objects, "
+            "people, scene context, and any relationships between them. "
+            "Be precise and factual."
+        )
+        try:
+            description = sync_wrapper_safe(
+                _describe_doc,
+                {"doc_dict": doc_dict, "query": query or None, "vlm": vlm, "system_prompt": system_prompt},
+            )
+        except Exception as exc:
+            raise ToolError(f"VLM description failed: {exc}")
+
+        displayable = _media_url_to_displayable(media_url)
+        return json.dumps(
+            {
+                "description": description,
+                "media_url": displayable,
+                "markdown": f"![media]({displayable})" if "image" in media_url.lower() or file_type == "image" else "",
+            },
+            indent=2,
+            default=str,
+        )
+
+    @mcp.tool()
+    def transcribe_audio(
+        audio_url: str,
+        max_seconds: float = 60.0,
+    ) -> str:
+        """Transcribe an audio file using the speech recognition model (ASR).
+
+        Useful when the user wants a transcription **without** searching a
+        dataset — e.g. "what's said in this recording?".
+
+        Parameters
+        ----------
+        audio_url:
+            URL or path to the audio file.  Accepts ``file://`` paths
+            (staged uploads, dataset files), ``http(s)://`` URLs, and
+            ``data:`` base64 URLs.
+        max_seconds:
+            Maximum duration (in seconds) to transcribe.  Audio longer
+            than this is truncated from the start.  Default 60s to stay
+            within the ASR endpoint's payload cap.
+        """
+        from multimodal_rag.rag_system import _transcribe_media, _media_url_to_displayable
+        from multimodal_rag.utils.general_tools import sync_wrapper_safe
+
+        dm = get_manager()
+        asr = dm.asr
+        if asr is None:
+            raise ToolError("No ASR model configured on this server.")
+
+        # Preprocess (truncate local audio to max_seconds) — same helper
+        # as describe_media, ensures the ASR endpoint never receives an
+        # oversized payload.
+        processed_url = _preprocess_media_url(audio_url, dm)
+
+        # Check transcript cache (by original file hash)
+        cache_key: Optional[str] = None
+        orig_path = audio_url
+        if orig_path.startswith("file://"):
+            orig_path = orig_path[7:]
+        if os.path.exists(orig_path):
+            file_hash = _hash_file(orig_path)
+            cache_key = f"asr_tool:{file_hash}"
+            with _asr_transcript_cache_lock:
+                cached = _asr_transcript_cache.get(cache_key)
+            if cached is not None:
+                logger.info("ASR tool: cache HIT for %s", orig_path[-60:])
+                displayable = _media_url_to_displayable(audio_url)
+                return json.dumps(
+                    {"transcript": cached, "audio_url": displayable},
+                    indent=2,
+                    default=str,
+                )
+
+        try:
+            transcript = sync_wrapper_safe(
+                _transcribe_media,
+                {"url": processed_url, "asr": asr},
+            )
+        except Exception as exc:
+            raise ToolError(f"ASR transcription failed: {exc}")
+
+        if not transcript:
+            raise ToolError("ASR returned an empty transcript.")
+
+        # Cache for future calls
+        if cache_key:
+            with _asr_transcript_cache_lock:
+                _asr_transcript_cache[cache_key] = transcript
+
+        displayable = _media_url_to_displayable(audio_url)
+        return json.dumps(
+            {
+                "transcript": transcript,
+                "audio_url": displayable,
+                "duration_limit_seconds": max_seconds if cache_key else None,
+            },
+            indent=2,
+            default=str,
+        )
+
+except ImportError:
+    logger.error("MCP package not installed. Run: pip install mcp>=1.0.0")
+    raise
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Multimodal RAG MCP Server")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse", "streamable-http"],
+        default="streamable-http",
+    )
+    parser.add_argument("--port", type=int, default=8001)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--data-path", default="/data")
+    parser.add_argument("--qdrant-host", default="")
+    parser.add_argument("--qdrant-port", type=int, default=6333)
+    parser.add_argument("--log-level", default="INFO")
+    args = parser.parse_args()
+
+    os.environ["DATA_PATH"] = args.data_path
+    os.environ["QDRANT_HOST"] = args.qdrant_host
+    os.environ["QDRANT_PORT"] = str(args.qdrant_port)
+
+    setup_logger(level=args.log_level)
+
+    import uvicorn
+
+    if args.transport == "stdio":
+        logger.info("Starting MCP stdio server")
+        mcp.run(transport="stdio")
+    elif args.transport == "sse":
+        logger.info("Starting MCP SSE server on %s:%s", args.host, args.port)
+        uvicorn.run(mcp.sse_app(), host=args.host, port=args.port)
+    elif args.transport == "streamable-http":
+        logger.info("Starting MCP streamable-http server on %s:%s", args.host, args.port)
+        uvicorn.run(mcp.streamable_http_app(), host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,30 @@
+# -- Sensitive / local-only files --------------------------------------------
+# Hidden helm chart copies containing real API keys and internal URLs.
+multimodal-rag/.helm/
+multimodal-rag/.helm_hosted_trial/
+
+# Full model definitions with live API keys (private; the tracked
+# pcai_models.py is a scrubbed template with empty keys/URLs).
+multimodal-rag/src/multimodal_rag/utils/pcai_models_full.py
+
+# Local backups (not for the public repo).
+multimodal-rag/.backup_pre_token_chunking/
+
+# Packaged helm charts — rebuild locally from the chart directories.
+multimodal-rag/*.tar.gz
+
+# -- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# -- IDE / OS ----------------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
