@@ -11,7 +11,7 @@ Environment variable convention (each model role has its own prefix)::
     MODEL_<ROLE>_URL        — full remote URL (e.g. "https://...")
     MODEL_<ROLE>_API_KEY    — API key / service-account token
     MODEL_<ROLE>_CLASS      — Python class: "MultiModalEmbeddings" |
-                              "MultiModalReranker" | "ChatOpenAI"
+                              "MultiModalReranker"
     MODEL_<ROLE>_EXTRA      — JSON object of additional constructor kwargs
                               (e.g. ``{"chunk_size": 2048, "embedding_dim": 4096}``)
 

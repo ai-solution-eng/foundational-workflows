@@ -9,9 +9,6 @@ from typing import Optional, Any, Sequence
 
 import numpy as np
 
-from langchain_core.documents import Document
-from langchain_core.vectorstores import VectorStore
-
 from multimodal_rag.utils.pcai_model_classes import (
     ChatModel,
     EmbeddingModel,
@@ -21,6 +18,12 @@ from multimodal_rag.utils.pcai_model_classes import (
 from multimodal_rag.utils.langchain_overrides import (
     MultiModalEmbeddings,
     MultiModalReranker,
+)
+from multimodal_rag.vector_store import (
+    Document,
+    InMemoryVectorStore,
+    QdrantVectorStore,
+    VectorStore,
 )
 from multimodal_rag.utils.general_tools import (
     sync_wrapper_safe,
@@ -677,8 +680,6 @@ class MultimodalRAG:
                 self.embedder.base_url,
             )
         else:
-            from langchain_core.vectorstores.in_memory import InMemoryVectorStore
-
             self.vector_store = InMemoryVectorStore(embedding=self.embed)
             logger.info("No vector_store provided — using in-memory store")
 
@@ -691,7 +692,6 @@ class MultimodalRAG:
         qdrant_port: int = 6333,
         **kwargs,
     ) -> VectorStore:
-        from langchain_qdrant import QdrantVectorStore
         from qdrant_client import QdrantClient
         from qdrant_client.models import Distance, VectorParams
 

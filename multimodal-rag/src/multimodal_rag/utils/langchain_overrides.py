@@ -11,7 +11,6 @@ from openai.types.create_embedding_response import CreateEmbeddingResponse
 
 from .logging_utils import logging
 from .general_tools import list_chunker, sync_wrapper_safe
-from langchain_core.embeddings import Embeddings
 
 logger = logging.getLogger(__name__)
 
@@ -792,9 +791,9 @@ class InputConversion:
         return requests
 
 
-class MultiModalEmbeddings(Embeddings):
+class MultiModalEmbeddings:
     chunk_size: int = 64
-    "Mock class for langchain Embeddings compatible with multimodal inputs."
+    "Multimodal embeddings wrapper (embed_documents / embed_query) for vLLM-style endpoints."
 
     # typing requires circular import. Is pcai_model_classes.EmbeddingModel
     def __init__(
@@ -1002,7 +1001,7 @@ class MultiModalEmbeddings(Embeddings):
 
 class MultiModalReranker:
     chunk_size: int = 64
-    "Mock class for langchain Embeddings compatible with multimodal inputs."
+    "Multimodal reranker wrapper (score / rerank) for vLLM-style endpoints."
 
     # Template constants for text-only query/document formatting.
     # See: https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/Qwen3-VL-Reranker.html

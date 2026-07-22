@@ -1,20 +1,24 @@
 from dataclasses import dataclass, field
 from functools import cached_property, partial
 import asyncio
+import base64
+import io
 import httpx
 import threading
 import weakref
-from typing import Optional, Literal, Callable, Any
+from typing import Optional, Literal, Callable, Any, Awaitable
 
 from openai import OpenAI, AsyncOpenAI
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.embeddings import Embeddings
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_core.tools import BaseTool
-from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_mcp_adapters.sessions import Connection
-from langchain.agents import create_agent as lc_ca
+try:
+    from agents import Agent, set_tracing_disabled
+    from agents.mcp import MCPServerStreamableHttp
+    from agents.models.openai_responses import OpenAIResponsesModel
+except ImportError:
+    Agent = None  # type: ignore[assignment, misc]
+    set_tracing_disabled = None  # type: ignore[assignment]
+    MCPServerStreamableHttp = None  # type: ignore[assignment, misc]
+    OpenAIResponsesModel = None  # type: ignore[assignment, misc]
 
 from .logging_utils import logging
 from .langchain_overrides import MultiModalEmbeddings, MultiModalReranker
@@ -82,24 +86,90 @@ def _get_async_client(remote: bool = False) -> httpx.AsyncClient:
 
 
 __all__ = [
+    "BaseModel",
     "ChatModel",
     "EmbeddingModel",
     "RerankerModel",
     "VoiceModel",
+    "ToolDefinition",
 ]
 
 input_modalities = Literal["text", "audio", "image", "video"]
 messages_dtype = str | dict[str, Any] | list[dict[str, Any]]
 
 
-async def _get_mcp_tools(mcp_servers) -> list[BaseTool]:
-    try:
-        client = MultiServerMCPClient(mcp_servers)
-        tools = await client.get_tools()
-        return tools
-    except Exception as e:
-        logger.warning("Failed to load MCP tools: %s", e)
-        return []
+@dataclass
+class ToolDefinition:
+    """Describes a single MCP tool exposed by a model endpoint.
+
+    The ``handler`` is an async callable taking a single ``dict[str, Any]``
+    of arguments (matching ``input_schema``) and returning a JSON-serializable
+    dict.  The orchestration layer wraps handlers with depth/budget
+    instrumentation before they reach the MCP server.
+    """
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    handler: Callable[[dict[str, Any]], Awaitable[Any]]
+
+
+async def _get_mcp_servers(mcp_servers: dict[str, dict[str, Any]]) -> list[MCPServerStreamableHttp]:
+    """Build and connect one MCPServerStreamableHttp per entry in the
+    {name: {url, headers, transport}} config dict. Each server is returned
+    already connected; the caller is responsible for calling cleanup() on
+    each when the owning session ends.
+    """
+    servers: list[MCPServerStreamableHttp] = []
+    for name, cfg in mcp_servers.items():
+        try:
+            params: dict[str, Any] = {
+                "url": cfg["url"],
+                # TLS-bypass httpx factory (PCAI ingress serves self-signed
+                # certs); defined below.
+                "httpx_client_factory": _streamable_http_factory,
+                # Skip the session-terminate DELETE on cleanup - the PCAI
+                # istio ingress doesn't support DELETE on /mcp and the call
+                # hangs until asyncio tears the loop down. MCP servers will
+                # reap idle sessions by TTL on their side.
+                "terminate_on_close": False,
+            }
+            if cfg.get("headers"):
+                params["headers"] = cfg["headers"]
+            server = MCPServerStreamableHttp(params=params, name=name)  # type: ignore[arg-type]
+            await server.connect()
+            servers.append(server)
+        except Exception as e:
+            logger.warning("Failed to load MCP server %s: %s", name, e)
+    return servers
+
+
+def _streamable_http_factory(
+    headers: dict[str, str] | None = None,
+    timeout: httpx.Timeout | None = None,
+    auth: httpx.Auth | None = None,
+) -> httpx.AsyncClient:
+    """httpx client factory for MCPServerStreamableHttp that disables TLS
+    verification - required for the PCAI ingress which serves self-signed
+    certs. Mirrors the default factory signature so it can be dropped in
+    via params['httpx_client_factory']."""
+    kwargs: dict = {"follow_redirects": False, "verify": False}
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    if headers is not None:
+        kwargs["headers"] = headers
+    if auth is not None:
+        kwargs["auth"] = auth
+    return httpx.AsyncClient(**kwargs)
+
+
+class _NamedBytesIO(io.BytesIO):
+    """BytesIO with a ``name`` attribute, required by the OpenAI
+    transcription API to infer the audio format."""
+
+    def __init__(self, content: bytes, name: str = "audio"):
+        super().__init__(content)
+        self.name = name
 
 
 @dataclass
@@ -109,7 +179,8 @@ class BaseModel:
     url_remote: str
 
     # Model args w/ defaults
-    model_instantiation_class: Callable = ChatOpenAI
+    description: str = ""
+    model_instantiation_class: Optional[Callable] = None
     model_instantiation_kwargs: dict[str, Any] = field(default_factory=dict)
 
     # OpenAI clients
@@ -136,6 +207,39 @@ class BaseModel:
     currently_deployed: bool = True
 
     allowable_modalities: tuple[input_modalities, ...] = ("text",)
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any], api_key: str = "") -> "BaseModel":
+        """Construct from a DB config dict + resolved api_key.
+
+        Only fields that exist on the dataclass are mapped.  Callable
+        fields (``preprocessor``, ``model_instantiation_class``) are
+        skipped when the JSON value is a string — they can't be
+        deserialized.  Lists are converted to tuples/sets where the
+        dataclass expects them.
+        """
+        from dataclasses import fields as dc_fields
+
+        field_names = {f.name for f in dc_fields(cls)}
+        _CALLABLE_FIELDS = frozenset({
+            "preprocessor",
+            "model_instantiation_class",
+            "model_client_class",
+            "model_async_client_class",
+        })
+        kwargs: dict[str, Any] = {}
+        for k, v in config.items():
+            if k not in field_names:
+                continue
+            if k in _CALLABLE_FIELDS and not callable(v):
+                continue
+            if k == "allowable_modalities" and isinstance(v, list):
+                v = tuple(v)
+            if k == "tts_supported_voices" and isinstance(v, list):
+                v = set(v)
+            kwargs[k] = v
+        kwargs["api_key"] = api_key
+        return cls(**kwargs)  # type: ignore[arg-type]
 
     def _clear_cached_class_elements(self) -> None:
         for property in self._cached_properties + self._cached_functions:
@@ -193,6 +297,13 @@ class BaseModel:
         return self.build_model()
 
     def build_model(self, **kwargs):
+        if self.model_instantiation_class is None:
+            raise ValueError(
+                "model_instantiation_class is not set. The langchain-based defaults "
+                "(ChatOpenAI / OpenAIEmbeddings) were removed; pass an explicit "
+                "callable (e.g. MultiModalEmbeddings) or use `.client` / "
+                "`.async_client` for direct OpenAI API access."
+            )
         return self.model_instantiation_class(
             model=self.model_name,
             api_key=self.api_key,
@@ -253,10 +364,8 @@ class ChatModel(BaseModel):
     )
 
     @cached_property
-    def model(self) -> BaseChatModel:
+    def model(self):
         m = super().model
-
-        assert isinstance(m, BaseChatModel)
         return m
 
     @staticmethod
@@ -297,14 +406,91 @@ class ChatModel(BaseModel):
     def llm_async_response_function_call(self, input: str | dict[str, Any] | list[dict[str, Any]], **chat_kwargs):
         return self.llm_async_response_function(input=input, **chat_kwargs)
 
-    def agent(self, tool_json: Optional[dict[str, dict[str, Connection]]] = None):
+    def agent(self, tool_json: Optional[dict[str, dict[str, Any]]] = None):
+        if Agent is None:
+            raise ImportError(
+                "The `agents` SDK is not installed. Install with: pip install openai-agents"
+            )
         return sync_wrapper_safe(self.aagent, dict(tool_json=tool_json))
 
-    async def aagent(self, tool_json: Optional[dict[str, dict[str, Connection]]] = None):
+    async def aagent(self, tool_json: Optional[dict[str, dict[str, Any]]] = None) -> Agent:
+        if Agent is None:
+            raise ImportError(
+                "The `agents` SDK is not installed. Install with: pip install openai-agents"
+            )
+        # Tracing off: the SDK phones home to api.openai.com by default,
+        # which fails behind the PCAI firewall and adds noise to logs.
+        # set_tracing_disabled is process-global; safe to call repeatedly.
+        set_tracing_disabled(True)
+        model_obj = OpenAIResponsesModel(model=self.model_name, openai_client=self.async_client)
         if not tool_json:
-            return lc_ca(self.model, None)
-        tools = await _get_mcp_tools(tool_json)
-        return lc_ca(self.model, tools=tools)
+            return Agent(name=self.model_name, model=model_obj)
+        servers = await _get_mcp_servers(tool_json)
+        return Agent(name=self.model_name, model=model_obj, mcp_servers=servers)  # type: ignore[arg-type]
+
+    def to_mcp_tools(self) -> list[ToolDefinition]:
+        """Expose this chat model as a single ``respond`` tool using the
+        OpenAI Responses API (``responses.create``).
+
+        The handler always does a single non-looping call — tool-calling
+        agent loops are handled by the orchestration layer, not here.
+        """
+
+        async def _respond(arguments: dict[str, Any]) -> dict[str, Any]:
+            params: dict[str, Any] = {
+                "model": self.model_name,
+                "input": arguments["input"],
+            }
+            if "instructions" in arguments:
+                params["instructions"] = arguments["instructions"]
+            for k in ("temperature", "max_output_tokens", "top_p"):
+                if k in arguments:
+                    params[k] = arguments[k]
+
+            response = await self.async_client.responses.create(**params)
+            usage = None
+            if hasattr(response, "usage") and response.usage:
+                usage = {
+                    "input_tokens": getattr(response.usage, "input_tokens", None),
+                    "output_tokens": getattr(response.usage, "output_tokens", None),
+                }
+            return {
+                "output": response.output_text,
+                "model": self.model_name,
+                "usage": usage,
+            }
+
+        modalities_str = ", ".join(self.allowable_modalities)
+        return [
+            ToolDefinition(
+                name="respond",
+                description=self.description
+                or f"Generate a response using {self.model_name}. Supports {modalities_str} inputs.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": ["string", "array"],
+                            "description": "The input text, or a structured message array for multi-turn / multimodal input.",
+                        },
+                        "instructions": {
+                            "type": "string",
+                            "description": "Optional system-level instructions to guide the model's behavior.",
+                        },
+                        "temperature": {
+                            "type": "number",
+                            "description": "Sampling temperature (0-2). Higher = more random.",
+                        },
+                        "max_output_tokens": {
+                            "type": "integer",
+                            "description": "Maximum number of tokens to generate.",
+                        },
+                    },
+                    "required": ["input"],
+                },
+                handler=_respond,
+            )
+        ]
 
 
 @dataclass(repr=False)
@@ -419,11 +605,97 @@ class VoiceModel(BaseModel):
     def asr_async_function_call(self, file, **chat_kwargs):
         return self.asr_async_function(file=file, **chat_kwargs)
 
+    def to_mcp_tools(self) -> list[ToolDefinition]:
+        """Expose TTS as ``synthesize`` and/or ASR as ``transcribe``,
+        depending on ``model_type``."""
+
+        tools: list[ToolDefinition] = []
+
+        if self.model_type != "ASR":
+            async def _synthesize(arguments: dict[str, Any]) -> dict[str, Any]:
+                text = arguments["text"]
+                voice = arguments.get("voice", self.tts_voice)
+                response = await self.tts_async_function_call(input=text, voice=voice)
+                return {
+                    "audio_base64": base64.b64encode(response.content).decode(),
+                    "model": self.model_name,
+                    "voice": voice,
+                }
+
+            voices_str = ", ".join(sorted(self.tts_supported_voices)) or "default"
+            tools.append(
+                ToolDefinition(
+                    name="synthesize",
+                    description=self.description
+                    or f"Synthesize speech from text using {self.model_name}.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "text": {
+                                "type": "string",
+                                "description": "The text to synthesize.",
+                            },
+                            "voice": {
+                                "type": "string",
+                                "description": f"Voice to use. Available: {voices_str}.",
+                            },
+                        },
+                        "required": ["text"],
+                    },
+                    handler=_synthesize,
+                )
+            )
+
+        if self.model_type != "TTS":
+            async def _transcribe(arguments: dict[str, Any]) -> dict[str, Any]:
+                audio_b64 = arguments.get("audio_base64")
+                audio_url = arguments.get("audio_url")
+
+                if audio_b64:
+                    audio_bytes = base64.b64decode(audio_b64)
+                elif audio_url:
+                    resp = await self.http_async_client.get(audio_url, follow_redirects=True)
+                    resp.raise_for_status()
+                    audio_bytes = resp.content
+                else:
+                    return {"error": "Either audio_base64 or audio_url must be provided."}
+
+                buf = _NamedBytesIO(audio_bytes)
+                result = await self.asr_async_function_call(file=buf)
+                return {
+                    "text": result.text,
+                    "model": self.model_name,
+                }
+
+            tools.append(
+                ToolDefinition(
+                    name="transcribe",
+                    description=self.description
+                    or f"Transcribe audio to text using {self.model_name}.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "audio_base64": {
+                                "type": "string",
+                                "description": "Base64-encoded audio data.",
+                            },
+                            "audio_url": {
+                                "type": "string",
+                                "description": "URL of the audio file to transcribe.",
+                            },
+                        },
+                    },
+                    handler=_transcribe,
+                )
+            )
+
+        return tools
+
 
 @dataclass(repr=False)
 class EmbeddingModel(BaseModel):
     # Model args w/ defaults
-    model_instantiation_class: Callable = OpenAIEmbeddings
+    model_instantiation_class: Optional[Callable] = None
 
     # Optional RAG args
     embedding_dim: int = 4096
@@ -466,12 +738,44 @@ class EmbeddingModel(BaseModel):
         )
 
     @cached_property
-    def model(self) -> Embeddings:
-        if self.model_instantiation_class is MultiModalEmbeddings:
-            return self.model_instantiation_class(self)
-        m = super().model
-        assert isinstance(m, Embeddings)
-        return m
+    def model(self):
+        if self.model_instantiation_class is None or self.model_instantiation_class is MultiModalEmbeddings:
+            return MultiModalEmbeddings(self)
+        return super().model
+
+    def to_mcp_tools(self) -> list[ToolDefinition]:
+        """Expose this embedder as a single ``embed`` tool."""
+
+        async def _embed(arguments: dict[str, Any]) -> dict[str, Any]:
+            texts = arguments["texts"]
+            embeddings = await self.model.aembed_documents(texts)
+            return {
+                "embeddings": embeddings,
+                "model": self.model_name,
+                "dim": self.embedding_dim,
+                "count": len(embeddings),
+            }
+
+        modalities_str = ", ".join(self.allowable_modalities)
+        return [
+            ToolDefinition(
+                name="embed",
+                description=self.description
+                or f"Generate embeddings using {self.model_name}. Supports {modalities_str} inputs.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "texts": {
+                            "type": "array",
+                            "items": {"type": ["string", "object"]},
+                            "description": "List of texts (strings) or multimodal dicts ({text, image, video, audio}) to embed.",
+                        },
+                    },
+                    "required": ["texts"],
+                },
+                handler=_embed,
+            )
+        ]
 
 
 @dataclass(repr=False)
@@ -489,3 +793,43 @@ class RerankerModel(BaseModel):
     @cached_property
     def model(self) -> MultiModalReranker:
         return self.model_instantiation_class(self)  # type: ignore[return-value]
+
+    def to_mcp_tools(self) -> list[ToolDefinition]:
+        """Expose this reranker as a single ``rerank`` tool."""
+
+        async def _rerank(arguments: dict[str, Any]) -> dict[str, Any]:
+            query = arguments["query"]
+            documents = arguments["documents"]
+            results = await self.model.arerank(query, documents)
+            # arerank returns list[list[dict]] (one inner list per query).
+            # For a single query (the common case), unwrap.
+            if isinstance(query, (str, dict)):
+                results = results[0] if results else []
+            return {
+                "results": results,
+                "model": self.model_name,
+            }
+
+        return [
+            ToolDefinition(
+                name="rerank",
+                description=self.description
+                or f"Rerank documents by relevance to a query using {self.model_name}.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": ["string", "object"],
+                            "description": "The search query (string or multimodal dict).",
+                        },
+                        "documents": {
+                            "type": "array",
+                            "items": {"type": ["string", "object"]},
+                            "description": "List of documents to rank.",
+                        },
+                    },
+                    "required": ["query", "documents"],
+                },
+                handler=_rerank,
+            )
+        ]

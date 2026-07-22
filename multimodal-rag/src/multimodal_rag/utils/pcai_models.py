@@ -1,13 +1,4 @@
 # flake8: noqa: E501
-"""Model definitions for the multimodal RAG pipeline.
-
-This is the public, scrubbed template.  All ``api_key`` and
-``url_remote`` values are intentionally empty.  Populate them locally
-from ``pcai_models_full.py`` (gitignored) or, in production, via the
-environment-driven factory in ``multimodal_rag.model_config`` which
-reads ``MODEL_<ROLE>_URL`` / ``MODEL_<ROLE>_API_KEY`` from the pod
-ConfigMap / Secret.
-"""
 from .langchain_overrides import MultiModalEmbeddings
 from .pcai_model_classes import (
     ChatModel,
@@ -22,10 +13,16 @@ from .preprocessors.qwen3_vl_8b import (
 
 __all__ = [
     "deepseek_v4_flash_280B",
+    "qwen35_397B",
     "gemma4_31B",
+    "nemotron_3_super_120B",
+    "minimax_2_7_240B",
     "qwen3_vl_8B",
     "qwen3_vl_reranker_8B",
+    "whisper_large_v3_turbo",
     "cohere_transcribe_3_2b",
+    "qwen3_tts_1_7B",
+    "fish_s2_pro_4B",
 ]
 
 
@@ -36,17 +33,57 @@ vlm_modalities: tuple[input_modalities, input_modalities, input_modalities] = (
 )
 
 # LLMs
+qwen35_397B = ChatModel(
+    model_name="Qwen/Qwen3.5-397B-A17B-FP8",
+    url_remote=(
+        "https://qwen35-397b-a17b-fp8.project-user-tanguy-pomas.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+    ),
+    api_key=(  # noqa: E501
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODA5NDYzOTc0LCJpYXQiOjE3Nzc5Mjc5NzQsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiMTYyM2Y3ODYtNDY4Zi00MzM2LTgyNDgtMmVkMmU5Mjk4NmM2Iiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3Nzc5Mjc5NzQ2NTQiLCJ1aWQiOiI2OWNhNTRiNi01ODlhLTQyYzUtOWJjYi0wNzFkNzNjMDYxNDEifX0sIm5iZiI6MTc3NzkyNzk3NCwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc3NzkyNzk3NDY1NCJ9.DvZhoaIEy8dNwE06Y_3_s23lR_GCdNVc_Kj7qhgT8vfkYmg_UTWxTEmNW5J6SP3ishxd6R4EBI0M_R7yBqWJ1q1q16fzKdmOdoN0dOHBXSWPutcR5WzbwbMHmrjWSEgi68GV-iOAIqFd27gIksL_XkQWfBVpuK16uQ-E8Ph2J3ND0tVwBp09rdEJM2hjeyWHkmtCBqK3zLzhg9zTGFCoHhm7Gl-G2MiLwHOVhQNGvSrBQEGHBTFnGO10InT_eRCz9iMlxk895RNa6NtZfUbeLNFfXMbGt3RkLvHDUmZbMCCktzdEPyP5lFGdaszCTJamKK53-91xdqG8wG_c5KhwSg"
+    ),
+    currently_deployed=False,
+    allowable_modalities=vlm_modalities,
+)
+
 gemma4_31B = ChatModel(
     model_name="RedHatAI/gemma-4-31B-it-FP8-block",
-    url_remote="",
-    api_key="",
+    url_remote=(
+        "https://gemma-4-31b-ab.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+    ),
+    api_key=(
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODExOTY2MzQ5LCJpYXQiOjE3ODA0MzAzNDksImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiY2NhNDMzZmYtY2QwMC00NzExLTllOTctNTg2MTE3ZWRkOTQ1Iiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODA0MzAzNDkwNjYiLCJ1aWQiOiI3NmUxZTdmNC05MWE2LTQzMDgtOTA2NC05YzVkY2E5ZDA3ZTAifX0sIm5iZiI6MTc4MDQzMDM0OSwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4MDQzMDM0OTA2NiJ9.hi2bZBWnUEnuMJPv7ujwomDiY21AN1Xk1Dr_Bh5pLHaL1Xph9i1UnqsCQnfmv6c0FOWrPzCoUoUL5kqBt_7MtqP2xw8XX-estZ4J1bKLr52_xUU3UIzJia5dRG4xSFfAKytts7IepLV8gs9PWPvfwgzwxHfNNYC9v-cEW3uf8ZgZP2QwQM9J7gDwwb9TJxU-x42b8s89xiCOEYkkBIC_YEOs1nN2GMHFGWTekNELodcEkZUxYA2XmqJSpEuMfXrBNf02cBeI2X3GNes71081ILPO3dJHmSmPVYtjU8kk71F2se4j3RbZ1epVXUOXzFnGQhGkCPDa13vszTE8s2t3mg"
+    ),
     allowable_modalities=vlm_modalities,
+)
+
+nemotron_3_super_120B = ChatModel(
+    model_name="",
+    url_remote=(
+        "https://nemotron-3-super-120b-a12b.project-user-tanguy-pomas.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+    ),
+    api_key="",
+    currently_deployed=False,
+)
+
+minimax_2_7_240B = ChatModel(
+    model_name="MiniMaxAI/MiniMax-M2.7",
+    url_remote=(
+        "https://mini-max-m27.project-user-francesco-caliva.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+    ),
+    api_key=(
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODA5NjkxNDk4LCJpYXQiOjE3NzgxNTU0OTgsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiZWY0NWJiNmYtM2U5Ni00ZWI1LWE0ZjUtNTllMWI0YmJjYTY4Iiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3NzgxNTU0OTg5MDUiLCJ1aWQiOiI0NWJlMGZlZS1kYjUwLTRiNWYtODAzYS03MTk2YWFmMDFkZTUifX0sIm5iZiI6MTc3ODE1NTQ5OCwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc3ODE1NTQ5ODkwNSJ9.Z7lhmVNRJGr8BM1MKlrT36DUUrFEPg5NK86-tHbZtuDH0zQXop2L3bnoSrG7UzLYLBPSGFgdtQywSdWMq2HrUzH2LUcIxAYMQtt3iDBxtuhGCmwET0Xk24Rziql_sNpABGx4DqRP1lu4Ze8R9nDNZhQjUyYkpyObKNXC_3o_bx18HklHhxv8vWiVtEVxcQW8jWUkXrtAfftjD89bznK1XnE9M9LSvVpZIHNFCZ7J-jrXFBE9dvKeRJh_OoP8vDsYdgmJkerKo0K6InlYnxOpiJRKycHZxbOeu3g0Q2mICKo0fYOKbbVYX2oZ-IQf8jKwoOoG9FRU1StnqatDDy-ycw"
+    ),
+    currently_deployed=False,
 )
 
 deepseek_v4_flash_280B = ChatModel(
     model_name="deepseek-ai/DeepSeek-V4-Flash",
-    url_remote="",
-    api_key="",
+    url_remote=(
+        "https://deepseek-v4-flash-ab.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+    ),
+    api_key=(
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODE1NTc0NzgwLCJpYXQiOjE3ODQwMzg3ODAsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiYmFlYWQzYTItMzEwNi00ZDg0LWEwNWYtNzU2YmZhNWUzOTU0Iiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODQwMzg3Nzc5ODgiLCJ1aWQiOiI4NjU2Y2VjNy1mOTkyLTRhNWItYjc0OS0zN2ViNDdkNWY3ZDQifX0sIm5iZiI6MTc4NDAzODc4MCwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4NDAzODc3Nzk4OCJ9.hXrolm_fG1DD6l4BzqbuwHpS7KW12UjhlwSlKwNqW3MiGu6z8MH-kdEsPZPLh_7RKlnO-CmJsCjglgGfoxmNG63baVWBCdS9xvszmvmGusZ25BVqnFJ_O-kyA4T5_h-EJHhDm9MJGhg9Nq3SvJU5P0gGWxlXuEBziihSTlV5arKAK7Z0UbtNn-MVGLQFyfnjzzIaR-lT3OBFne9fNjWdIiNtrk3dhbDD1r-Hfnk4rQ9BZB4QA8jqYzzGvpy8XO_5Mtm9jUxUhnyoqWRWcG3aYGwm8wQl-2c_FfPykIEEHN6TDqv9wpG9ykvlH5KUHo-9pnCRIfGqhKKtFaJ1DTKm8w"
+    ),
 )
 
 _qwen3_vl_mm_proc_kwargs = dict(
@@ -61,8 +98,12 @@ _qwen3_vl_mm_proc_kwargs = dict(
 qwen3_vl_8B = EmbeddingModel(
     model_name="Qwen/Qwen3-VL-Embedding-8B",
     model_instantiation_class=MultiModalEmbeddings,
-    url_remote="",
-    api_key="",
+    url_remote=(
+        "https://qwen3-vl-embedding-8b.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+    ),
+    api_key=(
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODExNTM2OTU1LCJpYXQiOjE3ODAwMDA5NTUsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiNmIxMTIyNzgtNmMzMi00Zjk5LTk5NWEtNzYzMGZlOWNkODRjIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODAwMDA5NTU3ODUiLCJ1aWQiOiJhNWVlNzA4Ni05NDNhLTQyZTktYjI1ZS1lYzVlYTFhN2RlMzEifX0sIm5iZiI6MTc4MDAwMDk1NSwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4MDAwMDk1NTc4NSJ9.qgYrdEJ8kebRtev6OdbZjVbafGSkbPVev0Qiz3qkQ6f90Br6RXvuQsslYfuyNZLrCwt-6e7B7zAIJCPUDk-VZgmMRSf7iZZcEYAeE9ZCx9gNNNG9mlq7qpz9ztr4d0ltYmxgrLFAYUHCtZu12_XZme2f47iJ4KHU-_VRmwkT3zy2V1VK4OLlU_V9VRtYlQojfp9O2IWnYCZ13OL2hMsxzEXk31RoOEkMKPu57U-ob-pmARIHsC9Z7uOog3vGI3T86KWc3VYfYWM6pYoZ_pfpAc0kahqIocghyrDmGtQyhKo-Zz5RB0uLNbemlNmDjaQV7Y0dccQPRCwu_txCkjb9fQ"
+    ),
     embedding_dim=4096,
     model_instantiation_kwargs=dict(tiktoken_enabled=False, check_embedding_ctx_length=False),
     code_chunk_size=8192,
@@ -77,16 +118,68 @@ qwen3_vl_8B = EmbeddingModel(
 # Reranker
 qwen3_vl_reranker_8B = RerankerModel(
     model_name="Qwen/Qwen3-VL-Reranker-8B",
-    url_remote="",
-    api_key="",
+    url_remote=(
+        "https://qwen3-vl-reranker-8b.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+    ),
+    api_key=(
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODExNTM2OTgyLCJpYXQiOjE3ODAwMDA5ODIsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiMTFjZGNiZjUtZGQxNS00NGUyLWFhNWUtYTA4N2UzNzUxM2FkIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODAwMDA5ODIxMjIiLCJ1aWQiOiJlM2ZhZjI3Ny1jNWE0LTQ4ODgtODVlYi05NGZlMWVhM2QxNzAifX0sIm5iZiI6MTc4MDAwMDk4Miwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4MDAwMDk4MjEyMiJ9.AoWV-tYYP_z7PhXLqKI9XmYsG2BLYqzjCwDyF1PAKKbWH2Op3nZK29RkLeltc6Xtq3v-0372eD1mekX3iPapJNNP3wnmjmLmvvj59SD9_8PvvkDBgdfB_1h0Qnx-nsOxLvrsqr9WCMIJLKmWAjReFUWG8fcnwtKoFJPbONmOinUde7o3U-205eqI3OoQ-bxSamyFGJkk3IfSUr_KEI8HGWDWYlz6dKxHj3fKugddDNtVR8l1hSpJW8eka3sFKb8SquYUkhL0w4eU8Te_DU994kl7odPcp9xV7XI1t424rxN5XNrBQRwMvKxC7zu8NB-1nSVd9TgJGFcANWAzuX32iQ"
+    ),
     preprocessor=qwen3_vl_8b_template,
     allowable_modalities=vlm_modalities,
     mm_processor_kwargs=_qwen3_vl_mm_proc_kwargs,
 )
 
 # Voice Models
+whisper_large_v3_turbo = VoiceModel(
+    model_name="openai/whisper-large-v3-turbo",
+    url_remote=(
+        "https://whisper-large-v3-turbo-ab.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+    ),
+    api_key=(
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODExOTY4OTExLCJpYXQiOjE3ODA0MzI5MTEsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiY2ViM2Q2MjctMDc0My00YTQ4LTk1OTAtMmIzMDYxYmEyNTQyIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODA0MzI5MTEzNTIiLCJ1aWQiOiI4MDY0ODZjYS02N2FiLTRiOTctODhjMy1kYzU4NTUyZmI5MmEifX0sIm5iZiI6MTc4MDQzMjkxMSwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4MDQzMjkxMTM1MiJ9.CKyShXeNA3EHbD7toKbMr7ogNmo7xsyQLcyQV3I4V-IJ9QWKAUCOFi7HMLw4phUO8SBuqmAnjK7KOWg1Dbd_M_UeMR9uJLUqimbHGvLOK7KkjFZwgKKleQDGHPwd9uRY0BzqxL8iFJmwHmANEX8Cm-__ehtlDqPEbJKv91knLQJAZYKEw1NVCYczfVueZ6U374EhzFoVVN4A1HbTYvlVMr8qwvZeyJ8mHl3HtYKK2p7v6yb5tQb_yb2Dt28oyZfwj496p1CGfMHARBMt32yN4NOBELQUGreUiwUungx34-EFQe_BJSNyt7pS2JEKD4ylPIRCVl7k6Aa3XY2n9H7vjA"
+    ),
+    currently_deployed=False,
+)
+
 cohere_transcribe_3_2b = VoiceModel(
     model_name="CohereLabs/cohere-transcribe-03-2026",
-    url_remote="",
-    api_key="",
+    url_remote=(
+        "https://cohere-transcribe-03-2026.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+    ),
+    api_key=(
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODA5NTUwNzg5LCJpYXQiOjE3NzgwMTQ3ODksImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiNDI0NjI1MTMtY2ExNi00ZTgxLWIyZTItZDA1OTg2MzA4ODZlIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3NzgwMTQ3ODk4OTAiLCJ1aWQiOiI4MTE2YmIwMS01OTljLTQ3MjMtOGZmNC0yNTkxYTU0NjhjMzUifX0sIm5iZiI6MTc3ODAxNDc4OSwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc3ODAxNDc4OTg5MCJ9.iMeplOjNYeTjHy0hEQ6_AsRhVsovEVOQJkm2YQeAra7Tez8txFx_QBUvKECSztv4R2pMd4g1MpBWF4Nk69DaCvXXem8VL5NFh2K9IzW6uA8D_AJ_OPpcXlDOb6xWtzgm0C8r8FOo1SsgHfpPVqgn8WvhBSlPIYx4uyrSs5LCJaZ-4-q_kHaCRu4xlLZ2wbVnlnaGCBQjbGFl1IcDVLy8FqgswX6_mexHc1fQxeRQ86CmNFrXYoMnJMDEpqU5sMPzAyyk3otxj-G7N3Y2WK_FpcJLCGApcmF3KaKcIU7IdsLC_FVSC3VTBrOp5gDxSUqN61mEowVD8R4PceslwQiBdg"
+    ),
+)
+
+qwen3_tts_1_7B = VoiceModel(
+    model_name="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    url_remote=(
+        "https://qwen3-tts-12hz-1-7b-customvoice-ab.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+    ),
+    api_key=(
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODExNDI1MDIwLCJpYXQiOjE3Nzk4ODkwMjAsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiYzEzN2ExZDUtZTc3OC00NTY1LWE1OGYtYTQyN2Q2ZGUxZTcxIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3Nzk4ODkwMjA0NDIiLCJ1aWQiOiJlODU1ZDQ3Zi02ODcxLTQzYjgtYTcyYS0yNmMxMDdiOWQ4MzAifX0sIm5iZiI6MTc3OTg4OTAyMCwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc3OTg4OTAyMDQ0MiJ9.nxzsJMTnYuoY3BlCMvto0TUOT1Hu90mX5-wp1_33RLLDcl5F_bJX1U_F-qsyK1nHEoiJrsOvSQICMGuURob0kp373Yb87t_n1b5Y_uYQprt3ePqH6sgWYxDlG7Tx7hRhTlBTZA161w9oHRSeQlrEty6gorjN5gYexeHx73PurSq2WQse6cQ3gsMkDlzx-dqo8qJnfZLKzT3ZGLu_nXL_xEvpDeO7HDEZtKw8lBL6z4SfqrDyC6mehVF505lcI1-D3F8CwLHgWkEM3hUYMbSU2RTEjoDZqCiMku_7TWDa7UkbmuROSpUSuxC5llgOPBl95VTYH_wMOAHgUbPH0zqy8Q"
+    ),
+    tts_supported_voices={
+        "aiden",
+        "dylan",
+        "eric",
+        "ono_anna",
+        "ryan",
+        "serena",
+        "sohee",
+        "uncle_fu",
+        "vivian",
+    },
+    model_type="TTS",
+)
+
+fish_s2_pro_4B = VoiceModel(
+    model_name="fishaudio/s2-pro",
+    url_remote=("https://fish-s2-pro.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"),
+    api_key=(
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODE1NzM5MTcxLCJpYXQiOjE3ODQyMDMxNzEsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiNGNhNmM4OTItMWZhOC00Y2ViLTlmODMtOGVjYzU5NDk4NmRmIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODQyMDMxNzE0MTEiLCJ1aWQiOiJmZjA4MzAyOC1hZDIzLTQ0NjUtYjYxNC0xYzYxYmZiMjBhYmMifX0sIm5iZiI6MTc4NDIwMzE3MSwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4NDIwMzE3MTQxMSJ9.SAJERzJ2hux4UPOlY14KmnTETjyIC7XMwGC6awLQedJn6vJDP80Lep65SSN6L0CXTeEMCqJTEx0VIat6HBy8sOuz3IUuzVGpH2tnhtVx9ylIrMW1EWH86ee3akd8O75tN6WPlbKj0jC14FAEx3IXwyjf47QK3KjRoX7DoUsmKMBCQr_6Kx4R9bQL5rQmsq3vHcjnHSpkjYlFav2shU284EPoGSCGCfKhnheiuK6cDFk_YdY6lXGpvk8X-vOrBlPdoWJyTE7d-ycpWukVKmF3ufO1heeMsyDMjn2EXl3KOHj5Olbywj1uTQBwdfNinJCZVMudd0sZbBHCCE0AfGZqEg"
+    ),
+    tts_supported_voices=set(),
+    tts_voice="alys",
+    model_type="TTS",
 )
