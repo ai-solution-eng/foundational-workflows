@@ -11,12 +11,13 @@ Or with a specific transport::
 """
 
 import argparse
+import contextvars
 import hashlib
 import json
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from multimodal_rag.dataset_manager import DatasetManager
@@ -93,6 +94,90 @@ def _check_unlocked_or_password(
             "'unlock_dataset' tool to unlock it for your session."
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Memory-dataset identity (per-request, transport-level)
+# ---------------------------------------------------------------------------
+#
+# The ``add_memory`` / ``search_memory`` tools resolve *which* dataset is
+# the caller's personal memory store WITHOUT the LLM having to pass a
+# dataset name or password in tool arguments.  An MCP client (e.g. opencode)
+# sends ``X-Memory-Dataset`` and ``X-Dataset-Password`` HTTP headers on every
+# request; this pure-ASGI middleware captures them into ContextVars that the
+# memory tools read.
+#
+# SECURITY: these ContextVars are consulted ONLY by ``_resolve_memory_*`` /
+# ``add_memory`` / ``search_memory``.  The general dataset tools
+# (``search_dataset``, ``get_dataset_files``, ...) never read them, so a
+# memory password arriving on the connection CANNOT silently unlock some
+# other dataset — it is scoped to the memory tools alone.
+#
+# Sync tools run inline in the request coroutine (FastMCP calls ``fn(...)``
+# directly, not in a thread pool), and child tasks copy the parent context,
+# so a ContextVar set here is reliably visible inside the tool functions.
+
+_memory_dataset_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("rag_memory_dataset", default=None)
+_memory_password_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "rag_memory_password", default=None
+)
+
+
+class _MemoryHeaderMiddleware:
+    """ASGI middleware that funnels memory-identity headers into ContextVars."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        ds: Optional[str] = None
+        pw: Optional[str] = None
+        for name, value in scope.get("headers") or []:
+            if name == b"x-memory-dataset":
+                ds = value.decode("latin-1").strip() or None
+            elif name == b"x-dataset-password":
+                pw = value.decode("latin-1").strip() or None
+        ds_tok = _memory_dataset_ctx.set(ds)
+        pw_tok = _memory_password_ctx.set(pw)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _memory_dataset_ctx.reset(ds_tok)
+            _memory_password_ctx.reset(pw_tok)
+
+
+def _resolve_memory_dataset(dataset_name: str | None) -> str:
+    """Resolve the memory dataset name: explicit arg → request header → env."""
+    ds = dataset_name or _memory_dataset_ctx.get() or os.environ.get("MEMORY_DATASET")
+    if not ds:
+        raise ToolError(
+            "No memory dataset specified. Provide 'dataset_name', send the "
+            "'X-Memory-Dataset' header from your MCP client, or set the "
+            "MEMORY_DATASET environment variable on the server."
+        )
+    return ds
+
+
+def _resolve_memory_password(password: str | None) -> Optional[str]:
+    """Resolve the memory dataset password: explicit arg → request header."""
+    return password if password else _memory_password_ctx.get()
+
+
+def _resolve_and_unlock(
+    dm: "DatasetManager",
+    dataset_name: str,
+    password: str | None,
+) -> str | None:
+    """Verify access to *dataset_name* and return the verified password.
+
+    Wraps ``_check_unlocked_or_password`` (which raises ``ToolError`` on
+    failure and caches a successful unlock) then returns the password to
+    use for ``?password=`` media-URL suffixes.
+    """
+    _check_unlocked_or_password(dm, dataset_name, password)
+    return _is_unlocked(dataset_name) or password
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +582,229 @@ def _resolve_audio_query_vector(
 
 
 # ---------------------------------------------------------------------------
+# Shared retrieval + post-processing + formatting
+# ---------------------------------------------------------------------------
+#
+# Factored out of ``search_dataset`` so that ``search_memory`` (and any
+# future recall tool) reuses the exact same retrieval / post-processing /
+# media-URL-conversion / markdown-append logic.  Keeping the two paths
+# identical avoids drift between "search a dataset" and "search my memory".
+
+
+def _run_retrieval(
+    rag: "MultimodalRAG",
+    dataset_name: str,
+    query_dict: "str | dict[str, Any]",
+    query: str,
+    top_k: int,
+    use_reranker: bool,
+    reranker_top_k: int,
+    base_llm_modalities: list[str] | None,
+    verified_password: str | None,
+    media_base_url: str | None,
+) -> str:
+    """Run retrieval, post-process modalities, and format the JSON result.
+
+    Shared by ``search_dataset`` and ``search_memory``.  Mirrors the
+    original ``search_dataset`` body verbatim so behaviour is unchanged.
+    """
+    if base_llm_modalities is None:
+        base_llm_modalities = ["text"]
+    llm_modalities = set(base_llm_modalities)
+
+    # Try to reuse a cached/stored query vector so we don't re-embed
+    # the same media twice (covers both "LLM passes back a result URL"
+    # and "user uploads the same file again").  On miss we embed
+    # up-front and cache the result for next time.
+    query_vector: Optional[list[float]] = None
+    if isinstance(query_dict, dict):
+        query_vector = _resolve_query_vector(rag, dataset_name, query_dict)
+
+        # Audio: embedder doesn't support audio natively.
+        if query_vector is None and query_dict.get("audio"):
+            query_vector = _resolve_audio_query_vector(rag, dataset_name, query_dict)
+
+        if query_vector is None and any(query_dict.get(k) for k in ("image", "video", "audio")):
+            try:
+                query_vector = rag.embed_query(query_dict)
+                _cache_query_vector(rag, query_dict, query_vector)
+            except Exception:
+                logger.warning("query embedding failed; falling back to retrieve()", exc_info=True)
+                query_vector = None
+
+    results = rag.retrieve(
+        query_dict,
+        top_k=top_k,
+        use_reranker=use_reranker,
+        reranker_top_k=reranker_top_k,
+        query_vector=query_vector,
+    )
+    if not results:
+        return "No results found."
+
+    retrieved_docs = [doc for doc, _ in results]
+    scores = [score for _, score in results]
+
+    # -- Post-process: convert unsupported modalities for the LLM --
+    needs_conversion = rag._postprocessor is not None and any(
+        isinstance(d, dict) and any(k in d for k in ("image", "video", "audio")) for d in retrieved_docs
+    )
+
+    if needs_conversion:
+        from multimodal_rag import Postprocessor
+
+        postproc = Postprocessor(
+            vlm=rag.vlm,
+            asr=rag.asr,
+            caption_video=rag.caption_video,
+        )
+        postprocessed = postproc(
+            retrieved_docs,
+            llm_modalities=llm_modalities,
+            query=query,
+        )
+    else:
+        postprocessed = retrieved_docs
+
+    # -- Format context for the LLM --
+    context_parts: list[str] = []
+    for i, doc in enumerate(postprocessed):
+        if isinstance(doc, str):
+            text = doc
+        elif isinstance(doc, dict):
+            text = doc.get("text", "")
+            src = doc.get("source", "")
+            page = doc.get("page", "")
+            if src or page:
+                ref = f"[Source: {src}" + (f", Page: {page}" if page else "") + "]"
+                text = f"{ref}\n{text}" if text else ref
+        else:
+            text = str(doc)
+
+        if text:
+            context_parts.append(f"[Result {i + 1}] (score: {scores[i]:.4f})\n{text}")
+
+    if not context_parts:
+        return "No textual content found in results."
+
+    context = "\n\n".join(context_parts)
+
+    # -- Also include raw results as JSON for clients that want structured data --
+    raw_results: list[dict[str, Any]] = []
+    for i, doc in enumerate(retrieved_docs):
+        entry: dict[str, Any] = {"score": scores[i]}
+        if isinstance(doc, str):
+            entry["text"] = doc
+        elif isinstance(doc, dict):
+            entry["embedding_score"] = doc.pop("_embedding_score", entry["score"])
+            entry["reranker_score"] = doc.pop("_reranker_score", None)
+            # Surface higher-quality original_* media (preprocessed
+            # files) as the primary image/video/audio keys so the LLM
+            # cites the best available version, not the embedding-grade
+            # surrogate stored in Qdrant.
+            entry.update(_prefer_original_media(doc))
+        raw_results.append(entry)
+
+    # -- Optionally convert PVC paths to HTTP URLs --
+    media_base_url = media_base_url or MEDIA_BASE_URL
+    if media_base_url:
+        data_path = os.environ.get("DATA_PATH", "/data")
+        pvc_prefix = f"{data_path}/datasets/{dataset_name}/files/"
+        file_prefix = f"file://{pvc_prefix}"
+        api_prefix = f"{media_base_url}/api/datasets/{dataset_name}/files/"
+        # For password-protected datasets, append ?password= so the
+        # browser can fetch media in <img>/<video>/<audio> tags (which
+        # can't set custom headers).  The file-serving endpoint accepts
+        # the password via this query parameter.
+        pw_suffix = f"?password={verified_password}" if verified_password else ""
+
+        def _convert(val: str) -> str:
+            if val.startswith(file_prefix):
+                return api_prefix + val[len(file_prefix) :] + pw_suffix
+            if val.startswith(pvc_prefix):
+                return api_prefix + val[len(pvc_prefix) :] + pw_suffix
+            return val
+
+        def _convert_dict(d: dict[str, Any]) -> dict[str, Any]:
+            return {k: _convert(v) if isinstance(v, str) else v for k, v in d.items()}
+
+        raw_results = [_convert_dict(r) for r in raw_results]
+        context = _convert(context)
+
+    # -- Append ready-to-paste markdown image links --
+    image_md_lines: list[str] = []
+    for i, r in enumerate(raw_results):
+        img = r.get("image")
+        if not img:
+            continue
+        urls = img if isinstance(img, list) else [img]
+        for url in urls:
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                src = r.get("source") or r.get("original_source") or ""
+                alt = (src.split("/")[-1] if src else f"matched image {i + 1}")[:60]
+                image_md_lines.append(f"![{alt}]({url})")
+    if image_md_lines:
+        context += (
+            "\n\nMatched images — include these markdown image links "
+            "verbatim in your response so the user sees them inline:\n" + "\n".join(image_md_lines)
+        )
+
+    # -- Append HTML5 audio players for matched audio --
+    audio_md_lines: list[str] = []
+    for i, r in enumerate(raw_results):
+        aud = r.get("audio")
+        if not aud:
+            continue
+        urls = aud if isinstance(aud, list) else [aud]
+        for url in urls:
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                src = r.get("source") or r.get("original_source") or ""
+                alt = (src.split("/")[-1] if src else f"matched audio {i + 1}")[:60]
+                audio_md_lines.append(
+                    f'<audio controls preload="none" src="{url}" title="{alt}"></audio>' f"\n([🎧 {alt}]({url}))"
+                )
+    if audio_md_lines:
+        context += (
+            "\n\nMatched audio — include these HTML5 audio players verbatim "
+            "in your response so the user can listen inline:\n" + "\n".join(audio_md_lines)
+        )
+
+    # -- Append markdown links for documents (PDFs, text, code, etc.) --
+    doc_link_lines: list[str] = []
+    for i, r in enumerate(raw_results):
+        # Skip results that already have image/audio markdown blocks
+        if r.get("image") or r.get("audio"):
+            continue
+        src = r.get("source") or r.get("original_source") or ""
+        if not isinstance(src, str) or not src.startswith(("http://", "https://")):
+            continue
+        # Derive a readable label from the filename + page
+        label = src.split("/")[-1] if src else f"document {i + 1}"
+        # Strip the uuid prefix for readability
+        import re
+
+        label = re.sub(r"^[0-9a-f]{32}_", "", label)[:60]
+        page = r.get("page")
+        if page:
+            label += f" (p. {page})"
+        doc_link_lines.append(f"- [📄 {label}]({src})")
+    if doc_link_lines:
+        context += (
+            "\n\nMatched documents — include these links in your response "
+            "so the user can open the source files:\n" + "\n".join(doc_link_lines)
+        )
+
+    return json.dumps(
+        {
+            "context": context,
+            "results": raw_results,
+        },
+        indent=2,
+        default=str,
+    )
+
+
+# ---------------------------------------------------------------------------
 # MCP tools
 # ---------------------------------------------------------------------------
 
@@ -625,16 +933,7 @@ try:
             dm.get_dataset(dataset_name)
         except FileNotFoundError:
             raise ToolError(f"Dataset '{dataset_name}' not found.")
-        _check_unlocked_or_password(dm, dataset_name, password)
-        # Capture the verified password so we can append it as a query
-        # parameter to media URLs — the browser's <img>/<video>/<audio>
-        # tags can't set custom headers, so the file-serving endpoint
-        # accepts ?password= for password-protected datasets.
-        verified_password = _is_unlocked(dataset_name) or password
-
-        if base_llm_modalities is None:
-            base_llm_modalities = ["text"]
-        llm_modalities = set(base_llm_modalities)
+        verified_password = _resolve_and_unlock(dm, dataset_name, password)
 
         # -- Build multimodal query dict --
         query_dict: str | dict[str, Any] = query
@@ -649,224 +948,199 @@ try:
             if audio:
                 query_dict["audio"] = audio
 
-        # -- Run retrieval --
         rag = dm._get_rag(dataset_name)
-
-        # Try to reuse a cached/stored query vector so we don't re-embed
-        # the same media twice (covers both "LLM passes back a result URL"
-        # and "user uploads the same file again").  On miss we embed
-        # up-front and cache the result for next time.
-        query_vector: Optional[list[float]] = None
-        if isinstance(query_dict, dict):
-            query_vector = _resolve_query_vector(rag, dataset_name, query_dict)
-
-            # Audio: embedder doesn't support audio natively.
-            # ASR the (already-truncated) audio → text → embed the text.
-            # Dataset audio files are caught by _resolve_query_vector
-            # above (stored vector reuse).  This handles new uploads only.
-            if query_vector is None and query_dict.get("audio"):
-                query_vector = _resolve_audio_query_vector(rag, dataset_name, query_dict)
-
-            # Non-audio media (or audio ASR failed): regular embedding.
-            # The embedder will skip audio it can't process and embed the
-            # text placeholder — better than nothing for a text search.
-            if query_vector is None and any(query_dict.get(k) for k in ("image", "video", "audio")):
-                try:
-                    query_vector = rag.embed_query(query_dict)
-                    _cache_query_vector(rag, query_dict, query_vector)
-                except Exception:
-                    logger.warning("query embedding failed; falling back to retrieve()", exc_info=True)
-                    query_vector = None
-
-        results = rag.retrieve(
+        return _run_retrieval(
+            rag,
+            dataset_name,
             query_dict,
-            top_k=top_k,
-            use_reranker=use_reranker,
-            reranker_top_k=reranker_top_k,
-            query_vector=query_vector,
-        )
-        if not results:
-            return "No results found."
-
-        retrieved_docs = [doc for doc, _ in results]
-        scores = [score for _, score in results]
-
-        # -- Post-process: convert unsupported modalities for the LLM --
-        needs_conversion = rag._postprocessor is not None and any(
-            isinstance(d, dict) and any(k in d for k in ("image", "video", "audio")) for d in retrieved_docs
+            query,
+            top_k,
+            use_reranker,
+            reranker_top_k,
+            base_llm_modalities,
+            verified_password,
+            media_base_url,
         )
 
-        if needs_conversion:
-            from multimodal_rag import Postprocessor
+    @mcp.tool()
+    def add_memory(
+        text: str,
+        image: str | None = None,
+        video: str | None = None,
+        audio: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        dataset_name: str | None = None,
+        password: str | None = None,
+    ) -> str:
+        """Store a memory (a durable fact / decision / preference) for later recall.
 
-            postproc = Postprocessor(
-                vlm=rag.vlm,
-                asr=rag.asr,
-                caption_video=rag.caption_video,
+        Intended for LLM-curated long-term memory: the agent distils a
+        concise, self-contained record — NOT a raw transcript — and stores
+        it so future sessions can recall it via ``search_memory``.  The
+        memory dataset and password are normally supplied by the MCP client
+        via request headers, so the model does NOT need to pass
+        ``dataset_name`` / ``password``.
+
+        Parameters
+        ----------
+        text:
+            The memory content, written to be useful standalone — a future
+            session with no other context should understand it.  Prefer
+            "User prefers tabs over spaces because of repo style" over
+            "prefers tabs".
+        image / video / audio:
+            Optional media attached to the memory (URLs or data URLs).
+            Rarely needed for coding memories; supported for completeness.
+        metadata:
+            Optional structured provenance, e.g.
+            ``{"kind": "decision", "tags": ["auth", "refactor"],
+            "session_id": "abc123"}``.  Stored alongside the memory in the
+            vector payload for later filtering.
+        dataset_name:
+            Memory dataset.  Optional — resolved from the
+            ``X-Memory-Dataset`` request header or ``MEMORY_DATASET`` env
+            var when omitted.  The model usually does NOT pass this.
+        password:
+            Password for the protected memory dataset.  Optional — resolved
+            from the ``X-Dataset-Password`` request header when omitted.
+        """
+        ds_name = _resolve_memory_dataset(dataset_name)
+        pw = _resolve_memory_password(password)
+
+        dm = get_manager()
+        try:
+            dm.get_dataset(ds_name)
+        except FileNotFoundError:
+            raise ToolError(
+                f"Memory dataset '{ds_name}' not found. Create it first via "
+                "the REST API (POST /api/datasets) or the HTML frontend."
             )
-            postprocessed = postproc(
-                retrieved_docs,
-                llm_modalities=llm_modalities,
-                query=query,
-            )
-        else:
-            postprocessed = retrieved_docs
+        _resolve_and_unlock(dm, ds_name, pw)
 
-        # -- Format context for the LLM --
-        context_parts: list[str] = []
-        for i, doc in enumerate(postprocessed):
-            if isinstance(doc, str):
-                text = doc
-            elif isinstance(doc, dict):
-                text = doc.get("text", "")
-                src = doc.get("source", "")
-                page = doc.get("page", "")
-                if src or page:
-                    ref = f"[Source: {src}" + (f", Page: {page}" if page else "") + "]"
-                    text = f"{ref}\n{text}" if text else ref
-            else:
-                text = str(doc)
+        # Build the document.  In MultimodalRAG._to_documents every non-
+        # 'text' key becomes Qdrant payload metadata, so the provenance
+        # fields below are stored queryably alongside the embedding.
+        doc: dict[str, Any] = {"text": text}
+        if image:
+            doc["image"] = image
+        if video:
+            doc["video"] = video
+        if audio:
+            doc["audio"] = audio
+        doc["source"] = "opencode:memory"
+        doc["memory_kind"] = (metadata or {}).get("kind", "note")
+        doc["memory_ts"] = datetime.now(timezone.utc).isoformat()
+        if metadata:
+            tags = metadata.get("tags")
+            if tags:
+                doc["memory_tags"] = tags
+            sid = metadata.get("session_id")
+            if sid:
+                doc["session_id"] = sid
+            # Carry any other metadata keys through verbatim.
+            for k, v in metadata.items():
+                if k not in ("kind", "tags", "session_id") and k not in doc:
+                    doc[k] = v
 
-            if text:
-                context_parts.append(f"[Result {i + 1}] (score: {scores[i]:.4f})\n{text}")
+        try:
+            ids = dm.add_documents(ds_name, [doc])
+        except Exception as exc:
+            raise ToolError(f"Failed to store memory: {exc}") from exc
 
-        if not context_parts:
-            return "No textual content found in results."
-
-        context = "\n\n".join(context_parts)
-
-        # -- Also include raw results as JSON for clients that want structured data --
-        raw_results: list[dict[str, Any]] = []
-        for i, doc in enumerate(retrieved_docs):
-            entry: dict[str, Any] = {"score": scores[i]}
-            if isinstance(doc, str):
-                entry["text"] = doc
-            elif isinstance(doc, dict):
-                entry["embedding_score"] = doc.pop("_embedding_score", entry["score"])
-                entry["reranker_score"] = doc.pop("_reranker_score", None)
-                # Surface higher-quality original_* media (preprocessed
-                # files) as the primary image/video/audio keys so the LLM
-                # cites the best available version, not the embedding-grade
-                # surrogate stored in Qdrant.
-                entry.update(_prefer_original_media(doc))
-            raw_results.append(entry)
-
-        # -- Optionally convert PVC paths to HTTP URLs --
-        media_base_url = media_base_url or MEDIA_BASE_URL
-        if media_base_url:
-            data_path = os.environ.get("DATA_PATH", "/data")
-            pvc_prefix = f"{data_path}/datasets/{dataset_name}/files/"
-            file_prefix = f"file://{pvc_prefix}"
-            api_prefix = f"{media_base_url}/api/datasets/{dataset_name}/files/"
-            # For password-protected datasets, append ?password= so the
-            # browser can fetch media in <img>/<video>/<audio> tags (which
-            # can't set custom headers).  The file-serving endpoint accepts
-            # the password via this query parameter.
-            pw_suffix = f"?password={verified_password}" if verified_password else ""
-
-            def _convert(val: str) -> str:
-                if val.startswith(file_prefix):
-                    return api_prefix + val[len(file_prefix) :] + pw_suffix
-                if val.startswith(pvc_prefix):
-                    return api_prefix + val[len(pvc_prefix) :] + pw_suffix
-                return val
-
-            def _convert_dict(d: dict[str, Any]) -> dict[str, Any]:
-                return {k: _convert(v) if isinstance(v, str) else v for k, v in d.items()}
-
-            raw_results = [_convert_dict(r) for r in raw_results]
-            context = _convert(context)
-
-        # -- Append ready-to-paste markdown image links --
-        # For LLMs that don't natively accept image content (text-only
-        # models like DeepSeek), the Postprocessor above has already
-        # converted result images to VLM text descriptions and dropped the
-        # URL from ``context``.  Left alone, the LLM has to dig the URL out
-        # of the ``results`` JSON and format it as markdown itself — which
-        # it rarely does, so the user sees a plain link instead of an
-        # inline image.  Append the image URLs as ready-to-paste markdown
-        # so the LLM only has to echo the context verbatim.  Only HTTP(S)
-        # URLs are embedded (browsers can't fetch ``file://``).
-        image_md_lines: list[str] = []
-        for i, r in enumerate(raw_results):
-            img = r.get("image")
-            if not img:
-                continue
-            urls = img if isinstance(img, list) else [img]
-            for url in urls:
-                if isinstance(url, str) and url.startswith(("http://", "https://")):
-                    # Derive short alt text from the result's source/text so
-                    # the markdown is self-describing without being huge.
-                    src = r.get("source") or r.get("original_source") or ""
-                    alt = (src.split("/")[-1] if src else f"matched image {i + 1}")[:60]
-                    image_md_lines.append(f"![{alt}]({url})")
-        if image_md_lines:
-            context += (
-                "\n\nMatched images — include these markdown image links "
-                "verbatim in your response so the user sees them inline:\n" + "\n".join(image_md_lines)
-            )
-
-        # -- Append HTML5 audio players for matched audio --
-        # Markdown has no native audio syntax, so we use the HTML5
-        # ``<audio controls>`` tag.  Open WebUI's markdown renderer passes
-        # inline HTML through, so the user gets a play button in chat.
-        # A markdown link is appended as a fallback for renderers that
-        # strip HTML.
-        audio_md_lines: list[str] = []
-        for i, r in enumerate(raw_results):
-            aud = r.get("audio")
-            if not aud:
-                continue
-            urls = aud if isinstance(aud, list) else [aud]
-            for url in urls:
-                if isinstance(url, str) and url.startswith(("http://", "https://")):
-                    src = r.get("source") or r.get("original_source") or ""
-                    alt = (src.split("/")[-1] if src else f"matched audio {i + 1}")[:60]
-                    audio_md_lines.append(
-                        f'<audio controls preload="none" src="{url}" title="{alt}"></audio>' f"\n([🎧 {alt}]({url}))"
-                    )
-        if audio_md_lines:
-            context += (
-                "\n\nMatched audio — include these HTML5 audio players verbatim "
-                "in your response so the user can listen inline:\n" + "\n".join(audio_md_lines)
-            )
-
-        # -- Append markdown links for documents (PDFs, text, code, etc.) --
-        # Images get inline markdown, audio gets HTML5 players — documents
-        # (PDFs, code, text, etc.) get a clickable markdown link so the
-        # user can open the source file.  Only results whose source URL
-        # was converted to HTTP(S) are included.
-        doc_link_lines: list[str] = []
-        for i, r in enumerate(raw_results):
-            # Skip results that already have image/audio markdown blocks
-            if r.get("image") or r.get("audio"):
-                continue
-            src = r.get("source") or r.get("original_source") or ""
-            if not isinstance(src, str) or not src.startswith(("http://", "https://")):
-                continue
-            # Derive a readable label from the filename + page
-            label = src.split("/")[-1] if src else f"document {i + 1}"
-            # Strip the uuid prefix for readability
-            import re
-
-            label = re.sub(r"^[0-9a-f]{32}_", "", label)[:60]
-            page = r.get("page")
-            if page:
-                label += f" (p. {page})"
-            doc_link_lines.append(f"- [📄 {label}]({src})")
-        if doc_link_lines:
-            context += (
-                "\n\nMatched documents — include these links in your response "
-                "so the user can open the source files:\n" + "\n".join(doc_link_lines)
-            )
-
+        meta = dm.get_dataset(ds_name)
+        count = meta.get("document_count", 0) if isinstance(meta, dict) else 0
+        dedup_thr = os.environ.get("RAG_DEDUP_THRESHOLD", "0.995")
         return json.dumps(
             {
-                "context": context,
-                "results": raw_results,
+                "status": "stored",
+                "dataset": ds_name,
+                "document_count": count,
+                "stored_ids": ids,
+                "note": (
+                    "Memory stored. Near-duplicates (cosine >= "
+                    + dedup_thr
+                    + ") are auto-skipped, so this may be a no-op if an "
+                    "identical memory already exists."
+                ),
             },
             indent=2,
             default=str,
+        )
+
+    @mcp.tool()
+    def search_memory(
+        query: str,
+        image: str | None = None,
+        video: str | None = None,
+        audio: str | None = None,
+        top_k: int = 5,
+        use_reranker: bool = False,
+        reranker_top_k: int = 3,
+        base_llm_modalities: list[str] | None = None,
+        dataset_name: str | None = None,
+        password: str | None = None,
+    ) -> str:
+        """Recall relevant memories from your personal long-term memory store.
+
+        Use at the start of a non-trivial task to check whether past work,
+        decisions, or preferences are relevant, or whenever the user
+        references prior work.  The memory dataset and password are normally
+        supplied by the MCP client via request headers, so the model does
+        NOT need to pass ``dataset_name`` / ``password``.
+
+        Parameters
+        ----------
+        query:
+            Natural-language description of what you are looking for.
+        image / video / audio:
+            Optional media to search by similarity.
+        top_k:
+            Number of memories to retrieve (default 5).
+        use_reranker / reranker_top_k:
+            Cross-encoder reranking (off by default for speed).
+        base_llm_modalities:
+            Modalities the calling LLM supports, e.g. ``["text"]``.
+        dataset_name / password:
+            Optional — resolved from request headers / env var.  The model
+            usually does NOT pass these.
+        """
+        ds_name = _resolve_memory_dataset(dataset_name)
+        pw = _resolve_memory_password(password)
+
+        dm = get_manager()
+        try:
+            dm.get_dataset(ds_name)
+        except FileNotFoundError:
+            raise ToolError(f"Memory dataset '{ds_name}' not found.")
+        verified_pw = _resolve_and_unlock(dm, ds_name, pw)
+
+        query_dict: str | dict[str, Any] = query
+        if image or video or audio:
+            query_dict = {}
+            if query:
+                query_dict["text"] = query
+            if image:
+                query_dict["image"] = image
+            if video:
+                query_dict["video"] = video
+            if audio:
+                query_dict["audio"] = audio
+
+        rag = dm._get_rag(ds_name)
+        # media_base_url=None lets _run_retrieval fall back to the global
+        # MEDIA_BASE_URL env var so any media memories also get clickable
+        # HTTP URLs (with the ?password= suffix for protected datasets).
+        return _run_retrieval(
+            rag,
+            ds_name,
+            query_dict,
+            query,
+            top_k,
+            use_reranker,
+            reranker_top_k,
+            base_llm_modalities,
+            verified_pw,
+            None,
         )
 
     @mcp.tool()
@@ -1311,10 +1585,14 @@ def main() -> None:
         mcp.run(transport="stdio")
     elif args.transport == "sse":
         logger.info("Starting MCP SSE server on %s:%s", args.host, args.port)
-        uvicorn.run(mcp.sse_app(), host=args.host, port=args.port)
+        app = mcp.sse_app()
+        app.add_middleware(_MemoryHeaderMiddleware)
+        uvicorn.run(app, host=args.host, port=args.port)
     elif args.transport == "streamable-http":
         logger.info("Starting MCP streamable-http server on %s:%s", args.host, args.port)
-        uvicorn.run(mcp.streamable_http_app(), host=args.host, port=args.port)
+        app = mcp.streamable_http_app()
+        app.add_middleware(_MemoryHeaderMiddleware)
+        uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

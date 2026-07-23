@@ -1,4 +1,10 @@
-# MultiModal RAG — Usage Guide
+# Usage Guide
+
+How to use the HTML frontend and the Python programmatic API. For MCP
+tool access see [documentation/MCP.md](documentation/MCP.md); for
+deployment see [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md).
+
+---
 
 ## 1. HTML Frontend (Dataset Manager UI)
 
@@ -19,84 +25,11 @@ Open `http://localhost:8000`.
 | **Upload files** | Pick a file (PDF, image, audio, video, text). PDFs are split page-by-page with images extracted alongside text blocks |
 | **Search** | Enter a query with optional `top_k` / reranker params, see scored results |
 
-Uploaded files land in `/data/datasets/<name>/files/`. Every dataset gets its own Qdrant instance on disk at `/data/datasets/<name>/qdrant/`.
+Uploaded files land in `/data/datasets/<name>/files/`. Every dataset gets its own Qdrant collection.
 
 ---
 
-## 2. PDF Processing
-
-```python
-from pdf_processor import PDFProcessor
-
-pp = PDFProcessor()
-
-# Page-level (full page text + all embedded images)
-pages = pp.extract_pages("doc.pdf")
-# [{"page_num": 1, "text": "...", "images": [{"path": "...", "index": 0}]}, ...]
-
-# Structured blocks (text blocks paired with nearby images)
-blocks = pp.extract_text_blocks("doc.pdf")
-# [{"page_num": 1, "block_num": 0, "text": "...", "nearby_images": [...]}, ...]
-
-# RAG-ready entries (recommended)
-entries = pp.extract_structured_pages("doc.pdf")
-# [{"text": "...", "image": "/tmp/...png", "source": "doc.pdf", "page": 1}, ...]
-```
-
-The `DatasetManager.add_file()` method uses `extract_structured_pages` automatically for PDFs.
-
----
-
-## 3. MCP Server
-
-Start it (stdio mode):
-
-```bash
-cd /workspace/src/multimodal_rag
-python -m mcp_server.server
-```
-
-### Exposed tools
-
-**`multimodal_rag_search`**
-
-```json
-{
-  "dataset_name": "dataset_1",
-  "query": "aurora borealis",
-  "top_k": 5,
-  "use_reranker": false,
-  "reranker_top_k": null,
-  "base_llm_modalities": ["text"]
-}
-```
-
-Returns `context` (formatted for LLM consumption) + raw `results` array. If the base LLM doesn't support images/audio/video (set via `base_llm_modalities`), unsupported media is automatically converted:
-
-- **images/video** → Gemma4 describes them → text
-- **audio** → Cohere Transcribe 2026-03 transcribes → text
-
-**`list_datasets`**
-
-Returns metadata for all datasets.
-
-### Connect from an MCP client
-
-```json
-{
-  "mcpServers": {
-    "multimodal-rag": {
-      "command": "python",
-      "args": ["-m", "mcp_server.server"],
-      "cwd": "/workspace/src/multimodal_rag"
-    }
-  }
-}
-```
-
----
-
-## 4. Programmatic API
+## 2. Programmatic API
 
 ```python
 from multimodal_rag import DatasetManager
@@ -131,54 +64,45 @@ dm.list_datasets()
 dm.delete_dataset("dataset_1")
 ```
 
+Input format follows the HuggingFace API convention: strings are
+auto-detected (plain text stays text, URLs/data URIs/local paths to
+media files are recognised). For dicts, the `image`, `video` and
+`audio` keys accept either a single URL or a list for multiple items:
+
+```python
+inputs = [
+    "A caption as plain text",
+    "https://example.com/image.jpg",
+    {"text": "A caption", "image": "https://example.com/image.jpg"},
+    {"text": "Two images", "image": ["https://.../a.jpg", "https://.../b.jpg"]},
+]
+```
+
 **Preprocessing** (audio→Cohere→text, images/video→Gemma4→text):
 - Happens by default when `preprocess=True` (the default). Disable with `preprocess=False` if your embedding model supports the modality natively.
 
 ---
 
-## 5. Helm Deployment
+## 3. REST API
 
-```bash
-helm install multimodal-rag ./helm \
-  --set persistence.size=100Gi \
-  --set ingress.hosts[0].host=rag.mycluster.io
-```
+The API server exposes 17+ REST endpoints. Key ones:
 
-| Key | Default | Notes |
-|---|---|---|
-| `persistence.size` | `50Gi` | PVC size for datasets + Qdrant DBs |
-| `persistence.storageClass` | `""` | Set if your cluster requires one |
-| `frontend.port` | `8000` | HTML UI port |
-| `mcp.enabled` | `true` | Deploys MCP container alongside |
-| `mcp.port` | `8001` | MCP server port |
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/healthz` | Liveness/readiness |
+| `POST` | `/api/datasets` | Create (name, description, caption_video, password) |
+| `GET` | `/api/datasets` | List all |
+| `GET` | `/api/datasets/{name}` | Get one (uses `X-Dataset-Password` header) |
+| `DELETE` | `/api/datasets/{name}` | Delete dataset + Qdrant collection |
+| `POST` | `/api/datasets/{name}/documents` | Add raw text/dict docs |
+| `POST` | `/api/datasets/{name}/files` | Single file upload (multipart) |
+| `POST` | `/api/datasets/{name}/batch-files` | Multi-file upload with SSE progress |
+| `POST` | `/api/datasets/{name}/batch-urls` | S3/HTTP URL ingestion with SSE |
+| `GET` | `/api/datasets/{name}/search` | Text search (`q`, `top_k`, `use_reranker`) |
+| `POST` | `/api/datasets/{name}/search` | Multimodal search (body: text + image/video/audio) |
+| `GET` | `/api/datasets/{name}/documents` | List stored docs |
+| `DELETE` | `/api/datasets/{name}/documents/{doc_id}` | Delete single doc |
+| `GET` | `/api/datasets/{name}/files/{filepath}` | Serve stored file |
 
-Both containers (frontend + MCP) run in one pod sharing a PVC mounted at `/data`.
-
----
-
-## 6. Data Flow
-
-```
-User Input (UI / MCP / API)
-  │
-  ├─ Text/JSON ──→ DatasetManager.add_documents()
-  ├─ URLs ──────→ DatasetManager.add_documents()
-  │
-  ├─ PDF ──────→ PDFProcessor.extract_structured_pages()
-  │                └─ page-by-page: text blocks + paired images/charts
-  │
-  ├─ Audio ────→ PreprocessingPipeline (Cohere) → text
-  ├─ Image ────→ PreprocessingPipeline (Gemma4, optional) → text description
-  └─ Video ────→ PreprocessingPipeline (Cohere + Gemma4) → text
-                   │
-                   ▼
-              Qwen3-VL-Embedding-8B → Qdrant (on PVC)
-                   │
-Search ──────────► Embed query → Qdrant similarity
-                   │
-              [Optional] Qwen3-VL-Reranker-8B (re-rank top_k)
-                   │
-              [Optional] Gemma4/Cohere for unsupported modalities
-                   │
-              Context → DeepSeek-V4-Flash → Answer (with source/page refs)
-```
+See [documentation/FEATURES.md](documentation/FEATURES.md) for full
+endpoint details and search parameters.

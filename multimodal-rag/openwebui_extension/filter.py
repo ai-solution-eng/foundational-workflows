@@ -20,7 +20,10 @@ licence: MIT
 """
 
 import base64
+import hashlib
+import hmac
 import logging
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
@@ -251,6 +254,86 @@ class Filter:
             default=0,
             description="Filter priority (lower = runs first)",
         )
+        # -- Long-term memory (recall at conversation start) -----------------
+        MEMORY_ENABLED: bool = Field(
+            default=True,
+            description="Enable long-term memory: recall relevant memories at "
+            "conversation start (inlet) and distil/store memories after each "
+            "turn (outlet). Per-user: the dataset name is derived from the "
+            "OWUI user id (see MEMORY_DATASET_PREFIX).",
+        )
+        MEMORY_DATASET_PREFIX: str = Field(
+            default="owui-memory-",
+            description="Per-user memory datasets are named "
+            "'{PREFIX}{user_id}'. The filter builds this at runtime from the "
+            "OWUI __user__ identity, so each user gets an isolated dataset "
+            "without per-user valve config. The admin pre-creates each "
+            "user's dataset with the shared MEMORY_PASSWORD (or set "
+            "MEMORY_AUTO_CREATE=true to create on first write).",
+        )
+        MEMORY_AUTO_CREATE: bool = Field(
+            default=False,
+            description="If true, the filter creates a user's memory dataset "
+            "(with MEMORY_PASSWORD) on first write when it doesn't exist. "
+            "Convenient; needs the shared password to also satisfy any "
+            "dataset-name policy on the server.",
+        )
+        MEMORY_PASSWORD: str = Field(
+            default="",
+            description="Shared password for ALL per-user memory datasets "
+            "(every 'owui-memory-{user_id}' uses this same password). Stored "
+            "in the filter Valves (server-side) — never injected into the LLM "
+            "context. Used as the FALLBACK when MEMORY_SECRET is empty. "
+            "Per-user isolation is dataset-NAME based, not crypto: "
+            "if this password leaks, all users' memories are exposed.",
+        )
+        MEMORY_SECRET: str = Field(
+            default="",
+            description="Server-side HMAC key for deriving a UNIQUE per-user "
+            "memory password from the SSO-authenticated __user__ id. When set, "
+            "each user's dataset password = HMAC-SHA256(MEMORY_SECRET, user_id) "
+            "(base64url, 24 chars) — unpredictable per user, so a single leak "
+            "exposes only that user. Leverages the fact that OWUI's __user__ "
+            "identity is trusted post-SSO. Leave empty to fall back to the "
+            "shared MEMORY_PASSWORD (weaker, name-based isolation only).",
+        )
+        MEMORY_RECALL_TOP_K: int = Field(
+            default=5,
+            ge=1,
+            le=20,
+            description="Number of memories to recall and inject at conversation " "start.",
+        )
+        MEMORY_RECALL_FIRST_ONLY: bool = Field(
+            default=True,
+            description="Recall only on the first user message of each chat. "
+            "False = recall on every turn (more context, more tokens).",
+        )
+        MEMORY_INJECT_AS_SYSTEM: bool = Field(
+            default=True,
+            description="Inject recalled memories as a system message (True) "
+            "or prepend to the user message (False).",
+        )
+        # -- Distillation LLM (for LLM-curated memory writes) ---------------
+        DISTILL_LLM_URL: str = Field(
+            default="",
+            description="OpenAI-compatible base URL for the distillation LLM "
+            "(e.g. https://vllm.example.com/v1). When empty, no memories are "
+            "written (recall still works if MEMORY_DATASET_PREFIX is set).",
+        )
+        DISTILL_LLM_MODEL: str = Field(
+            default="",
+            description="Model name for distillation (e.g. 'deepseek-v4-flash').",
+        )
+        DISTILL_LLM_API_KEY: str = Field(
+            default="",
+            description="API key for the distillation LLM endpoint.",
+        )
+        DISTILL_MIN_REPLY_CHARS: int = Field(
+            default=200,
+            ge=0,
+            description="Skip distillation for assistant replies shorter than "
+            "this (trivial exchanges aren't worth storing). 0 = distil all.",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -435,6 +518,248 @@ class Filter:
             logger.warning("Failed to list datasets from %s", url, exc_info=True)
             return None
 
+    # ── long-term memory helpers ─────────────────────────────────────────
+
+    def _memory_enabled(self) -> bool:
+        return bool(self.valves.MEMORY_ENABLED and self.valves.MEMORY_DATASET_PREFIX)
+
+    def _memory_password_for_user(self, user: Optional[dict]) -> str:
+        """Return the memory-dataset password for *user*.
+
+        - When ``MEMORY_SECRET`` is set: HMAC-SHA256(MEMORY_SECRET, user_id)
+          → base64url, 24 chars.  Unique and unpredictable per SSO-authenticated
+          user, so one user's password leaking cannot expose another's.
+        - Otherwise: the shared ``MEMORY_PASSWORD`` valve (name-based isolation
+          only).  May be empty ( callers must handle that — the RAG API then
+          treats the dataset as unprotected).
+        """
+        secret = self.valves.MEMORY_SECRET
+        if secret:
+            uid = self._user_identifier(user) or ""
+            digest = hmac.new(secret.encode("utf-8"), uid.encode("utf-8"), hashlib.sha256).digest()
+            # 18 bytes → 24 base64url chars, no padding.  Plenty of entropy,
+            # URL-safe, safe in an HTTP header value.
+            return base64.urlsafe_b64encode(digest[:18]).decode("ascii").rstrip("=")
+        return self.valves.MEMORY_PASSWORD
+
+    def _memory_headers(self, user: Optional[dict]) -> dict[str, str]:
+        pw = self._memory_password_for_user(user)
+        return {"X-Dataset-Password": pw} if pw else {}
+
+    @staticmethod
+    def _user_identifier(user: Optional[dict]) -> Optional[str]:
+        """Extract a stable, sanitised identifier from the OWUI __user__ dict.
+
+        Preference: ``id`` → ``email`` → ``name``.  The value is lowercased
+        and reduced to ``[a-z0-9_-]`` so it is safe to embed in a dataset
+        name.  Returns ``None`` when no usable identity is present (the
+        caller skips memory in that case).
+        """
+        if not isinstance(user, dict):
+            return None
+        raw = user.get("id") or user.get("email") or user.get("name") or ""
+        raw = str(raw).strip().lower()
+        if not raw:
+            return None
+        import re
+
+        sanitised = re.sub(r"[^a-z0-9_-]+", "-", raw).strip("-")
+        return sanitised or None
+
+    def _memory_dataset_for_user(self, user: Optional[dict]) -> Optional[str]:
+        """Return the per-user memory dataset name, or None if unidentified."""
+        uid = self._user_identifier(user)
+        if not uid:
+            return None
+        prefix = self.valves.MEMORY_DATASET_PREFIX
+        # AWS-style trailing hyphen is ugly; collapse any doubled hyphens.
+        import re
+
+        name = re.sub(r"-+", "-", f"{prefix}{uid}").strip("-")
+        return name or None
+
+    async def _ensure_dataset_exists(self, dataset_name: str, user: Optional[dict]) -> bool:
+        """Create *dataset_name* (with the user's password) if missing.
+
+        Returns True when the dataset exists (pre-existing or just created),
+        False on failure.  Used by the outlet when MEMORY_AUTO_CREATE=true.
+        """
+        api = self.valves.RAG_API_URL.rstrip("/")
+        user_pw = self._memory_password_for_user(user)
+        # Check existence first to avoid creating duplicates / noisy logs.
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{api}/api/datasets/{dataset_name}",
+                    headers=self._memory_headers(user),
+                )
+                if resp.status_code == 200:
+                    return True
+        except Exception:
+            logger.debug("dataset existence check failed", exc_info=True)
+        # Create it.
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{api}/api/datasets",
+                    json={
+                        "name": dataset_name,
+                        "description": "Open WebUI long-term memory (auto-created)",
+                        "password": user_pw or None,
+                    },
+                )
+                if resp.status_code in (200, 201):
+                    logger.info("Auto-created memory dataset '%s'", dataset_name)
+                    return True
+                # 409 Conflict = already exists (race) — also fine.
+                if resp.status_code == 409:
+                    return True
+                logger.warning(
+                    "Auto-create of '%s' failed: %s %s",
+                    dataset_name,
+                    resp.status_code,
+                    resp.text[:200],
+                )
+        except Exception:
+            logger.warning("Auto-create of '%s' failed", dataset_name, exc_info=True)
+        return False
+
+    @staticmethod
+    def _is_first_user_message(messages: list[dict]) -> bool:
+        """True when the last message is the first user message in the chat."""
+        user_count = sum(1 for m in messages if m.get("role") == "user")
+        return user_count <= 1
+
+    async def _recall_memory(self, dataset_name: str, user: Optional[dict], query: str) -> str:
+        """Search the memory dataset and return formatted context (or '')."""
+        if not query.strip():
+            return ""
+        api = self.valves.RAG_API_URL.rstrip("/")
+        url = f"{api}/api/datasets/{dataset_name}/search"
+        params = {"q": query[:500], "top_k": self.valves.MEMORY_RECALL_TOP_K}
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(url, params=params, headers=self._memory_headers(user))
+                resp.raise_for_status()
+                results = resp.json().get("results", [])
+        except Exception:
+            logger.warning("Memory recall failed", exc_info=True)
+            return ""
+        if not results:
+            return ""
+        lines = ["Relevant memories from past conversations:"]
+        for i, r in enumerate(results):
+            content = r.get("content", "") if isinstance(r, dict) else str(r)
+            score = r.get("score", 0) if isinstance(r, dict) else 0
+            if content:
+                lines.append(f"[Memory {i + 1}] (score: {score:.4f})\n{content}")
+        context = "\n\n".join(lines)
+        logger.info("Memory recall: %d hit(s) for query '%.40s…'", len(results), query)
+        return context
+
+    def _inject_memory_context(self, messages: list[dict], context: str) -> None:
+        """Inject recalled memory context as a system or user-prefix message."""
+        full = (
+            "The following are relevant memories from this user's past "
+            "conversations. Use them as background context — do not mention "
+            "'memory' or 'recall' to the user unless they ask.\n\n" + context
+        )
+        if self.valves.MEMORY_INJECT_AS_SYSTEM:
+            messages.insert(0, {"role": "system", "content": full})
+        else:
+            last = messages[-1]
+            content = last.get("content", "")
+            if isinstance(content, str):
+                last["content"] = f"{full}\n\n{content}"
+            elif isinstance(content, list):
+                content.insert(0, {"type": "text", "text": full})
+
+    _DISTILL_SYSTEM_PROMPT = (
+        "You are a memory curator for an LLM chat application. Given a "
+        "user-assistant exchange, decide whether anything durable was "
+        "established that would be useful in FUTURE conversations — a "
+        "decision and its rationale, a confirmed user preference, a "
+        "non-obvious fact about the user's project/setup, or a gotcha that "
+        "took effort to resolve.\n\n"
+        "If nothing notable (trivial Q&A, transient debugging, chitchat), "
+        "respond with exactly: NOTHING\n\n"
+        "Otherwise respond with 1-3 concise, standalone sentences that a "
+        "future session with zero other context can understand. Do NOT "
+        "prefix with 'The user' or 'Memory:' — write the fact directly. "
+        "One memory only; if multiple facts stand out, pick the most durable."
+    )
+
+    async def _distill_and_store_memory(
+        self,
+        dataset_name: str,
+        user: Optional[dict],
+        user_text: str,
+        assistant_text: str,
+    ) -> Optional[str]:
+        """Ask the distillation LLM to extract a memory, then store it.
+
+        Returns the stored memory text, or ``None`` if the exchange was
+        deemed not worth remembering (or distillation is disabled/failed).
+        """
+        if not self.valves.DISTILL_LLM_URL or not self.valves.DISTILL_LLM_MODEL:
+            return None
+        if len(assistant_text) < self.valves.DISTILL_MIN_REPLY_CHARS:
+            return None
+
+        url = self.valves.DISTILL_LLM_URL.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.valves.DISTILL_LLM_API_KEY:
+            headers["Authorization"] = f"Bearer {self.valves.DISTILL_LLM_API_KEY}"
+        payload = {
+            "model": self.valves.DISTILL_LLM_MODEL,
+            "messages": [
+                {"role": "system", "content": self._DISTILL_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"User: {user_text[:2000]}\n\nAssistant: {assistant_text[:4000]}",
+                },
+            ],
+            "max_tokens": 256,
+            "temperature": 0.1,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+                memory = resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception:
+            logger.warning("Memory distillation LLM call failed", exc_info=True)
+            return None
+
+        if not memory or memory.upper().strip() == "NOTHING":
+            return None
+
+        # Optionally auto-create the per-user dataset on first write.
+        if self.valves.MEMORY_AUTO_CREATE:
+            if not await self._ensure_dataset_exists(dataset_name, user):
+                # Dataset missing and couldn't be created — skip this write.
+                return None
+
+        # Store via the REST API (password in header, never in chat context).
+        api = self.valves.RAG_API_URL.rstrip("/")
+        store_url = f"{api}/api/datasets/{dataset_name}/documents"
+        doc = {
+            "text": memory,
+            "source": "openwebui:memory",
+            "memory_kind": "auto",
+            "memory_ts": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(store_url, json=[doc], headers=self._memory_headers(user))
+                resp.raise_for_status()
+        except Exception:
+            logger.warning("Memory store failed", exc_info=True)
+            return None
+
+        logger.info("Memory stored in '%s': %.80s…", dataset_name, memory)
+        return memory
+
     def _build_mcp_hint(
         self,
         hints: list[dict],
@@ -573,6 +898,20 @@ class Filter:
 
         content: Any = last_msg.get("content", "")
         user_text = self._extract_user_text(content)
+
+        # ── 0. Long-term memory recall (independent of media) ───────────
+        # At conversation start (or every turn if configured), search the
+        # user's PER-USER memory dataset (named from __user__) and inject
+        # relevant past memories as context.  Runs before media processing
+        # so it works even for text-only messages with no file uploads.
+        if self._memory_enabled():
+            memory_ds = self._memory_dataset_for_user(__user__)
+            if memory_ds:
+                should_recall = not self.valves.MEMORY_RECALL_FIRST_ONLY or self._is_first_user_message(messages)
+                if should_recall and user_text:
+                    memory_ctx = await self._recall_memory(memory_ds, __user__, user_text)
+                    if memory_ctx:
+                        self._inject_memory_context(messages, memory_ctx)
 
         # Determine early whether media should be stripped for this model.
         # This must be known before the early return below so that
@@ -831,4 +1170,55 @@ class Filter:
         # file_handler = True → Open WebUI strips body["files"] after
         # inlet() returns. No manual cleanup needed.
 
+        return body
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  outlet  —  called AFTER the LLM reply
+    # ════════════════════════════════════════════════════════════════════════
+
+    async def outlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __model__: Optional[dict] = None,
+        **kwargs,
+    ) -> dict:
+        """Distil and store a memory from the completed exchange.
+
+        Runs after the LLM has replied and the user has seen the answer.
+        Asks the distillation LLM to extract a durable memory from the
+        user-assistant exchange; if one is produced, stores it in the
+        memory dataset via the RAG REST API.  All of this is invisible to
+        the user (no extra tool calls in the chat, no password in context).
+        """
+        if not self._memory_enabled():
+            return body
+        if not self.valves.DISTILL_LLM_URL or not self.valves.DISTILL_LLM_MODEL:
+            return body  # recall works, but writes are disabled
+
+        # Resolve the per-user memory dataset from the OWUI user identity.
+        memory_ds = self._memory_dataset_for_user(__user__)
+        if not memory_ds:
+            return body  # no usable user identity → cannot isolate memory
+
+        messages: list[dict] = body.get("messages", [])
+        if not messages:
+            return body
+
+        # Extract the last user message and the last assistant reply.
+        user_text = ""
+        assistant_text = ""
+        for msg in reversed(messages):
+            role = msg.get("role", "")
+            if role == "assistant" and not assistant_text:
+                assistant_text = self._extract_user_text(msg.get("content", ""))
+            elif role == "user" and not user_text:
+                user_text = self._extract_user_text(msg.get("content", ""))
+            if user_text and assistant_text:
+                break
+
+        if not user_text or not assistant_text:
+            return body
+
+        await self._distill_and_store_memory(memory_ds, __user__, user_text, assistant_text)
         return body

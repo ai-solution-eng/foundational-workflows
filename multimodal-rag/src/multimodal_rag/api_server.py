@@ -188,7 +188,7 @@ def _require_dataset_password(
 
 app = FastAPI(
     title="Multimodal RAG Dataset Manager",
-    version="0.1.0",
+    version="1.0.0",
 )
 
 

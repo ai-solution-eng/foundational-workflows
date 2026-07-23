@@ -127,6 +127,112 @@ After installing, click the ⚙️ icon next to the filter to configure:
 | `INJECT_AS_SYSTEM` | `true` | Inject as system message (vs. append to user) |
 | `MAX_CONTEXT_CHARS` | `4000` | Max characters of injected context (hint + text files) |
 | `CONTEXT_HEADER` | _(default text)_ | Header before injected context |
+| `PRIORITY` | `0` | Filter priority (lower = runs first) |
+| `MEMORY_ENABLED` | `true` | Enable long-term memory (recall + write) |
+| `MEMORY_DATASET_PREFIX` | `owui-memory-` | Per-user datasets are named `{PREFIX}{user_id}` (derived from the OWUI `__user__` identity at runtime). Each user gets an isolated dataset with no per-user valve config. |
+| `MEMORY_AUTO_CREATE` | `false` | If true, create a user's memory dataset (with their derived password) on first write when it doesn't exist. |
+| `MEMORY_PASSWORD` | _(empty)_ | Shared password fallback for all per-user datasets. Used ONLY when `MEMORY_SECRET` is empty (name-based isolation). Server-side, never in LLM context. |
+| `MEMORY_SECRET` | _(empty)_ | HMAC key for deriving a UNIQUE per-user password from the SSO-authenticated `__user__` identity. When set: crypto isolation (one leak exposes one user). When empty: falls back to shared `MEMORY_PASSWORD` (one leak exposes all users). See "Per-user isolation" below. |
+| `MEMORY_RECALL_TOP_K` | `5` | Number of memories to recall at conversation start |
+| `MEMORY_RECALL_FIRST_ONLY` | `true` | Recall only on the first user message (false = every turn) |
+| `MEMORY_INJECT_AS_SYSTEM` | `true` | Inject recalled memories as a system message (vs. prepend to user) |
+| `DISTILL_LLM_URL` | _(empty)_ | OpenAI-compatible base URL for the distillation LLM. Empty = writes disabled (recall still works). |
+| `DISTILL_LLM_MODEL` | _(empty)_ | Model name for distillation (e.g. `deepseek-v4-flash`) |
+| `DISTILL_LLM_API_KEY` | _(empty)_ | API key for the distillation LLM |
+| `DISTILL_MIN_REPLY_CHARS` | `200` | Skip distillation for shorter assistant replies |
+
+## Long-term Memory
+
+In addition to multimodal media routing, the filter provides per-user
+long-term memory of past conversations:
+
+1. **Recall (inlet):** at the start of each conversation (first user
+   message), the filter searches that user's memory dataset via the RAG
+   REST API and injects the top-k relevant memories as context — so the
+   LLM knows about past decisions, preferences, and gotchas without the
+   user having to repeat them. Toggle with `MEMORY_RECALL_FIRST_ONLY`.
+2. **Write (outlet):** after the LLM replies, the filter asks a separate
+   distillation LLM (`DISTILL_LLM_*` valves) to extract any durable fact
+   worth remembering from the exchange. If the LLM produces a memory (and
+   doesn't respond `NOTHING`), it's stored in the user's memory dataset
+   via the RAG REST API. The user sees nothing — no tool calls in chat,
+   no password in context.
+
+### Per-user isolation (multi-user OWUI, SSO)
+
+OWUI filter Valves are **global** (admin-configured once, shared by all
+users on the instance), so per-user passwords can't be configured
+per-user in Valves. The filter instead derives **two** per-user secrets
+from the SSO-authenticated `__user__` identity at runtime:
+
+```
+dataset_name = MEMORY_DATASET_PREFIX + sanitised(__user__.id)
+             e.g. "owui-memory-a1b2c3d4"
+
+password     = HMAC-SHA256(MEMORY_SECRET, __user__.id)[:18]   (base64url, 24 chars)
+             e.g. "c82tY2vCJGCxRjTwr7MDxYxs"
+```
+
+Because OWUI populates `__user__` **after** SSO authentication, a user
+cannot forge another user's `id` — the derivation is sound. Two isolation
+layers, both server-side, neither in the LLM context:
+
+**When `MEMORY_SECRET` is set (recommended):**
+Each user gets a **unique, unpredictable** password derived from the
+SSO-verified identity. This is **crypto isolation**: if one user's
+password leaks, only that user's dataset is exposed. The admin sets one
+random `MEMORY_SECRET` (the HMAC key); no per-user provisioning, no
+registry.
+
+**When `MEMORY_SECRET` is empty (fallback):**
+All per-user datasets share the one `MEMORY_PASSWORD` from the Valves.
+Isolation is **dataset-name-based only**: users can't see each other's
+memories (different names), but if `MEMORY_PASSWORD` leaks, all users'
+datasets are exposed.
+
+| | `MEMORY_SECRET` set | `MEMORY_SECRET` empty |
+|---|---|---|
+| Dataset name | per-user (from `__user__.id`) | per-user (from `__user__.id`) |
+| Dataset password | per-user (HMAC-derived, unpredictable) | shared (`MEMORY_PASSWORD`) |
+| If password leaks | one user exposed | all users exposed |
+| Admin setup | one `MEMORY_SECRET` string | one `MEMORY_PASSWORD` string |
+
+### Setup (multi-user, SSO)
+
+1. **Generate a random secret** for `MEMORY_SECRET` (e.g.
+   `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
+2. **Provision each user's dataset** — either:
+   - **Automatically (recommended):** set `MEMORY_AUTO_CREATE = true`
+     and the filter creates each user's dataset on their first
+     memorable reply, using their HMAC-derived password. Zero per-user
+     admin work.
+   - **Manually:** for each OWUI user, compute their dataset name and
+     password (same HMAC formula above), then create the dataset via
+     the RAG HTML frontend with that password. Only needed if you
+     disable `MEMORY_AUTO_CREATE`.
+3. In the filter's ⚙️ settings, set:
+   - `MEMORY_DATASET_PREFIX` (default `owui-memory-` is fine)
+   - `MEMORY_SECRET` (your random secret from step 1)
+   - `MEMORY_AUTO_CREATE = true` (unless provisioning manually)
+4. Set `DISTILL_LLM_URL` / `DISTILL_LLM_MODEL` / `DISTILL_LLM_API_KEY`
+   to a lightweight OpenAI-compatible LLM for distillation (any small
+   fast model works — it just decides "is this worth remembering?").
+5. Leave `MEMORY_ENABLED = true`. Recall starts immediately (returns
+   empty for users whose dataset doesn't exist yet); writes start once
+   the distillation LLM is configured (and create the dataset first if
+   `MEMORY_AUTO_CREATE = true`).
+
+> **Secret rotation:** changing `MEMORY_SECRET` re-derives all per-user
+> passwords. Existing datasets (hashed with the old derived passwords)
+> become inaccessible. To rotate, re-create each user's dataset or
+> update each dataset's password via the REST API.
+
+### How recall + write interact with the existing media routing
+
+Memory recall runs **before** media processing in the inlet — the two
+are independent. A single user message can trigger both a memory recall
+(context injection) and media staging (MCP `search_dataset` hint). The
+outlet runs after the reply and is completely separate from the inlet.
 
 ## Model Setup in Open WebUI
 

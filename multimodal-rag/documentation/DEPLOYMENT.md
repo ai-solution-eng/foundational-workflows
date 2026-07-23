@@ -25,7 +25,7 @@ docker push your-registry/rag-api-server:latest
 
 ## 2. Configure deployment values
 
-All configuration lives in `deploy/helm//values.yaml`. Key settings:
+All configuration lives in `helm/values.yaml`. Key settings:
 
 ```bash
 # Set your image (required)
@@ -89,7 +89,7 @@ You can set these via `--set` flags or edit `values.yaml` directly.
 ## 3. Install the Helm chart
 
 ```bash
-cd deploy/helm/
+cd helm/
 
 # 1. Resolve ${DOMAIN_NAME} in values.yaml
 export DOMAIN_NAME="your-domain.com"
@@ -110,7 +110,7 @@ helm install multimodal-rag . \
   --set models.vlm.url="https://..." \
   --set models.asr.url="https://..." \
   --set modelSecrets.embedderApiKey="eyJ..." \
-  --set modelSecrets.rerankerApiKey="eyJ..." \i
+  --set modelSecrets.rerankerApiKey="eyJ..." \
   --set modelSecrets.vlmApiKey="eyJ..." \
   --set modelSecrets.asrApiKey="eyJ..."
 ```
@@ -124,7 +124,7 @@ envsubst < values.yaml > values-resolved.yaml
 helm install multimodal-rag . \
   -f values-resolved.yaml \
   --set image.repository=your-registry/rag-api-server \
-  --set image.tag=v0.1.0 \
+  --set image.tag=v1.0.0 \
   --set models.embedder.url="https://..." \
   --set models.reranker.url="https://..." \
   --set models.vlm.url="https://..." \
@@ -199,45 +199,27 @@ The UI lets you:
 
 ## 6. Connect an MCP client
 
-When `mcp.enabled=true` (default), the MCP server runs as a sidecar container
-exposing `streamable-http` transport on port 8001.
+When `mcp.enabled=true` (default), the MCP server runs as a sidecar
+container exposing `streamable-http` transport on port 9090 at `/mcp`.
 
-### From Claude Desktop or any MCP client
+For the full tool list, connection configs (opencode, Claude Desktop,
+Open WebUI, stdio), and the long-term memory setup, see:
+
+- **[MCP.md](MCP.md)** — all 9 MCP tools + connection configs for any client
+- **[MEMORY.md](MEMORY.md)** — per-user long-term memory setup (opencode + Open WebUI)
+
+### Quick reference
 
 ```json
 {
   "mcpServers": {
     "multimodal-rag": {
-      "url": "https://rag-mcp-server.your-domain.com:8001/mcp"
+      "url": "https://rag-mcp-server.your-domain.com/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
     }
   }
 }
 ```
-
-### Available MCP tools
-
-| Tool | Description |
-|------|-------------|
-| `list_datasets` | List all datasets with metadata |
-| `get_dataset_info` | Get metadata for one dataset |
-| `search_dataset` | Full multimodal retrieval with postprocessing |
-
-### `search_dataset` parameters
-
-```json
-{
-  "dataset_name": "my-dataset",
-  "query": "aurora borealis over snowy mountains",
-  "top_k": 10,
-  "use_reranker": false,
-  "reranker_top_k": 3,
-  "base_llm_modalities": ["text"]
-}
-```
-
-Returns JSON with:
-- **`context`** — formatted text ready for LLM consumption (unsupported media is auto-described by VLM/ASR)
-- **`results`** — raw result array with scores and content
 
 ---
 
@@ -285,7 +267,7 @@ When `ezua.enabled=true` (default), the chart also creates:
 
 ```bash
 helm upgrade multimodal-rag . \
-  --set image.tag=v0.2.0 \
+  --set image.tag=v1.0.0 \
   --reuse-values  # keep existing non-default values
 ```
 
@@ -293,7 +275,7 @@ To change specific values while upgrading:
 
 ```bash
 helm upgrade multimodal-rag . \
-  --set image.tag=v0.2.0 \
+  --set image.tag=v1.0.0 \
   --set persistence.data.size=500Gi
 ```
 

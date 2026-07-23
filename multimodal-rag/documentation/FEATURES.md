@@ -362,7 +362,7 @@ When a HuggingFace tokenizer is bundled (`tokenizer_type="HuggingFace"`), all te
 
 **Deduplication:**
 - **File-level**: SHA-256 hash of input files; duplicates are skipped before copying to PVC. Tracked in `.hashes.json` per dataset.
-- **Vector-level**: cosine similarity > 0.999 against existing vectors — skipped before insertion. Uses a **single batched `query_batch_points` call** per sub-batch (1 HTTP request instead of 64 individual queries). The `score_threshold` is enforced server-side by Qdrant, so only matches above the threshold are returned. The InMemoryVectorStore path uses vectorised numpy cosine similarity (N×M matrix in one shot).
+- **Vector-level**: cosine similarity > 0.995 against existing vectors — skipped before insertion. Uses a **single batched `query_batch_points` call** per sub-batch (1 HTTP request instead of 64 individual queries). The `score_threshold` is enforced server-side by Qdrant, so only matches above the threshold are returned. The InMemoryVectorStore path uses vectorised numpy cosine similarity (N×M matrix in one shot). The threshold is tunable via the `RAG_DEDUP_THRESHOLD` env var.
 
 **Media payload stripping:** After embedding and storage, base64 data URLs in Qdrant payloads are replaced with lightweight `file://` PVC paths to reduce storage size. Existing valid `file://` refs are left alone; remote URLs (`http://`/`https://`/`s3://`) are kept as-is.
 
@@ -475,16 +475,25 @@ A routing step can optionally skip RAG entirely if the LLM determines it can ans
 
 ## MCP Server
 
-Exposes **4 MCP tools** (`mcp_server.py`):
+Exposes **9 MCP tools** (`mcp_server.py`):
 
 | Tool | Purpose |
 |------|---------|
 | `list_datasets()` | Returns formatted text of all datasets (with `[caption_video]` / `[password]` markers) |
+| `unlock_dataset()` | Verify a dataset password and cache the unlock for the session (default TTL 30 min) |
 | `search_dataset()` | Multimodal search (`dataset_name`, `query`, `image`/`video`/`audio`, `top_k`, `use_reranker`, `reranker_top_k`, `password`, `media_base_url`). Instantiates a `Postprocessor` for modality conversion based on `base_llm_modalities`. |
 | `get_dataset_files()` | List or retrieve files from a dataset (text inline; binary returns metadata + `download_url`) |
 | `get_dataset_info()` | Returns dataset metadata |
+| `describe_media()` | Standalone VLM description of an image/video (no dataset needed) |
+| `transcribe_audio()` | Standalone ASR transcription of an audio file (no dataset needed) |
+| `add_memory()` | Store an LLM-curated memory into a personal memory dataset. `dataset_name`/`password` optional — resolved from the `X-Memory-Dataset` / `X-Dataset-Password` request headers (or `MEMORY_DATASET` env) so the model does not pass them. Merges provenance metadata (`source`, `memory_kind`, `memory_ts`, `memory_tags`, `session_id`) into the Qdrant payload. |
+| `search_memory()` | Recall from the personal memory dataset; same resolution + retrieval/postproc as `search_dataset` (via the shared `_run_retrieval` helper). |
 
-**Transport:** Default `streamable-http` (port 9090 in helm). Also supports `stdio` and `sse`.
+**Long-term memory (opencode):** the `add_memory` / `search_memory` tools back a per-user long-term memory store. An MCP client (e.g. opencode) connects **twice** to the same URL — once as `rag-memory` (sending `X-Memory-Dataset`/`X-Dataset-Password` headers, exposing only `add_memory`/`search_memory`) and once as `rag-knowledge` (exposing the general dataset tools). Per-user isolation is the dataset **password**; the memory headers are read ONLY inside `add_memory`/`search_memory`, so a memory password can never silently unlock another dataset. See `MCP.md`, `MEMORY.md`, `opencode.jsonc`, and `AGENTS.md` for the full pattern.
+
+**Transport:** Default `streamable-http` (port 9090 in helm). Also supports `stdio` and `sse`. A `_MemoryHeaderMiddleware` (wired in `main()`) captures the memory-identity headers into `contextvars.ContextVar`s for the memory tools.
+
+**Query-vector caching:** `search_dataset`/`search_memory` reuse a stored Qdrant vector when the query media is already in the dataset, else a hash-keyed in-process LRU cache, avoiding re-embedding the same media twice.
 
 **PVC→HTTP URL conversion:** When `media_base_url` is set (via `MEDIA_BASE_URL` env), `file://` PVC paths in results are rewritten to `{media_base_url}/api/datasets/{name}/files/{path}` HTTP URLs.
 
