@@ -407,15 +407,17 @@ class PDFProcessor:
         """Split *text* into budget-sized sub-chunks (token-aware or character-based).
 
         When *text_splitter* is provided the token-aware ``TokenTextSplitter.split_text``
-        is used (which itself avoids tiny tails).  The character-based fallback
-        applies the same 5 % threshold.
+        is used (which itself avoids tiny tails via a 10 % net-new merge and a
+        ``chunk_size // 4`` minimum-tail backfill).  The character-based fallback
+        applies the same two rules.
         """
         if not text:
             return []
         if text_splitter is not None:
             return text_splitter.split_text(text)
 
-        min_new = max(chunk_size // 20, 1)
+        min_new = max(chunk_size // 10, 1)
+        min_tail = max(chunk_size // 4, 1)
         chunks: list[str] = []
         start = 0
         prev_start = 0
@@ -432,6 +434,8 @@ class PDFProcessor:
                 if new_content < min_new:
                     chunks[-1] = text[prev_start:end].strip()
                     break
+                if end - start < min_tail:
+                    start = max(0, end - min_tail)
 
             chunks.append(text[start:end].strip())
             if end >= len(text):

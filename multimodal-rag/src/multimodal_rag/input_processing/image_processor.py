@@ -24,12 +24,26 @@ def _resize_image(raw_bytes: bytes, mime_type: str, max_pixels: int) -> bytes:
     img = Image.open(BytesIO(raw_bytes))
     w, h = img.size
     if max_pixels <= 0 or w * h <= max_pixels:
+        # Still need to convert non-RGB modes for format compatibility
+        if img.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+            img = img.convert("RGB")
+            buf = BytesIO()
+            fmt = mime_type.split("/")[-1]
+            pil_fmt = {"jpg": "JPEG", "tiff": "TIFF"}.get(fmt, fmt.upper())
+            if pil_fmt not in ("JPEG", "PNG", "GIF", "BMP", "TIFF", "WEBP"):
+                pil_fmt = "PNG"
+            img.save(buf, format=pil_fmt)
+            return buf.getvalue()
         return raw_bytes
 
     scale = (max_pixels / (w * h)) ** 0.5
     nw = max(1, int(w * scale))
     nh = max(1, int(h * scale))
     resized = img.resize((nw, nh), Image.Resampling.LANCZOS)
+
+    # Convert non-RGB modes (e.g. CMYK) to RGB for format compatibility
+    if resized.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+        resized = resized.convert("RGB")
 
     fmt = mime_type.split("/")[-1]
     pil_fmt = {"jpg": "JPEG", "tiff": "TIFF"}.get(fmt, fmt.upper())

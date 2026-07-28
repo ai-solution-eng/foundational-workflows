@@ -33,6 +33,9 @@ COPY --from=builder /usr/local/lib/python3.14/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=builder /app /app
 
+# Ensure tokenizer.json (downloaded as root in builder) is world-readable
+RUN chmod 644 /app/tokenizer.json
+
 ENV PYTHONPATH=/app/src
 ENV PYTHONDONTWRITEBYTECODE=1
 

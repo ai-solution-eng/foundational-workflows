@@ -1,4 +1,5 @@
 import importlib
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -44,10 +45,19 @@ class TokenTextSplitter:
     def split_text(self, text: str) -> list[str]:
         """Split *text* into chunks of at most *chunk_size* tokens.
 
-        Overlap is applied at token boundaries.  If the final chunk would
-        contain fewer than 5 % *chunk_size* **net-new** tokens (tokens not
-        already present in the previous chunk via overlap), those few tokens
-        are appended to the previous chunk instead, avoiding a tiny tail.
+        Overlap is applied at token boundaries.  Two tail rules prevent tiny
+        final chunks:
+
+        * **Merge:** if the final chunk would contain fewer than 10 %
+          *chunk_size* **net-new** tokens (tokens not already present in the
+          previous chunk via overlap), those tokens are folded into the
+          previous chunk instead.
+        * **Backfill:** otherwise, if the final chunk is still shorter than
+          ``chunk_size // 4`` tokens (512 for a 2048-token *chunk_size*, 2048
+          for an 8192-token one), its start is extended backward so the chunk
+          reaches that minimum.  The extended region duplicates tokens already
+          present in the previous chunk (extra leading overlap), which is
+          consistent with the overlap-based design.
         """
         if not text:
             return []
@@ -55,7 +65,8 @@ class TokenTextSplitter:
         if len(ids) <= self.chunk_size:
             return [text]
 
-        min_new = max(self.chunk_size // 20, 1)
+        min_new = max(self.chunk_size // 10, 1)
+        min_tail = max(self.chunk_size // 4, 1)
 
         chunks: list[str] = []
         start = 0
@@ -67,8 +78,13 @@ class TokenTextSplitter:
             if chunks and end >= len(ids):
                 new_content = len(ids) - prev_end
                 if new_content < min_new:
+                    # Tail is tiny: fold it into the previous chunk.
                     chunks[-1] = self._tok.decode(ids[prev_start:end])
                     break
+                # Tail stands on its own; backfill to the minimum length by
+                # extending its start backward (extra leading overlap).
+                if end - start < min_tail:
+                    start = max(0, end - min_tail)
 
             chunks.append(self._tok.decode(ids[start:end]))
             if end >= len(ids):
@@ -178,17 +194,44 @@ _TOKENIZER_CACHE: dict[str, Path | None] = {}
 
 
 def _find_bundled_tokenizer(rel: str) -> Path | None:
-    """Search upward from this file's directory for *rel*."""
+    """Locate the bundled tokenizer file.
+
+    Resolution order:
+
+    1. ``RAG_TOKENIZER_PATH`` env var (explicit override; takes precedence).
+    2. An upward search from this file's directory: ``utils/`` -> package ->
+       ``src/`` root -> application root.  The final level (application root)
+       covers the production Docker layout, where the image bundles the
+       tokenizer at ``/app/tokenizer.json`` while the package lives under
+       ``/app/src/multimodal_rag/``.
+
+    Returns ``None`` (and logs a warning) when the file cannot be found, so
+    callers fall back to character-based chunking visibly rather than silently.
+    """
     if rel in _TOKENIZER_CACHE:
         return _TOKENIZER_CACHE[rel]
 
-    # Walk up from the utils directory
+    env_path = os.environ.get("RAG_TOKENIZER_PATH")
+    if env_path:
+        candidate = Path(env_path)
+        if candidate.exists():
+            _TOKENIZER_CACHE[rel] = candidate
+            logger.info("Using tokenizer from RAG_TOKENIZER_PATH: %s", candidate)
+            return candidate
+        logger.warning("RAG_TOKENIZER_PATH=%s does not exist; ignoring", env_path)
+
     start = Path(__file__).resolve().parent  # multimodal_rag/utils/
-    for parent in [start, start.parent, start.parent.parent]:
+    for parent in (start, start.parent, start.parent.parent, start.parent.parent.parent):
         candidate = parent / rel
         if candidate.exists():
             _TOKENIZER_CACHE[rel] = candidate
+            logger.info("Using bundled tokenizer: %s", candidate)
             return candidate
 
+    logger.warning(
+        "Bundled tokenizer %r not found near %s; falling back to character-based chunking",
+        rel,
+        start,
+    )
     _TOKENIZER_CACHE[rel] = None
     return None

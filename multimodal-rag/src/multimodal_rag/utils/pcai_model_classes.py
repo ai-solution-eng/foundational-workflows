@@ -48,6 +48,56 @@ _async_client_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _async_remote_client_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _async_client_lock = threading.Lock()
 
+# Cache of discovered model names keyed by the ``{base_url}/models`` URL.
+# Only successful lookups are stored so a temporarily-down endpoint is
+# retried on the next construction. Sessions rebuild ASR/LLM/TTS frequently,
+# so this avoids redundant /v1/models round-trips per session.
+_discovered_model_names: dict[str, str] = {}
+_discovered_model_lock = threading.Lock()
+
+
+def discover_model_name(base_url: str, api_key: str = "", remote: bool = True) -> str:
+    """Best-effort lookup of the served model id via ``GET {base_url}/models``.
+
+    ``base_url`` is the OpenAI base URL (root + ``"/v1"``).  PCAI/vLLM endpoints
+    serve a single model, so the first ``data[].id`` is returned.  Returns
+    ``""`` on any failure (network, non-200, empty list) -- keeping this
+    best-effort so a transient blip never hard-fails the caller.  Successful
+    lookups are cached per URL; failures are not, so a recovered endpoint is
+    retried on the next call.
+    """
+    url = f"{base_url}/models"
+    cached = _discovered_model_names.get(url)
+    if cached:
+        return cached
+    client = _SHARED_REMOTE_HTTP_CLIENT if remote else _SHARED_HTTP_CLIENT
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        resp = client.get(url, headers=headers, timeout=10.0)
+        resp.raise_for_status()
+        data = resp.json()
+        models = data.get("data", []) if isinstance(data, dict) else []
+        ids = [str(m["id"]) for m in models if isinstance(m, dict) and m.get("id")]
+        if ids:
+            logger.info(
+                "Auto-discovered model name '%s' from %s (available: %s)",
+                ids[0],
+                url,
+                ids,
+            )
+            with _discovered_model_lock:
+                _discovered_model_names[url] = ids[0]
+            return ids[0]
+        logger.warning("No models listed at %s; leaving model_name empty.", url)
+    except Exception as e:
+        logger.warning(
+            "Could not auto-discover model name from %s: %s. "
+            "Set model_name explicitly if the endpoint lacks /v1/models.",
+            url,
+            e,
+        )
+    return ""
+
 
 def _get_async_client(remote: bool = False) -> httpx.AsyncClient:
     try:
@@ -92,6 +142,7 @@ __all__ = [
     "RerankerModel",
     "VoiceModel",
     "ToolDefinition",
+    "discover_model_name",
 ]
 
 input_modalities = Literal["text", "audio", "image", "video"]
@@ -174,9 +225,12 @@ class _NamedBytesIO(io.BytesIO):
 
 @dataclass
 class BaseModel:
-    # Model args
-    model_name: str
-    url_remote: str
+    # Model args. ``model_name`` is optional: when left empty (and the model
+    # is deployed) it is auto-discovered at construction time from the
+    # OpenAI-compatible ``GET {base_url}/models`` endpoint -- the same trick
+    # Open WebUI uses. Pass an explicit name to pin/override it.
+    model_name: str = ""
+    url_remote: str = ""
 
     # Model args w/ defaults
     description: str = ""
@@ -221,12 +275,14 @@ class BaseModel:
         from dataclasses import fields as dc_fields
 
         field_names = {f.name for f in dc_fields(cls)}
-        _CALLABLE_FIELDS = frozenset({
-            "preprocessor",
-            "model_instantiation_class",
-            "model_client_class",
-            "model_async_client_class",
-        })
+        _CALLABLE_FIELDS = frozenset(
+            {
+                "preprocessor",
+                "model_instantiation_class",
+                "model_client_class",
+                "model_async_client_class",
+            }
+        )
         kwargs: dict[str, Any] = {}
         for k, v in config.items():
             if k not in field_names:
@@ -240,6 +296,26 @@ class BaseModel:
             kwargs[k] = v
         kwargs["api_key"] = api_key
         return cls(**kwargs)  # type: ignore[arg-type]
+
+    def __post_init__(self) -> None:
+        # Auto-discover the model name from the serving endpoint when none was
+        # supplied.  This mirrors Open WebUI, which lists models via the
+        # OpenAI ``/v1/models`` API rather than requiring a hardcoded name.
+        # Disabled models are skipped so the catalog can hold placeholders.
+        if not self.model_name and self.currently_deployed:
+            self.model_name = self._discover_model_name()
+
+    def _discover_model_name(self) -> str:
+        """Look up the served model id via ``GET {base_url}/models``.
+
+        Thin instance wrapper around :func:`discover_model_name` that passes
+        this model's resolved base URL, API key, and transport.
+        """
+        return discover_model_name(
+            self.base_url,
+            self.api_key,
+            remote=self.model_usage == "remote",
+        )
 
     def _clear_cached_class_elements(self) -> None:
         for property in self._cached_properties + self._cached_functions:
@@ -408,16 +484,12 @@ class ChatModel(BaseModel):
 
     def agent(self, tool_json: Optional[dict[str, dict[str, Any]]] = None):
         if Agent is None:
-            raise ImportError(
-                "The `agents` SDK is not installed. Install with: pip install openai-agents"
-            )
+            raise ImportError("The `agents` SDK is not installed. Install with: pip install openai-agents")
         return sync_wrapper_safe(self.aagent, dict(tool_json=tool_json))
 
     async def aagent(self, tool_json: Optional[dict[str, dict[str, Any]]] = None) -> Agent:
         if Agent is None:
-            raise ImportError(
-                "The `agents` SDK is not installed. Install with: pip install openai-agents"
-            )
+            raise ImportError("The `agents` SDK is not installed. Install with: pip install openai-agents")
         # Tracing off: the SDK phones home to api.openai.com by default,
         # which fails behind the PCAI firewall and adds noise to logs.
         # set_tracing_disabled is process-global; safe to call repeatedly.
@@ -471,7 +543,9 @@ class ChatModel(BaseModel):
                     "properties": {
                         "input": {
                             "type": ["string", "array"],
-                            "description": "The input text, or a structured message array for multi-turn / multimodal input.",
+                            "description": (
+                                "The input text, or a structured message array for " "multi-turn / multimodal input."
+                            ),
                         },
                         "instructions": {
                             "type": "string",
@@ -525,6 +599,9 @@ class VoiceModel(BaseModel):
     )
 
     def __post_init__(self) -> None:
+        # Resolve model_name first (BaseModel auto-discovery via /v1/models),
+        # then seed the lazy voices cache.
+        super().__post_init__()
         # Save the init-provided voices as a seed and remove from __dict__
         # so the cached_property descriptor takes over on first access.
         # This lets callers do:  tts = VoiceModel(...); tts.remote();
@@ -612,6 +689,7 @@ class VoiceModel(BaseModel):
         tools: list[ToolDefinition] = []
 
         if self.model_type != "ASR":
+
             async def _synthesize(arguments: dict[str, Any]) -> dict[str, Any]:
                 text = arguments["text"]
                 voice = arguments.get("voice", self.tts_voice)
@@ -626,8 +704,7 @@ class VoiceModel(BaseModel):
             tools.append(
                 ToolDefinition(
                     name="synthesize",
-                    description=self.description
-                    or f"Synthesize speech from text using {self.model_name}.",
+                    description=self.description or f"Synthesize speech from text using {self.model_name}.",
                     input_schema={
                         "type": "object",
                         "properties": {
@@ -647,6 +724,7 @@ class VoiceModel(BaseModel):
             )
 
         if self.model_type != "TTS":
+
             async def _transcribe(arguments: dict[str, Any]) -> dict[str, Any]:
                 audio_b64 = arguments.get("audio_base64")
                 audio_url = arguments.get("audio_url")
@@ -670,8 +748,7 @@ class VoiceModel(BaseModel):
             tools.append(
                 ToolDefinition(
                     name="transcribe",
-                    description=self.description
-                    or f"Transcribe audio to text using {self.model_name}.",
+                    description=self.description or f"Transcribe audio to text using {self.model_name}.",
                     input_schema={
                         "type": "object",
                         "properties": {
@@ -720,22 +797,56 @@ class EmbeddingModel(BaseModel):
         """Return a token-count-aware text splitter, or ``None`` if the
         tokenizer file is not available (fall back to character-based)."""
         if self.tokenizer_type != "HuggingFace":
+            logger.info(
+                "Text chunking: character-based (tokenizer_type=%r; set "
+                "tokenizer_type=HuggingFace to enable token counts)",
+                self.tokenizer_type,
+            )
             return None
-        return TokenTextSplitter.from_bundled(
+        splitter = TokenTextSplitter.from_bundled(
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
+        if splitter is not None:
+            logger.info(
+                "Text chunking: token-based (chunk_size=%d, chunk_overlap=%d)",
+                self.chunk_size,
+                self.chunk_overlap,
+            )
+        else:
+            logger.warning(
+                "Text chunking: character-based fallback (tokenizer file not "
+                "found despite tokenizer_type=HuggingFace)",
+            )
+        return splitter
 
     @cached_property
     def code_text_splitter(self) -> Optional[TokenTextSplitter]:
         """Return a token-count-aware text splitter for code/structured data,
         using ``code_chunk_size`` / ``code_chunk_overlap``."""
         if self.tokenizer_type != "HuggingFace":
+            logger.info(
+                "Code chunking: character-based (tokenizer_type=%r; set "
+                "tokenizer_type=HuggingFace to enable token counts)",
+                self.tokenizer_type,
+            )
             return None
-        return TokenTextSplitter.from_bundled(
+        splitter = TokenTextSplitter.from_bundled(
             chunk_size=self.code_chunk_size,
             chunk_overlap=self.code_chunk_overlap,
         )
+        if splitter is not None:
+            logger.info(
+                "Code chunking: token-based (chunk_size=%d, chunk_overlap=%d)",
+                self.code_chunk_size,
+                self.code_chunk_overlap,
+            )
+        else:
+            logger.warning(
+                "Code chunking: character-based fallback (tokenizer file not "
+                "found despite tokenizer_type=HuggingFace)",
+            )
+        return splitter
 
     @cached_property
     def model(self):
@@ -768,7 +879,9 @@ class EmbeddingModel(BaseModel):
                         "texts": {
                             "type": "array",
                             "items": {"type": ["string", "object"]},
-                            "description": "List of texts (strings) or multimodal dicts ({text, image, video, audio}) to embed.",
+                            "description": (
+                                "List of texts (strings) or multimodal dicts " "({text, image, video, audio}) to embed."
+                            ),
                         },
                     },
                     "required": ["texts"],
@@ -804,7 +917,10 @@ class RerankerModel(BaseModel):
             # arerank returns list[list[dict]] (one inner list per query).
             # For a single query (the common case), unwrap.
             if isinstance(query, (str, dict)):
-                results = results[0] if results else []
+                return {
+                    "results": results[0] if results else [],
+                    "model": self.model_name,
+                }
             return {
                 "results": results,
                 "model": self.model_name,
@@ -813,8 +929,7 @@ class RerankerModel(BaseModel):
         return [
             ToolDefinition(
                 name="rerank",
-                description=self.description
-                or f"Rerank documents by relevance to a query using {self.model_name}.",
+                description=self.description or f"Rerank documents by relevance to a query using {self.model_name}.",
                 input_schema={
                     "type": "object",
                     "properties": {

@@ -1193,7 +1193,7 @@ class DatasetManager:
                         # pages are still being extracted.
                         if len(pdf_batch) >= embed_batch:
                             _fix_source(pdf_batch, fname, dst_str)
-                            self._save_doc_media(dataset_name, pdf_batch)
+                            self._save_doc_media(dataset_name, pdf_batch, model_max_pixels=max_pixels)
                             batch_docs.extend(pdf_batch)
                             batch_files_list.append((fname, len(pdf_batch), file_type))
                             pdf_batch = []
@@ -1207,24 +1207,29 @@ class DatasetManager:
                     # Handle remaining chunks from the generator
                     if pdf_batch:
                         _fix_source(pdf_batch, fname, dst_str)
-                        self._save_doc_media(dataset_name, pdf_batch)
+                        self._save_doc_media(dataset_name, pdf_batch, model_max_pixels=max_pixels)
                         batch_docs.extend(pdf_batch)
                         batch_files_list.append((fname, len(pdf_batch), file_type))
                     current_score = 0.0
                     file_total = chunk_count
 
                 elif file_type == "image":
+                    original_dst = dst_str
                     dst = _preprocess_image_file(dst)
                     dst_str = str(dst)
                     img_proc = ImageProcessor(max_pixels=max_pixels)
                     doc = img_proc.process(dst_str)
                     _fix_source([doc], fname, dst_str)
+                    doc["preprocessed_image"] = f"file://{dst_str}"
+                    if dst_str != original_dst:
+                        doc["original_image"] = f"file://{original_dst}"
                     batch_docs.append(doc)
                     current_score += file_bytes / _MB
                     batch_files_list.append((fname, 1, file_type))
                     file_total = 1
 
                 elif file_type == "video":
+                    original_dst = dst_str
                     dst = _preprocess_video_file(dst)
                     dst_str = str(dst)
                     vid_proc = VideoProcessor(
@@ -1237,8 +1242,11 @@ class DatasetManager:
                     vid_batch: list[dict[str, Any]] = []
                     vid_chunk_count = 0
                     store_url = f"file://{dst_str}"
+                    original_url = f"file://{original_dst}" if dst_str != original_dst else None
                     for doc in vid_proc.process_iter(dst_str):
-                        doc["original_video"] = store_url
+                        doc["preprocessed_video"] = store_url
+                        if original_url:
+                            doc["original_video"] = original_url
                         vid_batch.append(doc)
                         vid_chunk_count += 1
 
@@ -1515,25 +1523,30 @@ class DatasetManager:
                 text_splitter=text_splitter,
             )
             _fix_source(chunks, fname, source_str)
-            self._save_doc_media(dataset_name, chunks)
+            self._save_doc_media(dataset_name, chunks, model_max_pixels=mpk.get("max_pixels", 720 * 720))
             ids = rag.add_to_vector_store(chunks)
             self._strip_media_payloads(rag, ids)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
             return {"type": "pdf", "chunks": len(ids), "stored_ids": ids}
 
         elif file_type == "image":
+            original_path = str(dst_path)
             dst_path = _preprocess_image_file(dst_path)
             source_str = str(dst_path)
             store_url = f"file://{source_str}"
             img_proc = ImageProcessor(max_pixels=mpk.get("max_pixels", 720 * 720))
             doc = img_proc.process(source_str)
             _fix_source([doc], fname, source_str)
+            doc["preprocessed_image"] = store_url
+            if not source_url and source_str != original_path:
+                doc["original_image"] = f"file://{original_path}"
             ids = rag.add_to_vector_store([doc])
             self._strip_media_payloads(rag, ids, store_url)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
             return {"type": "image", "chunks": len(ids), "stored_ids": ids}
 
         elif file_type == "video":
+            original_path = str(dst_path)
             dst_path = _preprocess_video_file(dst_path)
             source_str = str(dst_path)
             store_url = f"file://{source_str}"
@@ -1544,8 +1557,11 @@ class DatasetManager:
                 target_frames=_VIDEO_TARGET_FRAMES,
             )
             docs = vid_proc.process(source_str)
+            original_url = f"file://{original_path}" if not source_url and source_str != original_path else None
             for doc in docs:
-                doc["original_video"] = store_url
+                doc["preprocessed_video"] = store_url
+                if original_url:
+                    doc["original_video"] = original_url
             _fix_source(docs, fname, source_str)
             if docs:
                 ids = rag.add_to_vector_store(docs)
@@ -1729,12 +1745,15 @@ class DatasetManager:
     # ------------------------------------------------------------------
 
     def _strip_media_payloads(self, rag: MultimodalRAG, point_ids: list[str], source_url: str | None = None) -> None:
-        """Replace data URL payloads in Qdrant with lightweight ``file://`` refs.
+        """Replace heavy data-URL payloads in Qdrant with lightweight ``file://`` refs.
 
-        After embedding, the stored ``image`` / ``video`` / ``audio`` keys
-        can contain multi-megabyte base64 blobs.  This strips them down to
-        just the ``file://`` PVC path, which the postprocessor re-expands
-        at query time via :func:`_file_url_to_data_url`.
+        **Tier 3 keys** (``image``, ``video``) are **kept as data URLs** — they
+        hold model-ready base64 that the reranker and VLM consume directly at
+        retrieval time, avoiding redundant file reads and re-resizing.
+
+        **Tier 1/2 keys** (``preprocessed_*``, ``original_*``) and ``audio``
+        are stripped if they still contain data URLs (they should normally be
+        ``file://`` refs by this point, but this is a safety net).
         """
         if not point_ids:
             return
@@ -1758,7 +1777,17 @@ class DatasetManager:
                 continue
 
             modified = False
-            for key in ("image", "video", "audio", "original_video"):
+            # NOTE: "image" and "video" are intentionally excluded — their
+            # tier-3 data URLs are consumed directly by the reranker/VLM.
+            for key in (
+                "audio",
+                "preprocessed_image",
+                "preprocessed_video",
+                "preprocessed_audio",
+                "original_image",
+                "original_video",
+                "original_audio",
+            ):
                 val = meta.get(key)
                 if val is None:
                     continue
@@ -1813,13 +1842,27 @@ class DatasetManager:
             except Exception:
                 continue
 
-    def _save_doc_media(self, dataset_name: str, docs: list[dict[str, Any]]) -> None:
+    def _save_doc_media(
+        self,
+        dataset_name: str,
+        docs: list[dict[str, Any]],
+        model_max_pixels: int = 720 * 720,
+    ) -> None:
         """Save inline data-URL media to files and swap the reference.
 
-        Iterates over every document dict and, for each ``image`` /
-        ``video`` / ``audio`` value that is a data URL, writes the
-        decoded bytes to a file in the dataset's ``files/`` directory
-        and replaces the data URL with a ``file://`` path.
+        **Tier 3 keys** (``image``, ``video``) are **kept as data URLs** so the
+        reranker and VLM can consume them directly from Qdrant without file
+        I/O or re-resizing.
+
+        For ``image`` data URLs that arrive at a resolution above tier 3
+        (e.g. PDF-extracted images), the data URL is resized down to
+        *model_max_pixels* and a tier-2 ``preprocessed_image`` ``file://``
+        ref is produced alongside.
+
+        ``audio`` data URLs are saved to PVC files (existing behaviour).
+
+        ``preprocessed_*`` / ``original_*`` data URLs, if any, are saved to
+        PVC files as a safety net.
         """
         files_dir = self._dataset_dir(dataset_name) / "files"
         files_dir.mkdir(parents=True, exist_ok=True)
@@ -1827,17 +1870,17 @@ class DatasetManager:
         for doc in docs:
             if not isinstance(doc, dict):
                 continue
-            for key in ("image", "video", "audio", "original_video"):
-                val = doc.get(key)
-                if not val:
-                    continue
+
+            # -- image: keep tier-3 data URL, produce tier-2 file ref ------
+            val = doc.get("image")
+            if val:
                 urls = val if isinstance(val, list) else [val]
                 new_urls: list[str] = []
+                preproc_urls: list[str] = []
                 for url in urls:
                     if not url.startswith("data:"):
                         new_urls.append(url)
                         continue
-                    # Decode data URL and write to a file
                     m = re.match(r"data:([^;]+);base64,(.+)", url)
                     if not m:
                         new_urls.append(url)
@@ -1845,20 +1888,276 @@ class DatasetManager:
                     mime = m.group(1)
                     raw = base64.b64decode(m.group(2))
 
-                    # Preprocess inline media before writing to PVC
-                    if key == "image":
-                        from multimodal_rag.input_processing.image_processor import (
-                            _resize_image,
-                        )
+                    from multimodal_rag.input_processing.image_processor import (
+                        _resize_image,
+                    )
 
-                        raw = _resize_image(raw, mime, _PVC_IMAGE_MAX_PIXELS)
+                    # Tier 2: save to PVC file
+                    tier2_raw = _resize_image(raw, mime, _PVC_IMAGE_MAX_PIXELS)
+                    ext = mimetypes.guess_extension(mime) or ".bin"
+                    fname = f"{uuid.uuid4().hex}_image{ext}"
+                    dest = files_dir / fname
+                    dest.write_bytes(tier2_raw)
+                    preproc_urls.append(f"file://{dest}")
 
+                    # Tier 3: keep as data URL (resized to model-ready)
+                    tier3_raw = _resize_image(raw, mime, model_max_pixels)
+                    b64 = base64.b64encode(tier3_raw).decode("utf-8")
+                    new_urls.append(f"data:{mime};base64,{b64}")
+
+                doc["image"] = new_urls if isinstance(val, list) else new_urls[0]
+                if preproc_urls:
+                    doc["preprocessed_image"] = preproc_urls if isinstance(val, list) else preproc_urls[0]
+
+            # -- video: keep as tier-3 data URL (no file save) --------------
+            # VideoProcessor already produces model-ready segments.
+            # Don't save to file — the data URL stays in Qdrant for the
+            # reranker/VLM to consume directly.
+            # (No action needed for "video" key.)
+
+            # -- audio: save to file (existing behaviour) ------------------
+            for key in ("audio",):
+                val = doc.get(key)
+                if not val:
+                    continue
+                urls = val if isinstance(val, list) else [val]
+                new_urls = []
+                for url in urls:
+                    if not url.startswith("data:"):
+                        new_urls.append(url)
+                        continue
+                    m = re.match(r"data:([^;]+);base64,(.+)", url)
+                    if not m:
+                        new_urls.append(url)
+                        continue
+                    mime = m.group(1)
+                    raw = base64.b64decode(m.group(2))
                     ext = mimetypes.guess_extension(mime) or ".bin"
                     fname = f"{uuid.uuid4().hex}_{key}{ext}"
                     dest = files_dir / fname
                     dest.write_bytes(raw)
                     new_urls.append(f"file://{dest}")
                 doc[key] = new_urls if isinstance(val, list) else new_urls[0]
+
+            # -- preprocessed_*/original_*: save data URLs to file ----------
+            # Safety net — these should normally be file:// refs already.
+            for key in (
+                "preprocessed_image",
+                "preprocessed_video",
+                "preprocessed_audio",
+                "original_image",
+                "original_video",
+                "original_audio",
+            ):
+                val = doc.get(key)
+                if not val:
+                    continue
+                urls = val if isinstance(val, list) else [val]
+                new_urls = []
+                for url in urls:
+                    if not url.startswith("data:"):
+                        new_urls.append(url)
+                        continue
+                    m = re.match(r"data:([^;]+);base64,(.+)", url)
+                    if not m:
+                        new_urls.append(url)
+                        continue
+                    mime = m.group(1)
+                    raw = base64.b64decode(m.group(2))
+                    ext = mimetypes.guess_extension(mime) or ".bin"
+                    fname = f"{uuid.uuid4().hex}_{key}{ext}"
+                    dest = files_dir / fname
+                    dest.write_bytes(raw)
+                    new_urls.append(f"file://{dest}")
+                doc[key] = new_urls if isinstance(val, list) else new_urls[0]
+
+    # ------------------------------------------------------------------
+    # Tier-schema migration
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _derive_tier1_path(tier2_path: str) -> str | None:
+        """Reverse-engineer the tier-1 (full-quality) path from a tier-2
+        ``_preprocessed`` path.
+
+        ``_preprocess_image_file`` / ``_preprocess_video_file`` create a
+        sibling whose stem ends with ``_preprocessed``.  Stripping that
+        suffix yields the original file.  Returns ``None`` when the tier-1
+        file does not exist on disk (e.g. it was never preprocessed, or the
+        original was deleted).
+        """
+        p = Path(tier2_path)
+        if not p.stem.endswith("_preprocessed"):
+            return None
+        tier1 = p.with_name(p.stem[: -len("_preprocessed")] + p.suffix)
+        if tier1.exists():
+            return str(tier1)
+        return None
+
+    def migrate_tier_schema(
+        self,
+        dataset_name: str,
+        model_max_pixels: int = 720 * 720,
+        batch_size: int = 200,
+    ) -> dict[str, Any]:
+        """Migrate existing Qdrant points to the three-tier media schema.
+
+        * ``original_video`` (old tier-2 key) → renamed to ``preprocessed_video``
+        * ``preprocessed_image`` / ``preprocessed_video`` derived from
+          ``source`` when missing
+        * ``original_image`` / ``original_video`` (tier 1) reverse-engineered
+          from ``preprocessed_*`` paths
+        * ``image`` / ``video`` ``file://`` refs converted to tier-3 base64
+          data URLs (images are resized; videos are read as-is when small
+          enough)
+
+        The migration is **idempotent** — points that already have
+        ``preprocessed_*`` keys and data-URL ``image``/``video`` are skipped.
+
+        Returns a summary dict with ``migrated``, ``skipped``, and ``errors``
+        counts.
+        """
+        import base64 as _b64
+        from multimodal_rag.input_processing.image_processor import _resize_image
+
+        rag = self._get_rag(dataset_name)
+        vs = rag.vector_store
+        if vs is None or isinstance(vs, dict):
+            return {"error": "no vector store"}
+        client = vs._client  # type: ignore[attr-defined]
+        coll = vs.collection_name  # type: ignore[attr-defined]
+
+        migrated = 0
+        skipped = 0
+        errors = 0
+
+        scroll_offset: str | None = None
+        while True:
+            pts, scroll_offset = client.scroll(
+                coll,
+                limit=batch_size,
+                offset=scroll_offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not pts:
+                break
+
+            updates: dict[str, list[str]] = {}
+            for pt in pts:
+                payload = pt.payload or {}
+                meta = payload.get("metadata", {})
+                if not isinstance(meta, dict):
+                    continue
+
+                changed = False
+                pt_id = str(pt.id)
+
+                # 1. Rename original_video → preprocessed_video (old tier 2)
+                ov = meta.get("original_video")
+                pv = meta.get("preprocessed_video")
+                if ov and not pv:
+                    meta["preprocessed_video"] = ov
+                    del meta["original_video"]
+                    changed = True
+                elif ov and pv:
+                    # Both exist — just drop the old key
+                    del meta["original_video"]
+                    changed = True
+
+                # 2. Derive preprocessed_image from source if missing
+                pi = meta.get("preprocessed_image")
+                src = meta.get("source")
+                if not pi and src:
+                    if isinstance(src, str) and (src.startswith("file://") or os.path.exists(src)):
+                        meta["preprocessed_image"] = f"file://{src}" if not src.startswith("file://") else src
+                        changed = True
+
+                # 3. Derive original_image / original_video (tier 1)
+                for modality in ("image", "video"):
+                    preproc_key = f"preprocessed_{modality}"
+                    orig_key = f"original_{modality}"
+                    if meta.get(orig_key):
+                        continue  # already set
+                    preproc_val = meta.get(preproc_key)
+                    if not preproc_val:
+                        # Fall back to source for images
+                        if modality == "image" and src:
+                            preproc_val = f"file://{src}" if not src.startswith("file://") else src
+                        else:
+                            continue
+                    path_str = preproc_val[7:] if preproc_val.startswith("file://") else preproc_val
+                    tier1 = self._derive_tier1_path(path_str)
+                    if tier1:
+                        meta[orig_key] = f"file://{tier1}"
+                        changed = True
+
+                # 4. Convert image file:// ref → tier-3 data URL
+                img_val = meta.get("image")
+                if img_val and isinstance(img_val, str) and img_val.startswith("file://"):
+                    img_path = img_val[7:]
+                    if os.path.exists(img_path):
+                        try:
+                            raw = Path(img_path).read_bytes()
+                            mime = mimetypes.guess_type(img_path)[0] or "image/jpeg"
+                            tier3 = _resize_image(raw, mime, model_max_pixels)
+                            b64 = _b64.b64encode(tier3).decode("utf-8")
+                            meta["image"] = f"data:{mime};base64,{b64}"
+                            changed = True
+                        except Exception:
+                            errors += 1
+                    # If file doesn't exist, leave as-is
+
+                # 5. Convert video file:// ref → tier-3 data URL
+                #    Skip if the file is too large (> 8 MB) to avoid
+                #    bloating Qdrant — those points will still work via
+                #    file:// refs (reranker/VLM read the file).
+                vid_val = meta.get("video")
+                if vid_val and isinstance(vid_val, str) and vid_val.startswith("file://"):
+                    vid_path = vid_val[7:]
+                    if os.path.exists(vid_path):
+                        try:
+                            fsize = os.path.getsize(vid_path)
+                            if fsize <= 8 * 1024 * 1024:
+                                raw = Path(vid_path).read_bytes()
+                                mime = mimetypes.guess_type(vid_path)[0] or "video/mp4"
+                                b64 = _b64.b64encode(raw).decode("utf-8")
+                                meta["video"] = f"data:{mime};base64,{b64}"
+                                changed = True
+                        except Exception:
+                            errors += 1
+
+                if not changed:
+                    skipped += 1
+                    continue
+
+                new_payload = {
+                    "page_content": payload.get("page_content", ""),
+                    "metadata": meta,
+                }
+                key = json.dumps(new_payload, sort_keys=True, default=str)
+                updates.setdefault(key, []).append(pt_id)
+                migrated += 1
+
+            # Batch set_payload
+            for payload_json, ids in updates.items():
+                try:
+                    client.set_payload(
+                        coll,
+                        payload=json.loads(payload_json),
+                        points=ids,
+                    )
+                except Exception:
+                    errors += len(ids)
+
+            if scroll_offset is None:
+                break
+
+        return {
+            "migrated": migrated,
+            "skipped": skipped,
+            "errors": errors,
+        }
 
     # ------------------------------------------------------------------
     # Search

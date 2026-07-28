@@ -1042,10 +1042,12 @@ def _get_embedder_mm_kwargs() -> dict[str, Any]:
 
     Builds the embedder config from environment variables via
     :func:`build_embedder` — this reads ``MODEL_EMBEDDER_EXTRA`` /
-    ``MODEL_EMBEDDER_NAME`` etc. and does **not** probe the embedder
-    endpoint, so it is safe to call at staging time before the
-    DatasetManager is initialised.  Falls back to the default Qwen3-VL
-    kwargs when the embedder env vars are not set.
+    ``MODEL_EMBEDDER_NAME`` etc. and never invokes the embedding API,
+    so it is safe to call at staging time before the DatasetManager is
+    initialised.  If ``MODEL_EMBEDDER_NAME`` is omitted the model id is
+    auto-discovered via a best-effort ``GET /v1/models`` probe (harmless
+    to fail).  Falls back to the default Qwen3-VL kwargs when the
+    embedder env vars are not set.
     """
     global _embedder_mm_kwargs
     if _embedder_mm_kwargs is not None:
@@ -1479,6 +1481,23 @@ def _build_storage_stats(dm: DatasetManager) -> dict[str, Any]:
         "total_datasets": len(datasets),
         "total_documents": total_docs,
     }
+
+
+@app.post("/api/admin/datasets/{name}/migrate-tier-schema")
+async def api_migrate_tier_schema(name: str) -> dict[str, Any]:
+    """Migrate a dataset's Qdrant points to the three-tier media schema.
+
+    Renames ``original_video`` → ``preprocessed_video``, derives tier-1
+    ``original_*`` paths, and converts ``image``/``video`` ``file://`` refs
+    to tier-3 base64 data URLs.  Idempotent.
+    """
+    dm = await get_manager_async()
+
+    def _do_migrate() -> dict[str, Any]:
+        return dm.migrate_tier_schema(name)
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(sync_pool, _do_migrate)
 
 
 # ---------------------------------------------------------------------------

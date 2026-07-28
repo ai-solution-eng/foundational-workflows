@@ -2,7 +2,7 @@
 replicaCount: 1
 image:
   repository: andrewbydlon/rag-api-server
-  tag: v1.0.0
+  tag: v1.1.0
   pullPolicy: IfNotPresent
 
 deployment:
@@ -23,9 +23,10 @@ persistence:
 
 
 # -- Model configuration ------------------------------------------------------
-# Each model role has a name, URL, optional className, and optional extra
-# kwargs (serialised as JSON into the ConfigMap).  API keys are set
-# separately via `modelSecrets` (Kubernetes Secret).
+# Each model role has a URL (required to enable), an optional name (auto-
+# detected from the endpoint's /v1/models listing when omitted), an optional
+# className, and optional extra kwargs (serialised as JSON into the ConfigMap).
+# API keys are set separately via `modelSecrets` (Kubernetes Secret).
 # Set url to "" to disable a component.
 models:
   embedder:
@@ -38,7 +39,7 @@ models:
       chunk_overlap: 256
       code_chunk_size: 8192
       code_chunk_overlap: 512
-      tokenizer_name: "Qwen/Qwen3-VL-Reranker-8B"
+      tokenizer_name: "Qwen/Qwen3-VL-Embedding-8B"
       tokenizer_type: "HuggingFace"
   reranker:
     name: "Qwen/Qwen3-VL-Reranker-8B"
@@ -140,6 +141,7 @@ ezua:
 
   # configure the authorization policy
   authorizationPolicy:
+    enabled: true
     namespace: "istio-system"
     providerName: "oauth2-proxy"
 

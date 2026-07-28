@@ -6,6 +6,7 @@ metadata:
   labels:
     app: {{ .Values.deployment.appName }}
 data:
+  # NAME entries are optional: empty → auto-discovered via /v1/models.
   # Embedder
   MODEL_EMBEDDER_NAME: {{ .Values.models.embedder.name | quote }}
   MODEL_EMBEDDER_URL: {{ .Values.models.embedder.url | quote }}

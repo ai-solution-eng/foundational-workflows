@@ -20,6 +20,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from starlette.types import ASGIApp, Receive, Scope, Send
+
 from multimodal_rag.dataset_manager import DatasetManager
 from multimodal_rag.rag_system import MultimodalRAG
 from multimodal_rag.utils.logging_utils import logging, setup_logger
@@ -121,31 +123,45 @@ _memory_dataset_ctx: contextvars.ContextVar[Optional[str]] = contextvars.Context
 _memory_password_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "rag_memory_password", default=None
 )
+_opencode_session_id_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "opencode_session_id", default=None
+)
 
 
 class _MemoryHeaderMiddleware:
-    """ASGI middleware that funnels memory-identity headers into ContextVars."""
+    """ASGI middleware that funnels memory-identity headers into ContextVars.
 
-    def __init__(self, app):
+    Captures:
+      * ``X-Memory-Dataset``     → memory dataset name
+      * ``X-Dataset-Password``   → memory dataset password
+      * ``X-Opencode-Session-ID``→ opencode session ID (auto-tagged on memories)
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
-    async def __call__(self, scope, receive, send):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("type") != "http":
             return await self.app(scope, receive, send)
         ds: Optional[str] = None
         pw: Optional[str] = None
+        sid: Optional[str] = None
         for name, value in scope.get("headers") or []:
             if name == b"x-memory-dataset":
                 ds = value.decode("latin-1").strip() or None
             elif name == b"x-dataset-password":
                 pw = value.decode("latin-1").strip() or None
+            elif name == b"x-opencode-session-id":
+                sid = value.decode("latin-1").strip() or None
         ds_tok = _memory_dataset_ctx.set(ds)
         pw_tok = _memory_password_ctx.set(pw)
+        sid_tok = _opencode_session_id_ctx.set(sid)
         try:
             await self.app(scope, receive, send)
         finally:
             _memory_dataset_ctx.reset(ds_tok)
             _memory_password_ctx.reset(pw_tok)
+            _opencode_session_id_ctx.reset(sid_tok)
 
 
 def _resolve_memory_dataset(dataset_name: str | None) -> str:
@@ -163,6 +179,20 @@ def _resolve_memory_dataset(dataset_name: str | None) -> str:
 def _resolve_memory_password(password: str | None) -> Optional[str]:
     """Resolve the memory dataset password: explicit arg → request header."""
     return password if password else _memory_password_ctx.get()
+
+
+def _resolve_session_id(existing: str | None = None) -> Optional[str]:
+    """Resolve the opencode session ID: explicit arg → request header → env.
+
+    Resolution order:
+      1. *existing* — a session ID already present in the caller's metadata
+         (the LLM may have passed it explicitly via the ``session-id`` tool).
+      2. ``X-Opencode-Session-ID`` request header (captured by the middleware
+         into ``_opencode_session_id_ctx``).
+      3. ``OPENCODE_SESSION_ID`` environment variable (e.g. set by an opencode
+         plugin via the ``shell.env`` hook).
+    """
+    return existing or _opencode_session_id_ctx.get() or os.environ.get("OPENCODE_SESSION_ID")
 
 
 def _resolve_and_unlock(
@@ -244,26 +274,26 @@ async def get_manager_async() -> DatasetManager:
     return await loop.run_in_executor(_pool, get_manager)
 
 
-def _prefer_original_media(doc: Any) -> Any:
-    """Return a copy of *doc* where embedding-grade media keys are replaced
-    by their higher-quality ``original_*`` counterparts when available.
+def _prefer_preprocessed_media(doc: Any) -> Any:
+    """Return a copy of *doc* where tier-3 media keys are replaced by their
+    tier-2 ``preprocessed_*`` counterparts when available.
 
-    At ingest time ``image`` / ``video`` / ``audio`` hold the low-resolution
-    surrogate used for embedding (e.g. a 1 fps, ≤720×720 video segment).
-    The ``original_image`` / ``original_video`` / ``original_audio`` keys
-    (when present) point at the preprocessed, higher-quality file on the PVC
-    (e.g. the full video at ≤720p @ 24 fps).  Surfacing the higher-quality
-    reference in the primary ``image`` / ``video`` / ``audio`` keys ensures
-    the LLM cites and links the best available version rather than the
-    embedding-grade surrogate stored in Qdrant.
+    At ingest time ``image`` / ``video`` / ``audio`` hold the tier-3
+    model-ready data URL used for embedding (e.g. a 1 fps, ≤720×720 video
+    segment).  The ``preprocessed_image`` / ``preprocessed_video`` /
+    ``preprocessed_audio`` keys (when present) point at the tier-2
+    preprocessed file on the PVC (e.g. the full video at ≤720p @ 24 fps).
+    Surfacing the tier-2 ref in the primary ``image`` / ``video`` / ``audio``
+    keys ensures the LLM cites and links a user-viewable version rather than
+    the embedding-grade data URL stored in Qdrant.
     """
     if not isinstance(doc, dict):
         return doc
     d = dict(doc)
     for modality in ("image", "video", "audio"):
-        orig = d.get(f"original_{modality}")
-        if orig:
-            d[modality] = orig
+        preproc = d.get(f"preprocessed_{modality}")
+        if preproc:
+            d[modality] = preproc
     return d
 
 
@@ -373,6 +403,9 @@ def _lookup_dataset_vector(
         "metadata.image",
         "metadata.video",
         "metadata.audio",
+        "metadata.preprocessed_image",
+        "metadata.preprocessed_video",
+        "metadata.preprocessed_audio",
         "metadata.original_image",
         "metadata.original_video",
         "metadata.original_audio",
@@ -698,11 +731,11 @@ def _run_retrieval(
         elif isinstance(doc, dict):
             entry["embedding_score"] = doc.pop("_embedding_score", entry["score"])
             entry["reranker_score"] = doc.pop("_reranker_score", None)
-            # Surface higher-quality original_* media (preprocessed
-            # files) as the primary image/video/audio keys so the LLM
-            # cites the best available version, not the embedding-grade
-            # surrogate stored in Qdrant.
-            entry.update(_prefer_original_media(doc))
+            # Surface tier-2 preprocessed_* media (PVC files) as the
+            # primary image/video/audio keys so the LLM cites a
+            # user-viewable version, not the tier-3 data URL stored
+            # in Qdrant.
+            entry.update(_prefer_preprocessed_media(doc))
         raw_results.append(entry)
 
     # -- Optionally convert PVC paths to HTTP URLs --
@@ -995,7 +1028,9 @@ try:
             Optional structured provenance, e.g.
             ``{"kind": "decision", "tags": ["auth", "refactor"],
             "session_id": "abc123"}``.  Stored alongside the memory in the
-            vector payload for later filtering.
+            vector payload for later filtering.  The ``session_id`` field is
+            auto-populated from the ``X-Opencode-Session-ID`` request header
+            or ``OPENCODE_SESSION_ID`` env var when not provided explicitly.
         dataset_name:
             Memory dataset.  Optional — resolved from the
             ``X-Memory-Dataset`` request header or ``MEMORY_DATASET`` env
@@ -1006,6 +1041,16 @@ try:
         """
         ds_name = _resolve_memory_dataset(dataset_name)
         pw = _resolve_memory_password(password)
+
+        # Auto-tag the opencode session ID if one is available (from a
+        # request header, env var, or the caller's metadata).  An explicit
+        # session_id in metadata always wins; otherwise we fill it in so
+        # memories are traceable to the session that created them without
+        # the LLM having to pass it manually.
+        metadata = dict(metadata) if metadata else {}
+        resolved_sid = _resolve_session_id(metadata.get("session_id"))
+        if resolved_sid:
+            metadata["session_id"] = resolved_sid
 
         dm = get_manager()
         try:

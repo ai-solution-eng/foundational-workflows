@@ -55,25 +55,25 @@ def _split_media(doc: dict[str, Any]) -> dict[str, list[str]]:
 
 
 def _preferred_media(doc: dict[str, Any]) -> dict[str, list[str]]:
-    """Like :func:`_split_media` but prefer higher-quality ``original_*`` refs.
+    """Like :func:`_split_media` but prefer tier-2 ``preprocessed_*`` refs.
 
-    At ingest time each media key (``image`` / ``video`` / ``audio``) holds
-    the low-resolution surrogate used for embedding — e.g. a 1 fps, ≤720×720
-    video segment.  A parallel ``original_image`` / ``original_video`` /
-    ``original_audio`` key (when present) points at the preprocessed,
-    higher-quality file on the PVC (e.g. the full video at ≤720p @ 24 fps).
+    Each media key (``image`` / ``video`` / ``audio``) holds the tier-3
+    model-ready data URL used for embedding (e.g. a 1 fps, ≤720×720 video
+    segment).  A parallel ``preprocessed_image`` / ``preprocessed_video`` /
+    ``preprocessed_audio`` key (when present) points at the tier-2
+    preprocessed file on the PVC (e.g. the full video at ≤720p @ 24 fps),
+    which is what the base LLM and end user should see by default.
 
     Use this helper at *retrieval* time when surfacing media URLs to the LLM
-    or end user, so they are pointed at the best available version rather
-    than the embedding-grade surrogate stored in Qdrant.  VLM captioning and
-    ASR should keep using :func:`_split_media` so they operate on the precise
-    matched segment and stay cheap.
+    or end user.  VLM captioning and ASR should keep using
+    :func:`_split_media` so they operate on the tier-3 data URL already
+    stored in Qdrant — no file read or re-resize needed.
     """
     out: dict[str, list[str]] = {}
     for k in ("audio", "image", "video"):
-        orig = doc.get(f"original_{k}")
-        if orig:
-            out[k] = _as_url_list(orig)
+        preproc = doc.get(f"preprocessed_{k}")
+        if preproc:
+            out[k] = _as_url_list(preproc)
         else:
             out[k] = _as_url_list(doc.get(k))
     return out
@@ -490,11 +490,11 @@ class Postprocessor:
             d = doc if isinstance(doc, dict) else {"text": str(doc)}
             text = d.get("text", "")
             media = _split_media(d)
-            # Higher-quality (preprocessed) media refs — used when surfacing
-            # URLs to vision LLMs / users so they link the best available
-            # version.  VLM captioning and ASR keep using ``media`` (the
-            # matched, embedding-grade segment) so descriptions stay precise
-            # and cheap.
+            # Tier-2 preprocessed_* refs — used when surfacing URLs to the
+            # base LLM / users so they link a user-viewable version.
+            # VLM captioning and ASR keep using ``media`` (the tier-3 data
+            # URL already in Qdrant) so descriptions stay precise and cheap
+            # — no file read or re-resize needed.
             preferred = _preferred_media(d)
 
             result: dict[str, Any] = {}
@@ -502,8 +502,8 @@ class Postprocessor:
                 result["text"] = text
 
             # -- pass through modalities the LLM supports natively ----------
-            # Surface the higher-quality original_* refs (preprocessed files)
-            # rather than the embedding-grade surrogates.
+            # Surface the tier-2 preprocessed_* refs (PVC files) rather than
+            # the tier-3 embedding-grade data URLs stored in Qdrant.
             for modality in ("image", "video", "audio"):
                 if modality in llm_modalities and preferred[modality]:
                     result[modality] = preferred[modality]
@@ -577,8 +577,8 @@ class Postprocessor:
             # -- Fallback: include clickable links for unconverted media ----
             # When the LLM doesn't support a modality AND the conversion
             # model (ASR/VLM) is unavailable, include a link so the LLM
-            # can share the reference with the user.  Link the
-            # higher-quality original_* ref when available.
+            # can share the reference with the user.  Link the tier-2
+            # preprocessed_* ref when available.
             if "image" not in llm_modalities and preferred["image"] and self.vlm is None:
                 links = [_media_url_to_displayable(u) for u in preferred["image"]]
                 link_text = f"[Image file]: {' '.join(links)}"
@@ -1087,8 +1087,10 @@ class MultimodalRAG:
         def _split(text: str) -> list[str]:
             if text_splitter is not None:
                 return text_splitter.split_text(text)
-            # Character-based fallback
-            min_new = max(chunk_size // 20, 1)
+            # Character-based fallback (mirrors TokenTextSplitter.split_text:
+            # 10% net-new tail merge + chunk_size//4 minimum-tail backfill).
+            min_new = max(chunk_size // 10, 1)
+            min_tail = max(chunk_size // 4, 1)
             result: list[str] = []
             start = 0
             prev_end = 0
@@ -1105,6 +1107,8 @@ class MultimodalRAG:
                         if tail:
                             result[-1] = result[-1] + " " + tail
                         break
+                    if end - start < min_tail:
+                        start = max(0, end - min_tail)
                 result.append(text[start:end].strip())
                 if end >= len(text):
                     break
@@ -1333,7 +1337,7 @@ class MultimodalRAG:
                     points.append(
                         PointStruct(
                             id=doc_id,
-                            vector={vector_name: emb},
+                            vector={vector_name: emb} if vector_name else emb,
                             payload={
                                 "page_content": doc.page_content,
                                 "metadata": doc.metadata,

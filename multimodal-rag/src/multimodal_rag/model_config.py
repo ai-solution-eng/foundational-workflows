@@ -1,14 +1,18 @@
 """Build model instances from environment variables.
 
 Replaces the hardcoded model definitions in ``pcai_models.py`` for
-production deployment.  All parameters (URLs, API keys, model names)
+production deployment.  URLs, API keys, and (optionally) model names
 are injected at pod start via ConfigMap / Secret, keeping secrets out
-of the Docker image.
+of the Docker image; model names are auto-discovered from the endpoint
+when not specified.
 
 Environment variable convention (each model role has its own prefix)::
 
-    MODEL_<ROLE>_NAME       — e.g. "Qwen/Qwen3-VL-Embedding-8B"
-    MODEL_<ROLE>_URL        — full remote URL (e.g. "https://...")
+    MODEL_<ROLE>_NAME       — optional served model id, e.g.
+                              "Qwen/Qwen3-VL-Embedding-8B".  When empty
+                              the id is auto-discovered via GET /v1/models.
+    MODEL_<ROLE>_URL        — full remote URL (e.g. "https://..."); required
+                              to enable the role (empty disables it)
     MODEL_<ROLE>_API_KEY    — API key / service-account token
     MODEL_<ROLE>_CLASS      — Python class: "MultiModalEmbeddings" |
                               "MultiModalReranker"
@@ -84,11 +88,13 @@ def _load_extra(prefix: str) -> dict[str, Any]:
 
 
 def build_embedder(prefix: str = "MODEL_EMBEDDER") -> Optional[EmbeddingModel]:
-    name = _get(prefix, "NAME")
+    # URL is required to enable a role; NAME is optional and, when empty,
+    # auto-discovered from the endpoint's /v1/models listing.
     url = _get(prefix, "URL")
-    api_key = _get(prefix, "API_KEY")
-    if not name or not url:
+    if not url:
         return None
+    name = _get(prefix, "NAME")
+    api_key = _get(prefix, "API_KEY")
 
     extra = _load_extra(prefix)
 
@@ -112,11 +118,13 @@ def build_embedder(prefix: str = "MODEL_EMBEDDER") -> Optional[EmbeddingModel]:
 
 
 def build_reranker(prefix: str = "MODEL_RERANKER") -> Optional[RerankerModel]:
-    name = _get(prefix, "NAME")
+    # URL is required to enable a role; NAME is optional and, when empty,
+    # auto-discovered from the endpoint's /v1/models listing.
     url = _get(prefix, "URL")
-    api_key = _get(prefix, "API_KEY")
-    if not name or not url:
+    if not url:
         return None
+    name = _get(prefix, "NAME")
+    api_key = _get(prefix, "API_KEY")
 
     extra = _load_extra(prefix)
     mm_kwargs = dict(_DEFAULT_MM_KWARGS)
@@ -133,11 +141,13 @@ def build_reranker(prefix: str = "MODEL_RERANKER") -> Optional[RerankerModel]:
 
 
 def build_vlm(prefix: str = "MODEL_VLM") -> Optional[ChatModel]:
-    name = _get(prefix, "NAME")
+    # URL is required to enable a role; NAME is optional and, when empty,
+    # auto-discovered from the endpoint's /v1/models listing.
     url = _get(prefix, "URL")
-    api_key = _get(prefix, "API_KEY")
-    if not name or not url:
+    if not url:
         return None
+    name = _get(prefix, "NAME")
+    api_key = _get(prefix, "API_KEY")
     extra = _load_extra(prefix)
     return ChatModel(
         model_name=name,
@@ -149,11 +159,13 @@ def build_vlm(prefix: str = "MODEL_VLM") -> Optional[ChatModel]:
 
 
 def build_asr(prefix: str = "MODEL_ASR") -> Optional[VoiceModel]:
-    name = _get(prefix, "NAME")
+    # URL is required to enable a role; NAME is optional and, when empty,
+    # auto-discovered from the endpoint's /v1/models listing.
     url = _get(prefix, "URL")
-    api_key = _get(prefix, "API_KEY")
-    if not name or not url:
+    if not url:
         return None
+    name = _get(prefix, "NAME")
+    api_key = _get(prefix, "API_KEY")
     extra = _load_extra(prefix)
     return VoiceModel(
         model_name=name,
@@ -178,8 +190,8 @@ ModelPack = tuple[
 def build_all() -> ModelPack:
     """Build all four models from environment variables.
 
-    Falls back to ``None`` for any model whose ``_NAME`` / ``_URL``
-    variables are not set.
+    Falls back to ``None`` for any model whose ``_URL`` variable is not
+    set (``_NAME`` is optional and auto-discovered when omitted).
     """
     return (
         build_embedder("MODEL_EMBEDDER"),

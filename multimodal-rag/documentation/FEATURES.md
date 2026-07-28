@@ -28,17 +28,37 @@ Chunk sizes are **dynamic** — sourced from the embedder model config, with a d
 
 ---
 
-## PVC Preprocessing
+## Three-Tier Media Schema
 
-Before format-specific processing, oversized media files are normalized **on disk** to bound storage and embedding costs:
+Media files are stored at three quality tiers to balance fidelity, storage, and processing cost:
 
-| Type | Limit | Action |
-|------|-------|--------|
-| Image | `1920×1080` pixels | Downscaled (LANCZOS, aspect-preserving) via PIL; saved as `*_preprocessed` |
-| Video | `1280×720` @ 24 fps | Transcoded via ffmpeg (libx264 CRF 28, AAC 128k, `+faststart`); saved as `*_preprocessed` |
-| Audio | 5 MiB | Split into equal-duration segments via ffmpeg segment muxer (`-f segment -segment_time`); each segment becomes a separate document |
+| Tier | Key in Qdrant | Image limit | Video limit | Format | Consumer |
+|------|---------------|-------------|-------------|--------|----------|
+| 1 — Full quality | `original_image` / `original_video` | None (raw upload) | None (raw upload) | `file://` PVC path | Available on demand |
+| 2 — Preprocessed | `preprocessed_image` / `preprocessed_video` | `1920×1080` px | `1280×720` @ 24 fps | `file://` PVC path | Base LLM (display links), frontend |
+| 3 — Model-ready | `image` / `video` | `720×720` px | `720×720` segments @ 1 fps, ≤5×720² total px | Base64 data URL in Qdrant | Reranker, VLM, embedder |
 
-This is distinct from the per-doc `max_pixels=720×720` limit applied at embedding time (both apply — PVC stores at 1920×1080, embedder resizes to 720×720).
+**Tier 1** is the original file copied to PVC by `_store_file()`. It is referenced by `original_*` keys only when it differs from tier 2 (i.e. the file was large enough to require preprocessing). Previously this file was orphaned; it is now linked so users can request full quality on demand.
+
+**Tier 2** is produced by `_preprocess_image_file()` / `_preprocess_video_file()` which create a `*_preprocessed` sibling on PVC. Images are downscaled (LANCZOS, aspect-preserving) via PIL; videos are transcoded via ffmpeg (libx264 CRF 28, AAC 128k, `+faststart`). Files within the limits are returned unchanged (tier 1 = tier 2).
+
+**Tier 3** is produced by `ImageProcessor` / `VideoProcessor` at ingest time and stored directly as a base64 data URL in the Qdrant payload. The reranker and VLM consume these data URLs directly — no file I/O, no client-side re-resizing. The embedding endpoint's server-side `mm_processor_kwargs` (max_pixels=720×720) is a no-op on data that is already at tier 3.
+
+`_strip_media_payloads()` intentionally **does not** strip tier-3 `image`/`video` keys — the data URLs stay in Qdrant. Only `audio` and tier-1/2 `preprocessed_*`/`original_*` keys are stripped (as a safety net, since they should already be `file://` refs).
+
+### Migration
+
+Existing Qdrant points (ingested before the three-tier schema) can be migrated via:
+
+```
+POST /api/admin/datasets/{name}/migrate-tier-schema
+```
+
+The migration is idempotent and:
+- Renames `original_video` → `preprocessed_video` (old tier-2 key name)
+- Derives `preprocessed_image` from `source` when missing
+- Reverse-engineers tier-1 `original_*` paths by stripping the `_preprocessed` suffix
+- Converts `image`/`video` `file://` refs to tier-3 base64 data URLs (images are resized; videos > 8 MB are skipped to avoid bloating Qdrant)
 
 ---
 
@@ -82,7 +102,7 @@ This is distinct from the per-doc `max_pixels=720×720` limit applied at embeddi
 4. Text default: `[Image: {filename}]`.
 5. HTTP(S) URLs are downloaded to temp files and processed through full resizing (remote URLs are not passed through untouched).
 6. Output: `{"text": "[Image: photo.jpg]", "image": "data:image/jpeg;base64,...", "source": "/path/to/photo.jpg"}`
-7. **Media persistence**: inline data URLs are saved to PVC files (`_save_doc_media()`) with a 1920×1080 pre-resize, then referenced via `file://` paths.
+7. **Media persistence**: tier-3 data URLs are kept in Qdrant (consumed directly by reranker/VLM). Tier-2 `preprocessed_image` `file://` refs are produced for PDF-extracted images via `_save_doc_media()`. Tier-1 `original_image` refs are set when the file was preprocessed.
 
 ---
 
@@ -321,9 +341,9 @@ When a HuggingFace tokenizer is bundled (`tokenizer_type="HuggingFace"`), all te
 
 **`TokenTextSplitter`** (`utils/token_text_splitter.py`):
 - Uses standalone HuggingFace `tokenizers` library (Rust, CPU-only — no PyTorch needed).
-- `from_bundled()`: searches upward from `utils/` for `tokenizer.json`; returns `None` if missing (callers fall back to character-based chunking).
+- `from_bundled()`: locates `tokenizer.json` via the `RAG_TOKENIZER_PATH` env var (override) or an upward search from `utils/` through the package, `src/` root, and application root (covers the Docker layout where the file lives at `/app/tokenizer.json`); returns `None` and logs a warning if missing (callers fall back to character-based chunking).
 - `count_tokens()`: `len(tokenizer.encode(text).ids)`.
-- `split_text()`: token-boundary splitting with 5% net-new tail avoidance (merges tiny final chunks into the previous).
+- `split_text()`: token-boundary splitting with a 10% net-new tail merge (tiny final chunks fold into the previous) and a `chunk_size // 4` minimum-tail backfill (512 tokens for text, 2048 for code) so no standalone final chunk is smaller than the floor.
 - `merge_until_budget()`: merges fragments into groups fitting `chunk_size` tokens; carries overlap from the last fragment of the previous group.
 - `overlap_text()`: returns last `chunk_overlap` tokens decoded back.
 

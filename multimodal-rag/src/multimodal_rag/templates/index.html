@@ -688,39 +688,31 @@ async function handleFiles(files) {
   const start = Date.now();
   const timer = setInterval(() => {
     const secs = Math.floor((Date.now() - start) / 1000);
-    if (!summary.textContent.includes('%') && !summary.textContent.includes('Processing'))
-      summary.textContent = `Uploading ${fileArray.length} file(s)... ${secs}s`;
+    const uploaded = _completedUploads;
+    if (!summary.textContent.includes('Processing'))
+      summary.textContent = `Uploading ${fileArray.length} file(s)... ${uploaded}/${fileArray.length} (${secs}s)`;
   }, 1000);
-
-  const fd = new FormData();
-  for (const file of fileArray) {
-    fd.append('files', file);
-  }
-  const pw = datasetPasswords[selectedDataset] || '';
-  if (pw) fd.append('password', pw);
-
-  // Use XHR for upload progress, then parse SSE from response
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', `/api/datasets/${selectedDataset}/batch-files`);
-
-  // Upload progress
-  xhr.upload.onprogress = (e) => {
-    if (e.lengthComputable) {
-      const pct = Math.round(e.loaded / e.total * 100);
-      summary.textContent = `Uploading ${fileArray.length} file(s)... ${pct}%`;
-    }
-  };
-  xhr.upload.onload = () => {
-    clearInterval(timer);
-    summary.innerHTML = `Processing ${fileArray.length} file(s) — <span style="color:var(--text-muted)">0/${fileArray.length}</span> · 0 chunk(s)`;
-  };
 
   let totalChunks = 0;
   let _fileChunkTotal = {};    // fname → accumulated chunks across sub-batches
   let _fileChunkExpected = {}; // fname → estimated total chunks (0 if unknown)
-  let lastIndex = 0;
+  let _completedUploads = 0;
 
-  const processSSE = (text) => {
+  // Helper: update a file's status line
+  function _updateFileLine(fname, html) {
+    const matchLine = Array.from(status.querySelectorAll('div:not(:first-child)')).find(
+      el => el.textContent?.includes(escHtml(fname))
+    );
+    if (matchLine) matchLine.innerHTML = html;
+  }
+
+  // Helper: update summary line
+  function _updateSummary() {
+    summary.innerHTML = `Processing ${fileArray.length} file(s) · ${totalChunks.toLocaleString()} chunk(s)`;
+  }
+
+  // Process SSE events from a single file upload
+  function processSSE(text, sseState) {
     const parts = text.split('\n\n');
     const remainder = parts.pop() || '';
     for (const block of parts) {
@@ -731,190 +723,182 @@ async function handleFiles(files) {
       const data = JSON.parse(dataLine.slice(5));
 
       if (eventType === 'progress') {
-        const matchLine = Array.from(status.querySelectorAll('div:not(:first-child)')).find(
-          el => el.textContent?.includes(escHtml(data.file))
-        );
-        if (matchLine) {
-          if (data.status === 'uploaded') {
-            matchLine.innerHTML = `<span style="color:var(--accent);width:16px;flex-shrink:0">📦</span> ${escHtml(data.file)} <span style="color:var(--text-muted);font-size:.75rem">uploaded</span>`;
-          } else if (data.status === 'preprocessing') {
-            matchLine.innerHTML = `<span style="color:var(--text-muted);width:16px;flex-shrink:0">⚙</span> ${escHtml(data.file)}`;
-          } else if (data.status === 'preprocessed') {
-            if (data.total) _fileChunkExpected[data.file] = data.total;
-            matchLine.innerHTML = `<span style="color:var(--accent);width:16px;flex-shrink:0">◐</span> ${escHtml(data.file)}`;
-          } else if (data.status === 'embedding') {
-            const soFar = _fileChunkTotal[data.file] || 0;
-            const expected = _fileChunkExpected[data.file];
-            let chunkInfo;
-            if (soFar > 0 && expected) {
-              chunkInfo = `${soFar.toLocaleString()} / (est.) ${expected.toLocaleString()} chunks embedded…`;
-            } else if (soFar > 0) {
-              chunkInfo = `${soFar.toLocaleString()} chunks embedded…`;
-            } else {
-              chunkInfo = 'embedding…';
-            }
-            matchLine.innerHTML = `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> ${escHtml(data.file)} <span style="color:var(--text-muted);font-size:.75rem">${chunkInfo}</span>`;
-          } else if (data.status === 'complete' && data.chunks !== undefined) {
-            _fileChunkTotal[data.file] = (_fileChunkTotal[data.file] || 0) + (data.chunks || 0);
-            const fileTotal = _fileChunkTotal[data.file];
-            const color = fileTotal > 0 ? 'var(--green)' : 'var(--text-muted)';
-            const icon = fileTotal > 0 ? '✓' : '⏭';
-            const label = fileTotal > 0 ? `${fileTotal.toLocaleString()} chunk(s)` : 'already in dataset';
-            matchLine.innerHTML = `<span style="color:${color};width:16px;flex-shrink:0">${icon}</span> ${escHtml(data.file)} — ${label}`;
-            totalChunks += data.chunks || 0;
-            const rt = _retryFiles.find(r => r.name === data.file);
-            if (rt) { rt.done = true; rt.ok = true; }
-          } else if (data.status === 'error') {
-            matchLine.innerHTML = `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(data.file)} — ${escHtml(data.error || 'failed')}`;
-            const rt = _retryFiles.find(r => r.name === data.file);
-            if (rt) { rt.done = true; rt.ok = false; }
+        if (data.status === 'uploaded') {
+          _completedUploads++;
+          _updateFileLine(data.file, `<span style="color:var(--accent);width:16px;flex-shrink:0">📦</span> ${escHtml(data.file)} <span style="color:var(--text-muted);font-size:.75rem">uploaded</span>`);
+        } else if (data.status === 'preprocessing') {
+          _updateFileLine(data.file, `<span style="color:var(--text-muted);width:16px;flex-shrink:0">⚙</span> ${escHtml(data.file)}`);
+        } else if (data.status === 'preprocessed') {
+          if (data.total) _fileChunkExpected[data.file] = data.total;
+          _updateFileLine(data.file, `<span style="color:var(--accent);width:16px;flex-shrink:0">◐</span> ${escHtml(data.file)}`);
+        } else if (data.status === 'embedding') {
+          const soFar = _fileChunkTotal[data.file] || 0;
+          const expected = _fileChunkExpected[data.file];
+          let chunkInfo;
+          if (soFar > 0 && expected) {
+            chunkInfo = `${soFar.toLocaleString()} / (est.) ${expected.toLocaleString()} chunks embedded…`;
+          } else if (soFar > 0) {
+            chunkInfo = `${soFar.toLocaleString()} chunks embedded…`;
+          } else {
+            chunkInfo = 'embedding…';
           }
+          _updateFileLine(data.file, `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> ${escHtml(data.file)} <span style="color:var(--text-muted);font-size:.75rem">${chunkInfo}</span>`);
+        } else if (data.status === 'complete' && data.chunks !== undefined) {
+          _fileChunkTotal[data.file] = (_fileChunkTotal[data.file] || 0) + (data.chunks || 0);
+          const fileTotal = _fileChunkTotal[data.file];
+          const color = fileTotal > 0 ? 'var(--green)' : 'var(--text-muted)';
+          const icon = fileTotal > 0 ? '✓' : '⏭';
+          const label = fileTotal > 0 ? `${fileTotal.toLocaleString()} chunk(s)` : 'already in dataset';
+          _updateFileLine(data.file, `<span style="color:${color};width:16px;flex-shrink:0">${icon}</span> ${escHtml(data.file)} — ${label}`);
+          totalChunks += data.chunks || 0;
+          const rt = _retryFiles.find(r => r.name === data.file);
+          if (rt) { rt.done = true; rt.ok = true; }
+        } else if (data.status === 'error') {
+          _updateFileLine(data.file, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(data.file)} — ${escHtml(data.error || 'failed')}`);
+          const rt = _retryFiles.find(r => r.name === data.file);
+          if (rt) { rt.done = true; rt.ok = false; }
         }
-        summary.innerHTML = `Processing ${fileArray.length} file(s) · ${totalChunks.toLocaleString()} chunk(s)`;
+        _updateSummary();
       } else if (eventType === 'complete') {
-        clearInterval(timer);
-        summary.innerHTML = `<span style="color:var(--green)">Done</span> — ${totalChunks.toLocaleString()} chunk(s) stored from ${data.file_count} file(s)`;
-        toast(`Uploaded ${data.file_count} file(s), ${totalChunks.toLocaleString()} chunk(s)`);
+        // Batch complete — accumulate any file_count info
       } else if (eventType === 'error') {
-        clearInterval(timer);
-        summary.innerHTML = `<span style="color:var(--red)">Failed</span> — ${escHtml(data.error || 'Unknown error')}`;
-        toast(data.error || 'Upload failed', 'error');
+        _updateFileLine(data.file || '', `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(data.file || '')} — ${escHtml(data.error || 'failed')}`);
       }
     }
     return remainder;
-  };
+  }
 
-  return new Promise((resolve) => {
-    // Response data arriving (SSE events)
+  // Upload files in small concurrent batches (1 file per request, up to 3 parallel)
+  // This overlaps network upload of later files with server-side processing of earlier ones.
+  const _BATCH_CONCURRENCY = 3;
+  const fileQueue = [...fileArray];
+  const activeRequests = new Set();
+
+  async function uploadOne(file) {
+    const fd = new FormData();
+    fd.append('files', file);
+    const pw = datasetPasswords[selectedDataset] || '';
+    if (pw) fd.append('password', pw);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/api/datasets/${selectedDataset}/batch-files`);
+
+    let lastIndex = 0;
     let sseBuf = '';
-    xhr.onprogress = () => {
-      const newText = xhr.responseText.substring(lastIndex);
-      lastIndex = xhr.responseText.length;
-      sseBuf += newText;
-      sseBuf = processSSE(sseBuf);
-    };
+    let batchFileCount = 0;
+    let batchChunkCount = 0;
 
-    xhr.onload = () => {
-      // Process any remaining data
-      if (lastIndex < xhr.responseText.length) {
-        sseBuf += xhr.responseText.substring(lastIndex);
-        processSSE(sseBuf);
-      }
-      clearInterval(timer);
+    return new Promise((resolve) => {
+      xhr.onprogress = () => {
+        const newText = xhr.responseText.substring(lastIndex);
+        lastIndex = xhr.responseText.length;
+        sseBuf += newText;
+        sseBuf = processSSE(sseBuf, {});
+      };
 
-      // Check if any files are still in an intermediate state
-      const inFlight = Array.from(status.querySelectorAll('div:not(:first-child)')).filter(el => {
-        const txt = el.textContent || '';
-        return txt.includes('📤') || txt.includes('📦') || txt.includes('⚙') || txt.includes('◐') || el.querySelector('.spinner');
-      });
-
-      if (inFlight.length > 0) {
-        // Stream ended prematurely — poll document count for background progress
-        summary.innerHTML = `<span style="color:var(--accent)">Stream ended — checking background processing…</span>`;
-        for (const el of inFlight) {
-          const fname = el.getAttribute('data-fname') || 'file';
-          el.innerHTML = `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> ${escHtml(fname)} <span style="color:var(--text-muted);font-size:.75rem">background…</span>`;
+      xhr.onload = () => {
+        if (lastIndex < xhr.responseText.length) {
+          sseBuf += xhr.responseText.substring(lastIndex);
+          processSSE(sseBuf, {});
         }
-        let lastCount = -1;
-        let stablePolls = 0;
-        const pollInterval = setInterval(async () => {
-          try {
-            const ds = await api('GET', `/api/datasets/${selectedDataset}`,
-              undefined, undefined, passwordHeader());
-            const count = ds.dataset?.document_count || 0;
-            if (count !== lastCount) {
-              lastCount = count;
-              stablePolls = 0;
-              summary.innerHTML = `<span style="color:var(--accent)">Processing in background</span> — ${count} documents`;
-            } else {
-              stablePolls++;
-              if (stablePolls >= 3) {
-                clearInterval(pollInterval);
-                for (const el of inFlight) {
-                  const fname = el.getAttribute('data-fname') || 'file';
-                  const done = _fileChunkTotal[fname] || 0;
-                  const expected = _fileChunkExpected[fname] || 0;
-                  const label = done > 0 ? `${done.toLocaleString()} chunk(s)` : (expected ? `${expected.toLocaleString()} chunk(s)` : 'processed');
-                  el.innerHTML = `<span style="color:var(--green);width:16px;flex-shrink:0">✓</span> ${escHtml(fname)} — ${label}`;
-                  const rt = _retryFiles.find(r => r.name === fname);
-                  if (rt) { rt.done = true; rt.ok = true; }
-                }
-                summary.innerHTML = `<span style="color:var(--green)">Done</span> — ${count.toLocaleString()} documents (background upload complete)`;
-                toast('Background processing complete');
-                _updateRetryButton();
-                listDatasets();
-                resolve();
-              }
-            }
-          } catch (e) { /* keep polling */ }
-        }, 10000);
-      } else {
-        // All files resolved — normal completion
-        _updateRetryButton();
-        listDatasets();
-        resolve();
-      }
-    };
-
-    xhr.onerror = () => {
-      clearInterval(timer);
-      // Connection dropped — but the server keeps processing in its
-      // background thread.  Switch to polling the document count instead
-      // of showing a scary "Failed" message.
-      summary.innerHTML = `<span style="color:var(--accent)">Connection lost — processing continues in background</span>`;
-
-      // Mark in-flight files as "background processing"
-      for (const el of status.querySelectorAll('div:not(:first-child)')) {
-        const txt = el.textContent || '';
-        if (txt.includes('📤') || txt.includes('📦') || txt.includes('⚙') || txt.includes('◐') || el.querySelector('.spinner')) {
-          const fname = el.getAttribute('data-fname') || 'file';
-          el.innerHTML = `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> ${escHtml(fname)} <span style="color:var(--text-muted);font-size:.75rem">background…</span>`;
-        }
-      }
-
-      // Poll document count until it stabilizes (3 consecutive unchanged polls)
-      let lastCount = -1;
-      let stablePolls = 0;
-      const pollInterval = setInterval(async () => {
+        // Parse final "complete" event for file_count
         try {
-          const ds = await api('GET', `/api/datasets/${selectedDataset}`,
-            undefined, undefined, passwordHeader());
-          const count = ds.dataset?.document_count || 0;
-          if (count !== lastCount) {
-            lastCount = count;
-            stablePolls = 0;
-            summary.innerHTML = `<span style="color:var(--accent)">Processing in background</span> — ${count} documents`;
-          } else {
-            stablePolls++;
-            if (stablePolls >= 3) {
-              clearInterval(pollInterval);
-              // Mark all in-flight files as done
-              for (const el of status.querySelectorAll('div:not(:first-child)')) {
-                if (el.querySelector('.spinner')) {
-                  const fname = el.getAttribute('data-fname') || 'file';
-                  const done = _fileChunkTotal[fname] || 0;
-                  const expected = _fileChunkExpected[fname] || 0;
-                  const label = done > 0 ? `${done.toLocaleString()} chunk(s)` : (expected ? `${expected.toLocaleString()} chunk(s)` : 'processed');
-                  el.innerHTML = `<span style="color:var(--green);width:16px;flex-shrink:0">✓</span> ${escHtml(fname)} — ${label}`;
-                  const rt = _retryFiles.find(r => r.name === fname);
-                  if (rt) { rt.done = true; rt.ok = true; }
-                }
-              }
-              summary.innerHTML = `<span style="color:var(--green)">Done</span> — ${count.toLocaleString()} documents (background upload complete)`;
-              toast('Background processing complete');
-              _updateRetryButton();
-              listDatasets();
-              resolve();
+          const parts = xhr.responseText.split('\n\n');
+          for (const block of parts) {
+            const dataLine = block.split('\n').find(l => l.startsWith('data:'));
+            if (!dataLine) continue;
+            const evt = block.split('\n').find(l => l.startsWith('event:'))?.slice(6).trim();
+            if (evt === 'complete') {
+              const data = JSON.parse(dataLine.slice(5));
+              batchFileCount = data.file_count || 1;
+              batchChunkCount = data.total_chunks || totalChunks;
             }
           }
-        } catch (e) {
-          // Poll failed — keep trying
-        }
-      }, 10000);
-    };
+        } catch (e) { /* ignore parse errors */ }
+        resolve();
+      };
 
-    xhr.send(fd);
+      xhr.onerror = () => {
+        // Mark this file as background processing
+        _updateFileLine(file.name, `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> ${escHtml(file.name)} <span style="color:var(--text-muted);font-size:.75rem">background…</span>`);
+        resolve();
+      };
+
+      xhr.send(fd);
+    });
+  }
+
+  // Process files with bounded concurrency
+  async function runUploads() {
+    const workers = [];
+    for (let i = 0; i < _BATCH_CONCURRENCY; i++) {
+      workers.push((async () => {
+        while (fileQueue.length > 0) {
+          const file = fileQueue.shift();
+          if (!file) break;
+          await uploadOne(file);
+        }
+      })());
+    }
+    await Promise.all(workers);
+  }
+
+  await runUploads();
+
+  clearInterval(timer);
+
+  // Check if any files are still in an intermediate state
+  const inFlight = Array.from(status.querySelectorAll('div:not(:first-child)')).filter(el => {
+    const txt = el.textContent || '';
+    return txt.includes('📤') || txt.includes('📦') || txt.includes('⚙') || txt.includes('◐') || el.querySelector('.spinner');
   });
+
+  if (inFlight.length > 0) {
+    // Stream ended prematurely — poll document count for background progress
+    summary.innerHTML = `<span style="color:var(--accent)">Stream ended — checking background processing…</span>`;
+    for (const el of inFlight) {
+      const fname = el.getAttribute('data-fname') || 'file';
+      el.innerHTML = `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> ${escHtml(fname)} <span style="color:var(--text-muted);font-size:.75rem">background…</span>`;
+    }
+    let lastCount = -1;
+    let stablePolls = 0;
+    const pollInterval = setInterval(async () => {
+      try {
+        const ds = await api('GET', `/api/datasets/${selectedDataset}`,
+          undefined, undefined, passwordHeader());
+        const count = ds.dataset?.document_count || 0;
+        if (count !== lastCount) {
+          lastCount = count;
+          stablePolls = 0;
+          summary.innerHTML = `<span style="color:var(--accent)">Processing in background</span> — ${count} documents`;
+        } else {
+          stablePolls++;
+          if (stablePolls >= 3) {
+            clearInterval(pollInterval);
+            for (const el of inFlight) {
+              const fname = el.getAttribute('data-fname') || 'file';
+              const done = _fileChunkTotal[fname] || 0;
+              const expected = _fileChunkExpected[fname] || 0;
+              const label = done > 0 ? `${done.toLocaleString()} chunk(s)` : (expected ? `${expected.toLocaleString()} chunk(s)` : 'processed');
+              el.innerHTML = `<span style="color:var(--green);width:16px;flex-shrink:0">✓</span> ${escHtml(fname)} — ${label}`;
+              const rt = _retryFiles.find(r => r.name === fname);
+              if (rt) { rt.done = true; rt.ok = true; }
+            }
+            summary.innerHTML = `<span style="color:var(--green)">Done</span> — ${count.toLocaleString()} documents (background upload complete)`;
+            toast('Background processing complete');
+            _updateRetryButton();
+            listDatasets();
+          }
+        }
+      } catch (e) { /* keep polling */ }
+    }, 10000);
+  } else {
+    // All files resolved — normal completion
+    summary.innerHTML = `<span style="color:var(--green)">Done</span> — ${totalChunks.toLocaleString()} chunk(s) stored from ${fileArray.length} file(s)`;
+    toast(`Uploaded ${fileArray.length} file(s), ${totalChunks.toLocaleString()} chunk(s)`);
+    _updateRetryButton();
+    listDatasets();
+  }
 }
 
 function retryFailed() {
@@ -1127,7 +1111,7 @@ async function addUrls() {
 let _searchMediaDataUrl = null;
 let _searchMediaType = null;
 
-function handleSearchMedia(input) {
+async function handleSearchMedia(input) {
   const file = input.files[0];
   const label = document.getElementById('search-media-label');
   const info = document.getElementById('search-media-info');
@@ -1147,15 +1131,128 @@ function handleSearchMedia(input) {
   else if (file.type.startsWith('audio/')) _searchMediaType = 'audio';
   else { toast('Unsupported file type', 'error'); return; }
 
-  const reader = new FileReader();
-  reader.onload = function(e) {
-    _searchMediaDataUrl = e.target.result;
-    label.textContent = file.name;
-    input.parentElement.classList.add('has-file');
-    info.textContent = _searchMediaType;
-    clearBtn.style.display = 'inline';
-  };
-  reader.readAsDataURL(file);
+  label.textContent = file.name;
+  input.parentElement.classList.add('has-file');
+  clearBtn.style.display = 'inline';
+
+  if (_searchMediaType === 'image') {
+    // Resize image to 720×720 max in-browser before sending — avoids
+    // uploading multi-MB phone photos for a search query.
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      const img = new Image();
+      img.onload = function() {
+        const MAX_PIXELS = 720 * 720;
+        const w = img.width, h = img.height;
+        if (w * h <= MAX_PIXELS) {
+          _searchMediaDataUrl = e.target.result;
+          info.textContent = 'image';
+          return;
+        }
+        const scale = Math.sqrt(MAX_PIXELS / (w * h));
+        const nw = Math.max(1, Math.round(w * scale));
+        const nh = Math.max(1, Math.round(h * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = nw;
+        canvas.height = nh;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, nw, nh);
+        const mime = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
+        _searchMediaDataUrl = canvas.toDataURL(mime, 0.92);
+        info.textContent = 'image';
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  } else if (_searchMediaType === 'video') {
+    // Downscale video in-browser: first 30s, ≤720×720 per frame, 1 fps.
+    // Uses canvas + MediaRecorder to produce a small webm data URL.
+    info.textContent = 'video — processing…';
+    try {
+      const url = URL.createObjectURL(file);
+      const video = document.createElement('video');
+      video.muted = true;
+      video.playsInline = true;
+      video.src = url;
+      await new Promise((res, rej) => {
+        video.onloadedmetadata = res;
+        video.onerror = () => rej(new Error('Could not load video'));
+      });
+
+      const MAX_DURATION = 30;
+      const MAX_PIXELS = 720 * 720;
+      const TARGET_FPS = 1;
+      const duration = Math.min(video.duration || MAX_DURATION, MAX_DURATION);
+
+      const vw = video.videoWidth, vh = video.videoHeight;
+      let scale = 1;
+      if (vw * vh > MAX_PIXELS) scale = Math.sqrt(MAX_PIXELS / (vw * vh));
+      const nw = Math.max(2, Math.round(vw * scale / 2) * 2);
+      const nh = Math.max(2, Math.round(vh * scale / 2) * 2);
+
+      const canvas = document.createElement('canvas');
+      canvas.width = nw;
+      canvas.height = nh;
+      const ctx = canvas.getContext('2d');
+
+      const stream = canvas.captureStream(TARGET_FPS);
+      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+        ? 'video/webm;codecs=vp9' : 'video/webm';
+      const recorder = new MediaRecorder(stream, { mimeType });
+      const chunks = [];
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+      const stopped = new Promise((r) => { recorder.onstop = () => r(); });
+      recorder.start();
+
+      // Play at accelerated rate so 30s of video doesn't take 30s to process
+      const playbackRate = Math.min(8, Math.max(2, (video.duration || duration) / 8));
+      video.playbackRate = playbackRate;
+      await video.play();
+
+      const endTime = Math.min(duration, video.duration || duration);
+      await new Promise((resolve) => {
+        const draw = () => {
+          if (video.currentTime >= endTime || video.ended) {
+            video.pause();
+            resolve();
+            return;
+          }
+          ctx.drawImage(video, 0, 0, nw, nh);
+          requestAnimationFrame(draw);
+        };
+        requestAnimationFrame(draw);
+      });
+
+      await new Promise((r) => setTimeout(r, 300));
+      recorder.stop();
+      await stopped;
+      URL.revokeObjectURL(url);
+
+      const blob = new Blob(chunks, { type: 'video/webm' });
+      _searchMediaDataUrl = await new Promise((r) => {
+        const reader = new FileReader();
+        reader.onload = (e) => r(e.target.result);
+        reader.readAsDataURL(blob);
+      });
+      info.textContent = 'video';
+    } catch (err) {
+      console.warn('Video preprocessing failed, sending original', err);
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        _searchMediaDataUrl = e.target.result;
+        info.textContent = 'video';
+      };
+      reader.readAsDataURL(file);
+    }
+  } else {
+    // Audio — send as-is (no client-side transcode)
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      _searchMediaDataUrl = e.target.result;
+      info.textContent = _searchMediaType;
+    };
+    reader.readAsDataURL(file);
+  }
 }
 
 function clearSearchMedia() {
@@ -1235,9 +1332,9 @@ async function searchDataset() {
           }
           return html;
         };
-        mediaHtml += _renderMedia(c.image || c.original_image, ['.png','.jpg','.jpeg','.gif','.webp','.bmp','.tiff'], true);
-        mediaHtml += _renderMedia(c.original_video || c.video, ['.mp4','.webm','.mov','.avi','.mkv'], false);
-        mediaHtml += _renderMedia(c.audio || c.original_audio, ['.mp3','.wav','.ogg','.m4a','.flac','.wma'], false);
+        mediaHtml += _renderMedia(c.preprocessed_image || c.original_image || c.image, ['.png','.jpg','.jpeg','.gif','.webp','.bmp','.tiff'], true);
+        mediaHtml += _renderMedia(c.preprocessed_video || c.original_video || c.video, ['.mp4','.webm','.mov','.avi','.mkv'], false);
+        mediaHtml += _renderMedia(c.preprocessed_audio || c.original_audio || c.audio, ['.mp3','.wav','.ogg','.m4a','.flac','.wma'], false);
 
         // Source + page metadata
         const src = c.source || c.original_source;
@@ -1255,7 +1352,7 @@ async function searchDataset() {
       // Collect media URLs for copy payload
       const _mediaUrls = [];
       if (typeof c === 'object' && c !== null) {
-        for (const key of ['image', 'video', 'audio', 'original_image', 'original_video', 'original_audio']) {
+        for (const key of ['image', 'video', 'audio', 'preprocessed_image', 'preprocessed_video', 'preprocessed_audio', 'original_image', 'original_video', 'original_audio']) {
           const val = c[key];
           if (val) {
             const urls = Array.isArray(val) ? val : [val];

@@ -560,26 +560,17 @@ class InputConversion:
                     )
 
             for url in input_dict.pop("_image_urls", []):
-                if url.startswith(("http://", "https://")):
-                    # Remote URLs — let the server fetch them at full res
+                if url.startswith(("http://", "https://", "data:")):
+                    # Remote URL or model-ready data URL (tier 3) — pass
+                    # through without client-side resize; the server applies
+                    # mm_processor_kwargs if needed (no-op at tier 3).
                     input_dict["content"].insert(0, {"type": "image_url", "image_url": {"url": url}})
                 else:
-                    # Local file or data URL — decode, resize, re-encode
-                    if url.startswith("data:"):
-                        import re
-
-                        m = re.match(r"data:([^;]+);base64,(.+)", url)
-                        if m:
-                            mime_type = m.group(1)
-                            raw_bytes = base64.b64decode(m.group(2))
-                        else:
-                            mime_type = "image/png"
-                            raw_bytes = base64.b64decode(url.split(",", 1)[1])
-                    else:
-                        path = url[7:] if url.startswith("file://") else url
-                        with open(path, "rb") as f:
-                            raw_bytes = f.read()
-                        mime_type = _detect_media_type(path)
+                    # Local file — decode, resize, re-encode
+                    path = url[7:] if url.startswith("file://") else url
+                    with open(path, "rb") as f:
+                        raw_bytes = f.read()
+                    mime_type = _detect_media_type(path)
 
                     try:
                         max_px = (
