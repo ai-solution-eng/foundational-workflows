@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build artifacts
+*.tar.gz
+dist/
+build/
+
+# Test data / uploads
+uploads_for_test_dataset/
+tests/__pycache__/
+tests/**/__pycache__/
+
+# Backups
+.backup_pre_token_chunking/
+
+# Secrets / internal model defs with API keys
+src/multimodal_rag/utils/pcai_models.py
+
+# Local env
+.env
+*.local
+values-resolved.yaml
+
+# Editor
+.vscode/
+.idea/

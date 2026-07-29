@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import httpx
+import os
 import threading
 import weakref
 from typing import Optional, Literal, Callable, Any, Awaitable
@@ -30,14 +31,45 @@ logger = logging.getLogger(__name__)
 _MLIS_PAGE = "https://mlis.pcai-se-ai-application.hst.rdlabs.hpecorp.net/ui/deployments"
 _NOT_DEPLOYED = ""
 
+
+def _pool_limits_from_env(default_max_connections: int | None = 30) -> httpx.Limits:
+    """Build httpx connection-pool limits from env vars.
+
+    Async clients default to ``max_connections=30`` (matching the original
+    single-replica chart).  The sync ``_SHARED_REMOTE_HTTP_CLIENT`` calls
+    this with ``default_max_connections=None`` to preserve its original
+    unlimited behaviour.  The scale chart raises both via
+    ``MODEL_POOL_MAX_CONNECTIONS`` so the embedder — on every search's
+    critical path — is not the bottleneck at high concurrency.
+    """
+    raw = os.environ.get("MODEL_POOL_MAX_CONNECTIONS")
+    max_conn: int | None
+    if raw:
+        try:
+            max_conn = int(raw)
+        except (TypeError, ValueError):
+            max_conn = default_max_connections
+    else:
+        max_conn = default_max_connections
+    try:
+        max_keepalive = int(os.environ.get("MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS", "10"))
+    except (TypeError, ValueError):
+        max_keepalive = 10
+    return httpx.Limits(
+        max_connections=max_conn if max_conn and max_conn > 0 else None,
+        max_keepalive_connections=max(1, max_keepalive),
+        keepalive_expiry=120.0,
+    )
+
+
 # Sync clients are thread-safe and can be shared globally.
+# The sync remote client preserves the original unlimited max_connections
+# (only keepalive is capped) so it never becomes a bottleneck for one-off
+# model-discovery calls.
 _SHARED_HTTP_CLIENT = httpx.Client()
 _SHARED_REMOTE_HTTP_CLIENT = httpx.Client(
     verify=False,
-    limits=httpx.Limits(
-        max_keepalive_connections=10,
-        keepalive_expiry=120.0,
-    ),
+    limits=_pool_limits_from_env(default_max_connections=None),
 )
 
 # Async clients must be bound to a single event loop.
@@ -107,29 +139,19 @@ def _get_async_client(remote: bool = False) -> httpx.AsyncClient:
     if loop is None:
         # No running loop — create a short-lived client.  Caller is
         # responsible for closing it.
-        limits = httpx.Limits(
-            max_connections=30,
-            max_keepalive_connections=10,
-            keepalive_expiry=120.0,
-        )
         return httpx.AsyncClient(
             verify=False if remote else True,
             timeout=httpx.Timeout(300.0, connect=30.0),
-            limits=limits,
+            limits=_pool_limits_from_env(),
         )
     cache = _async_remote_client_cache if remote else _async_client_cache
     with _async_client_lock:
         client = cache.get(loop)
         if client is None:
-            limits = httpx.Limits(
-                max_connections=30,
-                max_keepalive_connections=10,
-                keepalive_expiry=120.0,
-            )
             client = httpx.AsyncClient(
                 verify=False if remote else True,
                 timeout=httpx.Timeout(300.0, connect=30.0),
-                limits=limits,
+                limits=_pool_limits_from_env(),
             )
             cache[loop] = client
         return client

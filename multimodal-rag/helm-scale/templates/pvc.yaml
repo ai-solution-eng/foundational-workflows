@@ -5,6 +5,8 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app: {{ .Values.deployment.appName }}
+  annotations:
+    "helm.sh/resource-policy": keep
 spec:
   accessModes: [{{ .Values.persistence.data.accessMode }}]
   {{- if .Values.persistence.data.storageClass }}

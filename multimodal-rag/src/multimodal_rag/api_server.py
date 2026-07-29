@@ -127,18 +127,103 @@ async def get_manager_async() -> DatasetManager:
 # Unlock cache (password once, use-for-N-minutes)
 # ---------------------------------------------------------------------------
 
+# Identity is derived from the authenticated user (oauth2-proxy headers)
+# rather than the client IP, which is unreliable behind Istio/oauth2-proxy
+# (many users may share one proxy IP — one unlock would open the dataset
+# for everyone).  Falls back to X-Forwarded-For / client host for
+# non-authenticated deployments.
 _UNLOCK_CACHE: dict[tuple[str, str], tuple[float, str]] = {}
 _UNLOCK_CACHE_LOCK = threading.Lock()
 _UNLOCK_TTL = int(os.environ.get("UNLOCK_TTL", "1800"))  # seconds, default 30 min
 
+# Optional Redis backend for cross-pod unlock sharing.  Enabled when
+# REDIS_URL is set (the scale chart sets it); otherwise the per-process
+# dict above is used (a user may be prompted to re-unlock if routed to a
+# different pod).
+_REDIS_URL = os.environ.get("REDIS_URL", "")
+_redis_client: Any = None
+_redis_client_lock = threading.Lock()
+
+
+def _get_redis() -> Any:
+    """Lazily build a Redis client, cached for the process lifetime."""
+    global _redis_client
+    if not _REDIS_URL:
+        return None
+    if _redis_client is not None:
+        return _redis_client
+    with _redis_client_lock:
+        if _redis_client is not None:
+            return _redis_client
+        try:
+            import redis  # type: ignore[import-untyped]
+
+            _redis_client = redis.from_url(_REDIS_URL, socket_timeout=2.0, socket_connect_timeout=2.0)
+            _redis_client.ping()
+            logger.info("Unlock cache: Redis backend connected at %s", _REDIS_URL)
+        except Exception as exc:
+            logger.warning("Unlock cache: Redis unavailable (%s); falling back to in-memory", exc)
+            _redis_client = None
+    return _redis_client
+
 
 def _unlock_client_id(request: Request) -> str:
-    """Return a client identifier for the unlock cache."""
+    """Return a per-user identifier for the unlock cache.
+
+    Prefers the authenticated user identity injected by oauth2-proxy
+    (``X-Auth-Request-Email`` / ``X-Auth-Request-User``), then falls back
+    to ``X-Forwarded-For`` and finally the socket peer — for deployments
+    without an auth proxy.
+    """
+    for header in ("X-Auth-Request-Email", "X-Auth-Request-User", "X-Email", "X-User"):
+        val = request.headers.get(header)
+        if val:
+            return val.strip()
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
         return forwarded.split(",")[0].strip()
     client = request.client
     return client.host if client else "unknown"
+
+
+def _unlock_cache_key(dataset: str, cid: str) -> str:
+    return f"unlock:{dataset}:{cid}"
+
+
+def _unlock_cache_get(dataset: str, cid: str) -> str | None:
+    """Return a cached password if present and unexpired, else None."""
+    r = _get_redis()
+    if r is not None:
+        try:
+            val = r.get(_unlock_cache_key(dataset, cid))
+            # Redis returns bytes; decode to str for downstream use.
+            if val is not None:
+                return val.decode() if isinstance(val, bytes) else val
+            return None
+        except Exception:
+            return None
+    with _UNLOCK_CACHE_LOCK:
+        entry = _UNLOCK_CACHE.get((dataset, cid))
+    if entry is None:
+        return None
+    expiry, cached_pw = entry
+    if time.monotonic() < expiry:
+        return cached_pw
+    with _UNLOCK_CACHE_LOCK:
+        _UNLOCK_CACHE.pop((dataset, cid), None)
+    return None
+
+
+def _unlock_cache_set(dataset: str, cid: str, password: str) -> None:
+    r = _get_redis()
+    if r is not None:
+        try:
+            r.set(_unlock_cache_key(dataset, cid), password, ex=_UNLOCK_TTL)
+            return
+        except Exception:
+            pass
+    with _UNLOCK_CACHE_LOCK:
+        _UNLOCK_CACHE[(dataset, cid)] = (time.monotonic() + _UNLOCK_TTL, password)
 
 
 def _require_dataset_password(
@@ -160,24 +245,19 @@ def _require_dataset_password(
     if password:
         if dm.verify_password(name, password):
             if request is not None:
-                cid = _unlock_client_id(request)
-                with _UNLOCK_CACHE_LOCK:
-                    _UNLOCK_CACHE[(name, cid)] = (time.monotonic() + _UNLOCK_TTL, password)
+                _unlock_cache_set(name, _unlock_client_id(request), password)
             return
         raise HTTPException(403, f"Incorrect password for dataset '{name}'")
 
-    # 2. Check the unlock cache
+    # 2. Check the unlock cache (trust the cached password without
+    #    re-hashing — it was verified when first cached, and the TTL
+    #    is short.  Re-verifying with PBKDF2-600k would add ~0.5s to
+    #    every cached request.)
     if request is not None:
         cid = _unlock_client_id(request)
-        with _UNLOCK_CACHE_LOCK:
-            entry = _UNLOCK_CACHE.get((name, cid))
-        if entry is not None:
-            expiry, cached_pw = entry
-            if time.monotonic() < expiry:
-                return
-            # expired
-            with _UNLOCK_CACHE_LOCK:
-                _UNLOCK_CACHE.pop((name, cid), None)
+        cached = _unlock_cache_get(name, cid)
+        if cached is not None:
+            return
 
     raise HTTPException(401, f"Dataset '{name}' is password protected")
 

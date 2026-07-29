@@ -7,7 +7,7 @@ metadata:
     app: {{ .Values.deployment.name }}-qdrant
 spec:
   serviceName: {{ .Values.deployment.name }}-qdrant
-  replicas: 1
+  replicas: {{ .Values.qdrant.replicas }}
   selector:
     matchLabels:
       app: {{ .Values.deployment.name }}-qdrant
@@ -20,11 +20,20 @@ spec:
         - name: qdrant
           image: "{{ .Values.qdrant.image.repository }}:{{ .Values.qdrant.image.tag }}"
           imagePullPolicy: {{ .Values.qdrant.image.pullPolicy }}
+          env:
+            # Tell Qdrant its advertised address so peers can bootstrap the
+            # cluster. Each pod registers as <sts-name>-<ordinal>.
+            - name: QDRANT__CLUSTER__ENABLED
+              value: "true"
+            - name: QDRANT__CLUSTER__P2P_PORT
+              value: "6335"
           ports:
             - containerPort: {{ .Values.qdrant.grpcPort }}
               name: grpc
             - containerPort: {{ .Values.qdrant.httpPort }}
               name: http
+            - containerPort: 6335
+              name: p2p
           volumeMounts:
             - name: data
               mountPath: /qdrant/storage

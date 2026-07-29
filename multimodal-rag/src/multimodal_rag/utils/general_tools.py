@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import logging
+import os
 import threading
 from math import ceil
 from typing import Callable, Sequence, Any
@@ -14,11 +15,26 @@ __all__ = [
     "sync_wrapper_safe",
     "list_chunker",
     "sync_pool",
+    "SYNC_POOL_SIZE",
     "retry_call",
     "retry_async_call",
 ]
 
-sync_pool = concurrent.futures.ThreadPoolExecutor(max_workers=12, thread_name_prefix="sync_wrapper")
+
+def _pool_size_from_env(default: int = 12) -> int:
+    raw = os.environ.get("SYNC_POOL_SIZE")
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+        return val if val > 0 else default
+    except (TypeError, ValueError):
+        logger.warning("SYNC_POOL_SIZE=%r is not a positive int; using %d", raw, default)
+        return default
+
+
+SYNC_POOL_SIZE = _pool_size_from_env()
+sync_pool = concurrent.futures.ThreadPoolExecutor(max_workers=SYNC_POOL_SIZE, thread_name_prefix="sync_wrapper")
 
 
 def cosine_sim(vec1: np.ndarray, vec2: np.ndarray):
