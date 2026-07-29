@@ -15,5 +15,8 @@ spec:
     - name: http
       port: {{ .Values.qdrant.httpPort }}
       targetPort: {{ .Values.qdrant.httpPort }}
+    - name: p2p
+      port: 6335
+      targetPort: 6335
   selector:
     app: {{ .Values.deployment.name }}-qdrant

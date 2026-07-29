@@ -38,6 +38,27 @@ logger = logging.getLogger(__name__)
 __all__ = ["MultiModalRAGSystem", "MultimodalRAG", "Preprocessor", "Postprocessor"]
 
 
+def _qdrant_prefer_grpc() -> bool:
+    """Whether Qdrant clients should prefer gRPC. Defaults to False (HTTP)
+    to preserve the single-replica chart's behaviour; the scale chart sets
+    ``QDRANT_PREFER_GRPC=true`` for higher throughput at high QPS."""
+    return os.environ.get("QDRANT_PREFER_GRPC", "false").lower() in ("true", "1", "yes")
+
+
+def _qdrant_client_timeout():
+    """Hard timeout (seconds) for Qdrant client calls. Defaults to None
+    (no timeout) to preserve the original behaviour; the scale chart sets
+    ``QDRANT_CLIENT_TIMEOUT=30`` so a hung Qdrant cannot pin a sync_pool
+    thread indefinitely."""
+    raw = os.environ.get("QDRANT_CLIENT_TIMEOUT")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Media helpers (shared by Preprocessor & Postprocessor)
 # ---------------------------------------------------------------------------
@@ -696,7 +717,12 @@ class MultimodalRAG:
         from qdrant_client.models import Distance, VectorParams
 
         if qdrant_host:
-            client = QdrantClient(host=qdrant_host, port=qdrant_port)
+            client = QdrantClient(
+                host=qdrant_host,
+                port=qdrant_port,
+                prefer_grpc=_qdrant_prefer_grpc(),
+                timeout=_qdrant_client_timeout(),
+            )
         else:
             client = QdrantClient(path=qdrant_path)
 

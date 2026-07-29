@@ -1,8 +1,11 @@
 # -- Global settings ----------------------------------------------------------
-replicaCount: 1
+# Scale variant: multiple API replicas + gunicorn workers, multi-replica
+# Qdrant, optional Redis for cross-pod unlock cache. See helm/ for the
+# original single-replica chart.
+replicaCount: 4
 image:
   repository: andrewbydlon/rag-api-server
-  tag: v1.0.0
+  tag: v1.1.0
   pullPolicy: IfNotPresent
 
 deployment:
@@ -10,16 +13,32 @@ deployment:
   appName: rag-mcp-server
 
 
+# -- App server tuning --------------------------------------------------------
+app:
+  # Run the API server under gunicorn with UvicornWorker so each pod runs
+  # `workers` event loops (one per process). Each worker gets its own
+  # `sync_pool`, so effective concurrency ≈ replicaCount * workers *
+  # syncPoolSize.
+  workers: 4
+  # Per-worker thread pool for blocking RAG work (embedding, Qdrant, file
+  # processing). Falls back to 12 if unset (matches the single-replica
+  # chart).
+  syncPoolSize: 64
+  # MCP server sync tools are converted to async + offloaded to a thread
+  # pool of this size (per pod). Keep >= syncPoolSize to avoid starving.
+  mcpPoolSize: 64
+
+
 # -- Persistence ---------------------------------------------------------------
 persistence:
   data:
-    size: 50Gi
+    size: 100Gi
     storageClass: "gl4f-filesystem"
     accessMode: ReadWriteMany
   qdrant:
-    size: 50Gi
+    size: 100Gi
     storageClass: "gl4f-filesystem"
-    accessMode: ReadWriteMany
+    accessMode: ReadWriteOnce   # per-pod volume via volumeClaimTemplates
 
 
 # -- Model configuration ------------------------------------------------------
@@ -47,13 +66,20 @@ models:
     className: "MultiModalReranker"
     extra: {}
   vlm:
-    name: "Gemma4-31B-FP8"
+    name: "RedHatAI/gemma-4-31B-it-FP8-block"
     url: ""
     extra: {}
   asr:
-    name: ""
+    name: "CohereLabs/cohere-transcribe-03-2026"
     url: ""
     extra: {}
+
+# Per-process httpx connection pool limit for model endpoint clients.
+# Raised from the single-replica default of 30 so the embedder (on every
+# search's critical path) is not the bottleneck.
+modelPool:
+  maxConnections: 200
+  maxKeepaliveConnections: 50
 
 # -- Model API keys (sensitive) -----------------------------------------------
 # These are stored in a Kubernetes Secret, not the ConfigMap.
@@ -77,22 +103,46 @@ rag:
   captionVideo: false  # Transcribe video audio tracks via ASR
   remote: false         # Use remote model URLs (vs in-cluster .svc.cluster.local)
   dedupThreshold: 0.995  # Cosine similarity above which a doc is considered a duplicate (0.0–1.0)
+  # When true, get_dataset() does NOT auto-sync document_count from Qdrant
+  # on every read. Counts are synced only on explicit admin requests. This
+  # avoids cross-replica meta.json write races and cuts Qdrant load.
+  deferCountSync: true
 
 # -- Qdrant configuration -----------------------------------------------------
-# Qdrant runs as a sidecar StatefulSet.  The API server connects to it
-# over the in-cluster DNS name.
+# Multi-replica Qdrant cluster with built-in sharding for read scaling.
 qdrant:
+  replicas: 3
   image:
     repository: qdrant/qdrant
-    tag: latest
+    tag: "v1.18.2"
     pullPolicy: IfNotPresent
   grpcPort: 6334
   httpPort: 6333
+  # Clients connect over gRPC (more efficient than HTTP at high QPS) with
+  # a hard timeout so a hung Qdrant cannot pin a sync_pool thread forever.
+  client:
+    preferGrpc: true
+    timeout: 30
+
+
+# -- Redis (optional cross-pod unlock cache) ----------------------------------
+# When enabled, dataset unlock state is shared across API replicas so a user
+# only unlocks once. When disabled, each pod keeps its own in-memory cache
+# (a user may be prompted to re-unlock if routed to a different pod).
+redis:
+  enabled: true
+  image:
+    repository: redis
+    tag: "7-alpine"
+    pullPolicy: IfNotPresent
+  port: 6379
+  # TTL for unlock cache entries (seconds). 30 min matches the in-memory default.
+  unlockTtl: 1800
 
 
 # -- MCP server (optional sidecar) --------------------------------------------
 # Runs alongside the API server and exposes the same retrieval pipeline
-# as MCP tools over SSE transport.
+# as MCP tools over SSE transport. Tools are async + thread-offloaded.
 mcp:
   enabled: true
   port: 9090
@@ -111,7 +161,7 @@ service:
 resources:
   app:
     requests:
-      memory: "2Gi"
+      memory: "4Gi"
       cpu: 2
     limits:
       memory: "8Gi"
@@ -123,6 +173,17 @@ resources:
     limits:
       memory: "32Gi"
       cpu: "8"
+  redis:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+# -- Pod anti-affinity (spread replicas across nodes) -------------------------
+antiAffinity:
+  enabled: true
 
 # -- Environment variables (extra) --------------------------------------------
 extraEnv: {}

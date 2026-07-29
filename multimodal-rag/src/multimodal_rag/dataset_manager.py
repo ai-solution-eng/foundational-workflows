@@ -7,6 +7,7 @@ uploaded files stored on a PVC at ``/data/datasets/<name>/files/``.
 """
 
 import base64
+import contextlib
 import hashlib
 import httpx
 import json
@@ -19,6 +20,14 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl  # Unix-only; k8s pods are Linux.
+
+    _HAS_FCNTL = True
+except ImportError:  # pragma: no cover - Windows dev only
+    fcntl = None  # type: ignore[assignment]
+    _HAS_FCNTL = False
 
 from multimodal_rag.rag_system import MultimodalRAG
 from multimodal_rag.input_processing import (
@@ -42,6 +51,50 @@ from multimodal_rag.utils.logging_utils import logging
 from multimodal_rag.utils.general_tools import retry_call
 
 logger = logging.getLogger(__name__)
+
+# When True, get_dataset()/list_datasets() skip the per-call Qdrant count
+# sync (which writes meta.json on every read). Counts are still maintained
+# incrementally via _increment_count/_decrement_count. The scale chart sets
+# this to avoid cross-replica meta.json write races and cut Qdrant load.
+_DEFER_COUNT_SYNC = os.environ.get("RAG_DEFER_COUNT_SYNC", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+# Fallback thread locks for platforms without fcntl (Windows dev only).
+_fallback_locks: dict[str, threading.Lock] = {}
+_fallback_locks_guard = threading.Lock()
+
+
+@contextlib.contextmanager
+def _cross_process_lock(lock_path: Path):
+    """Cross-process + cross-thread advisory file lock.
+
+    Uses ``fcntl.flock(LOCK_EX)`` on a sidecar ``.lock`` file so that
+    multiple pods sharing the RWX PVC serialize read→modify→write cycles
+    on dataset metadata and the dedup hash index. On non-unix platforms
+    falls back to a per-path ``threading.Lock`` (in-process only).
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if _HAS_FCNTL:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+    else:  # pragma: no cover - Windows dev only
+        key = str(lock_path)
+        with _fallback_locks_guard:
+            lk = _fallback_locks.get(key)
+            if lk is None:
+                lk = threading.Lock()
+                _fallback_locks[key] = lk
+        with lk:
+            yield
+
 
 # Supported file extensions mapped to a media type label
 _IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"})
@@ -748,9 +801,10 @@ class DatasetManager:
         self._rag_cache: dict[str, MultimodalRAG] = {}
         self._rag_cache_lock = threading.Lock()
 
-        # Per-dataset locks for meta.json read→modify→write cycles
-        self._meta_locks: dict[str, threading.Lock] = {}
-        self._meta_locks_lock = threading.Lock()
+        # Note: per-dataset meta.json locking is handled by
+        # _get_meta_lock() which returns a cross-process file lock
+        # (fcntl.flock on a .meta.lock sidecar file).  No in-process
+        # lock dict is needed.
 
     # ------------------------------------------------------------------
     # Model endpoint verification
@@ -933,7 +987,8 @@ class DatasetManager:
             if child.is_dir():
                 meta = self._read_meta(child.name)
                 if meta:
-                    self._sync_count_from_qdrant(child.name, meta)
+                    if not _DEFER_COUNT_SYNC:
+                        self._sync_count_from_qdrant(child.name, meta)
                     datasets.append(self._strip_password(meta))
         return datasets
 
@@ -941,23 +996,28 @@ class DatasetManager:
         """Return metadata for a single dataset (password hash stripped).
 
         Raises ``FileNotFoundError`` if it does not exist.
+
+        ``sync_count`` is ignored when ``RAG_DEFER_COUNT_SYNC`` is set, so
+        reads never trigger a Qdrant round-trip + meta.json write under the
+        scale deployment.
         """
         meta = self._read_meta(name)
         if not meta:
             raise FileNotFoundError(f"Dataset '{name}' not found")
-        if sync_count:
+        if sync_count and not _DEFER_COUNT_SYNC:
             self._sync_count_from_qdrant(name, meta)
         return self._strip_password(meta)
 
     def update_dataset(self, name: str, updates: dict[str, Any]) -> None:
         """Update metadata fields (e.g. description) for an existing dataset."""
-        meta = self._read_meta(name)
-        if not meta:
-            raise FileNotFoundError(f"Dataset '{name}' not found")
-        for key in ("description", "caption_video"):
-            if key in updates:
-                meta[key] = updates[key]
-        self._write_meta(name, meta)
+        with self._get_meta_lock(name):
+            meta = self._read_meta(name)
+            if not meta:
+                raise FileNotFoundError(f"Dataset '{name}' not found")
+            for key in ("description", "caption_video"):
+                if key in updates:
+                    meta[key] = updates[key]
+            self._write_meta(name, meta)
 
     # ------------------------------------------------------------------
     # Adding content
@@ -2284,17 +2344,26 @@ class DatasetManager:
                 info = client.get_collection(coll)
                 qdrant_count = info.points_count
                 if meta.get("document_count", 0) != qdrant_count:
-                    meta["document_count"] = qdrant_count
-                    self._write_meta(name, meta)
+                    # Re-read meta inside the cross-process lock so we
+                    # don't clobber a concurrent update (e.g. description
+                    # change) that happened between the caller's read and
+                    # our write.
+                    with self._get_meta_lock(name):
+                        fresh = self._read_meta(name)
+                        if fresh:
+                            fresh["document_count"] = qdrant_count
+                            self._write_meta(name, fresh)
         except Exception:
             pass  # Best-effort: don't fail if Qdrant is unreachable
 
-    def _get_meta_lock(self, name: str) -> threading.Lock:
-        """Return (or create) a per-dataset lock for meta.json updates."""
-        with self._meta_locks_lock:
-            if name not in self._meta_locks:
-                self._meta_locks[name] = threading.Lock()
-            return self._meta_locks[name]
+    def _get_meta_lock(self, name: str) -> contextlib.AbstractContextManager:
+        """Return a cross-process lock for *meta.json* read→modify→write.
+
+        Acquire this around any read-modify-write of a dataset's meta so
+        that concurrent pods (sharing the RWX PVC) cannot clobber each
+        other's updates.
+        """
+        return _cross_process_lock(self._dataset_dir(name) / ".meta.lock")
 
     def _increment_count(self, name: str, n: int, file_type: str | None = None) -> None:
         with self._get_meta_lock(name):
@@ -2335,32 +2404,39 @@ class DatasetManager:
                 h.update(chunk)
         file_hash = h.hexdigest()
 
-        # Load or create hash index
+        # Load or create hash index.  The read→modify→write of .hashes.json
+        # is guarded by a cross-process file lock so concurrent uploads
+        # (possibly from different pods sharing the RWX PVC) cannot lose
+        # hash entries and corrupt dedup.
         hash_index_path = files_dir / ".hashes.json"
-        if hash_index_path.exists():
-            hash_index = json.loads(hash_index_path.read_text())
-        else:
-            hash_index = {}
+        with _cross_process_lock(files_dir / ".hashes.lock"):
+            if hash_index_path.exists():
+                hash_index = json.loads(hash_index_path.read_text())
+            else:
+                hash_index = {}
 
-        # Check for existing file with same hash
-        if file_hash in hash_index:
-            existing = Path(hash_index[file_hash])
-            if existing.exists():
-                return existing
-            # Stale entry — remove and re-store
-            del hash_index[file_hash]
+            # Check for existing file with same hash
+            if file_hash in hash_index:
+                existing = Path(hash_index[file_hash])
+                if existing.exists():
+                    return existing
+                # Stale entry — remove and re-store
+                del hash_index[file_hash]
 
-        # Copy file — use original_name for a readable stem if available
-        if original_name:
-            stem = Path(original_name).stem
-            suffix = Path(original_name).suffix
-        else:
-            stem = Path(source_path).stem
-            suffix = Path(source_path).suffix
-        dest = files_dir / f"{uuid.uuid4().hex}_{stem}{suffix}"
-        import shutil
+            # Copy file — use original_name for a readable stem if available
+            if original_name:
+                stem = Path(original_name).stem
+                suffix = Path(original_name).suffix
+            else:
+                stem = Path(source_path).stem
+                suffix = Path(source_path).suffix
+            dest = files_dir / f"{uuid.uuid4().hex}_{stem}{suffix}"
+            import shutil
 
-        shutil.copy2(source_path, dest)
-        hash_index[file_hash] = str(dest)
-        hash_index_path.write_text(json.dumps(hash_index, indent=2))
-        return dest
+            shutil.copy2(source_path, dest)
+            hash_index[file_hash] = str(dest)
+            # Atomic write so a crash never leaves a truncated index.
+            tmp = hash_index_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(hash_index, indent=2))
+            os.replace(tmp, hash_index_path)
+            return dest

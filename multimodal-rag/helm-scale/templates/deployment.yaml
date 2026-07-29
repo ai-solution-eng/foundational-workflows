@@ -15,25 +15,48 @@ spec:
       labels:
         app: {{ .Values.deployment.appName }}
     spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      initContainers:
+        - name: fix-pvc-permissions
+          image: busybox:latest
+          securityContext:
+            runAsUser: 0
+          command: ["sh", "-c", "chown -R 1000:1000 /data"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- if .Values.antiAffinity.enabled }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - {{ .Values.deployment.appName }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
       containers:
         - name: rag-api-server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
-            - python
-            - -m
-            - multimodal_rag.api_server
-          args:
-            - --host
-            - "0.0.0.0"
-            - --port
-            - "8000"
-            - --data-path
-            - "/data"
-            - --qdrant-host
-            - {{ .Values.deployment.name }}-qdrant
-            - --qdrant-port
-            - "6333"
+            - gunicorn
+            - -k
+            - uvicorn.workers.UvicornWorker
+            - -w
+            - {{ .Values.app.workers | quote }}
+            - --bind
+            - "0.0.0.0:8000"
+            - --timeout
+            - "300"
+            - multimodal_rag.api_server:app
           envFrom:
             - configMapRef:
                 name: {{ .Values.deployment.name }}-config
@@ -42,6 +65,12 @@ spec:
           env:
             - name: RAG_REMOTE
               value: {{ .Values.rag.remote | quote }}
+            - name: DATA_PATH
+              value: "/data"
+            - name: QDRANT_HOST
+              value: {{ .Values.deployment.name }}-qdrant
+            - name: QDRANT_PORT
+              value: {{ .Values.qdrant.httpPort | quote }}
             {{- range $key, $val := .Values.extraEnv }}
             - name: {{ $key }}
               value: {{ $val | quote }}
@@ -53,20 +82,28 @@ spec:
             - name: data
               mountPath: /data
           resources: {{ toYaml .Values.resources.app | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            failureThreshold: 30
+            periodSeconds: 5
+            timeoutSeconds: 3
           livenessProbe:
             httpGet:
               path: /healthz
               port: 8000
-            initialDelaySeconds: 15
+            initialDelaySeconds: 0
             periodSeconds: 15
             timeoutSeconds: 3
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: 8000
             initialDelaySeconds: 5
             periodSeconds: 10
-            timeoutSeconds: 3
+            timeoutSeconds: 5
+            failureThreshold: 3
 
         {{- if .Values.mcp.enabled }}
         - name: rag-mcp-server
@@ -88,7 +125,7 @@ spec:
             - --qdrant-host
             - {{ .Values.deployment.name }}-qdrant
             - --qdrant-port
-            - "6333"
+            - {{ .Values.qdrant.httpPort | quote }}
           envFrom:
             - configMapRef:
                 name: {{ .Values.deployment.name }}-config
@@ -97,6 +134,12 @@ spec:
           env:
             - name: RAG_REMOTE
               value: {{ .Values.rag.remote | quote }}
+            - name: DATA_PATH
+              value: "/data"
+            - name: QDRANT_HOST
+              value: {{ .Values.deployment.name }}-qdrant
+            - name: QDRANT_PORT
+              value: {{ .Values.qdrant.httpPort | quote }}
             {{- range $key, $val := .Values.extraEnv }}
             - name: {{ $key }}
               value: {{ $val | quote }}

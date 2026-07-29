@@ -6,6 +6,7 @@ metadata:
   labels:
     app: {{ .Values.deployment.appName }}
 data:
+  # NAME entries are optional: empty → auto-discovered via /v1/models.
   # Embedder
   MODEL_EMBEDDER_NAME: {{ .Values.models.embedder.name | quote }}
   MODEL_EMBEDDER_URL: {{ .Values.models.embedder.url | quote }}
@@ -28,8 +29,25 @@ data:
   RAG_CAPTION_VIDEO: {{ .Values.rag.captionVideo | quote }}
   RAG_REMOTE: {{ .Values.rag.remote | quote }}
   RAG_DEDUP_THRESHOLD: {{ .Values.rag.dedupThreshold | quote }}
+  RAG_DEFER_COUNT_SYNC: {{ .Values.rag.deferCountSync | quote }}
   # Media base URL (for PVC-to-HTTP conversion in MCP search results)
   MEDIA_BASE_URL: {{ printf "https://%s" .Values.ezua.virtualService.endpoint | quote }}
   # S3 / MinIO endpoint (not sensitive — just a URL).  Optional: leave
   # empty to use the default boto3 credential chain (IAM, ~/.aws/…).
   S3_ENDPOINT_URL: {{ (.Values.s3.endpointUrl) | default "" | quote }}
+  # -- Scale tuning ----------------------------------------------------------
+  # Per-worker thread pool for blocking RAG work
+  SYNC_POOL_SIZE: {{ .Values.app.syncPoolSize | quote }}
+  # Per-pod thread pool for MCP async tool offload
+  MCP_POOL_SIZE: {{ .Values.app.mcpPoolSize | quote }}
+  # httpx connection pool limits for model endpoint clients
+  MODEL_POOL_MAX_CONNECTIONS: {{ .Values.modelPool.maxConnections | quote }}
+  MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS: {{ .Values.modelPool.maxKeepaliveConnections | quote }}
+  # Qdrant client tuning (gRPC + hard timeout)
+  QDRANT_PREFER_GRPC: {{ .Values.qdrant.client.preferGrpc | quote }}
+  QDRANT_CLIENT_TIMEOUT: {{ .Values.qdrant.client.timeout | quote }}
+  {{- if .Values.redis.enabled }}
+  # Redis-backed cross-pod unlock cache
+  REDIS_URL: {{ printf "redis://%s-redis.%s.svc.cluster.local:%d" .Values.deployment.name .Release.Namespace (int .Values.redis.port) | quote }}
+  REDIS_UNLOCK_TTL: {{ .Values.redis.unlockTtl | quote }}
+  {{- end }}

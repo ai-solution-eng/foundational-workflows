@@ -11,7 +11,10 @@ Or with a specific transport::
 """
 
 import argparse
+import asyncio
+import concurrent.futures
 import contextvars
+import functools
 import hashlib
 import json
 import os
@@ -37,6 +40,38 @@ QDRANT_HOST = os.environ.get("QDRANT_HOST", "")
 QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
 RAG_REMOTE = os.environ.get("RAG_REMOTE", "true").lower() in ("true", "1", "yes")
 MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "")
+
+# ---------------------------------------------------------------------------
+# Thread pool for offloading blocking tool bodies off the MCP event loop.
+# MCP tool functions are async and delegate their (sync, blocking) work here
+# so a single slow search can no longer stall every concurrent MCP client.
+# Sized via MCP_POOL_SIZE (default 64).
+# ---------------------------------------------------------------------------
+
+
+def _mcp_pool_size() -> int:
+    try:
+        return max(1, int(os.environ.get("MCP_POOL_SIZE", "64")))
+    except (TypeError, ValueError):
+        return 64
+
+
+_mcp_pool = concurrent.futures.ThreadPoolExecutor(max_workers=_mcp_pool_size(), thread_name_prefix="mcp-tool")
+
+
+async def _offload(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run a sync callable in the MCP thread pool.
+
+    Propagates the current ``contextvars`` context into the worker thread
+    so per-request ContextVars (memory dataset/password/session-id set by
+    ``_MemoryHeaderMiddleware``) remain visible inside offloaded tool
+    bodies.
+    """
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    call = functools.partial(ctx.run, functools.partial(fn, *args, **kwargs))
+    return await loop.run_in_executor(_mcp_pool, call)
+
 
 # ---------------------------------------------------------------------------
 # Unlock cache: dataset_name -> (expiry_timestamp, password)
@@ -115,9 +150,11 @@ def _check_unlocked_or_password(
 # memory password arriving on the connection CANNOT silently unlock some
 # other dataset — it is scoped to the memory tools alone.
 #
-# Sync tools run inline in the request coroutine (FastMCP calls ``fn(...)``
-# directly, not in a thread pool), and child tasks copy the parent context,
-# so a ContextVar set here is reliably visible inside the tool functions.
+# Tool functions are ``async def`` and delegate their blocking bodies to the
+# MCP thread pool via ``_offload`` (see ``_mcp_pool``).  ``_offload`` copies
+# the current ``contextvars`` context into the worker thread, so a
+# ContextVar set here by the middleware is reliably visible inside the
+# offloaded tool bodies.
 
 _memory_dataset_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("rag_memory_dataset", default=None)
 _memory_password_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
@@ -263,15 +300,20 @@ def get_manager() -> DatasetManager:
 
 
 async def get_manager_async() -> DatasetManager:
-    """Async-safe wrapper — offloads get_manager() to a thread pool."""
+    """Async-safe wrapper — offloads get_manager() to a thread.
+
+    Uses the shared ``sync_pool`` (rather than spawning a new
+    ``ThreadPoolExecutor`` per call, which leaked threads on every
+    slow-path invocation after a startup failure).
+    """
     if _dm is not None:
         return _dm
     import asyncio
-    from concurrent.futures import ThreadPoolExecutor
 
-    _pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mcp-sync")
+    from multimodal_rag.utils.general_tools import sync_pool
+
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_pool, get_manager)
+    return await loop.run_in_executor(sync_pool, get_manager)
 
 
 def _prefer_preprocessed_media(doc: Any) -> Any:
@@ -852,25 +894,29 @@ try:
     )
 
     @mcp.tool()
-    def list_datasets() -> str:
+    async def list_datasets() -> str:
         """List all available datasets with their metadata."""
-        datasets = get_manager().list_datasets()
-        if not datasets:
-            return "No datasets found."
-        lines = ["Available datasets:"]
-        for ds in datasets:
-            desc = ds.get("description", "")
-            caption = " [caption_video]" if ds.get("caption_video") else ""
-            lock = " [password]" if ds.get("has_password") else ""
-            unlocked = " [unlocked]" if _is_unlocked(ds["name"]) else ""
-            lines.append(
-                f"  • {ds['name']}{caption}{lock}{unlocked} — {ds.get('document_count', 0)} documents"
-                f"{' — ' + desc if desc else ''}"
-            )
-        return "\n".join(lines)
+
+        def _impl() -> str:
+            datasets = get_manager().list_datasets()
+            if not datasets:
+                return "No datasets found."
+            lines = ["Available datasets:"]
+            for ds in datasets:
+                desc = ds.get("description", "")
+                caption = " [caption_video]" if ds.get("caption_video") else ""
+                lock = " [password]" if ds.get("has_password") else ""
+                unlocked = " [unlocked]" if _is_unlocked(ds["name"]) else ""
+                lines.append(
+                    f"  • {ds['name']}{caption}{lock}{unlocked} — {ds.get('document_count', 0)} documents"
+                    f"{' — ' + desc if desc else ''}"
+                )
+            return "\n".join(lines)
+
+        return await _offload(_impl)
 
     @mcp.tool()
-    def unlock_dataset(
+    async def unlock_dataset(
         dataset_name: str,
         password: str,
         ttl: int = 1800,
@@ -890,27 +936,31 @@ try:
         ttl:
             Unlock duration in seconds (default 1800 = 30 min).
         """
-        if ttl < 60 or ttl > 86400:
-            raise ToolError("TTL must be between 60 seconds and 86400 seconds (24 hours).")
-        dm = get_manager()
-        try:
-            dm.get_dataset(dataset_name)
-        except FileNotFoundError:
-            raise ToolError(f"Dataset '{dataset_name}' not found.")
-        if not dm.has_password(dataset_name):
-            return f"Dataset '{dataset_name}' is not password protected — nothing to unlock."
-        if not dm.verify_password(dataset_name, password):
-            raise ToolError(f"Incorrect password for dataset '{dataset_name}'.")
-        with _unlocked_lock:
-            _unlocked[dataset_name] = (time.monotonic() + ttl, password)
-        return (
-            f"Dataset '{dataset_name}' unlocked for {ttl // 60} minutes "
-            f"(until approximately "
-            f"{datetime.fromtimestamp(time.time() + ttl).strftime('%H:%M:%S')})."
-        )
+
+        def _impl() -> str:
+            if ttl < 60 or ttl > 86400:
+                raise ToolError("TTL must be between 60 seconds and 86400 seconds (24 hours).")
+            dm = get_manager()
+            try:
+                dm.get_dataset(dataset_name)
+            except FileNotFoundError:
+                raise ToolError(f"Dataset '{dataset_name}' not found.")
+            if not dm.has_password(dataset_name):
+                return f"Dataset '{dataset_name}' is not password protected — nothing to unlock."
+            if not dm.verify_password(dataset_name, password):
+                raise ToolError(f"Incorrect password for dataset '{dataset_name}'.")
+            with _unlocked_lock:
+                _unlocked[dataset_name] = (time.monotonic() + ttl, password)
+            return (
+                f"Dataset '{dataset_name}' unlocked for {ttl // 60} minutes "
+                f"(until approximately "
+                f"{datetime.fromtimestamp(time.time() + ttl).strftime('%H:%M:%S')})."
+            )
+
+        return await _offload(_impl)
 
     @mcp.tool()
-    def search_dataset(
+    async def search_dataset(
         dataset_name: str,
         query: str = "",
         image: str | None = None,
@@ -961,42 +1011,46 @@ try:
             so the frontend can fetch media directly without large inline
             base64 payloads.
         """
-        dm = get_manager()
-        try:
-            dm.get_dataset(dataset_name)
-        except FileNotFoundError:
-            raise ToolError(f"Dataset '{dataset_name}' not found.")
-        verified_password = _resolve_and_unlock(dm, dataset_name, password)
 
-        # -- Build multimodal query dict --
-        query_dict: str | dict[str, Any] = query
-        if image or video or audio:
-            query_dict = {}
-            if query:
-                query_dict["text"] = query
-            if image:
-                query_dict["image"] = image
-            if video:
-                query_dict["video"] = video
-            if audio:
-                query_dict["audio"] = audio
+        def _impl() -> str:
+            dm = get_manager()
+            try:
+                dm.get_dataset(dataset_name)
+            except FileNotFoundError:
+                raise ToolError(f"Dataset '{dataset_name}' not found.")
+            verified_password = _resolve_and_unlock(dm, dataset_name, password)
 
-        rag = dm._get_rag(dataset_name)
-        return _run_retrieval(
-            rag,
-            dataset_name,
-            query_dict,
-            query,
-            top_k,
-            use_reranker,
-            reranker_top_k,
-            base_llm_modalities,
-            verified_password,
-            media_base_url,
-        )
+            # -- Build multimodal query dict --
+            query_dict: str | dict[str, Any] = query
+            if image or video or audio:
+                query_dict = {}
+                if query:
+                    query_dict["text"] = query
+                if image:
+                    query_dict["image"] = image
+                if video:
+                    query_dict["video"] = video
+                if audio:
+                    query_dict["audio"] = audio
+
+            rag = dm._get_rag(dataset_name)
+            return _run_retrieval(
+                rag,
+                dataset_name,
+                query_dict,
+                query,
+                top_k,
+                use_reranker,
+                reranker_top_k,
+                base_llm_modalities,
+                verified_password,
+                media_base_url,
+            )
+
+        return await _offload(_impl)
 
     @mcp.tool()
-    def add_memory(
+    async def add_memory(
         text: str,
         image: str | None = None,
         video: str | None = None,
@@ -1039,81 +1093,85 @@ try:
             Password for the protected memory dataset.  Optional — resolved
             from the ``X-Dataset-Password`` request header when omitted.
         """
-        ds_name = _resolve_memory_dataset(dataset_name)
-        pw = _resolve_memory_password(password)
 
-        # Auto-tag the opencode session ID if one is available (from a
-        # request header, env var, or the caller's metadata).  An explicit
-        # session_id in metadata always wins; otherwise we fill it in so
-        # memories are traceable to the session that created them without
-        # the LLM having to pass it manually.
-        metadata = dict(metadata) if metadata else {}
-        resolved_sid = _resolve_session_id(metadata.get("session_id"))
-        if resolved_sid:
-            metadata["session_id"] = resolved_sid
+        def _impl() -> str:
+            ds_name = _resolve_memory_dataset(dataset_name)
+            pw = _resolve_memory_password(password)
 
-        dm = get_manager()
-        try:
-            dm.get_dataset(ds_name)
-        except FileNotFoundError:
-            raise ToolError(
-                f"Memory dataset '{ds_name}' not found. Create it first via "
-                "the REST API (POST /api/datasets) or the HTML frontend."
+            # Auto-tag the opencode session ID if one is available (from a
+            # request header, env var, or the caller's metadata).  An explicit
+            # session_id in metadata always wins; otherwise we fill it in so
+            # memories are traceable to the session that created them without
+            # the LLM having to pass it manually.
+            meta = dict(metadata) if metadata else {}
+            resolved_sid = _resolve_session_id(meta.get("session_id"))
+            if resolved_sid:
+                meta["session_id"] = resolved_sid
+
+            dm = get_manager()
+            try:
+                dm.get_dataset(ds_name)
+            except FileNotFoundError:
+                raise ToolError(
+                    f"Memory dataset '{ds_name}' not found. Create it first via "
+                    "the REST API (POST /api/datasets) or the HTML frontend."
+                )
+            _resolve_and_unlock(dm, ds_name, pw)
+
+            # Build the document.  In MultimodalRAG._to_documents every non-
+            # 'text' key becomes Qdrant payload metadata, so the provenance
+            # fields below are stored queryably alongside the embedding.
+            doc: dict[str, Any] = {"text": text}
+            if image:
+                doc["image"] = image
+            if video:
+                doc["video"] = video
+            if audio:
+                doc["audio"] = audio
+            doc["source"] = "opencode:memory"
+            doc["memory_kind"] = meta.get("kind", "note")
+            doc["memory_ts"] = datetime.now(timezone.utc).isoformat()
+            if meta:
+                tags = meta.get("tags")
+                if tags:
+                    doc["memory_tags"] = tags
+                sid = meta.get("session_id")
+                if sid:
+                    doc["session_id"] = sid
+                # Carry any other metadata keys through verbatim.
+                for k, v in meta.items():
+                    if k not in ("kind", "tags", "session_id") and k not in doc:
+                        doc[k] = v
+
+            try:
+                ids = dm.add_documents(ds_name, [doc])
+            except Exception as exc:
+                raise ToolError(f"Failed to store memory: {exc}") from exc
+
+            meta = dm.get_dataset(ds_name)
+            count = meta.get("document_count", 0) if isinstance(meta, dict) else 0
+            dedup_thr = os.environ.get("RAG_DEDUP_THRESHOLD", "0.995")
+            return json.dumps(
+                {
+                    "status": "stored",
+                    "dataset": ds_name,
+                    "document_count": count,
+                    "stored_ids": ids,
+                    "note": (
+                        "Memory stored. Near-duplicates (cosine >= "
+                        + dedup_thr
+                        + ") are auto-skipped, so this may be a no-op if an "
+                        "identical memory already exists."
+                    ),
+                },
+                indent=2,
+                default=str,
             )
-        _resolve_and_unlock(dm, ds_name, pw)
 
-        # Build the document.  In MultimodalRAG._to_documents every non-
-        # 'text' key becomes Qdrant payload metadata, so the provenance
-        # fields below are stored queryably alongside the embedding.
-        doc: dict[str, Any] = {"text": text}
-        if image:
-            doc["image"] = image
-        if video:
-            doc["video"] = video
-        if audio:
-            doc["audio"] = audio
-        doc["source"] = "opencode:memory"
-        doc["memory_kind"] = (metadata or {}).get("kind", "note")
-        doc["memory_ts"] = datetime.now(timezone.utc).isoformat()
-        if metadata:
-            tags = metadata.get("tags")
-            if tags:
-                doc["memory_tags"] = tags
-            sid = metadata.get("session_id")
-            if sid:
-                doc["session_id"] = sid
-            # Carry any other metadata keys through verbatim.
-            for k, v in metadata.items():
-                if k not in ("kind", "tags", "session_id") and k not in doc:
-                    doc[k] = v
-
-        try:
-            ids = dm.add_documents(ds_name, [doc])
-        except Exception as exc:
-            raise ToolError(f"Failed to store memory: {exc}") from exc
-
-        meta = dm.get_dataset(ds_name)
-        count = meta.get("document_count", 0) if isinstance(meta, dict) else 0
-        dedup_thr = os.environ.get("RAG_DEDUP_THRESHOLD", "0.995")
-        return json.dumps(
-            {
-                "status": "stored",
-                "dataset": ds_name,
-                "document_count": count,
-                "stored_ids": ids,
-                "note": (
-                    "Memory stored. Near-duplicates (cosine >= "
-                    + dedup_thr
-                    + ") are auto-skipped, so this may be a no-op if an "
-                    "identical memory already exists."
-                ),
-            },
-            indent=2,
-            default=str,
-        )
+        return await _offload(_impl)
 
     @mcp.tool()
-    def search_memory(
+    async def search_memory(
         query: str,
         image: str | None = None,
         video: str | None = None,
@@ -1149,47 +1207,51 @@ try:
             Optional — resolved from request headers / env var.  The model
             usually does NOT pass these.
         """
-        ds_name = _resolve_memory_dataset(dataset_name)
-        pw = _resolve_memory_password(password)
 
-        dm = get_manager()
-        try:
-            dm.get_dataset(ds_name)
-        except FileNotFoundError:
-            raise ToolError(f"Memory dataset '{ds_name}' not found.")
-        verified_pw = _resolve_and_unlock(dm, ds_name, pw)
+        def _impl() -> str:
+            ds_name = _resolve_memory_dataset(dataset_name)
+            pw = _resolve_memory_password(password)
 
-        query_dict: str | dict[str, Any] = query
-        if image or video or audio:
-            query_dict = {}
-            if query:
-                query_dict["text"] = query
-            if image:
-                query_dict["image"] = image
-            if video:
-                query_dict["video"] = video
-            if audio:
-                query_dict["audio"] = audio
+            dm = get_manager()
+            try:
+                dm.get_dataset(ds_name)
+            except FileNotFoundError:
+                raise ToolError(f"Memory dataset '{ds_name}' not found.")
+            verified_pw = _resolve_and_unlock(dm, ds_name, pw)
 
-        rag = dm._get_rag(ds_name)
-        # media_base_url=None lets _run_retrieval fall back to the global
-        # MEDIA_BASE_URL env var so any media memories also get clickable
-        # HTTP URLs (with the ?password= suffix for protected datasets).
-        return _run_retrieval(
-            rag,
-            ds_name,
-            query_dict,
-            query,
-            top_k,
-            use_reranker,
-            reranker_top_k,
-            base_llm_modalities,
-            verified_pw,
-            None,
-        )
+            query_dict: str | dict[str, Any] = query
+            if image or video or audio:
+                query_dict = {}
+                if query:
+                    query_dict["text"] = query
+                if image:
+                    query_dict["image"] = image
+                if video:
+                    query_dict["video"] = video
+                if audio:
+                    query_dict["audio"] = audio
+
+            rag = dm._get_rag(ds_name)
+            # media_base_url=None lets _run_retrieval fall back to the global
+            # MEDIA_BASE_URL env var so any media memories also get clickable
+            # HTTP URLs (with the ?password= suffix for protected datasets).
+            return _run_retrieval(
+                rag,
+                ds_name,
+                query_dict,
+                query,
+                top_k,
+                use_reranker,
+                reranker_top_k,
+                base_llm_modalities,
+                verified_pw,
+                None,
+            )
+
+        return await _offload(_impl)
 
     @mcp.tool()
-    def get_dataset_files(
+    async def get_dataset_files(
         dataset_name: str,
         file_path: str | None = None,
         limit: int = 100,
@@ -1223,123 +1285,127 @@ try:
             ``unlock_dataset``; required otherwise.  When provided this
             also acts as an implicit unlock for future calls.
         """
-        dm = get_manager()
-        try:
-            dm.get_dataset(dataset_name)
-        except FileNotFoundError:
-            raise ToolError(f"Dataset '{dataset_name}' not found.")
-        _check_unlocked_or_password(dm, dataset_name, password)
 
-        files_dir = dm._dataset_dir(dataset_name) / "files"
-        if not files_dir.exists():
-            return json.dumps({"files": [], "message": "No files in dataset."})
-
-        # -- List files (paginated) --
-        if file_path is None:
-            limit = max(1, min(limit, 500))
-            offset = max(0, offset)
-            all_files = sorted(f for f in files_dir.iterdir() if f.is_file() and not f.name.startswith("."))
-            total = len(all_files)
-            page = all_files[offset : offset + limit]
-            entries: list[dict[str, Any]] = []
-            from multimodal_rag.dataset_manager import _classify_file
-
-            for f in page:
-                file_type = _classify_file(f.name)
-                stat = f.stat()
-                entries.append(
-                    {
-                        "name": f.name,
-                        "path": f.name,
-                        "size_bytes": stat.st_size,
-                        "type": file_type,
-                        "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                    }
-                )
-            return json.dumps(
-                {
-                    "dataset": dataset_name,
-                    "file_count": total,
-                    "returned": len(entries),
-                    "offset": offset,
-                    "limit": limit,
-                    "has_more": (offset + limit) < total,
-                    "files": entries,
-                },
-                indent=2,
-                default=str,
-            )
-
-        # -- Retrieve a specific file --
-        target = files_dir / file_path
-        # Resolve to prevent directory traversal
-        try:
-            target = target.resolve()
-            target.relative_to(files_dir.resolve())
-        except ValueError:
-            raise ToolError("Invalid file path.")
-
-        if not target.exists() or not target.is_file():
-            raise ToolError(f"File '{file_path}' not found in dataset '{dataset_name}'.")
-
-        stat = target.stat()
-        from multimodal_rag.dataset_manager import _classify_file
-
-        file_type = _classify_file(file_path)
-        import mimetypes
-
-        mime_type, _ = mimetypes.guess_type(file_path)
-
-        # Text-based types that can be returned inline
-        _TEXT_TYPES = frozenset(
-            {
-                "text",
-                "json",
-                "code",
-                "xml",
-                "yaml",
-                "log",
-                "html",
-                "notebook",
-            }
-        )
-        if file_type in _TEXT_TYPES:
+        def _impl() -> str:
+            dm = get_manager()
             try:
-                content = target.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                content = None
-            if content is not None:
+                dm.get_dataset(dataset_name)
+            except FileNotFoundError:
+                raise ToolError(f"Dataset '{dataset_name}' not found.")
+            _check_unlocked_or_password(dm, dataset_name, password)
+
+            files_dir = dm._dataset_dir(dataset_name) / "files"
+            if not files_dir.exists():
+                return json.dumps({"files": [], "message": "No files in dataset."})
+
+            # -- List files (paginated) --
+            if file_path is None:
+                lim = max(1, min(limit, 500))
+                off = max(0, offset)
+                all_files = sorted(f for f in files_dir.iterdir() if f.is_file() and not f.name.startswith("."))
+                total = len(all_files)
+                page = all_files[off : off + lim]
+                entries: list[dict[str, Any]] = []
+                from multimodal_rag.dataset_manager import _classify_file
+
+                for f in page:
+                    file_type = _classify_file(f.name)
+                    stat = f.stat()
+                    entries.append(
+                        {
+                            "name": f.name,
+                            "path": f.name,
+                            "size_bytes": stat.st_size,
+                            "type": file_type,
+                            "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                        }
+                    )
                 return json.dumps(
                     {
                         "dataset": dataset_name,
-                        "file": file_path,
-                        "size_bytes": stat.st_size,
-                        "type": file_type,
-                        "mime_type": mime_type,
-                        "content": content,
+                        "file_count": total,
+                        "returned": len(entries),
+                        "offset": off,
+                        "limit": lim,
+                        "has_more": (off + lim) < total,
+                        "files": entries,
                     },
                     indent=2,
                     default=str,
                 )
 
-        # Binary or unreadable file — return metadata + API download URL
-        api_url = f"/api/datasets/{dataset_name}/files/{file_path}"
-        return json.dumps(
-            {
-                "dataset": dataset_name,
-                "file": file_path,
-                "size_bytes": stat.st_size,
-                "type": file_type,
-                "mime_type": mime_type,
-                "note": "Binary file — use the REST API to download.",
-                "download_url": api_url,
-            },
-            indent=2,
-            default=str,
-        )
+            # -- Retrieve a specific file --
+            target = files_dir / file_path
+            # Resolve to prevent directory traversal
+            try:
+                target = target.resolve()
+                target.relative_to(files_dir.resolve())
+            except ValueError:
+                raise ToolError("Invalid file path.")
+
+            if not target.exists() or not target.is_file():
+                raise ToolError(f"File '{file_path}' not found in dataset '{dataset_name}'.")
+
+            stat = target.stat()
+            from multimodal_rag.dataset_manager import _classify_file
+
+            file_type = _classify_file(file_path)
+            import mimetypes
+
+            mime_type, _ = mimetypes.guess_type(file_path)
+
+            # Text-based types that can be returned inline
+            _TEXT_TYPES = frozenset(
+                {
+                    "text",
+                    "json",
+                    "code",
+                    "xml",
+                    "yaml",
+                    "log",
+                    "html",
+                    "notebook",
+                }
+            )
+            if file_type in _TEXT_TYPES:
+                try:
+                    content = target.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    content = None
+                if content is not None:
+                    return json.dumps(
+                        {
+                            "dataset": dataset_name,
+                            "file": file_path,
+                            "size_bytes": stat.st_size,
+                            "type": file_type,
+                            "mime_type": mime_type,
+                            "content": content,
+                        },
+                        indent=2,
+                        default=str,
+                    )
+
+            # Binary or unreadable file — return metadata + API download URL
+            api_url = f"/api/datasets/{dataset_name}/files/{file_path}"
+            return json.dumps(
+                {
+                    "dataset": dataset_name,
+                    "file": file_path,
+                    "size_bytes": stat.st_size,
+                    "type": file_type,
+                    "mime_type": mime_type,
+                    "note": "Binary file — use the REST API to download.",
+                    "download_url": api_url,
+                },
+                indent=2,
+                default=str,
+            )
+
+        return await _offload(_impl)
 
     @mcp.tool()
-    def get_dataset_info(dataset_name: str, password: str | None = None) -> str:
+    async def get_dataset_info(dataset_name: str, password: str | None = None) -> str:
         """Return metadata (including document count and password status) for a dataset.
 
         Parameters
@@ -1351,14 +1417,18 @@ try:
             ``unlock_dataset``; required otherwise.  When provided this
             also acts as an implicit unlock for future calls.
         """
-        dm = get_manager()
-        try:
-            dm.get_dataset(dataset_name)
-        except FileNotFoundError:
-            raise ToolError(f"Dataset '{dataset_name}' not found.")
-        _check_unlocked_or_password(dm, dataset_name, password)
-        meta = dm.get_dataset(dataset_name)
-        return json.dumps(meta, indent=2, default=str)
+
+        def _impl() -> str:
+            dm = get_manager()
+            try:
+                dm.get_dataset(dataset_name)
+            except FileNotFoundError:
+                raise ToolError(f"Dataset '{dataset_name}' not found.")
+            _check_unlocked_or_password(dm, dataset_name, password)
+            meta = dm.get_dataset(dataset_name)
+            return json.dumps(meta, indent=2, default=str)
+
+        return await _offload(_impl)
 
     # ------------------------------------------------------------------
     # Standalone media understanding tools (no dataset required)
@@ -1418,7 +1488,7 @@ try:
         return f"file://{result}"
 
     @mcp.tool()
-    def describe_media(
+    async def describe_media(
         media_url: str,
         query: str = "",
     ) -> str:
@@ -1438,82 +1508,87 @@ try:
             Optional question about the media — the VLM will answer it
             instead of giving a generic description.
         """
-        from multimodal_rag.rag_system import _describe_doc, _media_url_to_displayable
-        from multimodal_rag.utils.general_tools import sync_wrapper_safe
 
-        dm = get_manager()
-        vlm = dm.vlm
-        if vlm is None:
-            raise ToolError("No VLM model configured on this server.")
+        def _impl() -> str:
+            from multimodal_rag.rag_system import _describe_doc, _media_url_to_displayable
+            from multimodal_rag.utils.general_tools import sync_wrapper_safe
 
-        # Preprocess local files (resize images, transcode video) so the
-        # VLM endpoint doesn't receive oversized payloads.
-        processed_url = _preprocess_media_url(media_url, dm)
+            dm = get_manager()
+            vlm = dm.vlm
+            if vlm is None:
+                raise ToolError("No VLM model configured on this server.")
 
-        # Build a doc dict in the format _describe_doc expects
-        path = processed_url
-        if path.startswith("file://"):
-            path = path[7:]
+            # Preprocess local files (resize images, transcode video) so the
+            # VLM endpoint doesn't receive oversized payloads.
+            processed_url = _preprocess_media_url(media_url, dm)
 
-        # Detect modality from URL/path.  When the URL has no
-        # recognisable extension (e.g. a bare OWUI file ID like
-        # ``file://74a2ab6c-…``), fall back to magic-byte detection
-        # via ``_detect_media_type``.
-        from multimodal_rag.dataset_manager import _classify_file
-        from multimodal_rag.utils.langchain_overrides import _detect_media_type
+            # Build a doc dict in the format _describe_doc expects
+            path = processed_url
+            if path.startswith("file://"):
+                path = path[7:]
 
-        file_type: Optional[str] = None
-        if not path.startswith(("data:", "http")):
-            file_type = _classify_file(path)
-            # Extension-based classification failed → probe the bytes
-            if file_type not in ("image", "video") and os.path.exists(path):
-                try:
-                    detected_mime = _detect_media_type(path)
-                    if detected_mime.startswith("image/"):
-                        file_type = "image"
-                    elif detected_mime.startswith("video/"):
-                        file_type = "video"
-                except Exception:
-                    logger.debug("magic-byte detection failed for %s", path[-60:], exc_info=True)
+            # Detect modality from URL/path.  When the URL has no
+            # recognisable extension (e.g. a bare OWUI file ID like
+            # ``file://74a2ab6c-…``), fall back to magic-byte detection
+            # via ``_detect_media_type``.
+            from multimodal_rag.dataset_manager import _classify_file
+            from multimodal_rag.utils.langchain_overrides import _detect_media_type
 
-        if file_type == "image" or "image" in processed_url.lower():
-            doc_dict: dict[str, Any] = {"text": "", "image": processed_url}
-        elif file_type == "video" or "video" in processed_url.lower():
-            doc_dict = {"text": "", "video": processed_url}
-        else:
-            raise ToolError(
-                f"Could not determine if '{processed_url[:60]}' is an image or video. "
-                "Ensure the URL has a recognisable extension (.jpg, .png, .mp4, …) "
-                "or that the file is a supported image/video format."
+            file_type: Optional[str] = None
+            if not path.startswith(("data:", "http")):
+                file_type = _classify_file(path)
+                # Extension-based classification failed → probe the bytes
+                if file_type not in ("image", "video") and os.path.exists(path):
+                    try:
+                        detected_mime = _detect_media_type(path)
+                        if detected_mime.startswith("image/"):
+                            file_type = "image"
+                        elif detected_mime.startswith("video/"):
+                            file_type = "video"
+                    except Exception:
+                        logger.debug("magic-byte detection failed for %s", path[-60:], exc_info=True)
+
+            if file_type == "image" or "image" in processed_url.lower():
+                doc_dict: dict[str, Any] = {"text": "", "image": processed_url}
+            elif file_type == "video" or "video" in processed_url.lower():
+                doc_dict = {"text": "", "video": processed_url}
+            else:
+                raise ToolError(
+                    f"Could not determine if '{processed_url[:60]}' is an image or video. "
+                    "Ensure the URL has a recognisable extension (.jpg, .png, .mp4, …) "
+                    "or that the file is a supported image/video format."
+                )
+
+            system_prompt = (
+                "You are a detailed image and video captioning assistant. "
+                "Describe the media thoroughly: include visible text, objects, "
+                "people, scene context, and any relationships between them. "
+                "Be precise and factual."
+            )
+            try:
+                description = sync_wrapper_safe(
+                    _describe_doc,
+                    {"doc_dict": doc_dict, "query": query or None, "vlm": vlm, "system_prompt": system_prompt},
+                )
+            except Exception as exc:
+                raise ToolError(f"VLM description failed: {exc}")
+
+            displayable = _media_url_to_displayable(media_url)
+            is_image = "image" in media_url.lower() or file_type == "image"
+            return json.dumps(
+                {
+                    "description": description,
+                    "media_url": displayable,
+                    "markdown": f"![media]({displayable})" if is_image else "",
+                },
+                indent=2,
+                default=str,
             )
 
-        system_prompt = (
-            "You are a detailed image and video captioning assistant. "
-            "Describe the media thoroughly: include visible text, objects, "
-            "people, scene context, and any relationships between them. "
-            "Be precise and factual."
-        )
-        try:
-            description = sync_wrapper_safe(
-                _describe_doc,
-                {"doc_dict": doc_dict, "query": query or None, "vlm": vlm, "system_prompt": system_prompt},
-            )
-        except Exception as exc:
-            raise ToolError(f"VLM description failed: {exc}")
-
-        displayable = _media_url_to_displayable(media_url)
-        return json.dumps(
-            {
-                "description": description,
-                "media_url": displayable,
-                "markdown": f"![media]({displayable})" if "image" in media_url.lower() or file_type == "image" else "",
-            },
-            indent=2,
-            default=str,
-        )
+        return await _offload(_impl)
 
     @mcp.tool()
-    def transcribe_audio(
+    async def transcribe_audio(
         audio_url: str,
         max_seconds: float = 60.0,
     ) -> str:
@@ -1533,64 +1608,68 @@ try:
             than this is truncated from the start.  Default 60s to stay
             within the ASR endpoint's payload cap.
         """
-        from multimodal_rag.rag_system import _transcribe_media, _media_url_to_displayable
-        from multimodal_rag.utils.general_tools import sync_wrapper_safe
 
-        dm = get_manager()
-        asr = dm.asr
-        if asr is None:
-            raise ToolError("No ASR model configured on this server.")
+        def _impl() -> str:
+            from multimodal_rag.rag_system import _transcribe_media, _media_url_to_displayable
+            from multimodal_rag.utils.general_tools import sync_wrapper_safe
 
-        # Preprocess (truncate local audio to max_seconds) — same helper
-        # as describe_media, ensures the ASR endpoint never receives an
-        # oversized payload.
-        processed_url = _preprocess_media_url(audio_url, dm)
+            dm = get_manager()
+            asr = dm.asr
+            if asr is None:
+                raise ToolError("No ASR model configured on this server.")
 
-        # Check transcript cache (by original file hash)
-        cache_key: Optional[str] = None
-        orig_path = audio_url
-        if orig_path.startswith("file://"):
-            orig_path = orig_path[7:]
-        if os.path.exists(orig_path):
-            file_hash = _hash_file(orig_path)
-            cache_key = f"asr_tool:{file_hash}"
-            with _asr_transcript_cache_lock:
-                cached = _asr_transcript_cache.get(cache_key)
-            if cached is not None:
-                logger.info("ASR tool: cache HIT for %s", orig_path[-60:])
-                displayable = _media_url_to_displayable(audio_url)
-                return json.dumps(
-                    {"transcript": cached, "audio_url": displayable},
-                    indent=2,
-                    default=str,
+            # Preprocess (truncate local audio to max_seconds) — same helper
+            # as describe_media, ensures the ASR endpoint never receives an
+            # oversized payload.
+            processed_url = _preprocess_media_url(audio_url, dm)
+
+            # Check transcript cache (by original file hash)
+            cache_key: Optional[str] = None
+            orig_path = audio_url
+            if orig_path.startswith("file://"):
+                orig_path = orig_path[7:]
+            if os.path.exists(orig_path):
+                file_hash = _hash_file(orig_path)
+                cache_key = f"asr_tool:{file_hash}"
+                with _asr_transcript_cache_lock:
+                    cached = _asr_transcript_cache.get(cache_key)
+                if cached is not None:
+                    logger.info("ASR tool: cache HIT for %s", orig_path[-60:])
+                    displayable = _media_url_to_displayable(audio_url)
+                    return json.dumps(
+                        {"transcript": cached, "audio_url": displayable},
+                        indent=2,
+                        default=str,
+                    )
+
+            try:
+                transcript = sync_wrapper_safe(
+                    _transcribe_media,
+                    {"url": processed_url, "asr": asr},
                 )
+            except Exception as exc:
+                raise ToolError(f"ASR transcription failed: {exc}")
 
-        try:
-            transcript = sync_wrapper_safe(
-                _transcribe_media,
-                {"url": processed_url, "asr": asr},
+            if not transcript:
+                raise ToolError("ASR returned an empty transcript.")
+
+            # Cache for future calls
+            if cache_key:
+                with _asr_transcript_cache_lock:
+                    _asr_transcript_cache[cache_key] = transcript
+
+            displayable = _media_url_to_displayable(audio_url)
+            return json.dumps(
+                {
+                    "transcript": transcript,
+                    "audio_url": displayable,
+                    "duration_limit_seconds": max_seconds if cache_key else None,
+                },
+                indent=2,
+                default=str,
             )
-        except Exception as exc:
-            raise ToolError(f"ASR transcription failed: {exc}")
 
-        if not transcript:
-            raise ToolError("ASR returned an empty transcript.")
-
-        # Cache for future calls
-        if cache_key:
-            with _asr_transcript_cache_lock:
-                _asr_transcript_cache[cache_key] = transcript
-
-        displayable = _media_url_to_displayable(audio_url)
-        return json.dumps(
-            {
-                "transcript": transcript,
-                "audio_url": displayable,
-                "duration_limit_seconds": max_seconds if cache_key else None,
-            },
-            indent=2,
-            default=str,
-        )
+        return await _offload(_impl)
 
 except ImportError:
     logger.error("MCP package not installed. Run: pip install mcp>=1.0.0")
