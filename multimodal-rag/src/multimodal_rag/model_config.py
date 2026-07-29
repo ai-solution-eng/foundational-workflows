@@ -26,7 +26,7 @@ import json
 import os
 from typing import Any, Optional
 
-from multimodal_rag.utils.langchain_overrides import (
+from multimodal_rag.utils.model_adapters import (
     MultiModalEmbeddings,
 )
 from multimodal_rag.utils.pcai_model_classes import (

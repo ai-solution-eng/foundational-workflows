@@ -710,7 +710,7 @@ def _format_memory_provenance(doc: dict[str, Any]) -> str:
     return "[Provenance: " + ", ".join(parts) + "]"
 
 
-def _run_retrieval(
+async def _arun_retrieval(
     rag: "MultimodalRAG",
     dataset_name: str,
     query_dict: "str | dict[str, Any]",
@@ -724,8 +724,16 @@ def _run_retrieval(
 ) -> str:
     """Run retrieval, post-process modalities, and format the JSON result.
 
-    Shared by ``search_dataset`` and ``search_memory``.  Mirrors the
-    original ``search_dataset`` body verbatim so behaviour is unchanged.
+    Async version of the former ``_run_retrieval``.  Calls ``aretrieve``
+    and ``aembed_query`` directly so I/O runs on the caller's event loop
+    instead of being serialised through the single background event loop
+    in ``sync_wrapper_safe``.  This allows concurrent searches to proceed
+    in parallel (embed HTTP + Qdrant gRPC overlap across requests).
+
+    The sync helpers ``_resolve_query_vector`` / ``_resolve_audio_query_vector``
+    (multimodal-only) and ``Postprocessor`` (media conversion) remain sync
+    — they are only exercised by multimodal queries and are fast relative
+    to the embed + retrieve round-trip.
     """
     if base_llm_modalities is None:
         base_llm_modalities = ["text"]
@@ -745,13 +753,13 @@ def _run_retrieval(
 
         if query_vector is None and any(query_dict.get(k) for k in ("image", "video", "audio")):
             try:
-                query_vector = rag.embed_query(query_dict)
+                query_vector = await rag.aembed_query(query_dict)
                 _cache_query_vector(rag, query_dict, query_vector)
             except Exception:
                 logger.warning("query embedding failed; falling back to retrieve()", exc_info=True)
                 query_vector = None
 
-    results = rag.retrieve(
+    results = await rag.aretrieve(
         query_dict,
         top_k=top_k,
         use_reranker=use_reranker,
@@ -1071,42 +1079,48 @@ try:
             base64 payloads.
         """
 
-        def _impl() -> str:
+        # Sync setup — cheap (cached singleton, meta.json read, cached RAG).
+        # Offloaded so it never blocks the MCP event loop.
+        def _setup() -> tuple:
             dm = get_manager()
             try:
                 dm.get_dataset(dataset_name)
             except FileNotFoundError:
                 raise ToolError(f"Dataset '{dataset_name}' not found.")
             verified_password = _resolve_and_unlock(dm, dataset_name, password)
-
-            # -- Build multimodal query dict --
-            query_dict: str | dict[str, Any] = query
-            if image or video or audio:
-                query_dict = {}
-                if query:
-                    query_dict["text"] = query
-                if image:
-                    query_dict["image"] = image
-                if video:
-                    query_dict["video"] = video
-                if audio:
-                    query_dict["audio"] = audio
-
             rag = dm._get_rag(dataset_name)
-            return _run_retrieval(
-                rag,
-                dataset_name,
-                query_dict,
-                query,
-                top_k,
-                use_reranker,
-                reranker_top_k,
-                base_llm_modalities,
-                verified_password,
-                media_base_url,
-            )
+            return rag, verified_password
 
-        return await _offload(_impl)
+        rag, verified_password = await _offload(_setup)
+
+        # -- Build multimodal query dict --
+        query_dict: str | dict[str, Any] = query
+        if image or video or audio:
+            query_dict = {}
+            if query:
+                query_dict["text"] = query
+            if image:
+                query_dict["image"] = image
+            if video:
+                query_dict["video"] = video
+            if audio:
+                query_dict["audio"] = audio
+
+        # Async retrieval directly on the MCP event loop — concurrent
+        # embed + Qdrant I/O across requests instead of being serialised
+        # through the single background event loop in sync_wrapper_safe.
+        return await _arun_retrieval(
+            rag,
+            dataset_name,
+            query_dict,
+            query,
+            top_k,
+            use_reranker,
+            reranker_top_k,
+            base_llm_modalities,
+            verified_password,
+            media_base_url,
+        )
 
     @mcp.tool()
     async def add_memory(
@@ -1284,7 +1298,9 @@ try:
             usually does NOT pass these.
         """
 
-        def _impl() -> str:
+        # Sync setup — cheap (cached singleton, meta.json read, cached RAG).
+        # Offloaded so it never blocks the MCP event loop.
+        def _setup() -> tuple:
             ds_name = _resolve_memory_dataset(dataset_name)
             pw = _resolve_memory_password(password)
 
@@ -1294,37 +1310,42 @@ try:
             except FileNotFoundError:
                 raise ToolError(f"Memory dataset '{ds_name}' not found.")
             verified_pw = _resolve_and_unlock(dm, ds_name, pw)
-
-            query_dict: str | dict[str, Any] = query
-            if image or video or audio:
-                query_dict = {}
-                if query:
-                    query_dict["text"] = query
-                if image:
-                    query_dict["image"] = image
-                if video:
-                    query_dict["video"] = video
-                if audio:
-                    query_dict["audio"] = audio
-
             rag = dm._get_rag(ds_name)
-            # media_base_url=None lets _run_retrieval fall back to the global
-            # MEDIA_BASE_URL env var so any media memories also get clickable
-            # HTTP URLs (with the ?password= suffix for protected datasets).
-            return _run_retrieval(
-                rag,
-                ds_name,
-                query_dict,
-                query,
-                top_k,
-                use_reranker,
-                reranker_top_k,
-                base_llm_modalities,
-                verified_pw,
-                None,
-            )
+            return rag, ds_name, verified_pw
 
-        return await _offload(_impl)
+        rag, ds_name, verified_pw = await _offload(_setup)
+
+        # -- Build multimodal query dict --
+        query_dict: str | dict[str, Any] = query
+        if image or video or audio:
+            query_dict = {}
+            if query:
+                query_dict["text"] = query
+            if image:
+                query_dict["image"] = image
+            if video:
+                query_dict["video"] = video
+            if audio:
+                query_dict["audio"] = audio
+
+        # Async retrieval directly on the MCP event loop — concurrent
+        # embed + Qdrant I/O across requests instead of being serialised
+        # through the single background event loop in sync_wrapper_safe.
+        # media_base_url=None lets _arun_retrieval fall back to the global
+        # MEDIA_BASE_URL env var so any media memories also get clickable
+        # HTTP URLs (with the ?password= suffix for protected datasets).
+        return await _arun_retrieval(
+            rag,
+            ds_name,
+            query_dict,
+            query,
+            top_k,
+            use_reranker,
+            reranker_top_k,
+            base_llm_modalities,
+            verified_pw,
+            None,
+        )
 
     @mcp.tool()
     async def get_dataset_files(
@@ -1608,7 +1629,7 @@ try:
             # ``file://74a2ab6c-…``), fall back to magic-byte detection
             # via ``_detect_media_type``.
             from multimodal_rag.dataset_manager import _classify_file
-            from multimodal_rag.utils.langchain_overrides import _detect_media_type
+            from multimodal_rag.utils.model_adapters import _detect_media_type
 
             file_type: Optional[str] = None
             if not path.startswith(("data:", "http")):

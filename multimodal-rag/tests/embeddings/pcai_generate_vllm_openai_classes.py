@@ -4,7 +4,7 @@ from os.path import join as pj
 import numpy as np
 
 from multimodal_rag.utils.pcai_models import qwen3_vl_8B
-from multimodal_rag.utils.langchain_overrides import MultiModalEmbeddings
+from multimodal_rag.utils.model_adapters import MultiModalEmbeddings
 from multimodal_rag.utils.general_tools import cosine_sim
 from shared_queries_and_documents import all_inputs, multiimage_data, script_path
 

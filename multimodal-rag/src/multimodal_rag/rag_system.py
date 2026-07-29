@@ -15,7 +15,7 @@ from multimodal_rag.utils.pcai_model_classes import (
     RerankerModel,
     VoiceModel,
 )
-from multimodal_rag.utils.langchain_overrides import (
+from multimodal_rag.utils.model_adapters import (
     MultiModalEmbeddings,
     MultiModalReranker,
 )
@@ -1481,17 +1481,12 @@ class MultimodalRAG:
 
             if isinstance(query, dict):
                 # Multimodal query (text + image/video/audio) — embed and
-                # search by vector directly (sync, no async variant exists).
-                import asyncio
-
+                # search by vector directly.
                 if query_vector is not None:
                     query_emb = query_vector
                 else:
                     query_emb = await self.aembed_query(query)
-                loop = asyncio.get_running_loop()
-                docs_and_scores = await loop.run_in_executor(
-                    None,
-                    vs.similarity_search_with_score_by_vector,  # type: ignore[attr-defined]
+                docs_and_scores = await vs.asimilarity_search_with_score_by_vector(  # type: ignore[attr-defined]
                     query_emb,
                     top_k,
                 )

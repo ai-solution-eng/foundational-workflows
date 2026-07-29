@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from sentence_transformers import CrossEncoder
 
-from multimodal_rag.utils.langchain_overrides import InputConversion
+from multimodal_rag.utils.model_adapters import InputConversion
 from multimodal_rag.utils.pcai_models import qwen3_vl_reranker_8B
 
 np.set_printoptions(linewidth=120)

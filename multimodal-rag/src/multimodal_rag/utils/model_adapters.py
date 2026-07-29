@@ -5,7 +5,8 @@ from math import ceil
 import mimetypes
 from collections.abc import Sequence
 import re
-from typing import Optional, Any, overload
+import weakref
+from typing import Optional, Any, Callable, Awaitable, overload
 
 from openai.types.create_embedding_response import CreateEmbeddingResponse
 
@@ -782,6 +783,107 @@ class InputConversion:
         return requests
 
 
+class _QueryBatcher:
+    """Dynamic micro-batcher for concurrent text-only embedding queries.
+
+    When multiple search requests call ``aembed_query`` concurrently, each
+    normally fires its own HTTP request to the embedding endpoint.  vLLM's
+    pooling runner processes these sequentially, so N concurrent queries
+    take N × latency.
+
+    This batcher collects queries arriving within a short window (default
+    5 ms) or until ``max_batch_size`` accumulate, then sends them as a
+    single ``/v1/embeddings`` call with ``input=[q1, q2, ...]``.  vLLM
+    processes the batch in one forward pass, yielding up to ~10x higher
+    throughput under concurrent load.
+
+    Each caller awaits a ``Future`` and receives its individual embedding
+    vector — the batching is transparent.
+    """
+
+    def __init__(
+        self,
+        embed_fn: "Callable[[list[str]], Awaitable[list[list[float]]]]",
+        max_batch_size: int = 32,
+        max_wait_ms: float = 5.0,
+    ) -> None:
+        self._embed_fn = embed_fn
+        self._max_batch_size = max(1, max_batch_size)
+        self._max_wait = max(0.001, max_wait_ms / 1000.0)
+        self._queue: list[tuple[str, asyncio.Future[list[float]]]] = []
+        # asyncio.Lock() must be created inside a running event loop.
+        # Lazily initialised on first submit() / _flush() call.
+        self._lock: Optional[asyncio.Lock] = None
+        self._flush_task: Optional[asyncio.Task[None]] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def submit(self, text: str) -> list[float]:
+        """Submit a single text query and await its embedding."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[list[float]] = loop.create_future()
+        flush_now = False
+
+        async with self._get_lock():
+            self._queue.append((text, fut))
+            if len(self._queue) >= self._max_batch_size:
+                flush_now = True
+            elif self._flush_task is None:
+                # Schedule a timed flush so a partial batch doesn't wait forever.
+                self._flush_task = loop.create_task(self._timed_flush())
+
+        if flush_now:
+            await self._flush()
+
+        return await fut
+
+    async def _timed_flush(self) -> None:
+        """Wait for the max wait window, then flush whatever has accumulated."""
+        try:
+            await asyncio.sleep(self._max_wait)
+        except asyncio.CancelledError:
+            return
+        # Pass our own task so _flush() knows not to cancel us mid-flight.
+        await self._flush(caller_task=asyncio.current_task())
+
+    async def _flush(self, caller_task: "Optional[asyncio.Task[None]]" = None) -> None:
+        """Drain the queue and send one batched embedding request.
+
+        *caller_task* is the task that triggered this flush (e.g. the
+        ``_timed_flush`` task). It is NOT cancelled — only a stale timed
+        flush that didn't fire is cancelled, and only when it differs from
+        the caller.
+        """
+        async with self._get_lock():
+            if not self._queue:
+                return
+            batch = self._queue[:]
+            self._queue.clear()
+            # Cancel a pending timed flush only if this flush was NOT
+            # triggered by that timer (otherwise we'd cancel ourselves).
+            if self._flush_task is not None and not self._flush_task.done() and self._flush_task is not caller_task:
+                self._flush_task.cancel()
+            self._flush_task = None
+
+        texts = [t for t, _ in batch]
+        futs = [f for _, f in batch]
+
+        try:
+            embeddings = await self._embed_fn(texts)
+            if len(embeddings) != len(futs):
+                raise RuntimeError(f"Batch embedding returned {len(embeddings)} results for {len(futs)} queries")
+            for fut, emb in zip(futs, embeddings):
+                if not fut.done():
+                    fut.set_result(emb)
+        except Exception as exc:
+            for fut in futs:
+                if not fut.done():
+                    fut.set_exception(exc)
+
+
 class MultiModalEmbeddings:
     chunk_size: int = 64
     "Multimodal embeddings wrapper (embed_documents / embed_query) for vLLM-style endpoints."
@@ -800,6 +902,19 @@ class MultiModalEmbeddings:
             convert_to_base64=convert_to_base64,
             max_image_size=max_image_size,
             max_video_frames=max_video_frames,
+        )
+        # Dynamic micro-batcher for concurrent text-only search queries.
+        # Collects queries arriving within a short window and sends them as
+        # a single /v1/embeddings request with input=[q1, q2, ...], which
+        # vLLM processes in one forward pass instead of N sequential ones.
+        #
+        # One batcher per event loop — the MCP server and the REST API
+        # (via sync_wrapper_safe / background loop) each have their own
+        # event loop, and asyncio primitives cannot span loops.
+        self._batcher_max_size = int(os.environ.get("EMBEDDING_QUERY_BATCH_SIZE", "32"))
+        self._batcher_max_wait_ms = float(os.environ.get("EMBEDDING_QUERY_BATCH_WAIT_MS", "5"))
+        self._batchers: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _QueryBatcher]" = (
+            weakref.WeakKeyDictionary()
         )
 
     async def _embed_single_message_async(self, input_dict: list[dict[str, Any]]) -> list[float]:
@@ -985,7 +1100,28 @@ class MultiModalEmbeddings:
     async def aembed_query(self, text: str | dict[str, Any]) -> list[float]: ...
 
     async def aembed_query(self, text: str | dict[str, Any]) -> list[float]:
-        """Asynchronously embed a single query input_dict."""
+        """Asynchronously embed a single query input_dict.
+
+        Text-only string queries are routed through a dynamic micro-batcher
+        so that concurrent search requests share a single HTTP call to the
+        embedding endpoint (vLLM processes batched ``input`` in one forward
+        pass).  Multimodal queries (dict with image/video/audio) bypass the
+        batcher and use the per-request ``messages`` format.
+        """
+        # Text-only fast path: batch with other concurrent queries
+        if isinstance(text, str) and self._is_text_only(text):
+            loop = asyncio.get_running_loop()
+            batcher = self._batchers.get(loop)
+            if batcher is None:
+                batcher = _QueryBatcher(
+                    embed_fn=self._embed_text_batch_async,
+                    max_batch_size=self._batcher_max_size,
+                    max_wait_ms=self._batcher_max_wait_ms,
+                )
+                self._batchers[loop] = batcher
+            return await batcher.submit(text)
+
+        # Multimodal path: individual messages-format request
         inputs: list[list[dict[str, Any]]] = await self.input_conversion.acall([text])  # type: ignore[assignment]
         return await self._embed_single_message_async(inputs[0])
 

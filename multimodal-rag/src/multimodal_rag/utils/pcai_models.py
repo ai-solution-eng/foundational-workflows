@@ -1,4 +1,4 @@
-from .langchain_overrides import MultiModalEmbeddings
+from .model_adapters import MultiModalEmbeddings
 from .pcai_model_classes import (
     ChatModel,
     EmbeddingModel,

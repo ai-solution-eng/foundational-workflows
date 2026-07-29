@@ -6,7 +6,7 @@ from typing import Dict, Any
 from vllm import LLM, EngineArgs
 import numpy as np
 
-from multimodal_rag.utils.langchain_overrides import InputConversion
+from multimodal_rag.utils.model_adapters import InputConversion
 from multimodal_rag.utils.pcai_models import qwen3_vl_reranker_8B
 
 # Path to the current script file

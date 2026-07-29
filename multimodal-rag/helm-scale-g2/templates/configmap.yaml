@@ -46,6 +46,12 @@ data:
   # Qdrant client tuning (gRPC + hard timeout)
   QDRANT_PREFER_GRPC: {{ .Values.qdrant.client.preferGrpc | quote }}
   QDRANT_CLIENT_TIMEOUT: {{ .Values.qdrant.client.timeout | quote }}
+  # Dynamic embedding query batcher (search path)
+  EMBEDDING_QUERY_BATCH_SIZE: {{ .Values.app.embeddingQueryBatchSize | quote }}
+  EMBEDDING_QUERY_BATCH_WAIT_MS: {{ .Values.app.embeddingQueryBatchWaitMs | quote }}
+  # Dynamic Qdrant query batcher (search path)
+  QDRANT_QUERY_BATCH_SIZE: {{ .Values.app.qdrantQueryBatchSize | quote }}
+  QDRANT_QUERY_BATCH_WAIT_MS: {{ .Values.app.qdrantQueryBatchWaitMs | quote }}
   {{- if .Values.redis.enabled }}
   # Redis-backed cross-pod unlock cache
   REDIS_URL: {{ printf "redis://%s-redis.%s.svc.cluster.local:%d" .Values.deployment.name .Release.Namespace (int .Values.redis.port) | quote }}

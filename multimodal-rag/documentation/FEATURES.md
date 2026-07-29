@@ -366,7 +366,7 @@ When a HuggingFace tokenizer is bundled (`tokenizer_type="HuggingFace"`), all te
 
 **Image/video handling:** Images and videos in retrieved documents can be passed through to the LLM natively (if the LLM supports them) or converted to text descriptions via a VLM (Gemma 4 31B) by the **Postprocessor**.
 
-**Input conversion** (`InputConversion` in `langchain_overrides.py`):
+**Input conversion** (`InputConversion` in `model_adapters.py`):
 - Accepts plain strings, bare media URLs (auto-detected), data URIs, local file paths, and dicts with `text`/`image`/`video`/`audio` keys.
 - Bare-URL auto-detection supports `data:` URIs, local files (magic-byte sniffing via `_detect_media_type`), and remote URLs (via `mimetypes`).
 - Media-only docs get an auto-inserted label like `[Image & Video media]` to avoid degenerate duplicate embeddings.

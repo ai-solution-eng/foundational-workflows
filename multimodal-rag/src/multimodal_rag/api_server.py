@@ -1620,6 +1620,16 @@ async def index():
     return _HTML_INDEX
 
 
+@app.get("/favicon.png")
+async def favicon():
+    from fastapi.responses import FileResponse
+
+    favicon_path = Path(__file__).parent / "templates" / "favicon.png"
+    if favicon_path.exists():
+        return FileResponse(favicon_path, media_type="image/png")
+    return Response(status_code=404)
+
+
 @app.get("/manage", response_class=HTMLResponse)
 async def manage():
     return await index()

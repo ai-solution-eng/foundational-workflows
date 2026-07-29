@@ -242,6 +242,8 @@ async def run_user_mcp(
     duration: float,
     ramp_delay: float,
     stats: BenchmarkStats,
+    insecure: bool = False,
+    call_timeout: float = 120.0,
 ) -> None:
     """Simulate one user sending MCP tool calls for *duration* seconds.
 
@@ -249,6 +251,12 @@ async def run_user_mcp(
     initialises it, then calls ``search_dataset`` in a loop.  The session
     is kept alive for the entire duration — mirroring how a real LLM client
     maintains a persistent connection.
+
+    *call_timeout* caps how long a single ``call_tool`` may block.  Without
+    this, a queued request can hang for up to the MCP client's SSE read
+    timeout (300 s), which makes high-concurrency runs run far past
+    *duration* while ``asyncio.gather`` waits for stragglers.  Timed-out
+    calls are recorded as failures.
     """
     from mcp.client.session import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
@@ -268,9 +276,31 @@ async def run_user_mcp(
     if password:
         tool_args_base["password"] = password
 
+    # When --insecure is set, inject a custom httpx client factory that
+    # disables TLS verification while preserving MCP defaults (redirects,
+    # timeouts). This is needed for internal/dev servers with private CAs.
+    client_kwargs: dict = {"url": mcp_url}
+    if insecure:
+        from mcp.shared._httpx_utils import MCP_DEFAULT_SSE_READ_TIMEOUT, MCP_DEFAULT_TIMEOUT
+
+        def _insecure_http_client_factory(headers=None, timeout=None, auth=None):
+            kwargs: dict = {"follow_redirects": True, "verify": False}
+            kwargs["timeout"] = (
+                timeout
+                if timeout is not None
+                else httpx.Timeout(MCP_DEFAULT_TIMEOUT, read=MCP_DEFAULT_SSE_READ_TIMEOUT)
+            )
+            if headers is not None:
+                kwargs["headers"] = headers
+            if auth is not None:
+                kwargs["auth"] = auth
+            return httpx.AsyncClient(**kwargs)
+
+        client_kwargs["httpx_client_factory"] = _insecure_http_client_factory
+
     # One persistent session per user
     try:
-        async with streamablehttp_client(url=mcp_url) as (read, write, _):
+        async with streamablehttp_client(**client_kwargs) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
 
@@ -279,7 +309,10 @@ async def run_user_mcp(
                     tool_args = {**tool_args_base, "query": query}
                     t0 = time.monotonic()
                     try:
-                        result = await session.call_tool("search_dataset", tool_args)
+                        result = await asyncio.wait_for(
+                            session.call_tool("search_dataset", tool_args),
+                            timeout=call_timeout,
+                        )
                         elapsed = time.monotonic() - t0
                         stats.total += 1
                         stats.latencies.append(elapsed)
@@ -295,6 +328,13 @@ async def run_user_mcp(
                         else:
                             stats.success += 1
                             stats.result_counts.append(1)
+                    except asyncio.TimeoutError:
+                        elapsed = time.monotonic() - t0
+                        stats.total += 1
+                        stats.failed += 1
+                        stats.latencies.append(elapsed)
+                        err_key = f"Timeout (>{call_timeout:g}s)"
+                        stats.errors[err_key] = stats.errors.get(err_key, 0) + 1
                     except Exception as exc:
                         elapsed = time.monotonic() - t0
                         stats.total += 1
@@ -318,22 +358,22 @@ async def run_user_mcp(
 # ---------------------------------------------------------------------------
 
 
-async def check_health(base_url: str) -> bool:
+async def check_health(base_url: str, insecure: bool = False) -> bool:
     """Return True if the server health check passes."""
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
+        async with httpx.AsyncClient(timeout=10, verify=not insecure) as c:
             resp = await c.get(f"{base_url}/healthz")
             return resp.status_code == 200
     except Exception:
         return False
 
 
-async def discover_datasets(base_url: str, password: Optional[str] = None) -> list[str]:
+async def discover_datasets(base_url: str, password: Optional[str] = None, insecure: bool = False) -> list[str]:
     """Return a list of dataset names from the server."""
     headers: dict[str, str] = {}
     if password:
         headers["X-Dataset-Password"] = password
-    async with httpx.AsyncClient(timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10, verify=not insecure) as c:
         resp = await c.get(f"{base_url}/api/datasets", headers=headers)
         resp.raise_for_status()
         return [ds["name"] for ds in resp.json().get("datasets", [])]
@@ -402,7 +442,7 @@ async def run_benchmark(args: argparse.Namespace) -> None:
     # 1. Health check (always via REST API)
     if api_url:
         print(f"Checking server health at {api_url} ...", end=" ", flush=True)
-        if not await check_health(api_url):
+        if not await check_health(api_url, insecure=args.insecure):
             print("FAILED")
             print("Error: server is not responding. Check --url / --api-url.", file=sys.stderr)
             sys.exit(1)
@@ -418,7 +458,7 @@ async def run_benchmark(args: argparse.Namespace) -> None:
             sys.exit(1)
         print("No --dataset specified; discovering ...", end=" ", flush=True)
         try:
-            datasets = await discover_datasets(api_url, args.password)
+            datasets = await discover_datasets(api_url, args.password, insecure=args.insecure)
             if not datasets:
                 print("none found")
                 print("Error: no datasets available. Create one first.", file=sys.stderr)
@@ -451,6 +491,9 @@ async def run_benchmark(args: argparse.Namespace) -> None:
     print(f"  Reranker:        {reranker_status}")
     print(f"  Queries:         {len(queries)}")
     print(f"  Password:        {'set' if args.password else 'none'}")
+    print(f"  TLS verify:      {'OFF (--insecure)' if args.insecure else 'ON'}")
+    if is_mcp:
+        print(f"  Call timeout:    {args.call_timeout:g}s")
     if not is_mcp:
         print(f"  HTTP/2:          {args.http2}")
     print("=" * 60)
@@ -474,6 +517,8 @@ async def run_benchmark(args: argparse.Namespace) -> None:
                 duration=args.duration,
                 ramp_delay=i * ramp_step,
                 stats=stats,
+                insecure=args.insecure,
+                call_timeout=args.call_timeout,
             )
             for i in range(args.N)
         ]
@@ -486,7 +531,7 @@ async def run_benchmark(args: argparse.Namespace) -> None:
             max_connections=args.N * 2 + 10,
             max_keepalive_connections=args.N,
         )
-        async with httpx.AsyncClient(limits=limits, http2=args.http2) as client:
+        async with httpx.AsyncClient(limits=limits, http2=args.http2, verify=not args.insecure) as client:
             tasks = [
                 run_user(
                     user_id=i,
@@ -555,6 +600,8 @@ async def run_benchmark(args: argparse.Namespace) -> None:
                         "use_reranker": args.use_reranker,
                         "reranker_top_k": args.reranker_top_k,
                         "num_queries": len(queries),
+                        "insecure": args.insecure,
+                        "call_timeout": args.call_timeout if is_mcp else None,
                     },
                     "results": summary,
                 },
@@ -645,6 +692,22 @@ Examples:
     )
     parser.add_argument("--output", default=None, help="Path to save results as JSON")
     parser.add_argument("--http2", action="store_true", help="Use HTTP/2 (requires h2 package)")
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Disable TLS certificate verification (for internal/dev servers with "
+        "private or self-signed CAs). Applies to REST health check, dataset discovery, "
+        "and the MCP streamable-http client.",
+    )
+    parser.add_argument(
+        "--call-timeout",
+        type=float,
+        default=120.0,
+        help="Per-call timeout in seconds for a single search (MCP mode only). "
+        "Caps how long call_tool may block so high-concurrency runs terminate near "
+        "--duration instead of waiting for queued stragglers (MCP read timeout is 300s). "
+        "Timed-out calls are recorded as failures. Default: 120.",
+    )
     args = parser.parse_args()
 
     if args.N < 1:
@@ -655,6 +718,8 @@ Examples:
         parser.error("--top-k must be at least 1")
     if args.reranker_top_k < 1:
         parser.error("--reranker-top-k must be at least 1")
+    if args.call_timeout < 1:
+        parser.error("--call-timeout must be at least 1 second")
 
     asyncio.run(run_benchmark(args))
 

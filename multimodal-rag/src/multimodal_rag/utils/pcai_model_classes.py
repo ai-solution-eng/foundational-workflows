@@ -22,7 +22,7 @@ except ImportError:
     OpenAIResponsesModel = None  # type: ignore[assignment, misc]
 
 from .logging_utils import logging
-from .langchain_overrides import MultiModalEmbeddings, MultiModalReranker
+from .model_adapters import MultiModalEmbeddings, MultiModalReranker
 from .general_tools import sync_wrapper_safe
 from .token_text_splitter import TokenTextSplitter
 
@@ -397,7 +397,7 @@ class BaseModel:
     def build_model(self, **kwargs):
         if self.model_instantiation_class is None:
             raise ValueError(
-                "model_instantiation_class is not set. The langchain-based defaults "
+                "model_instantiation_class is not set. The old langchain-based "
                 "(ChatOpenAI / OpenAIEmbeddings) were removed; pass an explicit "
                 "callable (e.g. MultiModalEmbeddings) or use `.client` / "
                 "`.async_client` for direct OpenAI API access."

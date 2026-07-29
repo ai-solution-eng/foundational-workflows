@@ -8,7 +8,7 @@
 replicaCount: 2
 image:
   repository: andrewbydlon/rag-api-server
-  tag: v1.3.0
+  tag: v1.5.0
   pullPolicy: IfNotPresent
 
 deployment:
@@ -31,6 +31,19 @@ app:
   # MCP server sync tools are converted to async + offloaded to a thread
   # pool of this size (per pod). Keep >= syncPoolSize to avoid starving.
   mcpPoolSize: 32
+  # Dynamic query batcher for concurrent text-only search embeddings.
+  # Collects queries arriving within the wait window and sends them as a
+  # single /v1/embeddings call (vLLM processes batched input in one forward
+  # pass). Larger window = bigger batches = fewer HTTP calls, at the cost
+  # of added latency per query.
+  embeddingQueryBatchSize: 128
+  embeddingQueryBatchWaitMs: 200
+  # Dynamic Qdrant query batcher for concurrent similarity searches.
+  # Collects queries arriving within the wait window and sends them as a
+  # single query_batch_points gRPC call. Short window (5ms) since the
+  # embedding batcher already synchronises the burst.
+  qdrantQueryBatchSize: 128
+  qdrantQueryBatchWaitMs: 5
 
 
 # -- Persistence ---------------------------------------------------------------

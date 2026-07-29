@@ -24,7 +24,7 @@ from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 
 from multimodal_rag.input_processing.pdf_processor import PDFProcessor
-from multimodal_rag.utils.langchain_overrides import MultiModalReranker
+from multimodal_rag.utils.model_adapters import MultiModalReranker
 from multimodal_rag.utils.pcai_models import qwen3_vl_8B, qwen3_vl_reranker_8B
 
 
