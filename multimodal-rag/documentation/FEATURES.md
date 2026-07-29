@@ -500,7 +500,7 @@ Exposes **9 MCP tools** (`mcp_server.py`):
 | Tool | Purpose |
 |------|---------|
 | `list_datasets()` | Returns formatted text of all datasets (with `[caption_video]` / `[password]` markers) |
-| `unlock_dataset()` | Verify a dataset password and cache the unlock for the session (default TTL 30 min) |
+| `unlock_dataset()` | Verify a dataset password and cache the unlock across pods via Redis (default TTL 30 min) |
 | `search_dataset()` | Multimodal search (`dataset_name`, `query`, `image`/`video`/`audio`, `top_k`, `use_reranker`, `reranker_top_k`, `password`, `media_base_url`). Instantiates a `Postprocessor` for modality conversion based on `base_llm_modalities`. |
 | `get_dataset_files()` | List or retrieve files from a dataset (text inline; binary returns metadata + `download_url`) |
 | `get_dataset_info()` | Returns dataset metadata |

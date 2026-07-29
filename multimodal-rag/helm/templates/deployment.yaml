@@ -55,6 +55,12 @@ spec:
           env:
             - name: RAG_REMOTE
               value: {{ .Values.rag.remote | quote }}
+            - name: QDRANT_STORAGE_PATH
+              {{- if .Values.persistence.qdrant.mountReadOnly }}
+              value: "/qdrant-storage"
+              {{- else }}
+              value: ""
+              {{- end }}
             {{- range $key, $val := .Values.extraEnv }}
             - name: {{ $key }}
               value: {{ $val | quote }}
@@ -65,6 +71,14 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- /* Qdrant's PVC, mounted read-only so the API server can report */}}
+            {{- /* its disk usage on the management page. Disabled in the scale */}}
+            {{- /* chart where Qdrant runs as a sharded cluster (no single PVC). */}}
+            {{- if .Values.persistence.qdrant.mountReadOnly }}
+            - name: qdrant-data
+              mountPath: /qdrant-storage
+              readOnly: true
+            {{- end }}
           resources: {{ toYaml .Values.resources.app | nindent 12 }}
           startupProbe:
             httpGet:
@@ -128,6 +142,11 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- if .Values.persistence.qdrant.mountReadOnly }}
+            - name: qdrant-data
+              mountPath: /qdrant-storage
+              readOnly: true
+            {{- end }}
           resources: {{ toYaml .Values.resources.app | nindent 12 }}
         {{- end }}
 
@@ -135,3 +154,10 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ .Values.deployment.name }}-data
+        {{- if .Values.persistence.qdrant.mountReadOnly }}
+        {{- /* The Qdrant PVC is created by the qdrant StatefulSet's */}}
+        {{- /* volumeClaimTemplates as data-<sts-name>-0. */}}
+        - name: qdrant-data
+          persistentVolumeClaim:
+            claimName: data-{{ .Values.deployment.name }}-qdrant-0
+        {{- end }}

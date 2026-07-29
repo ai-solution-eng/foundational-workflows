@@ -1548,12 +1548,50 @@ async function pollHealth() {
 
     // Qdrant card
     const qdColor = qd.status === 'ok' ? 'var(--green)' : 'var(--red)';
+    const qpvc = qd.pvc;
+    const qdPvcRows = qpvc ? `
+        <tr><td>Used</td><td style="text-align:right">${formatBytes(qpvc.used_bytes)}</td></tr>
+        <tr><td>Limit</td><td style="text-align:right">${formatBytes(qpvc.total_bytes)}</td></tr>` : '';
+    const qdPvcBar = qpvc ? `
+      <div style="height:6px;background:var(--border);border-radius:3px;margin-bottom:8px;overflow:hidden">
+        <div style="width:${Math.min(qpvc.used_percent,100)}%;height:100%;background:${qpvc.used_percent > 80 ? 'var(--red)' : (qpvc.used_percent > 50 ? 'var(--accent)' : 'var(--green)')};transition:width .5s"></div>
+      </div>` : '';
     document.getElementById('health-qdrant').innerHTML = `
       <div style="font-weight:500;margin-bottom:6px;font-size:.85rem">Qdrant — <span style="color:${qdColor}">${qd.status}</span></div>
+      ${qdPvcBar}
       <table style="width:100%;font-size:.8rem;color:var(--text-muted)">
         <tr><td>Collections</td><td style="text-align:right">${qd.collections}</td></tr>
         <tr><td>Total points</td><td style="text-align:right">${qd.total_points.toLocaleString()}</td></tr>
+        ${qdPvcRows}
       </table>`;
+
+    // Qdrant PVC panel in the storage section (same data, fuller layout)
+    const qp = document.getElementById('qdrant-pvc-panel');
+    if (qp) {
+      if (qpvc) {
+        const qpColor = qpvc.used_percent > 80 ? 'var(--red)' : (qpvc.used_percent > 50 ? 'var(--accent)' : 'var(--green)');
+        qp.innerHTML = `
+          <div style="font-weight:500;margin-bottom:8px">Qdrant DB PVC</div>
+          <div style="height:6px;background:var(--border);border-radius:3px;margin-bottom:8px;overflow:hidden">
+            <div style="width:${Math.min(qpvc.used_percent,100)}%;height:100%;background:${qpColor};transition:width .5s"></div>
+          </div>
+          <table style="width:100%">
+            <tr><td style="padding:4px 0;color:var(--text-muted)">Total</td>
+                <td style="text-align:right">${formatBytes(qpvc.total_bytes)}</td></tr>
+            <tr><td style="padding:4px 0;color:var(--text-muted)">Used</td>
+                <td style="text-align:right">${formatBytes(qpvc.used_bytes)}</td></tr>
+            <tr><td style="padding:4px 0;color:var(--text-muted)">Free</td>
+                <td style="text-align:right">${formatBytes(qpvc.free_bytes)}</td></tr>
+            <tr><td style="padding:4px 0;color:var(--text-muted)">Utilization</td>
+                <td style="text-align:right">${qpvc.used_percent}%</td></tr>
+          </table>
+          <div style="font-size:.75rem;color:var(--text-muted);margin-top:8px">Qdrant StatefulSet PVC — stores vector index & payloads</div>`;
+      } else {
+        qp.innerHTML = `
+          <div style="font-weight:500;margin-bottom:8px">Qdrant DB PVC</div>
+          <div style="font-size:.8rem;color:var(--text-muted);padding:8px 0">Disk usage unavailable — Qdrant PVC not mounted on this pod.</div>`;
+      }
+    }
   } catch (e) {
     // Keep last values — don't flash red on a single failed poll
   }
@@ -1566,7 +1604,7 @@ async function loadManageStats() {
     const pvc = data.pvc;
     const ds = data.datasets;
     container.innerHTML = `
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px">
         <div style="background:var(--surface-2);padding:16px;border-radius:4px">
           <div style="font-weight:500;margin-bottom:8px">File Storage PVC</div>
           <table style="width:100%">
@@ -1581,6 +1619,9 @@ async function loadManageStats() {
           </table>
           <div style="font-size:.75rem;color:var(--text-muted);margin-top:8px">PVC mounted at /data — stores uploaded files (images, videos, audio, PDFs)</div>
         </div>
+        <div id="qdrant-pvc-panel" style="background:var(--surface-2);padding:16px;border-radius:4px">
+          <div style="text-align:center;padding:8px"><span class="spinner"></span></div>
+        </div>
         <div style="background:var(--surface-2);padding:16px;border-radius:4px">
           <div style="font-weight:500;margin-bottom:8px">Datasets</div>
           <table style="width:100%">
@@ -1589,7 +1630,7 @@ async function loadManageStats() {
             <tr><td style="padding:4px 0;color:var(--text-muted)">Documents</td>
                 <td style="text-align:right">${data.total_documents}</td></tr>
           </table>
-          <div style="font-size:.75rem;color:var(--text-muted);margin-top:8px">Qdrant has its own separate PVC — disk usage monitored via the live Qdrant card above</div>
+          <div style="font-size:.75rem;color:var(--text-muted);margin-top:8px">Document counts stored in Qdrant collections</div>
         </div>
       </div>
       <div style="margin-top:16px">

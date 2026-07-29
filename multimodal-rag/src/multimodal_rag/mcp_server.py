@@ -666,6 +666,50 @@ def _resolve_audio_query_vector(
 # identical avoids drift between "search a dataset" and "search my memory".
 
 
+def _format_memory_provenance(doc: dict[str, Any]) -> str:
+    """Build a compact one-line provenance string for a memory document.
+
+    Memories created via the opencode ``memory-provenance`` plugin carry git
+    and session metadata (``git_before``, ``git_after``, ``git_branch``,
+    ``session_id``, ...).  When present, surface a short ``[Provenance: ...]``
+    line so the recalling LLM (and the user) can see *when* and *where* the
+    memory was captured — e.g. whether it predates a refactor.
+
+    Returns an empty string when the document carries no provenance fields,
+    so the caller can treat it as optional.
+    """
+    parts: list[str] = []
+
+    def _commit(label: str, key: str) -> None:
+        val = doc.get(key)
+        if isinstance(val, dict):
+            short = val.get("short") or val.get("sha")
+            subject = val.get("subject")
+            if short:
+                parts.append(f"{label}={short}" + (f" ({subject})" if subject else ""))
+        elif isinstance(val, str) and val:
+            parts.append(f"{label}={val[:12]}")
+
+    _commit("before", "git_before")
+    _commit("after", "git_after")
+
+    branch = doc.get("git_branch")
+    if isinstance(branch, str) and branch:
+        parts.append(f"branch={branch}")
+
+    dirty = doc.get("git_dirty")
+    if dirty:
+        parts.append("dirty")
+
+    sid = doc.get("session_id")
+    if isinstance(sid, str) and sid:
+        parts.append(f"session={sid}")
+
+    if not parts:
+        return ""
+    return "[Provenance: " + ", ".join(parts) + "]"
+
+
 def _run_retrieval(
     rag: "MultimodalRAG",
     dataset_name: str,
@@ -753,6 +797,13 @@ def _run_retrieval(
             if src or page:
                 ref = f"[Source: {src}" + (f", Page: {page}" if page else "") + "]"
                 text = f"{ref}\n{text}" if text else ref
+            # Memories carry git/session provenance (injected by the
+            # opencode memory-provenance plugin). Surface it as a short
+            # line above the memory text so the recalling LLM knows the
+            # repository state at capture time.
+            prov = _format_memory_provenance(doc)
+            if prov:
+                text = f"{prov}\n{text}" if text else prov
         else:
             text = str(doc)
 
@@ -888,8 +939,16 @@ try:
     from mcp.server.fastmcp.exceptions import ToolError
     from mcp.server.transport_security import TransportSecuritySettings
 
+    # Stateless + JSON-response mode: each HTTP request is self-contained
+    # (no in-memory session tracking), so any pod in a multi-replica
+    # Deployment can handle any request. This is required for horizontal
+    # scaling — the default stateful mode stores sessions in-process, so a
+    # request routed to a different pod than the one that initialized the
+    # session fails with "Session not found".
     mcp = FastMCP(
         "multimodal-rag",
+        stateless_http=True,
+        json_response=True,
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
@@ -1085,6 +1144,23 @@ try:
             vector payload for later filtering.  The ``session_id`` field is
             auto-populated from the ``X-Opencode-Session-ID`` request header
             or ``OPENCODE_SESSION_ID`` env var when not provided explicitly.
+
+            When memories are created through the opencode
+            ``memory-provenance`` plugin, the following fields are injected
+            automatically (the plugin runs client-side, where the git repo
+            lives, so the remote server cannot derive them):
+              - ``git_before`` — HEAD commit at session start
+                (``{"sha", "short", "subject"}``)
+              - ``git_after``  — HEAD commit at memory-creation time
+              - ``git_branch`` — branch name
+              - ``git_repo``   — remote URL or repo root
+              - ``git_dirty``  — whether the working tree had uncommitted
+                changes
+              - ``git_diff_stat`` — one-line summary of uncommitted changes
+              - ``session_title``, ``session_created_at``, ``project_dir``
+            Explicit metadata keys always take precedence over auto-injected
+            ones.  ``search_memory`` surfaces these as a compact
+            ``[Provenance: ...]`` line above each result.
         dataset_name:
             Memory dataset.  Optional — resolved from the
             ``X-Memory-Dataset`` request header or ``MEMORY_DATASET`` env

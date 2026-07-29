@@ -1,8 +1,11 @@
 # -- Global settings ----------------------------------------------------------
-# Scale variant: multiple API replicas + gunicorn workers, multi-replica
-# Qdrant, optional Redis for cross-pod unlock cache. See helm/ for the
-# original single-replica chart.
-replicaCount: 4
+# Generation-2 scale variant: same architecture as helm-scale (gunicorn
+# workers, multi-replica Qdrant, Redis-backed unlock cache) but scaled back
+# to 2 app replicas + 2-node Qdrant so total requests are ~50% above the
+# single-replica chart and total PVC stays at 100Gi. Intended as a drop-in
+# replacement test on the current cluster. See helm-scale/ for the full-scale
+# (4x3) deployment intended for a larger cluster.
+replicaCount: 2
 image:
   repository: andrewbydlon/rag-api-server
   tag: v1.3.0
@@ -17,30 +20,34 @@ deployment:
 app:
   # Run the API server under gunicorn with UvicornWorker so each pod runs
   # `workers` event loops (one per process). Each worker gets its own
-  # `sync_pool`, so effective concurrency ≈ replicaCount * workers *
-  # syncPoolSize.
-  workers: 4
+  # `sync_pool`, so effective concurrency = replicaCount * workers *
+  # syncPoolSize. Halved vs helm-scale (2 workers, pools of 32) to match
+  # the smaller replica count: 2 pods * 2 workers * 32 = 128 concurrent.
+  workers: 2
   # Per-worker thread pool for blocking RAG work (embedding, Qdrant, file
   # processing). Falls back to 12 if unset (matches the single-replica
   # chart).
-  syncPoolSize: 64
+  syncPoolSize: 32
   # MCP server sync tools are converted to async + offloaded to a thread
   # pool of this size (per pod). Keep >= syncPoolSize to avoid starving.
-  mcpPoolSize: 64
+  mcpPoolSize: 32
 
 
 # -- Persistence ---------------------------------------------------------------
+# Total PVC budget held at 100Gi to match the single-replica chart:
+#   data PVC (shared, RWX)  = 50Gi  (unchanged from helm/ - no resize needed)
+#   qdrant PVCs (RWO)       = 2 x 25Gi = 50Gi  (replaces the old single 50Gi)
 persistence:
   data:
-    size: 100Gi
+    size: 50Gi
     storageClass: "gl4f-filesystem"
     accessMode: ReadWriteMany
   qdrant:
-    size: 100Gi
+    size: 25Gi
     storageClass: "gl4f-filesystem"
     accessMode: ReadWriteOnce   # per-pod volume via volumeClaimTemplates
-    # Disabled in the scale chart: Qdrant runs as a sharded cluster with one
-    # PVC per replica, so there is no single PVC to mount on the API pods.
+    # Disabled: Qdrant runs as a sharded cluster with one PVC per replica,
+    # so there is no single PVC to mount on the API pods.
     mountReadOnly: false
 
 
@@ -78,11 +85,10 @@ models:
     extra: {}
 
 # Per-process httpx connection pool limit for model endpoint clients.
-# Raised from the single-replica default of 30 so the embedder (on every
-# search's critical path) is not the bottleneck.
+# Halved vs helm-scale (100/25) to match the smaller worker count.
 modelPool:
-  maxConnections: 200
-  maxKeepaliveConnections: 50
+  maxConnections: 100
+  maxKeepaliveConnections: 25
 
 # -- Model API keys (sensitive) -----------------------------------------------
 # These are stored in a Kubernetes Secret, not the ConfigMap.
@@ -112,9 +118,11 @@ rag:
   deferCountSync: true
 
 # -- Qdrant configuration -----------------------------------------------------
-# Multi-replica Qdrant cluster with built-in sharding for read scaling.
+# 2-node Qdrant cluster with built-in sharding. Note: 2 is an even number so
+# Raft consensus has no failure tolerance - fine for testing. Use 3 (helm-scale)
+# for production.
 qdrant:
-  replicas: 3
+  replicas: 2
   image:
     repository: qdrant/qdrant
     tag: "v1.18.2"
@@ -161,21 +169,27 @@ service:
 
 
 # -- Resource limits ----------------------------------------------------------
+# Tuned so total requests are ~50% above the single-replica chart (helm/):
+#   app   : 2 pods x 2 containers x (2.5Gi/1.5cpu req, 8Gi/3cpu lim)
+#   qdrant: 2 pods x (10Gi/3cpu req, 20Gi/6cpu lim)
+#   redis : 1 pod x (256Mi/100m req, 512Mi/500m lim)
+#   total req  ~= 30Gi / 12 cpu   (helm/ = 20Gi / 8 cpu  -> +50%)
+#   total lim  ~= 72Gi / 24 cpu   (helm/ = 48Gi / 16 cpu -> +50%)
 resources:
   app:
     requests:
-      memory: "4Gi"
-      cpu: 2
+      memory: "2.5Gi"
+      cpu: "1.5"
     limits:
       memory: "8Gi"
-      cpu: 4
+      cpu: "3"
   qdrant:
     requests:
-      memory: "16Gi"
-      cpu: "4"
+      memory: "10Gi"
+      cpu: "3"
     limits:
-      memory: "32Gi"
-      cpu: "8"
+      memory: "20Gi"
+      cpu: "6"
   redis:
     requests:
       memory: "256Mi"

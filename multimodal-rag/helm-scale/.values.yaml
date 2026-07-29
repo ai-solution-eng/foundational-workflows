@@ -2,7 +2,7 @@
 replicaCount: 1
 image:
   repository: andrewbydlon/rag-api-server
-  tag: v1.0.0
+  tag: v1.3.0
   pullPolicy: IfNotPresent
 
 deployment:

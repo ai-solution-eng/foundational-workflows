@@ -2,7 +2,7 @@
 replicaCount: 1
 image:
   repository: andrewbydlon/rag-api-server
-  tag: v1.2.0
+  tag: v1.3.0
   pullPolicy: IfNotPresent
 
 deployment:
@@ -20,6 +20,10 @@ persistence:
     size: 50Gi
     storageClass: "gl4f-filesystem"
     accessMode: ReadWriteMany
+    # When true, the API server pod mounts the Qdrant PVC read-only at
+    # /qdrant-storage so it can report Qdrant disk usage on the management
+    # page. Requires a single Qdrant PVC (single-replica chart only).
+    mountReadOnly: true
 
 
 # -- Model configuration ------------------------------------------------------

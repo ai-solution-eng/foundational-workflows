@@ -41,6 +41,9 @@ logger = logging.getLogger(__name__)
 DATA_PATH = os.environ.get("DATA_PATH", "/data")
 QDRANT_HOST = os.environ.get("QDRANT_HOST", "")
 QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
+# Path where the Qdrant PVC is mounted read-only (so we can report its disk
+# usage). Empty when the mount is not configured (e.g. sharded Qdrant cluster).
+QDRANT_STORAGE_PATH = os.environ.get("QDRANT_STORAGE_PATH", "")
 RAG_REMOTE = os.environ.get("RAG_REMOTE", "true").lower() in ("true", "1", "yes")
 RAG_CAPTION_VIDEO = os.environ.get("RAG_CAPTION_VIDEO", "false").lower() in (
     "true",
@@ -1378,6 +1381,23 @@ async def api_health_stats() -> dict[str, Any]:
     except Exception:
         qdrant_status = "unreachable"
 
+    # -- Qdrant PVC disk usage (only when mounted read-only) -------------------
+    # The Qdrant PVC is a separate volume from the file PVC; Qdrant's HTTP API
+    # does not expose on-disk usage, so we read it from the read-only mount
+    # configured in the Helm chart (env QDRANT_STORAGE_PATH).
+    qdrant_pvc: Optional[dict[str, Any]] = None
+    if QDRANT_STORAGE_PATH and Path(QDRANT_STORAGE_PATH).exists():
+        try:
+            q_usage = shutil.disk_usage(QDRANT_STORAGE_PATH)
+            qdrant_pvc = {
+                "total_bytes": q_usage.total,
+                "used_bytes": q_usage.used,
+                "free_bytes": q_usage.free,
+                "used_percent": round(q_usage.used / q_usage.total * 100, 1),
+            }
+        except Exception:
+            logger.debug("Suppressed exception", exc_info=True)
+
     return {
         "cpu": {
             "percent": cpu_percent,
@@ -1399,6 +1419,7 @@ async def api_health_stats() -> dict[str, Any]:
             "status": qdrant_status,
             "collections": qdrant_collections,
             "total_points": qdrant_total_points,
+            "pvc": qdrant_pvc,
         },
     }
 

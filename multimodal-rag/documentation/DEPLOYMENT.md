@@ -124,7 +124,7 @@ envsubst < values.yaml > values-resolved.yaml
 helm install multimodal-rag . \
   -f values-resolved.yaml \
   --set image.repository=your-registry/rag-api-server \
-  --set image.tag=v1.0.0 \
+  --set image.tag=v1.3.0 \
   --set models.embedder.url="https://..." \
   --set models.reranker.url="https://..." \
   --set models.vlm.url="https://..." \
@@ -267,7 +267,7 @@ When `ezua.enabled=true` (default), the chart also creates:
 
 ```bash
 helm upgrade multimodal-rag . \
-  --set image.tag=v1.0.0 \
+  --set image.tag=v1.3.0 \
   --reuse-values  # keep existing non-default values
 ```
 
@@ -275,7 +275,7 @@ To change specific values while upgrading:
 
 ```bash
 helm upgrade multimodal-rag . \
-  --set image.tag=v1.0.0 \
+  --set image.tag=v1.3.0 \
   --set persistence.data.size=500Gi
 ```
 

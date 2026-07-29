@@ -23,7 +23,7 @@ store, not raw transcripts.
 |---|---|---|
 | **Write trigger** | Model calls `add_memory` MCP tool (proactive, per `AGENTS.md`) | `outlet()` filter asks a distillation LLM after each reply |
 | **Recall trigger** | Model calls `search_memory` MCP tool (proactive, per `AGENTS.md`) | `inlet()` filter auto-searches at conversation start |
-| **Transport** | MCP (streamable-http) | REST API (direct HTTP from filter) |
+| **Transport** | MCP (streamable-http, stateless) | REST API (direct HTTP from filter) |
 | **Dataset/password** | `{env:}` headers in `opencode.jsonc` | HMAC-derived from SSO `__user__` (or shared valve) |
 | **Provenance** | `source: "opencode:memory"` | `source: "openwebui:memory"` |
 
@@ -185,6 +185,10 @@ API and updating `RAG_MEMORY_PASSWORD` in users' env.
 - **Server:** `kubectl logs -l app=rag-mcp-server -c rag-mcp-server`
   shows tool invocations; `GET /api/datasets/{name}` returns
   `document_count` to confirm writes are landing.
+- **Multi-replica:** in stateless mode (v1.3.0+), each request logs as a
+  fresh transport (no "Created new transport with session ID" line).
+  Unlock state is shared via Redis, not in-memory — verify with
+  `kubectl exec deploy/rag-mcp-server-redis -- redis-cli KEYS '*unlock*'`.
 
 ### Troubleshooting
 
@@ -193,6 +197,7 @@ API and updating `RAG_MEMORY_PASSWORD` in users' env.
 | opencode: `ToolError: No memory dataset specified` | `RAG_MEMORY_DATASET` not exported | Export it in the shell that launches opencode |
 | opencode: `Incorrect password for dataset` | `RAG_MEMORY_PASSWORD` wrong / stale | Re-verify against the dataset's password |
 | opencode: `rag-memory` connection not listed | URL unreachable / ingress token missing | Check `RAG_INGRESS_TOKEN` and the URL; try `opencode mcp debug rag-memory` |
+| opencode: `Session not found` (404) on MCP calls | Multi-replica deployment running stateful MCP mode (pre-v1.3.0) | Upgrade to v1.3.0+ which enables `stateless_http=True`; see [SCALE.md](SCALE.md) |
 | OWUI: no memories recalled for a new user | Dataset doesn't exist yet | Set `MEMORY_AUTO_CREATE=true`, or pre-create the user's dataset |
 | OWUI: `Memory store failed` in logs | Derived password ≠ dataset's password (e.g. `MEMORY_SECRET` changed) | Re-create the dataset or restore the old secret |
 | OWUI: distillation never writes | `DISTILL_LLM_*` not set, or replies < `DISTILL_MIN_REPLY_CHARS` | Configure distillation LLM; lower the char threshold if needed |
