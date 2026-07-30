@@ -1,9 +1,10 @@
 import base64
 import json
 import subprocess as sp
+from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any
 
 from multimodal_rag.utils.logging_utils import logging
 

@@ -4,18 +4,20 @@ from pathlib import Path
 from pprint import pprint
 
 import numpy as np
-from sentence_transformers import CrossEncoder
 import torch
+from sentence_transformers import CrossEncoder
 
 from multimodal_rag.utils.pcai_models import qwen3_vl_reranker_8B
 
 np.set_printoptions(linewidth=120)
 
 from shared_queries_and_documents import (  # noqa: E402
-    text_only,
+    base_prompt as prompt,
+)
+from shared_queries_and_documents import (  # noqa: E402
     image_only,
     joint_text_image,
-    base_prompt as prompt,
+    text_only,
 )
 
 # Path to the current script file
@@ -32,8 +34,8 @@ print(emb_path)
 def main():
     model = CrossEncoder(
         "Qwen/Qwen3-VL-Reranker-8B",
-        model_kwargs=dict(torch_dtype="bfloat16"),
-        processor_kwargs=dict(mm_processor_kwargs=qwen3_vl_reranker_8B.mm_processor_kwargs),
+        model_kwargs={"torch_dtype": "bfloat16"},
+        processor_kwargs={"mm_processor_kwargs": qwen3_vl_reranker_8B.mm_processor_kwargs},
         local_files_only=True,
     )
 
@@ -44,15 +46,15 @@ def main():
     text_joint_scores = [[predict((x, y)) for y in joint_text_image] for x in text_only]
     image_joint_scores = [[predict((x, y)) for y in joint_text_image] for x in image_only]
 
-    data_dict = dict(
-        name="sentence_transformers",
-        text_only=text_only,
-        image_only=image_only,
-        joint=joint_text_image,
-        text_image_scores=np.array(text_image_scores),
-        text_joint_scores=np.array(text_joint_scores),
-        image_joint_scores=np.array(image_joint_scores),
-    )
+    data_dict = {
+        "name": "sentence_transformers",
+        "text_only": text_only,
+        "image_only": image_only,
+        "joint": joint_text_image,
+        "text_image_scores": np.array(text_image_scores),
+        "text_joint_scores": np.array(text_joint_scores),
+        "image_joint_scores": np.array(image_joint_scores),
+    }
 
     print("Text to image comparison")
     pprint(data_dict["text_image_scores"])

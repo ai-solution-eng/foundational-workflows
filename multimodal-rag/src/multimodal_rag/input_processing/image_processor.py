@@ -21,7 +21,7 @@ def _resize_image(raw_bytes: bytes, mime_type: str, max_pixels: int) -> bytes:
         )
         return raw_bytes
 
-    img = Image.open(BytesIO(raw_bytes))
+    img: Image.Image = Image.open(BytesIO(raw_bytes))
     w, h = img.size
     if max_pixels <= 0 or w * h <= max_pixels:
         # Still need to convert non-RGB modes for format compatibility
@@ -116,7 +116,7 @@ class ImageProcessor:
 
     @staticmethod
     def _read_file(path: str) -> tuple[bytes, str]:
-        p = path[7:] if path.startswith("file://") else path
+        p = path.removeprefix("file://")
         with open(p, "rb") as f:
             raw = f.read()
         mime, _ = ImageProcessor._guess_mime(p)

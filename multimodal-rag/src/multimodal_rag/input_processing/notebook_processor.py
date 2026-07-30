@@ -2,7 +2,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from multimodal_rag.utils.logging_utils import logging
 
@@ -42,7 +42,7 @@ class NotebookProcessor:
     strip_markdown: bool = False
     include_code: bool = True
     include_outputs: bool = True
-    text_splitter: Optional[Any] = None
+    text_splitter: Any | None = None
 
     # ------------------------------------------------------------------
     # Public API

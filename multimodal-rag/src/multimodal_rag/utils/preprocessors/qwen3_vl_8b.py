@@ -1,7 +1,7 @@
 import base64
-from io import BytesIO
 import os
-from typing import Any, Optional
+from io import BytesIO
+from typing import Any
 
 from vllm.multimodal.utils import fetch_image
 
@@ -51,7 +51,7 @@ def format_input_to_conversation(
 
 def prepare_vllm_inputs(
     text: str,
-    image: Optional[str] = None,
+    image: str | None = None,
     instruction: str = "Represent the user's input.",
     convert_base64: bool = False,
 ) -> str | dict[str, Any]:

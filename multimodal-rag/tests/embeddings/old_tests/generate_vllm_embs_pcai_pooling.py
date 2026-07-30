@@ -1,9 +1,12 @@
-import httpx
 import json
 from os.path import join as pj
 from pathlib import Path
+
+import httpx
 import numpy as np
-from HPE.MultimodalRAG.tests.old_tests.shared_queries_and_documents_old import all_inputs
+from HPE.MultimodalRAG.tests.old_tests.shared_queries_and_documents_old import (
+    all_inputs,
+)
 
 from multimodal_rag.utils.pcai_models import qwen3_vl_8B
 
@@ -57,13 +60,13 @@ similarities = (query_embeddings @ doc_embeddings.T) / (
 
 print("Similarities\n", similarities)
 
-data_dict = dict(
-    name="pcai_pooling",
-    queries=vllm_inputs[:4],
-    query_embeddings=query_embeddings,
-    documents=vllm_inputs[4:],
-    doc_embeddings=doc_embeddings,
-    similarities=similarities,
-)
+data_dict = {
+    "name": "pcai_pooling",
+    "queries": vllm_inputs[:4],
+    "query_embeddings": query_embeddings,
+    "documents": vllm_inputs[4:],
+    "doc_embeddings": doc_embeddings,
+    "similarities": similarities,
+}
 
 np.save(emb_path, data_dict)  # type: ignore

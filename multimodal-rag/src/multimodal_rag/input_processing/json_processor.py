@@ -1,7 +1,7 @@
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from multimodal_rag.utils.logging_utils import logging
 
@@ -96,7 +96,7 @@ class JSONProcessor:
     chunk_overlap: int = 512
     flatten: bool = True
     separator: str = "."
-    text_splitter: Optional[Any] = None
+    text_splitter: Any | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -238,4 +238,6 @@ class JSONProcessor:
 
 
 # Late import to avoid circular issues
-from multimodal_rag.input_processing.text_processor import TextProcessor  # noqa: E402, F811
+from multimodal_rag.input_processing.text_processor import (  # noqa: E402
+    TextProcessor,
+)

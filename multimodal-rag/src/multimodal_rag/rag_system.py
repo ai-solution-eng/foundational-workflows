@@ -2,22 +2,30 @@ import asyncio
 import base64
 import os
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from functools import cached_property
 from io import BytesIO
-from typing import Optional, Any, Sequence
+from typing import Any
 
 import numpy as np
 
+from multimodal_rag.utils.general_tools import (
+    cosine_sim,
+    list_chunker,
+    retry_call,
+    sync_wrapper_safe,
+)
+from multimodal_rag.utils.logging_utils import logging
+from multimodal_rag.utils.model_adapters import (
+    MultiModalEmbeddings,
+    MultiModalReranker,
+)
 from multimodal_rag.utils.pcai_model_classes import (
     ChatModel,
     EmbeddingModel,
     RerankerModel,
     VoiceModel,
-)
-from multimodal_rag.utils.model_adapters import (
-    MultiModalEmbeddings,
-    MultiModalReranker,
 )
 from multimodal_rag.vector_store import (
     Document,
@@ -25,17 +33,10 @@ from multimodal_rag.vector_store import (
     QdrantVectorStore,
     VectorStore,
 )
-from multimodal_rag.utils.general_tools import (
-    sync_wrapper_safe,
-    cosine_sim,
-    list_chunker,
-    retry_call,
-)
-from multimodal_rag.utils.logging_utils import logging
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["MultiModalRAGSystem", "MultimodalRAG", "Preprocessor", "Postprocessor"]
+__all__ = ["MultiModalRAGSystem", "MultimodalRAG", "Postprocessor", "Preprocessor"]
 
 
 def _qdrant_prefer_grpc() -> bool:
@@ -57,6 +58,45 @@ def _qdrant_client_timeout():
         return float(raw)
     except (TypeError, ValueError):
         return None
+
+
+def _qdrant_quantization_config():
+    """Scalar quantization config for new Qdrant collections.
+
+    Defaults to int8 (4x memory reduction, ~1-2% recall loss, faster
+    search). Set ``QDRANT_QUANTIZATION=none`` to disable, or
+    ``QDRANT_QUANTIZATION=int8`` to be explicit. No rescoring is used
+    — the 1-2% recall loss is acceptable without the extra full-
+    precision reranking pass.
+
+    ``QDRANT_QUANTIZATION_ALWAYS_RAM`` (default ``true``) controls whether
+    quantized vectors are pinned in RAM for fast search. Disable
+    (``false``) for very large datasets (2M+ points) to avoid OOM —
+    quantized vectors will be read from disk per-search instead.
+
+    Only applies to *newly created* collections; existing collections
+    keep their original config.
+    """
+    mode = os.environ.get("QDRANT_QUANTIZATION", "int8").lower().strip()
+    if mode in ("none", "off", "false", "0"):
+        return None
+
+    always_ram = os.environ.get("QDRANT_QUANTIZATION_ALWAYS_RAM", "true").lower() in ("true", "1", "yes")
+
+    kwargs = dict(
+        type=ScalarType.INT8,
+        quantile=0.99,
+        always_ram=always_ram,
+    )
+
+    if mode not in ("int8", "scalar", "true", "1", ""):
+        logger.warning("Unknown QDRANT_QUANTIZATION='%s', falling back to int8", mode)
+
+    from qdrant_client.models import ScalarQuantization, ScalarQuantizationConfig, ScalarType
+
+    return ScalarQuantization(
+        scalar=ScalarQuantizationConfig(**kwargs),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +152,7 @@ def _fetch_media_bytes(url: str, client=None) -> bytes:
             resp = c.get(url, follow_redirects=True)
             resp.raise_for_status()
             return resp.content
-    path = url[7:] if url.startswith("file://") else url
+    path = url.removeprefix("file://")
     with open(path, "rb") as f:
         return f.read()
 
@@ -134,7 +174,7 @@ async def _afetch_media_bytes(url: str, async_client=None) -> bytes:
 
         m = re.match(r"data:[^;]+;base64,(.+)", url)
         return base64.b64decode(m.group(1)) if m else base64.b64decode(url.split(",", 1)[1])
-    path = url[7:] if url.startswith("file://") else url
+    path = url.removeprefix("file://")
     with open(path, "rb") as f:
         return f.read()
 
@@ -153,7 +193,7 @@ def _file_url_to_data_url(url: str) -> str:
     import mimetypes
     import os
 
-    path = url[7:] if url.startswith("file://") else url
+    path = url.removeprefix("file://")
     if not os.path.exists(path):
         logger.warning("File not found, returning URL as-is: %s", path)
         return url
@@ -346,8 +386,8 @@ class Preprocessor:
         are split into chunks to avoid overwhelming the ASR / VLM endpoints.
     """
 
-    vlm: Optional[ChatModel] = None
-    asr: Optional[VoiceModel] = None
+    vlm: ChatModel | None = None
+    asr: VoiceModel | None = None
     caption_video: bool = False
     chunk_size: int = 128
 
@@ -359,7 +399,7 @@ class Preprocessor:
     ) -> list[str | dict[str, Any]]:
         return sync_wrapper_safe(
             self.acall,
-            dict(documents=documents, target_modalities=target_modalities, query=query),
+            {"documents": documents, "target_modalities": target_modalities, "query": query},
         )
 
     @cached_property
@@ -393,7 +433,7 @@ class Preprocessor:
                     text = (d.get("text") or "").strip()
                     if not has_other_media and (not text or text.startswith("[Audio:")):
                         logger.warning(
-                            "Omitting audio document: no ASR model and embedder " "does not support audio. Source: %s",
+                            "Omitting audio document: no ASR model and embedder does not support audio. Source: %s",
                             d.get("source", "(unknown)"),
                         )
                         return None
@@ -486,8 +526,8 @@ class Postprocessor:
     * ``video``  → VLM description + optional ASR audio transcription
     """
 
-    vlm: Optional[ChatModel] = None
-    asr: Optional[VoiceModel] = None
+    vlm: ChatModel | None = None
+    asr: VoiceModel | None = None
     caption_video: bool = False
 
     def __call__(
@@ -498,7 +538,7 @@ class Postprocessor:
     ) -> list[str | dict[str, Any]]:
         return sync_wrapper_safe(
             self.acall,
-            dict(documents=documents, llm_modalities=llm_modalities, query=query),
+            {"documents": documents, "llm_modalities": llm_modalities, "query": query},
         )
 
     async def acall(
@@ -643,9 +683,9 @@ class MultimodalRAG:
     """
 
     embedder: EmbeddingModel
-    reranker: Optional[RerankerModel] = None
-    vlm: Optional[ChatModel] = None
-    asr: Optional[VoiceModel] = None
+    reranker: RerankerModel | None = None
+    vlm: ChatModel | None = None
+    asr: VoiceModel | None = None
     caption_video: bool = False
     preprocess: bool = True
     preprocess_chunk_size: int = 128
@@ -653,7 +693,7 @@ class MultimodalRAG:
 
     # VectorStore option — pass a ``VectorStore`` instance, a config dict for
     # auto-creation, or ``None`` (in-memory retrieval via ``documents`` param).
-    vector_store: Optional[VectorStore | dict[str, Any]] = None
+    vector_store: VectorStore | dict[str, Any] | None = None
 
     remote: bool = False
 
@@ -739,6 +779,7 @@ class MultimodalRAG:
             client.create_collection(
                 collection_name=collection_name,
                 vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+                quantization_config=_qdrant_quantization_config(),
             )
 
         return QdrantVectorStore(
@@ -899,7 +940,7 @@ class MultimodalRAG:
                     kept.append(d)
                 if omitted:
                     logger.warning(
-                        "Omitting %d audio document(s): no ASR model and " "embedder does not support audio.",
+                        "Omitting %d audio document(s): no ASR model and embedder does not support audio.",
                         omitted,
                     )
                 docs = kept
@@ -915,7 +956,7 @@ class MultimodalRAG:
         Returns ``[(id, {"text": ..., "image": ..., ...}), ...]`` where the
         dict is the reconstructed multimodal entry.
         """
-        return sync_wrapper_safe(self.alist_documents, dict(limit=limit))
+        return sync_wrapper_safe(self.alist_documents, {"limit": limit})
 
     async def alist_documents(self, limit: int = 50) -> list[tuple[str, dict[str, Any]]]:
         vs = self.vector_store
@@ -948,7 +989,7 @@ class MultimodalRAG:
         self,
         documents: Sequence[str | dict[str, Any]],
         deduplicate: bool = True,
-        dedup_threshold: Optional[float] = None,
+        dedup_threshold: float | None = None,
         **kwargs,
     ) -> list[str]:
         """Sync wrapper around :meth:`aadd_to_vector_store`."""
@@ -1026,8 +1067,8 @@ class MultimodalRAG:
                         resized.append(f"data:{mime};base64,{b64}")
                     else:
                         # Video — transcode with ffmpeg: fps + dynamic aspect-ratio-aware resize
-                        import subprocess as sp
                         import json
+                        import subprocess as sp
 
                         vw = vh = 0
                         try:
@@ -1140,8 +1181,7 @@ class MultimodalRAG:
                     break
                 prev_end = end
                 start = end - chunk_overlap
-                if start < 0:
-                    start = 0
+                start = max(start, 0)
             return [c for c in result if c]
 
         out: list[str | dict[str, Any]] = []
@@ -1181,7 +1221,9 @@ class MultimodalRAG:
         if hasattr(vs, "store"):
             # ── InMemoryVectorStore — vectorised numpy ──────────────────
             stored_vecs = [
-                s.get("vector") for s in vs.store.values() if s.get("vector") is not None  # type: ignore[attr-defined]
+                s.get("vector")
+                for s in vs.store.values()
+                if s.get("vector") is not None  # type: ignore[attr-defined]
             ]
             if not stored_vecs:
                 return [False] * len(embs)
@@ -1217,7 +1259,7 @@ class MultimodalRAG:
         self,
         documents: Sequence[str | dict[str, Any]],
         deduplicate: bool = True,
-        dedup_threshold: Optional[float] = None,
+        dedup_threshold: float | None = None,
         **kwargs,
     ) -> list[str]:
         """Embed and add documents to the vector store.
@@ -1409,7 +1451,7 @@ class MultimodalRAG:
         query: str | dict[str, Any],
         results: list[tuple[Any, float]],
     ) -> list[tuple[Any, float]]:
-        return sync_wrapper_safe(self._arerank_results, dict(query=query, results=results))
+        return sync_wrapper_safe(self._arerank_results, {"query": query, "results": results})
 
     async def _arerank_results(
         self,
@@ -1439,34 +1481,43 @@ class MultimodalRAG:
     def retrieve(
         self,
         query: str | dict[str, Any],
-        documents: Optional[list[str | dict[str, Any]]] = None,
+        documents: list[str | dict[str, Any]] | None = None,
         top_k: int = 10,
         use_reranker: bool = True,
         reranker_top_k: int = 3,
-        query_vector: Optional[list[float]] = None,
+        query_vector: list[float] | None = None,
+        need_media: bool | None = None,
     ) -> list[tuple[Any, float]]:
         """Sync wrapper around :meth:`aretrieve`."""
         return sync_wrapper_safe(
             self.aretrieve,
-            dict(
-                query=query,
-                documents=documents,
-                top_k=top_k,
-                use_reranker=use_reranker,
-                reranker_top_k=reranker_top_k,
-                query_vector=query_vector,
-            ),
+            {
+                "query": query,
+                "documents": documents,
+                "top_k": top_k,
+                "use_reranker": use_reranker,
+                "reranker_top_k": reranker_top_k,
+                "query_vector": query_vector,
+                "need_media": need_media,
+            },
         )
 
     async def aretrieve(
         self,
         query: str | dict[str, Any],
-        documents: Optional[list[str | dict[str, Any]]] = None,
+        documents: list[str | dict[str, Any]] | None = None,
         top_k: int = 10,
         use_reranker: bool = False,
         reranker_top_k: int = 3,
-        query_vector: Optional[list[float]] = None,
+        query_vector: list[float] | None = None,
+        need_media: bool | None = None,
     ) -> list[tuple[Any, float]]:
+
+        # Auto-compute need_media: base64 media payloads are needed when the
+        # reranker will consume them.  (VLM / base-LLM-vision cases are
+        # handled by the caller — they pass need_media=True explicitly.)
+        if need_media is None:
+            need_media = use_reranker and self.reranker is not None
 
         if documents is not None:
             if query_vector is not None:
@@ -1489,16 +1540,27 @@ class MultimodalRAG:
                 docs_and_scores = await vs.asimilarity_search_with_score_by_vector(  # type: ignore[attr-defined]
                     query_emb,
                     top_k,
+                    need_media=need_media,
                 )
             else:
                 docs_and_scores = await vs.asimilarity_search_with_relevance_scores(
                     query,
                     k=top_k,
+                    need_media=need_media,
                 )
             results = [(self._extract_doc(doc), score) for doc, score in docs_and_scores]
 
-        if self.reranker is not None and use_reranker and results:
+        if use_reranker and self.reranker is None:
+            logger.warning(
+                "Reranker requested (use_reranker=True) but no reranker model is "
+                "configured — returning top embedding results."
+            )
+        elif self.reranker is not None and use_reranker and results:
             results = await self._arerank_results(query, results, reranker_top_k)
+        elif use_reranker and results and len(results) > reranker_top_k:
+            # Reranker unavailable — trim to reranker_top_k for consistency
+            # with what the caller expected.
+            results = results[:reranker_top_k]
 
         return results
 
@@ -1666,13 +1728,13 @@ class MultiModalRAGSystem:
         self,
         llm: ChatModel,
         embedder: EmbeddingModel,
-        reranker: Optional[RerankerModel] = None,
-        vlm: Optional[ChatModel] = None,
-        asr: Optional[VoiceModel] = None,
+        reranker: RerankerModel | None = None,
+        vlm: ChatModel | None = None,
+        asr: VoiceModel | None = None,
         caption_video: bool = False,
         preprocess: bool = True,
         preprocess_chunk_size: int = 128,
-        vector_store: Optional[VectorStore | dict[str, Any]] = None,
+        vector_store: VectorStore | dict[str, Any] | None = None,
         remote: bool = False,
     ):
         self.llm = llm
@@ -1874,7 +1936,7 @@ class MultiModalRAGSystem:
     )
 
     def _needs_rag(self, query: str | dict[str, Any]) -> bool:
-        return sync_wrapper_safe(self._aneeds_rag, dict(query=query))
+        return sync_wrapper_safe(self._aneeds_rag, {"query": query})
 
     async def _aneeds_rag(self, query: str | dict[str, Any]) -> bool:
         query_text = query if isinstance(query, str) else query.get("text", str(query))
@@ -1891,8 +1953,8 @@ class MultiModalRAGSystem:
     def generate(
         self,
         query: str | dict[str, Any],
-        documents: Optional[list[str | dict[str, Any]]] = None,
-        system_prompt: Optional[str] = None,
+        documents: list[str | dict[str, Any]] | None = None,
+        system_prompt: str | None = None,
         top_k: int = 10,
         use_vlm: bool = True,
         route: bool = False,
@@ -1918,8 +1980,8 @@ class MultiModalRAGSystem:
     async def agenerate(
         self,
         query: str | dict[str, Any],
-        documents: Optional[list[str | dict[str, Any]]] = None,
-        system_prompt: Optional[str] = None,
+        documents: list[str | dict[str, Any]] | None = None,
+        system_prompt: str | None = None,
         top_k: int = 10,
         use_vlm: bool = True,
         route: bool = False,
@@ -1946,12 +2008,21 @@ class MultiModalRAGSystem:
             logger.verbose("%.2fs route(llm)  → RAG needed", time.monotonic() - t_r)  # type: ignore[attr-defined]
 
         t_r = time.monotonic()
+        # Base64 media payloads are needed when the reranker, VLM, or a
+        # vision-capable base LLM will consume them.
+        llm_mods = self._llm_modalities
+        need_media = (
+            (use_reranker and self._rag.reranker is not None)
+            or (use_vlm and self._rag.vlm is not None)
+            or bool(llm_mods & {"image", "video"})
+        )
         retrieved = await self._rag.aretrieve(
             query,
             documents,
             top_k,
             use_reranker=use_reranker,
             reranker_top_k=reranker_top_k,
+            need_media=need_media,
         )
         retrieved_docs = [d for d, _ in retrieved]
         logger.verbose(  # type: ignore[attr-defined]

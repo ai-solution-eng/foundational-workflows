@@ -2,15 +2,15 @@ from os.path import join as pj
 from pprint import pprint
 
 import numpy as np
-
 from shared_queries_and_documents import (
     all_inputs,
-    text_only,
     image_only,
     joint_text_image,
     multiimage_data,
     script_path,
+    text_only,
 )
+
 from multimodal_rag.utils.model_adapters import MultiModalReranker
 from multimodal_rag.utils.pcai_models import qwen3_vl_reranker_8B
 
@@ -34,15 +34,15 @@ async def main():
 
     multiimage_score_example = model.score(all_inputs, multiimage_data)
 
-    all_scores = dict(
-        text=openai_inputs[::3],
-        image=openai_inputs[1::3],
-        joint=openai_inputs[2::3],
-        text_image_scores=np.array(text_image_scores),
-        text_joint_scores=np.array(text_joint_scores),
-        image_joint_scores=np.array(image_joint_scores),
-        multiimage_score_example=np.array(multiimage_score_example),
-    )
+    all_scores = {
+        "text": openai_inputs[::3],
+        "image": openai_inputs[1::3],
+        "joint": openai_inputs[2::3],
+        "text_image_scores": np.array(text_image_scores),
+        "text_joint_scores": np.array(text_joint_scores),
+        "image_joint_scores": np.array(image_joint_scores),
+        "multiimage_score_example": np.array(multiimage_score_example),
+    }
 
     print("\nSimilarity Scores (Text-Image):")
     pprint(all_scores["text_image_scores"])

@@ -14,14 +14,28 @@ import logging
 import os
 import uuid
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any
 
 import numpy as np
 
 from multimodal_rag.utils.general_tools import cosine_sim
 
 logger = logging.getLogger(__name__)
+
+
+def _lightweight_payload_selector():
+    """Payload selector that excludes heavy base64 ``image``/``video`` keys.
+
+    Used on the fast search path (no reranker, no VLM, base LLM doesn't
+    support image/video) to avoid transferring megabytes of base64 data
+    from Qdrant that would be immediately discarded and replaced with
+    ``preprocessed_*`` file refs.
+    """
+    from qdrant_client.models import PayloadSelectorExclude
+
+    return PayloadSelectorExclude(exclude=["metadata.image", "metadata.video"])
 
 
 @dataclass
@@ -107,30 +121,30 @@ class _QdrantBatcher:
 
     def __init__(
         self,
-        search_fn: "Callable[[list[tuple[list[float], int]]], list[list[tuple[Document, float]]]]",
+        search_fn: "Callable[[list[tuple[list[float], int, bool]]], list[list[tuple[Document, float]]]]",
         max_batch_size: int = 32,
         max_wait_ms: float = 5.0,
     ) -> None:
         self._search_fn = search_fn
         self._max_batch_size = max(1, max_batch_size)
         self._max_wait = max(0.001, max_wait_ms / 1000.0)
-        self._queue: list[tuple[list[float], int, asyncio.Future[list[tuple[Document, float]]]]] = []
-        self._lock: Optional[asyncio.Lock] = None
-        self._flush_task: Optional[asyncio.Task[None]] = None
+        self._queue: list[tuple[list[float], int, bool, asyncio.Future[list[tuple[Document, float]]]]] = []
+        self._lock: asyncio.Lock | None = None
+        self._flush_task: asyncio.Task[None] | None = None
 
     def _get_lock(self) -> asyncio.Lock:
         if self._lock is None:
             self._lock = asyncio.Lock()
         return self._lock
 
-    async def submit(self, embedding: list[float], k: int) -> list[tuple[Document, float]]:
+    async def submit(self, embedding: list[float], k: int, need_media: bool = True) -> list[tuple[Document, float]]:
         """Submit a single query and await its results."""
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[list[tuple[Document, float]]] = loop.create_future()
         flush_now = False
 
         async with self._get_lock():
-            self._queue.append((embedding, k, fut))
+            self._queue.append((embedding, k, need_media, fut))
             if len(self._queue) >= self._max_batch_size:
                 flush_now = True
             elif self._flush_task is None:
@@ -148,7 +162,7 @@ class _QdrantBatcher:
             return
         await self._flush(caller_task=asyncio.current_task())
 
-    async def _flush(self, caller_task: "Optional[asyncio.Task[None]]" = None) -> None:
+    async def _flush(self, caller_task: "asyncio.Task[None] | None" = None) -> None:
         """Drain the queue and send one batched Qdrant query."""
         async with self._get_lock():
             if not self._queue:
@@ -159,8 +173,8 @@ class _QdrantBatcher:
                 self._flush_task.cancel()
             self._flush_task = None
 
-        queries = [(emb, k) for emb, k, _ in batch]
-        futs = [f for _, _, f in batch]
+        queries = [(emb, k, need_media) for emb, k, need_media, _ in batch]
+        futs = [f for _, _, _, f in batch]
 
         try:
             results = await asyncio.get_running_loop().run_in_executor(None, self._search_fn, queries)
@@ -193,7 +207,7 @@ class QdrantVectorStore(VectorStore):
         client: Any,
         collection_name: str,
         embedding: Any,
-        vector_name: Optional[str] = None,
+        vector_name: str | None = None,
         **kwargs: Any,
     ) -> None:
         self._client = client
@@ -208,7 +222,7 @@ class QdrantVectorStore(VectorStore):
         # in model_adapters.py.
         self._batcher_max_size = int(os.environ.get("QDRANT_QUERY_BATCH_SIZE", "32"))
         self._batcher_max_wait_ms = float(os.environ.get("QDRANT_QUERY_BATCH_WAIT_MS", "5"))
-        self._batchers: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _QdrantBatcher]" = (
+        self._batchers: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _QdrantBatcher] = (
             weakref.WeakKeyDictionary()
         )
 
@@ -237,24 +251,28 @@ class QdrantVectorStore(VectorStore):
         return out
 
     def similarity_search_with_score_by_vector_batch(
-        self, queries: list[tuple[list[float], int]]
+        self, queries: list[tuple[list[float], int, bool]]
     ) -> list[list[tuple[Document, float]]]:
         """Batch-embed multiple queries in a single Qdrant gRPC call.
 
-        *queries* is a list of ``(embedding, k)`` pairs.  Returns a list of
-        result lists, one per query, in the same order as *queries*.
+        *queries* is a list of ``(embedding, k, need_media)`` tuples.
+        When *need_media* is False, heavy base64 ``image``/``video`` payload
+        keys are excluded from the Qdrant response to avoid transferring
+        megabytes of data that would be discarded on the fast path.
+        Returns a list of result lists, one per query, in the same order.
         """
         from qdrant_client.models import QueryRequest
 
+        lightweight = _lightweight_payload_selector()
         requests = [
             QueryRequest(
                 query=emb,
                 using=self.vector_name,
                 limit=k,
-                with_payload=True,
+                with_payload=True if need_media else lightweight,
                 with_vector=False,
             )
-            for emb, k in queries
+            for emb, k, need_media in queries
         ]
         responses = self._client.query_batch_points(
             collection_name=self.collection_name,
@@ -272,12 +290,16 @@ class QdrantVectorStore(VectorStore):
         return all_results
 
     async def asimilarity_search_with_score_by_vector(
-        self, embedding: list[float], k: int
+        self, embedding: list[float], k: int, need_media: bool = True
     ) -> list[tuple[Document, float]]:
         """Async batched similarity search by vector.
 
         Routes through a per-event-loop ``_QdrantBatcher`` so that
         concurrent searches share a single gRPC call.
+
+        When *need_media* is False, heavy base64 ``image``/``video`` payload
+        keys are excluded from the Qdrant response (fast path: no reranker,
+        no VLM, base LLM doesn't support image/video).
         """
         loop = asyncio.get_running_loop()
         batcher = self._batchers.get(loop)
@@ -288,8 +310,10 @@ class QdrantVectorStore(VectorStore):
                 max_wait_ms=self._batcher_max_wait_ms,
             )
             self._batchers[loop] = batcher
-        return await batcher.submit(embedding, k)
+        return await batcher.submit(embedding, k, need_media)
 
-    async def asimilarity_search_with_relevance_scores(self, query: str, k: int) -> list[tuple[Document, float]]:
+    async def asimilarity_search_with_relevance_scores(
+        self, query: str, k: int, need_media: bool = True
+    ) -> list[tuple[Document, float]]:
         emb = await self.embedding.aembed_query(query)
-        return await self.asimilarity_search_with_score_by_vector(emb, k)
+        return await self.asimilarity_search_with_score_by_vector(emb, k, need_media)

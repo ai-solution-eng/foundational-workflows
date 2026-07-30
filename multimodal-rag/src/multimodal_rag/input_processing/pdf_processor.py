@@ -1,6 +1,7 @@
 import base64
 import re
-from typing import Any, Generator
+from collections.abc import Generator
+from typing import Any
 
 from multimodal_rag.utils.logging_utils import logging
 
@@ -282,10 +283,7 @@ def _is_dense_author_list(text: str) -> bool:
 
     # Reject prose: a name list has almost no function words.
     stopword_hits = len(_PROSE_STOPWORDS.findall(text))
-    if stopword_hits > max(2, len(tokens) * 0.05):
-        return False
-
-    return True
+    return not stopword_hits > max(2, len(tokens) * 0.05)
 
 
 def _is_toc_chunk(text: str) -> bool:
@@ -332,9 +330,7 @@ class PDFProcessor:
         """Return True if an image is large enough to be a real figure/chart."""
         if width < PDFProcessor._MIN_IMG_WIDTH or height < PDFProcessor._MIN_IMG_HEIGHT:
             return False
-        if width * height < PDFProcessor._MIN_IMG_PIXELS:
-            return False
-        return True
+        return not width * height < PDFProcessor._MIN_IMG_PIXELS
 
     @staticmethod
     def _img_to_data_url(img_bytes: bytes, ext: str) -> str:
@@ -359,8 +355,9 @@ class PDFProcessor:
         renders the image through PyMuPDF's own decoders into a PNG.
         """
         try:
-            from PIL import Image as _PIL
             import io as _io
+
+            from PIL import Image as _PIL
 
             _PIL.open(_io.BytesIO(img_bytes))
             return img_bytes, ext
@@ -372,10 +369,7 @@ class PDFProcessor:
 
             pix = fitz.Pixmap(doc, xref)
             # CMYK (n==4) or 5+ component (CMYK+alpha) → RGB
-            if pix.n >= 4:
-                pix = fitz.Pixmap(fitz.csRGB, pix)
-            # Grayscale with alpha → RGBA
-            elif pix.n == 2:
+            if pix.n >= 4 or pix.n == 2:
                 pix = fitz.Pixmap(fitz.csRGB, pix)
             png_bytes = pix.tobytes("png")
             return png_bytes, "png"
@@ -443,8 +437,7 @@ class PDFProcessor:
             prev_start = start
             prev_end = end
             start = end - chunk_overlap
-            if start < 0:
-                start = 0
+            start = max(start, 0)
         return [c for c in chunks if c]
 
     # ------------------------------------------------------------------

@@ -1,10 +1,10 @@
 from os.path import join as pj
 from pathlib import Path
 from pprint import pprint
-from typing import Dict, Any
+from typing import Any
 
-from vllm import LLM, EngineArgs
 import numpy as np
+from vllm import LLM, EngineArgs
 
 from multimodal_rag.utils.model_adapters import InputConversion
 from multimodal_rag.utils.pcai_models import qwen3_vl_reranker_8B
@@ -35,7 +35,7 @@ async def replace_image_links_with_base64(images, joint):
     return images, joint
 
 
-def format_document_to_score_param(doc_dict: Dict[str, Any]):
+def format_document_to_score_param(doc_dict: dict[str, Any]):
     content = []
 
     text = doc_dict.get("text")
@@ -73,15 +73,15 @@ async def main() -> None:
 
     llm = LLM(**vars(eng_args))
 
-    from shared_queries_and_documents import text_only, image_only, joint_text_image
+    from shared_queries_and_documents import image_only, joint_text_image, text_only
 
     image_b64, joint_b64 = await replace_image_links_with_base64(image_only, joint_text_image)
 
-    all_scores: dict[str, Any] = dict(
-        text=text_only,
-        image=image_b64,
-        joint=joint_b64,
-    )
+    all_scores: dict[str, Any] = {
+        "text": text_only,
+        "image": image_b64,
+        "joint": joint_b64,
+    }
 
     text_image_comparisons = []
     text_joint_comparisons = []

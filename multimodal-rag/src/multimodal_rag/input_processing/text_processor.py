@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from multimodal_rag.utils.logging_utils import logging
 
@@ -34,7 +34,7 @@ class TextProcessor:
     chunk_size: int = 8192
     chunk_overlap: int = 512
     strip_markdown: bool = False
-    text_splitter: Optional[Any] = None  # TokenTextSplitter
+    text_splitter: Any | None = None  # TokenTextSplitter
 
     # ------------------------------------------------------------------
     # Public API
@@ -215,8 +215,7 @@ class TextProcessor:
                     end = next_space
             chunks.append(text[start:end].strip())
             start = end - self.chunk_overlap if end < len(text) else len(text)
-            if start < 0:
-                start = 0
+            start = max(start, 0)
         return [c for c in chunks if c]
 
     def _overlap_text(self, text: str) -> str:

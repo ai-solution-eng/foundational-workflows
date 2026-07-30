@@ -1,10 +1,10 @@
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-from defusedxml.ElementTree import fromstring as _safe_fromstring
 from defusedxml.common import DefusedXmlException
+from defusedxml.ElementTree import fromstring as _safe_fromstring
 
 from multimodal_rag.utils.logging_utils import logging
 
@@ -87,7 +87,7 @@ class XMLProcessor:
 
     chunk_size: int = 8192
     chunk_overlap: int = 512
-    text_splitter: Optional[Any] = None
+    text_splitter: Any | None = None
     separator: str = "."
 
     def process(self, xml_path: str) -> list[dict[str, Any]]:
@@ -190,7 +190,7 @@ class YAMLProcessor:
 
     chunk_size: int = 8192
     chunk_overlap: int = 512
-    text_splitter: Optional[Any] = None
+    text_splitter: Any | None = None
     separator: str = "."
 
     def process(self, yaml_path: str) -> list[dict[str, Any]]:

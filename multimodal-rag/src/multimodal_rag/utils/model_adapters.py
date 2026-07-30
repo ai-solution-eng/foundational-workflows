@@ -1,17 +1,17 @@
 import asyncio
 import base64
-import os
-from math import ceil
 import mimetypes
-from collections.abc import Sequence
+import os
 import re
 import weakref
-from typing import Optional, Any, Callable, Awaitable, overload
+from collections.abc import Awaitable, Callable, Sequence
+from math import ceil
+from typing import Any, overload
 
 from openai.types.create_embedding_response import CreateEmbeddingResponse
 
-from .logging_utils import logging
 from .general_tools import list_chunker, sync_wrapper_safe
+from .logging_utils import logging
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +21,13 @@ __all__ = ["InputConversion", "MultiModalEmbeddings", "MultiModalReranker"]
 _MEDIA_KEY_PATTERN = re.compile(r"^(image|video|audio)$")
 
 
-def _media_type_from_key(key: str) -> Optional[str]:
+def _media_type_from_key(key: str) -> str | None:
     """Return 'image', 'video', or 'audio' if *key* matches, else None."""
     m = _MEDIA_KEY_PATTERN.match(key)
     return m.group(1) if m else None
 
 
-def _classify_url(url: str) -> Optional[str]:
+def _classify_url(url: str) -> str | None:
     """Return media category ('image', 'video', 'audio') for a URL string, or None."""
     # Base64 data URI
     if url.startswith("data:"):
@@ -110,7 +110,7 @@ def _detect_media_type(file_path: str) -> str:
         return "image/jpeg"
     if header.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
-    if header.startswith(b"GIF87a") or header.startswith(b"GIF89a"):
+    if header.startswith((b"GIF87a", b"GIF89a")):
         return "image/gif"
     if header[:2] == b"BM":
         return "image/bmp"
@@ -321,8 +321,8 @@ class InputConversion:
         # -- ffmpeg pipe backend ---------------------------------------------
         if frames is None:
             try:
-                import subprocess
                 import json
+                import subprocess
 
                 # Probe duration
                 probe = subprocess.run(
@@ -339,6 +339,7 @@ class InputConversion:
                     input=video_bytes,
                     capture_output=True,
                     timeout=30,
+                    check=False,
                 )
                 info = json.loads(probe.stdout)
                 duration = float(info.get("format", {}).get("duration", 10))
@@ -364,6 +365,7 @@ class InputConversion:
                     input=video_bytes,
                     capture_output=True,
                     timeout=120,
+                    check=False,
                 )
 
                 # Parse concatenated JPEG stream
@@ -422,7 +424,7 @@ class InputConversion:
             response.raise_for_status()
             video_bytes = response.content
         else:
-            path = url[7:] if url.startswith("file://") else url
+            path = url.removeprefix("file://")
             with open(path, "rb") as f:
                 video_bytes = f.read()
 
@@ -452,8 +454,7 @@ class InputConversion:
             content_type = response.headers.get("content-type", "application/octet-stream")
             mime_type = content_type.split(";")[0].strip()
         else:
-            if url.startswith("file://"):
-                url = url[7:]
+            url = url.removeprefix("file://")
             with open(url, "rb") as f:
                 raw_bytes = f.read()
             mime_type = _detect_media_type(url)
@@ -549,7 +550,7 @@ class InputConversion:
                 if url.startswith(("http://", "https://", "data:")):
                     input_dict["content"].insert(0, {"type": "audio_url", "audio_url": {"url": url}})
                 else:
-                    path = url[7:] if url.startswith("file://") else url
+                    path = url.removeprefix("file://")
                     with open(path, "rb") as f:
                         b64 = base64.b64encode(f.read()).decode("utf-8")
                     input_dict["content"].insert(
@@ -568,7 +569,7 @@ class InputConversion:
                     input_dict["content"].insert(0, {"type": "image_url", "image_url": {"url": url}})
                 else:
                     # Local file — decode, resize, re-encode
-                    path = url[7:] if url.startswith("file://") else url
+                    path = url.removeprefix("file://")
                     with open(path, "rb") as f:
                         raw_bytes = f.read()
                     mime_type = _detect_media_type(path)
@@ -604,7 +605,7 @@ class InputConversion:
                 if url.startswith(("http://", "https://", "data:")):
                     input_dict["content"].insert(0, {"type": "video_url", "video_url": {"url": url}})
                 else:
-                    path = url[7:] if url.startswith("file://") else url
+                    path = url.removeprefix("file://")
                     with open(path, "rb") as f:
                         b64 = base64.b64encode(f.read()).decode("utf-8")
                     input_dict["content"].insert(
@@ -645,7 +646,7 @@ class InputConversion:
     ) -> list[list[dict[str, Any]]] | list[dict[str, Any]]:
         return sync_wrapper_safe(
             self.acall,
-            dict(inputs=inputs, add_conversational_elements=add_conversational_elements),
+            {"inputs": inputs, "add_conversational_elements": add_conversational_elements},
         )
 
     async def acall(
@@ -698,7 +699,7 @@ class InputConversion:
                 if media_type is not None:
                     if media_type not in self.emb.allowable_modalities:
                         logger.warning("Model does not support %ss. Skipping bare URL.", media_type)
-                        dictionary = dictionary  # fall through as text
+                        # fall through as text
                     else:
                         new_request.append(
                             {
@@ -813,8 +814,8 @@ class _QueryBatcher:
         self._queue: list[tuple[str, asyncio.Future[list[float]]]] = []
         # asyncio.Lock() must be created inside a running event loop.
         # Lazily initialised on first submit() / _flush() call.
-        self._lock: Optional[asyncio.Lock] = None
-        self._flush_task: Optional[asyncio.Task[None]] = None
+        self._lock: asyncio.Lock | None = None
+        self._flush_task: asyncio.Task[None] | None = None
 
     def _get_lock(self) -> asyncio.Lock:
         if self._lock is None:
@@ -849,7 +850,7 @@ class _QueryBatcher:
         # Pass our own task so _flush() knows not to cancel us mid-flight.
         await self._flush(caller_task=asyncio.current_task())
 
-    async def _flush(self, caller_task: "Optional[asyncio.Task[None]]" = None) -> None:
+    async def _flush(self, caller_task: "asyncio.Task[None] | None" = None) -> None:
         """Drain the queue and send one batched embedding request.
 
         *caller_task* is the task that triggered this flush (e.g. the
@@ -913,7 +914,7 @@ class MultiModalEmbeddings:
         # event loop, and asyncio primitives cannot span loops.
         self._batcher_max_size = int(os.environ.get("EMBEDDING_QUERY_BATCH_SIZE", "32"))
         self._batcher_max_wait_ms = float(os.environ.get("EMBEDDING_QUERY_BATCH_WAIT_MS", "5"))
-        self._batchers: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _QueryBatcher]" = (
+        self._batchers: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _QueryBatcher] = (
             weakref.WeakKeyDictionary()
         )
 
@@ -922,14 +923,14 @@ class MultiModalEmbeddings:
         response = await self.emb.async_client.post(
             "/embeddings",
             cast_to=CreateEmbeddingResponse,  # Ensure this type is imported in your script
-            body=dict(
-                model=self.emb.model_name,
-                messages=input_dict,  # Assuming the endpoint accepts the string input_dict here
-                encoding_format="float",
-                continue_final_message=True,
-                add_special_tokens=True,
-                mm_processor_kwargs=self.emb.mm_processor_kwargs,
-            ),
+            body={
+                "model": self.emb.model_name,
+                "messages": input_dict,  # Assuming the endpoint accepts the string input_dict here
+                "encoding_format": "float",
+                "continue_final_message": True,
+                "add_special_tokens": True,
+                "mm_processor_kwargs": self.emb.mm_processor_kwargs,
+            },
         )
         # Parse the vector array out of your specific CreateEmbeddingResponse structure
         # (Update 'response.embedding' to match your actual response object schema)
@@ -990,11 +991,11 @@ class MultiModalEmbeddings:
         response = await self.emb.async_client.post(
             "/embeddings",
             cast_to=CreateEmbeddingResponse,
-            body=dict(
-                model=self.emb.model_name,
-                input=formatted,
-                encoding_format="float",
-            ),
+            body={
+                "model": self.emb.model_name,
+                "input": formatted,
+                "encoding_format": "float",
+            },
         )
         return [d.embedding for d in response.data]
 
@@ -1009,7 +1010,7 @@ class MultiModalEmbeddings:
 
     def embed_documents(self, texts: Sequence[str | dict[str, Any]]) -> list[list[float]]:
         """Synchronous fallback that executes the async loop safely."""
-        return sync_wrapper_safe(self.aembed_documents, dict(texts=texts))
+        return sync_wrapper_safe(self.aembed_documents, {"texts": texts})
 
     # -- aembed_documents -------------------------------------------------------
 
@@ -1089,7 +1090,7 @@ class MultiModalEmbeddings:
 
     def embed_query(self, text: str | dict[str, Any]) -> list[float]:
         """Synchronous fallback that executes the async loop safely."""
-        return sync_wrapper_safe(self.aembed_query, dict(text=text))
+        return sync_wrapper_safe(self.aembed_query, {"text": text})
 
     # -- aembed_query -----------------------------------------------------------
 
@@ -1288,7 +1289,7 @@ class MultiModalReranker:
         query: str | dict[str, Any] | list[str | dict[str, Any]],
         documents: str | list[str | dict[str, Any]],
     ):
-        return sync_wrapper_safe(self.ascore, dict(query=query, documents=documents))
+        return sync_wrapper_safe(self.ascore, {"query": query, "documents": documents})
 
     async def _rerank_one_query(
         self, query: str | dict[str, Any], documents: Sequence[str | dict[str, Any]]
@@ -1338,4 +1339,4 @@ class MultiModalReranker:
         query: str | dict[str, Any] | list[str | dict[str, Any]],
         documents: str | list[str | dict[str, Any]],
     ):
-        return sync_wrapper_safe(self.arerank, dict(query=query, documents=documents))
+        return sync_wrapper_safe(self.arerank, {"query": query, "documents": documents})

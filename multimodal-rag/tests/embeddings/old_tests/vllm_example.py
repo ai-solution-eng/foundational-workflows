@@ -1,7 +1,6 @@
 # https://github.com/vllm-project/vllm/blob/main/examples/pooling/embed/vision_embedding_online.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# ruff: noqa: E501
 """Example Python client for multimodal embedding API using vLLM API server.
 
 Refer to each `run_*` function for the command to run the server for that model.
@@ -13,7 +12,6 @@ from openai import OpenAI
 from openai._types import NOT_GIVEN, NotGiven
 from openai.types.chat import ChatCompletionMessageParam
 from openai.types.create_embedding_response import CreateEmbeddingResponse
-
 from vllm.utils.print_utils import print_embeddings
 
 from multimodal_rag.utils.pcai_models import qwen3_vl_8B

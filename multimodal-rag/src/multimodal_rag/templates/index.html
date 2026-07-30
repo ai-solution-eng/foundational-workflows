@@ -660,7 +660,6 @@ async function handleFiles(files) {
   // Register these files for potential retry (skip ones already tracked as done+ok)
   for (const f of fileArray) {
     if (!_retryFiles.some(r => r.name === f.name && r.done && r.ok)) {
-      // Remove any previous failed entry for same name
       _retryFiles = _retryFiles.filter(r => r.name !== f.name);
       _retryFiles.push({name: f.name, file: f, done: false, ok: false});
     }
@@ -687,22 +686,14 @@ async function handleFiles(files) {
   }
 
   const start = Date.now();
-  const timer = setInterval(() => {
-    const secs = Math.floor((Date.now() - start) / 1000);
-    const uploaded = _completedUploads;
-    if (!summary.textContent.includes('Processing'))
-      summary.textContent = `Uploading ${fileArray.length} file(s)... ${uploaded}/${fileArray.length} (${secs}s)`;
-  }, 1000);
-
   let totalChunks = 0;
-  let _fileChunkTotal = {};    // fname → accumulated chunks across sub-batches
-  let _fileChunkExpected = {}; // fname → estimated total chunks (0 if unknown)
-  let _completedUploads = 0;
+  let _fileChunkTotal = {};
+  let _fileChunkExpected = {};
 
   // Helper: update a file's status line
   function _updateFileLine(fname, html) {
-    const matchLine = Array.from(status.querySelectorAll('div:not(:first-child)')).find(
-      el => el.textContent?.includes(escHtml(fname))
+    const matchLine = Array.from(status.querySelectorAll('div[data-fname]')).find(
+      el => el.getAttribute('data-fname') === fname
     );
     if (matchLine) matchLine.innerHTML = html;
   }
@@ -712,68 +703,9 @@ async function handleFiles(files) {
     summary.innerHTML = `Processing ${fileArray.length} file(s) · ${totalChunks.toLocaleString()} chunk(s)`;
   }
 
-  // Process SSE events from a single file upload
-  function processSSE(text, sseState) {
-    const parts = text.split('\n\n');
-    const remainder = parts.pop() || '';
-    for (const block of parts) {
-      const lines = block.split('\n');
-      const eventType = lines.find(l => l.startsWith('event:'))?.slice(6).trim();
-      const dataLine = lines.find(l => l.startsWith('data:'));
-      if (!dataLine) continue;
-      const data = JSON.parse(dataLine.slice(5));
-
-      if (eventType === 'progress') {
-        if (data.status === 'uploaded') {
-          _completedUploads++;
-          _updateFileLine(data.file, `<span style="color:var(--accent);width:16px;flex-shrink:0">📦</span> ${escHtml(data.file)} <span style="color:var(--text-muted);font-size:.75rem">uploaded</span>`);
-        } else if (data.status === 'preprocessing') {
-          _updateFileLine(data.file, `<span style="color:var(--text-muted);width:16px;flex-shrink:0">⚙</span> ${escHtml(data.file)}`);
-        } else if (data.status === 'preprocessed') {
-          if (data.total) _fileChunkExpected[data.file] = data.total;
-          _updateFileLine(data.file, `<span style="color:var(--accent);width:16px;flex-shrink:0">◐</span> ${escHtml(data.file)}`);
-        } else if (data.status === 'embedding') {
-          const soFar = _fileChunkTotal[data.file] || 0;
-          const expected = _fileChunkExpected[data.file];
-          let chunkInfo;
-          if (soFar > 0 && expected) {
-            chunkInfo = `${soFar.toLocaleString()} / (est.) ${expected.toLocaleString()} chunks embedded…`;
-          } else if (soFar > 0) {
-            chunkInfo = `${soFar.toLocaleString()} chunks embedded…`;
-          } else {
-            chunkInfo = 'embedding…';
-          }
-          _updateFileLine(data.file, `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> ${escHtml(data.file)} <span style="color:var(--text-muted);font-size:.75rem">${chunkInfo}</span>`);
-        } else if (data.status === 'complete' && data.chunks !== undefined) {
-          _fileChunkTotal[data.file] = (_fileChunkTotal[data.file] || 0) + (data.chunks || 0);
-          const fileTotal = _fileChunkTotal[data.file];
-          const color = fileTotal > 0 ? 'var(--green)' : 'var(--text-muted)';
-          const icon = fileTotal > 0 ? '✓' : '⏭';
-          const label = fileTotal > 0 ? `${fileTotal.toLocaleString()} chunk(s)` : 'already in dataset';
-          _updateFileLine(data.file, `<span style="color:${color};width:16px;flex-shrink:0">${icon}</span> ${escHtml(data.file)} — ${label}`);
-          totalChunks += data.chunks || 0;
-          const rt = _retryFiles.find(r => r.name === data.file);
-          if (rt) { rt.done = true; rt.ok = true; }
-        } else if (data.status === 'error') {
-          _updateFileLine(data.file, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(data.file)} — ${escHtml(data.error || 'failed')}`);
-          const rt = _retryFiles.find(r => r.name === data.file);
-          if (rt) { rt.done = true; rt.ok = false; }
-        }
-        _updateSummary();
-      } else if (eventType === 'complete') {
-        // Batch complete — accumulate any file_count info
-      } else if (eventType === 'error') {
-        _updateFileLine(data.file || '', `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(data.file || '')} — ${escHtml(data.error || 'failed')}`);
-      }
-    }
-    return remainder;
-  }
-
-  // Upload files in small concurrent batches (1 file per request, up to 3 parallel)
-  // This overlaps network upload of later files with server-side processing of earlier ones.
+  // Upload files — each file gets its own job, up to 3 concurrent
   const _BATCH_CONCURRENCY = 3;
   const fileQueue = [...fileArray];
-  const activeRequests = new Set();
 
   async function uploadOne(file) {
     const fd = new FormData();
@@ -781,52 +713,31 @@ async function handleFiles(files) {
     const pw = datasetPasswords[selectedDataset] || '';
     if (pw) fd.append('password', pw);
 
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/api/datasets/${selectedDataset}/batch-files`);
-
-    let lastIndex = 0;
-    let sseBuf = '';
-    let batchFileCount = 0;
-    let batchChunkCount = 0;
-
-    return new Promise((resolve) => {
-      xhr.onprogress = () => {
-        const newText = xhr.responseText.substring(lastIndex);
-        lastIndex = xhr.responseText.length;
-        sseBuf += newText;
-        sseBuf = processSSE(sseBuf, {});
-      };
-
-      xhr.onload = () => {
-        if (lastIndex < xhr.responseText.length) {
-          sseBuf += xhr.responseText.substring(lastIndex);
-          processSSE(sseBuf, {});
-        }
-        // Parse final "complete" event for file_count
-        try {
-          const parts = xhr.responseText.split('\n\n');
-          for (const block of parts) {
-            const dataLine = block.split('\n').find(l => l.startsWith('data:'));
-            if (!dataLine) continue;
-            const evt = block.split('\n').find(l => l.startsWith('event:'))?.slice(6).trim();
-            if (evt === 'complete') {
-              const data = JSON.parse(dataLine.slice(5));
-              batchFileCount = data.file_count || 1;
-              batchChunkCount = data.total_chunks || totalChunks;
-            }
-          }
-        } catch (e) { /* ignore parse errors */ }
-        resolve();
-      };
-
-      xhr.onerror = () => {
-        // Mark this file as background processing
-        _updateFileLine(file.name, `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> ${escHtml(file.name)} <span style="color:var(--text-muted);font-size:.75rem">background…</span>`);
-        resolve();
-      };
-
-      xhr.send(fd);
-    });
+    try {
+      const resp = await fetch(`/api/datasets/${selectedDataset}/batch-files`, {
+        method: 'POST',
+        body: fd,
+      });
+      if (!resp.ok) {
+        let errMsg = `HTTP ${resp.status}`;
+        try { const e = await resp.json(); errMsg = e.detail || e.message || errMsg; } catch {}
+        _updateFileLine(file.name, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(file.name)} — ${escHtml(errMsg)}`);
+        const rt = _retryFiles.find(r => r.name === file.name);
+        if (rt) { rt.done = true; rt.ok = false; }
+        return;
+      }
+      const { job_id } = await resp.json();
+      _updateFileLine(file.name, `<span style="color:var(--accent);width:16px;flex-shrink:0">📦</span> ${escHtml(file.name)} <span style="color:var(--text-muted);font-size:.75rem">uploaded</span>`);
+      await pollJob(job_id, file.name, _updateFileLine, _fileChunkTotal, _fileChunkExpected,
+        (fname, chunks) => { totalChunks += chunks; _updateSummary(); },
+        (fname) => { const rt = _retryFiles.find(r => r.name === fname); if (rt) { rt.done = true; rt.ok = true; } },
+        (fname) => { const rt = _retryFiles.find(r => r.name === fname); if (rt) { rt.done = true; rt.ok = false; } }
+      );
+    } catch (e) {
+      _updateFileLine(file.name, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(file.name)} — ${escHtml(e.message)}`);
+      const rt = _retryFiles.find(r => r.name === file.name);
+      if (rt) { rt.done = true; rt.ok = false; }
+    }
   }
 
   // Process files with bounded concurrency
@@ -846,60 +757,72 @@ async function handleFiles(files) {
 
   await runUploads();
 
-  clearInterval(timer);
+  summary.innerHTML = `<span style="color:var(--green)">Done</span> — ${totalChunks.toLocaleString()} chunk(s) stored from ${fileArray.length} file(s)`;
+  toast(`Uploaded ${fileArray.length} file(s), ${totalChunks.toLocaleString()} chunk(s)`);
+  _updateRetryButton();
+  listDatasets();
+}
 
-  // Check if any files are still in an intermediate state
-  const inFlight = Array.from(status.querySelectorAll('div:not(:first-child)')).filter(el => {
-    const txt = el.textContent || '';
-    return txt.includes('📤') || txt.includes('📦') || txt.includes('⚙') || txt.includes('◐') || el.querySelector('.spinner');
-  });
+// Poll an upload job until completion
+async function pollJob(jobId, fileLabel, updateLine, chunkTotals, chunkExpected, onComplete, onOk, onFail) {
+  const POLL_INTERVAL = 2000;
+  let lastEventIdx = 0;
 
-  if (inFlight.length > 0) {
-    // Stream ended prematurely — poll document count for background progress
-    summary.innerHTML = `<span style="color:var(--accent)">Stream ended — checking background processing…</span>`;
-    for (const el of inFlight) {
-      const fname = el.getAttribute('data-fname') || 'file';
-      el.innerHTML = `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> ${escHtml(fname)} <span style="color:var(--text-muted);font-size:.75rem">background…</span>`;
-    }
-    let lastCount = -1;
-    let stablePolls = 0;
-    const pollInterval = setInterval(async () => {
+  return new Promise((resolve) => {
+    const poll = async () => {
       try {
-        const ds = await api('GET', `/api/datasets/${selectedDataset}`,
+        const job = await api('GET', `/api/datasets/${selectedDataset}/upload-status/${jobId}`,
           undefined, undefined, passwordHeader());
-        const count = ds.dataset?.document_count || 0;
-        if (count !== lastCount) {
-          lastCount = count;
-          stablePolls = 0;
-          summary.innerHTML = `<span style="color:var(--accent)">Processing in background</span> — ${count} documents`;
-        } else {
-          stablePolls++;
-          if (stablePolls >= 3) {
-            clearInterval(pollInterval);
-            for (const el of inFlight) {
-              const fname = el.getAttribute('data-fname') || 'file';
-              const done = _fileChunkTotal[fname] || 0;
-              const expected = _fileChunkExpected[fname] || 0;
-              const label = done > 0 ? `${done.toLocaleString()} chunk(s)` : (expected ? `${expected.toLocaleString()} chunk(s)` : 'processed');
-              el.innerHTML = `<span style="color:var(--green);width:16px;flex-shrink:0">✓</span> ${escHtml(fname)} — ${label}`;
-              const rt = _retryFiles.find(r => r.name === fname);
-              if (rt) { rt.done = true; rt.ok = true; }
-            }
-            summary.innerHTML = `<span style="color:var(--green)">Done</span> — ${count.toLocaleString()} documents (background upload complete)`;
-            toast('Background processing complete');
-            _updateRetryButton();
-            listDatasets();
+
+        // Process new events
+        const events = job.events || [];
+        for (let i = lastEventIdx; i < events.length; i++) {
+          const data = events[i];
+          if (data.status === 'preprocessing') {
+            updateLine(fileLabel, `<span style="color:var(--text-muted);width:16px;flex-shrink:0">⚙</span> ${escHtml(fileLabel)}`);
+          } else if (data.status === 'preprocessed') {
+            if (data.total) chunkExpected[fileLabel] = data.total;
+            updateLine(fileLabel, `<span style="color:var(--accent);width:16px;flex-shrink:0">◐</span> ${escHtml(fileLabel)}`);
+          } else if (data.status === 'embedding') {
+            const soFar = chunkTotals[fileLabel] || 0;
+            const exp = chunkExpected[fileLabel];
+            let chunkInfo;
+            if (soFar > 0 && exp) chunkInfo = `${soFar.toLocaleString()} / (est.) ${exp.toLocaleString()} chunks embedded…`;
+            else if (soFar > 0) chunkInfo = `${soFar.toLocaleString()} chunks embedded…`;
+            else chunkInfo = 'embedding…';
+            updateLine(fileLabel, `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> ${escHtml(fileLabel)} <span style="color:var(--text-muted);font-size:.75rem">${chunkInfo}</span>`);
+          } else if (data.status === 'complete' && data.chunks !== undefined) {
+            chunkTotals[fileLabel] = (chunkTotals[fileLabel] || 0) + (data.chunks || 0);
+            const fileTotal = chunkTotals[fileLabel];
+            const color = fileTotal > 0 ? 'var(--green)' : 'var(--text-muted)';
+            const icon = fileTotal > 0 ? '✓' : '⏭';
+            const label = fileTotal > 0 ? `${fileTotal.toLocaleString()} chunk(s)` : 'already in dataset';
+            updateLine(fileLabel, `<span style="color:${color};width:16px;flex-shrink:0">${icon}</span> ${escHtml(fileLabel)} — ${label}`);
+            onComplete(fileLabel, data.chunks || 0);
+          } else if (data.status === 'error') {
+            updateLine(fileLabel, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(fileLabel)} — ${escHtml(data.error || 'failed')}`);
           }
         }
-      } catch (e) { /* keep polling */ }
-    }, 10000);
-  } else {
-    // All files resolved — normal completion
-    summary.innerHTML = `<span style="color:var(--green)">Done</span> — ${totalChunks.toLocaleString()} chunk(s) stored from ${fileArray.length} file(s)`;
-    toast(`Uploaded ${fileArray.length} file(s), ${totalChunks.toLocaleString()} chunk(s)`);
-    _updateRetryButton();
-    listDatasets();
-  }
+        lastEventIdx = events.length;
+
+        if (job.status === 'complete') {
+          if (onOk) onOk(fileLabel);
+          resolve();
+          return;
+        } else if (job.status === 'error') {
+          if (onFail) onFail(fileLabel);
+          updateLine(fileLabel, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(fileLabel)} — ${escHtml(job.error || 'failed')}`);
+          resolve();
+          return;
+        }
+        setTimeout(poll, POLL_INTERVAL);
+      } catch (e) {
+        // Keep polling on transient errors
+        setTimeout(poll, POLL_INTERVAL);
+      }
+    };
+    poll();
+  });
 }
 
 function retryFailed() {
@@ -984,9 +907,9 @@ async function addUrls() {
       headers: { 'Content-Type': 'application/json', ...passwordHeader() },
       body: JSON.stringify({ urls }),
     });
-    clearInterval(timer);
 
     if (!resp.ok) {
+      clearInterval(timer);
       let errMsg = `HTTP ${resp.status}`;
       try { const e = await resp.json(); errMsg = e.detail || e.message || errMsg; } catch {}
       status.innerHTML = `<span style="color:var(--red)">✗</span> ${escHtml(errMsg)}`;
@@ -994,104 +917,100 @@ async function addUrls() {
       return;
     }
 
-    // Read the SSE stream
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
+    const { job_id } = await resp.json();
+
+    // Poll for progress
     let totalChunks = 0;
-    let _urlFileChunkTotal = {};    // fname → accumulated chunks across sub-batches
-    let _urlFileChunkExpected = {}; // fname → estimated total chunks
+    let _urlFileChunkTotal = {};
+    let _urlFileChunkExpected = {};
+    let lastEventIdx = 0;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const parts = buf.split('\n\n');
-      buf = parts.pop() || '';
-      for (const block of parts) {
-        const lines = block.split('\n');
-        const eventType = lines.find(l => l.startsWith('event:'))?.slice(6).trim();
-        const dataLine = lines.find(l => l.startsWith('data:'));
-        if (!dataLine) continue;
-        const data = JSON.parse(dataLine.slice(5));
+    await new Promise((resolve) => {
+      const poll = async () => {
+        try {
+          const job = await api('GET', `/api/datasets/${selectedDataset}/upload-status/${job_id}`,
+            undefined, undefined, passwordHeader());
 
-        if (eventType === 'progress') {
-          let matchLine = Array.from(progress.querySelectorAll('div')).find(
-            el => el.textContent?.includes(escHtml(data.file))
-          );
+          const events = job.events || [];
+          for (let i = lastEventIdx; i < events.length; i++) {
+            const data = events[i];
 
-          // If no line exists for this file (e.g. S3 directory expansion),
-          // create one dynamically.
-          if (!matchLine) {
-            matchLine = document.createElement('div');
-            matchLine.style.marginTop = '4px';
-            matchLine.style.display = 'flex';
-            matchLine.style.alignItems = 'center';
-            matchLine.style.gap = '8px';
-            matchLine.setAttribute('data-url', data.file);
-            progress.appendChild(matchLine);
-          }
+            let matchLine = Array.from(progress.querySelectorAll('div[data-url]')).find(
+              el => el.getAttribute('data-url') === data.file
+            );
+            if (!matchLine) {
+              matchLine = document.createElement('div');
+              matchLine.style.marginTop = '4px';
+              matchLine.style.display = 'flex';
+              matchLine.style.alignItems = 'center';
+              matchLine.style.gap = '8px';
+              matchLine.setAttribute('data-url', data.file);
+              progress.appendChild(matchLine);
+            }
 
-          if (data.status === 'listed') {
-            // Mark original prefix URL lines as "expanded"
-            for (const el of progress.querySelectorAll('div[data-url]')) {
-              const url = el.getAttribute('data-url') || '';
-              if (el.textContent?.includes('⏳') && url !== data.file &&
-                  (url.endsWith('/') || url !== data.file)) {
-                el.innerHTML = `<span style="color:var(--accent);width:16px;flex-shrink:0">📂</span> <span style="font-size:.82rem;word-break:break-all">${escHtml(url)}</span> <span style="color:var(--text-muted);font-size:.75rem">expanded</span>`;
+            if (data.status === 'listed') {
+              for (const el of progress.querySelectorAll('div[data-url]')) {
+                const url = el.getAttribute('data-url') || '';
+                if (el.textContent?.includes('⏳') && url !== data.file &&
+                    (url.endsWith('/') || url !== data.file)) {
+                  el.innerHTML = `<span style="color:var(--accent);width:16px;flex-shrink:0">📂</span> <span style="font-size:.82rem;word-break:break-all">${escHtml(url)}</span> <span style="color:var(--text-muted);font-size:.75rem">expanded</span>`;
+                }
               }
+              matchLine.innerHTML = `<span style="color:var(--text-muted);width:16px;flex-shrink:0">⏳</span> <span style="font-size:.82rem;word-break:break-all">${escHtml(data.file)}</span>`;
+            } else if (data.status === 'preprocessing') {
+              matchLine.innerHTML = `<span style="color:var(--text-muted);width:16px;flex-shrink:0">⚙</span> <span style="font-size:.82rem;word-break:break-all">${escHtml(data.file)}</span>`;
+            } else if (data.status === 'preprocessed') {
+              if (data.total) _urlFileChunkExpected[data.file] = data.total;
+              matchLine.innerHTML = `<span style="color:var(--accent);width:16px;flex-shrink:0">◐</span> <span style="font-size:.82rem;word-break:break-all">${escHtml(data.file)}</span>`;
+            } else if (data.status === 'embedding') {
+              const soFar = _urlFileChunkTotal[data.file] || 0;
+              const exp = _urlFileChunkExpected[data.file];
+              let chunkInfo;
+              if (soFar > 0 && exp) chunkInfo = `${soFar.toLocaleString()} / (est.) ${exp.toLocaleString()} chunks embedded…`;
+              else if (soFar > 0) chunkInfo = `${soFar.toLocaleString()} chunks embedded…`;
+              else chunkInfo = 'embedding…';
+              matchLine.innerHTML = `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> <span style="font-size:.82rem;word-break:break-all">${escHtml(data.file)}</span> <span style="color:var(--text-muted);font-size:.75rem">${chunkInfo}</span>`;
+            } else if (data.status === 'complete' && data.chunks !== undefined) {
+              _urlFileChunkTotal[data.file] = (_urlFileChunkTotal[data.file] || 0) + (data.chunks || 0);
+              const fileTotal = _urlFileChunkTotal[data.file];
+              const color = fileTotal > 0 ? 'var(--green)' : 'var(--text-muted)';
+              const icon = fileTotal > 0 ? '✓' : '⏭';
+              const label = fileTotal > 0 ? `${fileTotal.toLocaleString()} chunk(s)` : 'already in dataset';
+              matchLine.innerHTML = `<span style="color:${color};width:16px;flex-shrink:0">${icon}</span> <span style="font-size:.82rem;word-break:break-all">${escHtml(data.file)}</span> — ${label}`;
+              totalChunks += data.chunks || 0;
+            } else if (data.status === 'error') {
+              matchLine.innerHTML = `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> <span style="font-size:.82rem;word-break:break-all">${escHtml(data.file)}</span> — ${escHtml(data.error || 'failed')}`;
             }
-            matchLine.innerHTML = `<span style="color:var(--text-muted);width:16px;flex-shrink:0">⏳</span> <span style="font-size:.82rem;word-break:break-all">${escHtml(data.file)}</span>`;
-          } else if (data.status === 'preprocessing') {
-            matchLine.innerHTML = `<span style="color:var(--text-muted);width:16px;flex-shrink:0">⚙</span> <span style="font-size:.82rem;word-break:break-all">${escHtml(data.file)}</span>`;
-          } else if (data.status === 'preprocessed') {
-            if (data.total) _urlFileChunkExpected[data.file] = data.total;
-            matchLine.innerHTML = `<span style="color:var(--accent);width:16px;flex-shrink:0">◐</span> <span style="font-size:.82rem;word-break:break-all">${escHtml(data.file)}</span>`;
-          } else if (data.status === 'embedding') {
-            const soFar = _urlFileChunkTotal[data.file] || 0;
-            const expected = _urlFileChunkExpected[data.file];
-            let chunkInfo;
-            if (soFar > 0 && expected) {
-              chunkInfo = `${soFar.toLocaleString()} / (est.) ${expected.toLocaleString()} chunks embedded…`;
-            } else if (soFar > 0) {
-              chunkInfo = `${soFar.toLocaleString()} chunks embedded…`;
-            } else {
-              chunkInfo = 'embedding…';
-            }
-            matchLine.innerHTML = `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> <span style="font-size:.82rem;word-break:break-all">${escHtml(data.file)}</span> <span style="color:var(--text-muted);font-size:.75rem">${chunkInfo}</span>`;
-          } else if (data.status === 'complete' && data.chunks !== undefined) {
-            _urlFileChunkTotal[data.file] = (_urlFileChunkTotal[data.file] || 0) + (data.chunks || 0);
-            const fileTotal = _urlFileChunkTotal[data.file];
-            const color = fileTotal > 0 ? 'var(--green)' : 'var(--text-muted)';
-            const icon = fileTotal > 0 ? '✓' : '⏭';
-            const label = fileTotal > 0 ? `${fileTotal.toLocaleString()} chunk(s)` : 'already in dataset';
-            matchLine.innerHTML = `<span style="color:${color};width:16px;flex-shrink:0">${icon}</span> <span style="font-size:.82rem;word-break:break-all">${escHtml(data.file)}</span> — ${label}`;
-            totalChunks += data.chunks || 0;
-          } else if (data.status === 'error') {
-            matchLine.innerHTML = `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> <span style="font-size:.82rem;word-break:break-all">${escHtml(data.file)}</span> — ${escHtml(data.error || 'failed')}`;
-          }
 
-          // Update count dynamically — may be more than original urls.length
-          // if S3 directory expansion occurred
-          const fileListed = progress.querySelectorAll('div[data-url]').length;
-          const fileDone = Object.keys(_urlFileChunkTotal).length;
-          status.innerHTML = `Processing ${fileListed} file(s) · ${totalChunks.toLocaleString()} chunk(s)`;
-        } else if (eventType === 'complete') {
-          status.innerHTML = `<span style="color:var(--green)">Done</span> — ${totalChunks.toLocaleString()} chunk(s) stored from ${data.file_count} file(s)`;
-          toast(`Ingested ${data.file_count} URL(s), ${totalChunks.toLocaleString()} chunk(s)`);
-          input.value = '';
-        } else if (eventType === 'error') {
-          status.innerHTML = `<span style="color:var(--red)">Failed</span> — ${escHtml(data.error || 'Unknown error')}`;
-          toast(data.error || 'Ingestion failed', 'error');
+            const fileListed = progress.querySelectorAll('div[data-url]').length;
+            status.innerHTML = `Processing ${fileListed} file(s) · ${totalChunks.toLocaleString()} chunk(s)`;
+          }
+          lastEventIdx = events.length;
+
+          if (job.status === 'complete') {
+            clearInterval(timer);
+            const result = job.result || {};
+            const fileCount = result.file_count || urls.length;
+            status.innerHTML = `<span style="color:var(--green)">Done</span> — ${totalChunks.toLocaleString()} chunk(s) stored from ${fileCount} file(s)`;
+            toast(`Ingested ${fileCount} URL(s), ${totalChunks.toLocaleString()} chunk(s)`);
+            input.value = '';
+            resolve();
+            return;
+          } else if (job.status === 'error') {
+            clearInterval(timer);
+            status.innerHTML = `<span style="color:var(--red)">Failed</span> — ${escHtml(job.error || 'Unknown error')}`;
+            toast(job.error || 'Ingestion failed', 'error');
+            resolve();
+            return;
+          }
+          setTimeout(poll, 2000);
+        } catch (e) {
+          setTimeout(poll, 2000);
         }
-      }
-    }
-    // Mark leftover pending entries as failed
-    for (const el of progress.querySelectorAll('div')) {
-      if (el.querySelector('.spinner') || el.textContent?.includes('⏳') || el.textContent?.includes('⚙') || el.textContent?.includes('◐')) {
-        el.innerHTML = `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> <span style="font-size:.82rem;word-break:break-all">${el.textContent?.trim() || 'URL'}</span> — Connection error.`;
-      }
-    }
+      };
+      poll();
+    });
+
     await listDatasets();
   } catch (e) {
     clearInterval(timer);

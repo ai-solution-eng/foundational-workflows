@@ -1,5 +1,4 @@
 import logging
-from typing import Optional
 
 # Add VERBOSE logging level
 VERBOSE_LEVEL_NUM = 15
@@ -17,7 +16,7 @@ def verbose(self, message, *args, **kws):
 logging.Logger.verbose = verbose  # type: ignore[attr-defined]
 
 
-def setup_logger(string_logger: bool = True, log_path: Optional[str] = None, level: str = "INFO") -> None:
+def setup_logger(string_logger: bool = True, log_path: str | None = None, level: str = "INFO") -> None:
     """
     Builds a logger object with optional logging to a file.
     """
@@ -35,5 +34,3 @@ def setup_logger(string_logger: bool = True, log_path: Optional[str] = None, lev
         handlers=handler,
         force=True,
     )
-
-    return None

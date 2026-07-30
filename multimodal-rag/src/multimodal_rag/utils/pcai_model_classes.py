@@ -1,15 +1,16 @@
-from dataclasses import dataclass, field
-from functools import cached_property, partial
 import asyncio
 import base64
 import io
-import httpx
 import os
 import threading
 import weakref
-from typing import Optional, Literal, Callable, Any, Awaitable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from functools import cached_property, partial
+from typing import Any, Literal
 
-from openai import OpenAI, AsyncOpenAI
+import httpx
+from openai import AsyncOpenAI, OpenAI
 
 try:
     from agents import Agent, set_tracing_disabled
@@ -21,9 +22,9 @@ except ImportError:
     MCPServerStreamableHttp = None  # type: ignore[assignment, misc]
     OpenAIResponsesModel = None  # type: ignore[assignment, misc]
 
+from .general_tools import sync_wrapper_safe
 from .logging_utils import logging
 from .model_adapters import MultiModalEmbeddings, MultiModalReranker
-from .general_tools import sync_wrapper_safe
 from .token_text_splitter import TokenTextSplitter
 
 logger = logging.getLogger(__name__)
@@ -73,9 +74,11 @@ _SHARED_REMOTE_HTTP_CLIENT = httpx.Client(
 )
 
 # Async clients must be bound to a single event loop.
-# We cache one per running loop (keyed by the loop object itself, not
-# id(loop), to avoid id() recycling after GC hands a stale client to a
-# fresh loop).  WeakKeyDictionary auto-evicts when the loop is GC'd.
+# We cache one per (running loop, endpoint base_url) so that each model
+# endpoint (embedder, reranker, VLM, ...) gets its own connection pool
+# — a backlog of slow reranker calls can't starve the fast embedder path.
+# The outer WeakKeyDictionary is keyed by loop (auto-evicts on loop GC);
+# the inner dict is keyed by base_url.
 _async_client_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _async_remote_client_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _async_client_lock = threading.Lock()
@@ -131,7 +134,15 @@ def discover_model_name(base_url: str, api_key: str = "", remote: bool = True) -
     return ""
 
 
-def _get_async_client(remote: bool = False) -> httpx.AsyncClient:
+def _get_async_client(remote: bool = False, base_url: str = "") -> httpx.AsyncClient:
+    """Return a cached ``httpx.AsyncClient`` for *base_url* on the running loop.
+
+    Each (event loop, endpoint) pair gets its own connection pool so a
+    slow endpoint (e.g. the reranker) cannot exhaust connections needed
+    by a fast one (e.g. the embedder).  When *base_url* is empty a
+    fallback shared pool is used (back-compat for callers that don't
+    specify an endpoint).
+    """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -146,14 +157,18 @@ def _get_async_client(remote: bool = False) -> httpx.AsyncClient:
         )
     cache = _async_remote_client_cache if remote else _async_client_cache
     with _async_client_lock:
-        client = cache.get(loop)
+        loop_clients: dict = cache.get(loop)
+        if loop_clients is None:
+            loop_clients = {}
+            cache[loop] = loop_clients
+        client = loop_clients.get(base_url)
         if client is None:
             client = httpx.AsyncClient(
                 verify=False if remote else True,
                 timeout=httpx.Timeout(300.0, connect=30.0),
                 limits=_pool_limits_from_env(),
             )
-            cache[loop] = client
+            loop_clients[base_url] = client
         return client
 
 
@@ -162,8 +177,8 @@ __all__ = [
     "ChatModel",
     "EmbeddingModel",
     "RerankerModel",
-    "VoiceModel",
     "ToolDefinition",
+    "VoiceModel",
     "discover_model_name",
 ]
 
@@ -256,7 +271,7 @@ class BaseModel:
 
     # Model args w/ defaults
     description: str = ""
-    model_instantiation_class: Optional[Callable] = None
+    model_instantiation_class: Callable | None = None
     model_instantiation_kwargs: dict[str, Any] = field(default_factory=dict)
 
     # OpenAI clients
@@ -278,7 +293,7 @@ class BaseModel:
         init=False,
         repr=False,
     )
-    _cached_functions: tuple[str, ...] = field(default=tuple(), init=False, repr=False)
+    _cached_functions: tuple[str, ...] = field(default=(), init=False, repr=False)
 
     currently_deployed: bool = True
 
@@ -388,7 +403,7 @@ class BaseModel:
 
     @cached_property
     def http_async_client(self):
-        return _get_async_client(remote=self.model_usage == "remote")
+        return _get_async_client(remote=self.model_usage == "remote", base_url=self.base_url)
 
     @cached_property
     def model(self):
@@ -504,12 +519,12 @@ class ChatModel(BaseModel):
     def llm_async_response_function_call(self, input: str | dict[str, Any] | list[dict[str, Any]], **chat_kwargs):
         return self.llm_async_response_function(input=input, **chat_kwargs)
 
-    def agent(self, tool_json: Optional[dict[str, dict[str, Any]]] = None):
+    def agent(self, tool_json: dict[str, dict[str, Any]] | None = None):
         if Agent is None:
             raise ImportError("The `agents` SDK is not installed. Install with: pip install openai-agents")
-        return sync_wrapper_safe(self.aagent, dict(tool_json=tool_json))
+        return sync_wrapper_safe(self.aagent, {"tool_json": tool_json})
 
-    async def aagent(self, tool_json: Optional[dict[str, dict[str, Any]]] = None) -> Agent:
+    async def aagent(self, tool_json: dict[str, dict[str, Any]] | None = None) -> Agent:
         if Agent is None:
             raise ImportError("The `agents` SDK is not installed. Install with: pip install openai-agents")
         # Tracing off: the SDK phones home to api.openai.com by default,
@@ -566,7 +581,7 @@ class ChatModel(BaseModel):
                         "input": {
                             "type": ["string", "array"],
                             "description": (
-                                "The input text, or a structured message array for " "multi-turn / multimodal input."
+                                "The input text, or a structured message array for multi-turn / multimodal input."
                             ),
                         },
                         "instructions": {
@@ -659,7 +674,7 @@ class VoiceModel(BaseModel):
             voices.discard("")
             logger.info(f"Dynamically fetched {len(voices)} voices from {url}: {sorted(voices)}")
         except Exception as e:
-            logger.warning(f"Could not fetch voices from {url}: {e}. " f"Voice set will be empty.")
+            logger.warning(f"Could not fetch voices from {url}: {e}. Voice set will be empty.")
         return voices
 
     @cached_property
@@ -794,7 +809,7 @@ class VoiceModel(BaseModel):
 @dataclass(repr=False)
 class EmbeddingModel(BaseModel):
     # Model args w/ defaults
-    model_instantiation_class: Optional[Callable] = None
+    model_instantiation_class: Callable | None = None
 
     # Optional RAG args
     embedding_dim: int = 4096
@@ -804,18 +819,18 @@ class EmbeddingModel(BaseModel):
     code_chunk_overlap: int = 512
 
     # For enabling splitting by token
-    tokenizer_name: Optional[str] = None
-    tokenizer_type: Optional[Literal["HuggingFace", "TikToken"]] = None
+    tokenizer_name: str | None = None
+    tokenizer_type: Literal["HuggingFace", "TikToken"] | None = None
 
     mm_processor_kwargs: dict[str, Any] = field(default_factory=dict)
 
     # If input should be preprocessed
-    preprocessor: Optional[Callable] = None
+    preprocessor: Callable | None = None
 
     allowable_modalities = ("text", "audio", "image", "video")
 
     @cached_property
-    def text_splitter(self) -> Optional[TokenTextSplitter]:
+    def text_splitter(self) -> TokenTextSplitter | None:
         """Return a token-count-aware text splitter, or ``None`` if the
         tokenizer file is not available (fall back to character-based)."""
         if self.tokenizer_type != "HuggingFace":
@@ -837,13 +852,12 @@ class EmbeddingModel(BaseModel):
             )
         else:
             logger.warning(
-                "Text chunking: character-based fallback (tokenizer file not "
-                "found despite tokenizer_type=HuggingFace)",
+                "Text chunking: character-based fallback (tokenizer file not found despite tokenizer_type=HuggingFace)",
             )
         return splitter
 
     @cached_property
-    def code_text_splitter(self) -> Optional[TokenTextSplitter]:
+    def code_text_splitter(self) -> TokenTextSplitter | None:
         """Return a token-count-aware text splitter for code/structured data,
         using ``code_chunk_size`` / ``code_chunk_overlap``."""
         if self.tokenizer_type != "HuggingFace":
@@ -865,8 +879,7 @@ class EmbeddingModel(BaseModel):
             )
         else:
             logger.warning(
-                "Code chunking: character-based fallback (tokenizer file not "
-                "found despite tokenizer_type=HuggingFace)",
+                "Code chunking: character-based fallback (tokenizer file not found despite tokenizer_type=HuggingFace)",
             )
         return splitter
 
@@ -902,7 +915,7 @@ class EmbeddingModel(BaseModel):
                             "type": "array",
                             "items": {"type": ["string", "object"]},
                             "description": (
-                                "List of texts (strings) or multimodal dicts " "({text, image, video, audio}) to embed."
+                                "List of texts (strings) or multimodal dicts ({text, image, video, audio}) to embed."
                             ),
                         },
                     },
@@ -921,7 +934,7 @@ class RerankerModel(BaseModel):
     mm_processor_kwargs: dict[str, Any] = field(default_factory=dict)
 
     # If input should be preprocessed
-    preprocessor: Optional[Callable] = None
+    preprocessor: Callable | None = None
 
     allowable_modalities = ("text", "audio", "image", "video")
 

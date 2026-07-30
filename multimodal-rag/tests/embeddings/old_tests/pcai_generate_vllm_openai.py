@@ -1,7 +1,8 @@
 import asyncio
 import base64
 import mimetypes
-from os.path import exists, join as pj
+from os.path import exists
+from os.path import join as pj
 from pathlib import Path
 from typing import Any
 
@@ -9,10 +10,10 @@ import httpx
 import numpy as np
 import openai
 from openai.types.create_embedding_response import CreateEmbeddingResponse
-
 from shared_queries_and_documents import all_inputs
-from multimodal_rag.utils.pcai_models import qwen3_vl_8B
+
 from multimodal_rag.utils.general_tools import cosine_sim
+from multimodal_rag.utils.pcai_models import qwen3_vl_8B
 
 qwen3_vl_8B.remote()
 
@@ -43,7 +44,7 @@ def _get_image_mime_type(file_path: str) -> str:
         return "image/jpeg"
     elif header.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
-    elif header.startswith(b"GIF87a") or header.startswith(b"GIF89a"):
+    elif header.startswith((b"GIF87a", b"GIF89a")):
         return "image/gif"
     elif header.startswith(b"BM"):
         return "image/bmp"
@@ -64,8 +65,7 @@ async def _fetch_image_async(url: str, http_client: httpx.AsyncClient) -> tuple[
         content_type = response.headers.get("content-type", "image/jpeg")
         mime_type = content_type.split(";")[0].strip()
     else:
-        if url.startswith("file://"):
-            url = url[7:]
+        url = url.removeprefix("file://")
         with open(url, "rb") as f:
             image_data = base64.b64encode(f.read()).decode("utf-8")
         mime_type = _get_image_mime_type(url)
@@ -165,14 +165,14 @@ async def _get_embedding(
     response = await client.post(
         "/embeddings",
         cast_to=CreateEmbeddingResponse,
-        body=dict(
-            model=model,
-            messages=messages,
-            encoding_format="float",
-            continue_final_message=True,
-            add_special_tokens=True,
-            mm_processor_kwargs=dict(max_pixels=504 * 504),
-        ),
+        body={
+            "model": model,
+            "messages": messages,
+            "encoding_format": "float",
+            "continue_final_message": True,
+            "add_special_tokens": True,
+            "mm_processor_kwargs": {"max_pixels": 504 * 504},
+        },
     )
     return response.data[0].embedding
 
@@ -212,18 +212,18 @@ async def main():
 
     similarities = cosine_sim(text_embeddings, image_embeddings)
 
-    data_dict = dict(
-        name="pcai_vllm_openai_client",
-        text_only=openai_inputs[::3],
-        text_embeddings=text_embeddings,
-        image_only=openai_inputs[1::3],
-        image_embeddings=image_embeddings,
-        joint=openai_inputs[2::3],
-        joint_embeddings=joint_embeddings,
-        similarities=similarities,
-        text_joint_similarities=cosine_sim(text_embeddings, joint_embeddings),
-        image_joint_similarities=cosine_sim(image_embeddings, joint_embeddings),
-    )
+    data_dict = {
+        "name": "pcai_vllm_openai_client",
+        "text_only": openai_inputs[::3],
+        "text_embeddings": text_embeddings,
+        "image_only": openai_inputs[1::3],
+        "image_embeddings": image_embeddings,
+        "joint": openai_inputs[2::3],
+        "joint_embeddings": joint_embeddings,
+        "similarities": similarities,
+        "text_joint_similarities": cosine_sim(text_embeddings, joint_embeddings),
+        "image_joint_similarities": cosine_sim(image_embeddings, joint_embeddings),
+    }
 
     np.save(emb_path, data_dict)  # type: ignore
 

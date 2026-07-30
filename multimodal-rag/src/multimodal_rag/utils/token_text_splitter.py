@@ -92,8 +92,7 @@ class TokenTextSplitter:
             prev_start = start
             prev_end = end
             start = end - self.chunk_overlap
-            if start < 0:
-                start = 0
+            start = max(start, 0)
         return chunks
 
     def merge_until_budget(self, texts: list[str]) -> list[list[str]]:

@@ -1,15 +1,15 @@
-import numpy as np
 import os
 from os.path import join as pj
 from pprint import pprint
 from typing import Any
 
+import numpy as np
+from shared_queries_and_documents import all_inputs, script_path
 from vllm import LLM, EngineArgs
 from vllm.multimodal.utils import fetch_image
 
-from multimodal_rag.utils.pcai_models import qwen3_vl_8B
 from multimodal_rag.utils.general_tools import cosine_sim
-from shared_queries_and_documents import all_inputs, script_path
+from multimodal_rag.utils.pcai_models import qwen3_vl_8B
 
 emb_path = pj(script_path, "embs", "vllm_local")
 print(emb_path)
@@ -62,8 +62,10 @@ def prepare_vllm_inputs(
     input_dict: dict[str, Any],
     llm,
     instruction: str = "Represent the user's input.",
-    mm_processor_kwargs: dict[str, Any] = {},
+    mm_processor_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if mm_processor_kwargs is None:
+        mm_processor_kwargs = {}
     image = input_dict.get("image")
 
     conversation = format_input_to_conversation(input_dict, instruction)
@@ -144,18 +146,18 @@ def main():
     print("\nSimilarity Scores:")
     pprint(similarities)
 
-    data_dict = dict(
-        name="local_vllm_python",
-        text_only=vllm_inputs[::3],
-        text_embeddings=text_embeddings,
-        image_only=vllm_inputs[1::3],
-        image_embeddings=image_embeddings,
-        joint=vllm_inputs[2::3],
-        joint_embeddings=joint_embeddings,
-        similarities=similarities,
-        text_joint_similarities=cosine_sim(text_embeddings, joint_embeddings),
-        image_joint_similarities=cosine_sim(image_embeddings, joint_embeddings),
-    )
+    data_dict = {
+        "name": "local_vllm_python",
+        "text_only": vllm_inputs[::3],
+        "text_embeddings": text_embeddings,
+        "image_only": vllm_inputs[1::3],
+        "image_embeddings": image_embeddings,
+        "joint": vllm_inputs[2::3],
+        "joint_embeddings": joint_embeddings,
+        "similarities": similarities,
+        "text_joint_similarities": cosine_sim(text_embeddings, joint_embeddings),
+        "image_joint_similarities": cosine_sim(image_embeddings, joint_embeddings),
+    }
 
     np.save(emb_path, data_dict)  # type: ignore
 

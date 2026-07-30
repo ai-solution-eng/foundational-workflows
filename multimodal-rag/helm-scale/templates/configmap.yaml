@@ -46,6 +46,8 @@ data:
   # Qdrant client tuning (gRPC + hard timeout)
   QDRANT_PREFER_GRPC: {{ .Values.qdrant.client.preferGrpc | quote }}
   QDRANT_CLIENT_TIMEOUT: {{ .Values.qdrant.client.timeout | quote }}
+  QDRANT_QUANTIZATION: {{ .Values.qdrant.client.quantization | quote }}
+  QDRANT_QUANTIZATION_ALWAYS_RAM: {{ .Values.qdrant.client.quantizationAlwaysRam | quote }}
   # Dynamic embedding query batcher (search path)
   EMBEDDING_QUERY_BATCH_SIZE: {{ .Values.app.embeddingQueryBatchSize | quote }}
   EMBEDDING_QUERY_BATCH_WAIT_MS: {{ .Values.app.embeddingQueryBatchWaitMs | quote }}

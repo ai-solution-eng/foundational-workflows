@@ -5,7 +5,7 @@
 replicaCount: 4
 image:
   repository: andrewbydlon/rag-api-server
-  tag: v1.5.0
+  tag: v1.6.1
   pullPolicy: IfNotPresent
 
 deployment:
@@ -90,13 +90,6 @@ models:
     url: ""
     extra: {}
 
-# Per-process httpx connection pool limit for model endpoint clients.
-# Raised from the single-replica default of 30 so the embedder (on every
-# search's critical path) is not the bottleneck.
-modelPool:
-  maxConnections: 200
-  maxKeepaliveConnections: 50
-
 # -- Model API keys (sensitive) -----------------------------------------------
 # These are stored in a Kubernetes Secret, not the ConfigMap.
 # Provide via --set or a separate encrypted values file.
@@ -105,6 +98,13 @@ modelSecrets:
   rerankerApiKey: ""
   vlmApiKey: ""
   asrApiKey: ""
+
+# Per-process httpx connection pool limit for model endpoint clients.
+# Raised from the single-replica default of 30 so the embedder (on every
+# search's critical path) is not the bottleneck.
+modelPool:
+  maxConnections: 200
+  maxKeepaliveConnections: 50
 
 # -- S3 / MinIO configuration --------------------------------------------------
 # Endpoint URL is stored in the ConfigMap (not sensitive).
@@ -139,6 +139,14 @@ qdrant:
   client:
     preferGrpc: true
     timeout: 30
+    # Scalar quantization for new collections: "int8" (default, 4x memory
+    # reduction, ~1-2% recall loss, faster search) or "none" (full float32).
+    # Only affects newly created collections; existing ones keep their config.
+    quantization: int8
+    # Pin quantized vectors in RAM for fast search (default true).
+    # Disable for very large datasets (2M+ points) to avoid OOM — quantized
+    # vectors will be read from disk per-search instead.
+    quantizationAlwaysRam: true
 
 
 # -- Redis (optional cross-pod unlock cache) ----------------------------------

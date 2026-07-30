@@ -21,18 +21,120 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, AsyncGenerator, Optional
+from typing import Any
 
 import httpx
-
-from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi import (
+    Body,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+from fastapi.responses import HTMLResponse, Response
 
 from multimodal_rag.dataset_manager import DatasetManager
-from multimodal_rag.utils.logging_utils import logging, setup_logger
 from multimodal_rag.utils.general_tools import sync_pool
+from multimodal_rag.utils.logging_utils import logging, setup_logger
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Upload job tracker (thread-safe, poll-based progress)
+# ---------------------------------------------------------------------------
+
+
+class _UploadJobTracker:
+    """Tracks background upload jobs for poll-based progress reporting.
+
+    Replaces the previous SSE stream approach which tied upload lifecycle
+    to a persistent HTTP connection.  With polling, a browser tab can be
+    closed and reopened without losing progress tracking.
+    """
+
+    def __init__(self) -> None:
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    def create(self, dataset_name: str, total_files: int, source: str = "files") -> str:
+        job_id = uuid.uuid4().hex[:12]
+        with self._lock:
+            self._jobs[job_id] = {
+                "job_id": job_id,
+                "dataset": dataset_name,
+                "source": source,
+                "status": "uploading",
+                "total_files": total_files,
+                "processed_files": 0,
+                "total_chunks": 0,
+                "events": [],
+                "result": None,
+                "error": None,
+                "created_at": time.time(),
+                "completed_at": None,
+            }
+        return job_id
+
+    def add_event(self, job_id: str, event: dict[str, Any]) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            job["events"].append(event)
+            # Keep last 500 events to bound memory
+            if len(job["events"]) > 500:
+                job["events"] = job["events"][-500:]
+            # Update aggregate counters
+            status = event.get("status")
+            if status == "complete" and event.get("chunks") is not None:
+                job["processed_files"] += 1
+                job["total_chunks"] += event.get("chunks", 0)
+            elif status == "error":
+                job["processed_files"] += 1
+
+    def complete(self, job_id: str, result: dict[str, Any] | None = None) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            job["status"] = "complete"
+            job["result"] = result
+            job["completed_at"] = time.time()
+
+    def fail(self, job_id: str, error: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            job["status"] = "error"
+            job["error"] = error
+            job["completed_at"] = time.time()
+
+    def get(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            return dict(job)
+
+    def cleanup_old(self, max_age_seconds: int = 3600) -> None:
+        """Remove completed jobs older than *max_age_seconds*."""
+        now = time.time()
+        with self._lock:
+            stale = [
+                jid
+                for jid, job in self._jobs.items()
+                if job.get("completed_at") and now - job["completed_at"] > max_age_seconds
+            ]
+            for jid in stale:
+                del self._jobs[jid]
+
+
+_upload_jobs = _UploadJobTracker()
 
 # ---------------------------------------------------------------------------
 # Application config from environment
@@ -55,7 +157,7 @@ RAG_CAPTION_VIDEO = os.environ.get("RAG_CAPTION_VIDEO", "false").lower() in (
 # Lazy-initialised DatasetManager singleton
 # ---------------------------------------------------------------------------
 
-_dm: Optional[DatasetManager] = None
+_dm: DatasetManager | None = None
 _dm_lock = threading.Lock()
 
 
@@ -592,10 +694,11 @@ async def api_upload_files_batch(
     files: list[UploadFile] = File(...),
     password: str = Form(""),
 ):
-    """Upload multiple files at once with SSE progress streaming."""
-    import json
-    from fastapi.responses import StreamingResponse
+    """Upload multiple files at once with poll-based progress tracking.
 
+    Returns a ``job_id`` immediately.  Poll ``GET /api/datasets/{name}/upload-status/{job_id}``
+    every 2-3 seconds for progress updates.
+    """
     dm = await get_manager_async()
     try:
         _require_dataset_password(dm, name, password or None, request)
@@ -603,109 +706,40 @@ async def api_upload_files_batch(
     except FileNotFoundError:
         raise HTTPException(404, f"Dataset '{name}' not found")
 
-    async def _progress_stream() -> AsyncGenerator[str, None]:
-        import queue as thr_queue
+    # Write files to temp before starting the background job
+    file_entries: list[tuple[str, str]] = []
+    for f in files:
+        suffix = Path(f.filename or "upload").suffix if f.filename else ".bin"
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        while chunk := await f.read(1 << 20):  # 1 MiB
+            tmp.write(chunk)
+        tmp.close()
+        file_entries.append((tmp.name, f.filename or "upload"))
 
-        q: thr_queue.Queue = thr_queue.Queue()
-        _KEEPALIVE_SECONDS = 10
-        _event_id = 0  # incrementing SSE event ID for client reconnection
+    job_id = _upload_jobs.create(name, len(file_entries), source="files")
 
-        # -- Write files to temp inside the SSE stream so the client gets
-        #    "uploaded" events immediately rather than waiting in silence
-        #    for all files to be copied first.
-        file_entries: list[tuple[str, str]] = []
+    def _process() -> None:
         try:
-            for f in files:
-                suffix = Path(f.filename or "upload").suffix if f.filename else ".bin"
-                tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-                while chunk := await f.read(1 << 20):  # 1 MiB
-                    tmp.write(chunk)
-                tmp.close()
-                file_entries.append((tmp.name, f.filename or "upload"))
-                q.put({"file": f.filename or "upload", "status": "uploaded"})
+
+            def cb(e):
+                _upload_jobs.add_event(job_id, e)
+
+            r = dm.add_files_batch(name, file_entries, progress_callback=cb)
+            _upload_jobs.complete(job_id, r)
         except Exception as exc:
-            for p, _ in file_entries:
-                try:
-                    os.unlink(p)
-                except Exception:
-                    logger.debug("Suppressed exception", exc_info=True)
-            q.put({"error": str(exc)})
-            q.put(None)
-            # Drain queue and yield events
-            while True:
-                try:
-                    event = await asyncio.get_running_loop().run_in_executor(
-                        None, lambda: q.get(timeout=_KEEPALIVE_SECONDS)
-                    )
-                except thr_queue.Empty:
-                    yield ": keepalive\n\n"
-                    continue
-                if event is None:
-                    break
-                if "error" in event and "file" not in event:
-                    _event_id += 1
-                    yield f"id: {_event_id}\nevent: error\ndata: {json.dumps(event)}\n\n"
-                    break
-                _event_id += 1
-                yield f"id: {_event_id}\nevent: progress\ndata: {json.dumps(event)}\n\n"
-            return
-
-        def _process() -> None:
-            try:
-
-                def cb(e):
-                    q.put(e)
-
-                r = dm.add_files_batch(name, file_entries, progress_callback=cb)
-                q.put(r)
-            except Exception as exc:
-                q.put({"error": str(exc)})
-            finally:
-                q.put(None)
-
-        loop = asyncio.get_running_loop()
-        task = loop.run_in_executor(None, _process)
-
-        try:
-            while True:
-                try:
-                    event = await loop.run_in_executor(None, lambda: q.get(timeout=_KEEPALIVE_SECONDS))
-                except thr_queue.Empty:
-                    yield ": keepalive\n\n"
-                    continue
-                if event is None:
-                    break
-                # Per-file progress errors have a "file" key — don't break
-                # the stream for those; only fatal _process errors lack "file".
-                if "error" in event and "file" not in event:
-                    _event_id += 1
-                    yield f"id: {_event_id}\nevent: error\ndata: {json.dumps(event)}\n\n"
-                    break
-                if "files" in event:
-                    _event_id += 1
-                    yield f"id: {_event_id}\nevent: complete\ndata: {json.dumps(event)}\n\n"
-                    break
-                _event_id += 1
-                yield f"id: {_event_id}\nevent: progress\ndata: {json.dumps(event)}\n\n"
+            _upload_jobs.fail(job_id, str(exc))
         finally:
-            await task
-            # Clean up temporary files (success path — error path already
-            # cleans up inside the except block above).
+            # Clean up temp files
             for p, _ in file_entries:
                 try:
                     os.unlink(p)
                 except Exception:
                     logger.debug("Suppressed exception", exc_info=True)
 
-    return StreamingResponse(
-        _progress_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, _process)
+
+    return {"job_id": job_id, "status": "uploading", "total_files": len(file_entries)}
 
 
 @app.post("/api/datasets/{name}/batch-urls")
@@ -715,18 +749,11 @@ async def api_upload_urls_batch(
     body: dict[str, Any] = Body(...),
     x_dataset_password: str | None = Header(None, alias="X-Dataset-Password"),
 ):
-    """Ingest files from URLs (S3, HTTP) into a dataset with SSE progress streaming.
+    """Ingest files from URLs (S3, HTTP) into a dataset with poll-based progress.
 
-    Request body::
-
-        {"urls": ["s3://bucket/doc1.pdf", "https://example.com/doc2.pdf", ...]}
-
-    Supports the same 17+ file formats as file upload (PDF, image, video,
-    audio, code, Office docs, etc.).  Progress events are streamed via SSE.
+    Returns a ``job_id`` immediately.  Poll ``GET /api/datasets/{name}/upload-status/{job_id}``
+    every 2-3 seconds for progress updates.
     """
-    import json
-    from fastapi.responses import StreamingResponse
-
     urls = body.get("urls", [])
     if not urls or not isinstance(urls, list):
         raise HTTPException(400, "Field 'urls' must be a non-empty array of URL strings")
@@ -738,60 +765,52 @@ async def api_upload_urls_batch(
     except FileNotFoundError:
         raise HTTPException(404, f"Dataset '{name}' not found")
 
-    async def _progress_stream() -> AsyncGenerator[str, None]:
-        import queue as thr_queue
+    job_id = _upload_jobs.create(name, len(urls), source="urls")
 
-        q: thr_queue.Queue = thr_queue.Queue()
-        _KEEPALIVE_SECONDS = 10
-        _event_id = 0  # incrementing SSE event ID for client reconnection
-
-        def _process() -> None:
-            try:
-
-                def cb(e):
-                    q.put(e)
-
-                r = dm.add_urls_batch(name, urls, progress_callback=cb)
-                q.put(r)
-            except Exception as exc:
-                q.put({"error": str(exc)})
-            finally:
-                q.put(None)
-
-        loop = asyncio.get_running_loop()
-        task = loop.run_in_executor(None, _process)
-
+    def _process() -> None:
         try:
-            while True:
-                try:
-                    event = await loop.run_in_executor(None, lambda: q.get(timeout=_KEEPALIVE_SECONDS))
-                except thr_queue.Empty:
-                    yield ": keepalive\n\n"
-                    continue
-                if event is None:
-                    break
-                if "error" in event and "file" not in event:
-                    _event_id += 1
-                    yield f"id: {_event_id}\nevent: error\ndata: {json.dumps(event)}\n\n"
-                    break
-                if "files" in event:
-                    _event_id += 1
-                    yield f"id: {_event_id}\nevent: complete\ndata: {json.dumps(event)}\n\n"
-                    break
-                _event_id += 1
-                yield f"id: {_event_id}\nevent: progress\ndata: {json.dumps(event)}\n\n"
-        finally:
-            await task
 
-    return StreamingResponse(
-        _progress_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
+            def cb(e):
+                _upload_jobs.add_event(job_id, e)
+
+            r = dm.add_urls_batch(name, urls, progress_callback=cb)
+            _upload_jobs.complete(job_id, r)
+        except Exception as exc:
+            _upload_jobs.fail(job_id, str(exc))
+
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, _process)
+
+    return {"job_id": job_id, "status": "uploading", "total_files": len(urls)}
+
+
+@app.get("/api/datasets/{name}/upload-status/{job_id}")
+async def api_upload_status(
+    name: str,
+    job_id: str,
+    request: Request,
+    x_dataset_password: str | None = Header(None, alias="X-Dataset-Password"),
+):
+    """Poll the status of an upload/ingestion job.
+
+    Returns the job's current status, accumulated events, and aggregate
+    counters.  When ``status`` is ``complete`` or ``error``, the job is
+    finished and polling can stop.
+    """
+    dm = await get_manager_async()
+    try:
+        _require_dataset_password(dm, name, x_dataset_password, request)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Dataset '{name}' not found")
+
+    job = _upload_jobs.get(job_id)
+    if job is None or job.get("dataset") != name:
+        raise HTTPException(404, f"Job '{job_id}' not found")
+
+    # Opportunistic cleanup of old completed jobs
+    _upload_jobs.cleanup_old()
+
+    return job
 
 
 # -- Search ------------------------------------------------------------------
@@ -1117,7 +1136,7 @@ def _preprocess_staged_file(dest: Path) -> Path:
 # Cached embedder mm_processor_kwargs — resolved once from env vars, no
 # endpoint probing.  Used by _preprocess_staged_file to size staged media
 # to the embedder's native processing caps.
-_embedder_mm_kwargs: Optional[dict[str, Any]] = None
+_embedder_mm_kwargs: dict[str, Any] | None = None
 
 
 def _get_embedder_mm_kwargs() -> dict[str, Any]:
@@ -1385,7 +1404,7 @@ async def api_health_stats() -> dict[str, Any]:
     # The Qdrant PVC is a separate volume from the file PVC; Qdrant's HTTP API
     # does not expose on-disk usage, so we read it from the read-only mount
     # configured in the Helm chart (env QDRANT_STORAGE_PATH).
-    qdrant_pvc: Optional[dict[str, Any]] = None
+    qdrant_pvc: dict[str, Any] | None = None
     if QDRANT_STORAGE_PATH and Path(QDRANT_STORAGE_PATH).exists():
         try:
             q_usage = shutil.disk_usage(QDRANT_STORAGE_PATH)
@@ -1605,7 +1624,7 @@ async def api_migrate_tier_schema(name: str) -> dict[str, Any]:
 # HTML frontend
 # ---------------------------------------------------------------------------
 
-_HTML_INDEX: Optional[str] = None
+_HTML_INDEX: str | None = None
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from multimodal_rag.utils.logging_utils import logging
 
@@ -35,7 +35,7 @@ class LogProcessor:
 
     chunk_size: int = 8192
     chunk_overlap: int = 0
-    text_splitter: Optional[Any] = None
+    text_splitter: Any | None = None
     max_entries_per_chunk: int = 0
 
     # ------------------------------------------------------------------
@@ -94,9 +94,7 @@ class LogProcessor:
             return True
         if _TIMESTAMP_RE.match(line):
             return True
-        if _SEVERITY_RE.match(line):
-            return True
-        return False
+        return bool(_SEVERITY_RE.match(line))
 
     @staticmethod
     def _build_entry(text: str) -> dict[str, Any]:

@@ -1,5 +1,5 @@
-import mimetypes
 import base64
+import mimetypes
 
 
 def save_data_url_with_auto_extension(data_url: str, base_filename: str):

@@ -2,11 +2,11 @@ import asyncio
 from os.path import join as pj
 
 import numpy as np
-
-from multimodal_rag.utils.pcai_models import qwen3_vl_8B
-from multimodal_rag.utils.model_adapters import MultiModalEmbeddings
-from multimodal_rag.utils.general_tools import cosine_sim
 from shared_queries_and_documents import all_inputs, multiimage_data, script_path
+
+from multimodal_rag.utils.general_tools import cosine_sim
+from multimodal_rag.utils.model_adapters import MultiModalEmbeddings
+from multimodal_rag.utils.pcai_models import qwen3_vl_8B
 
 qwen3_vl_8B.remote()
 
@@ -38,20 +38,20 @@ async def main():
 
     similarities = cosine_sim(text_embeddings, image_embeddings)
 
-    data_dict = dict(
-        name="pcai_vllm_openai_client",
-        text_only=openai_inputs[::3],
-        text_embeddings=text_embeddings,
-        image_only=openai_inputs[1::3],
-        image_embeddings=image_embeddings,
-        joint=openai_inputs[2::3],
-        joint_embeddings=joint_embeddings,
-        multiimage_data=multiimage_data,
-        multiimage_embeddings=multiimage_embeddings,
-        similarities=similarities,
-        text_joint_similarities=cosine_sim(text_embeddings, joint_embeddings),
-        image_joint_similarities=cosine_sim(image_embeddings, joint_embeddings),
-    )
+    data_dict = {
+        "name": "pcai_vllm_openai_client",
+        "text_only": openai_inputs[::3],
+        "text_embeddings": text_embeddings,
+        "image_only": openai_inputs[1::3],
+        "image_embeddings": image_embeddings,
+        "joint": openai_inputs[2::3],
+        "joint_embeddings": joint_embeddings,
+        "multiimage_data": multiimage_data,
+        "multiimage_embeddings": multiimage_embeddings,
+        "similarities": similarities,
+        "text_joint_similarities": cosine_sim(text_embeddings, joint_embeddings),
+        "image_joint_similarities": cosine_sim(image_embeddings, joint_embeddings),
+    }
 
     np.save(emb_path, data_dict)  # type: ignore
 
@@ -61,4 +61,4 @@ async def main():
 if __name__ == "__main__":
     result = asyncio.run(main())
     print("Done!")
-    print(f"Similarities:\n{result["similarities"]}")
+    print(f"Similarities:\n{result['similarities']}")

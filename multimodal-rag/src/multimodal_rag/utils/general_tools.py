@@ -3,21 +3,24 @@ import concurrent.futures
 import logging
 import os
 import threading
+from collections.abc import Callable, Sequence
 from math import ceil
-from typing import Callable, Sequence, Any
+from typing import Any
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "cosine_sim",
-    "sync_wrapper_safe",
-    "list_chunker",
-    "sync_pool",
     "SYNC_POOL_SIZE",
-    "retry_call",
+    "cosine_sim",
+    "cosine_sim_int8",
+    "list_chunker",
+    "quantize_int8",
     "retry_async_call",
+    "retry_call",
+    "sync_pool",
+    "sync_wrapper_safe",
 ]
 
 
@@ -50,6 +53,124 @@ def cosine_sim(vec1: np.ndarray, vec2: np.ndarray):
 
     n, m = len(vec1), len(vec2)
     return vec1 @ vec2.T / (np.linalg.norm(vec1, axis=-1).reshape(n, 1) * np.linalg.norm(vec2, axis=-1).reshape(1, m))
+
+
+# -- int8 scalar quantization (matches Qdrant's approach) --------------------
+
+
+def quantize_int8(
+    vectors: np.ndarray,
+    quantile: float = 0.99,
+    scale: float | None = None,
+) -> tuple[np.ndarray, float]:
+    """Quantize float32 vectors to int8 using Qdrant's scalar quantization scheme.
+
+    Each float32 value ``v`` is mapped to a signed int8 as::
+
+        q = clamp(round(v * 127 / scale), -128, 127)
+
+    where *scale* is the *quantile*-th percentile of the absolute values
+    across all dimensions (e.g. 0.99 ignores the top 1% of extreme values
+    for robustness).  Dequantization is approximate: ``v ≈ q * scale / 127``.
+
+    Parameters
+    ----------
+    vectors:
+        1-D or 2-D float32/float64 array.  A 1-D array is treated as a
+        single vector.
+    quantile:
+        Percentile of absolute values to use as the scale (default 0.99,
+        matching Qdrant's default).
+    scale:
+        If provided, use this scale instead of computing one.  Needed
+        when quantizing a query vector with the same scale that was used
+        for the stored vectors.
+
+    Returns
+    -------
+    (int8_vectors, scale)
+        ``int8_vectors`` has the same shape as *vectors* but dtype int8.
+        ``scale`` is the float scalar used for quantization.
+    """
+    was_1d = vectors.ndim == 1
+    if was_1d:
+        vectors = vectors.reshape(1, -1)
+    vectors = vectors.astype(np.float64)
+
+    if scale is None:
+        abs_vals = np.abs(vectors)
+        scale = float(np.quantile(abs_vals, quantile))
+        if scale == 0:
+            scale = 1.0
+
+    quantized = np.clip(np.round(vectors * 127.0 / scale), -128, 127).astype(np.int8)
+
+    if was_1d:
+        quantized = quantized.reshape(-1)
+    return quantized, scale
+
+
+def cosine_sim_int8(
+    vec1: np.ndarray,
+    vec2: np.ndarray,
+) -> np.ndarray:
+    """Cosine similarity using int8 scalar quantization (Qdrant-style).
+
+    Both vectors are quantized to int8 with a shared scale (the 99th
+    percentile of absolute values across both inputs), then cosine
+    similarity is computed on the int8 representations.
+
+    **Why this works**: for cosine similarity the scale factor cancels::
+
+        cos(a, b) = dot(a, b) / (|a| * |b|)
+
+        a ≈ q_a * (scale / 127)
+        b ≈ q_b * (scale / 127)
+
+        dot(a, b) ≈ (scale² / 127²) * dot(q_a, q_b)
+        |a|       ≈ (scale / 127) * |q_a|
+        |b|       ≈ (scale / 127) * |q_b|
+
+        cos(a, b) ≈ dot(q_a, q_b) / (|q_a| * |q_b|)
+
+    The scale cancels entirely — the int8 cosine similarity is
+    approximately equal to the float32 cosine similarity.  The only
+    error comes from rounding in the quantization step (typically 1-2%).
+
+    Parameters
+    ----------
+    vec1, vec2:
+        1-D or 2-D float arrays.  2-D inputs are treated as batches and
+        a similarity matrix is returned (same as :func:`cosine_sim`).
+
+    Returns
+    -------
+    Similarity scalar (1-D inputs) or (n, m) matrix (2-D inputs).
+    """
+    if len(vec1.shape) == 1:
+        vec1 = vec1.reshape(1, len(vec1))
+    if len(vec2.shape) == 1:
+        vec2 = vec2.reshape(1, len(vec2))
+
+    # Compute a shared scale from the combined absolute values
+    combined = np.vstack([vec1, vec2])
+    scale = float(np.quantile(np.abs(combined), 0.99))
+    if scale == 0:
+        scale = 1.0
+
+    q1, _ = quantize_int8(vec1, scale=scale)
+    q2, _ = quantize_int8(vec2, scale=scale)
+
+    # Convert to float for the dot product / norm computation.
+    # (Qdrant uses SIMD int8 multiply-add internally, but the math is
+    # identical — we use float here for clarity.)
+    q1f = q1.astype(np.float64)
+    q2f = q2.astype(np.float64)
+
+    n, m = len(q1f), len(q2f)
+    norms1 = np.linalg.norm(q1f, axis=-1).reshape(n, 1)
+    norms2 = np.linalg.norm(q2f, axis=-1).reshape(1, m)
+    return (q1f @ q2f.T) / (norms1 * norms2)
 
 
 # -- Persistent background event loop for sync→async bridging ---------------

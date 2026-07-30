@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from multimodal_rag.utils.logging_utils import logging
 
@@ -172,7 +172,7 @@ class CodeProcessor:
     chunk_size: int = 8192
     chunk_overlap: int = 512
     add_language_annotation: bool = True
-    text_splitter: Optional[Any] = None
+    text_splitter: Any | None = None
 
     # ------------------------------------------------------------------
     # Public API

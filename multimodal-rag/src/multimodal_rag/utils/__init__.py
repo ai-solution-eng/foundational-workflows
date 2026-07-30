@@ -12,11 +12,11 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
-    "gemma4_31B",
+    "cohere_transcribe_3_2b",
     "deepseek_v4_flash_280B",
+    "gemma4_31B",
     "qwen3_vl_8B",
     "qwen3_vl_reranker_8B",
-    "cohere_transcribe_3_2b",
 ]
 
 

@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from multimodal_rag.utils.logging_utils import logging
 
@@ -34,7 +34,7 @@ class EbookProcessor:
 
     chunk_size: int = 8192
     chunk_overlap: int = 512
-    text_splitter: Optional[Any] = None
+    text_splitter: Any | None = None
     extract_images: bool = True
 
     # ------------------------------------------------------------------

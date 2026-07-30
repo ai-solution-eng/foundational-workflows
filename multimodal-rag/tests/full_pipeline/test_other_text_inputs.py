@@ -19,13 +19,13 @@ import tempfile
 # Ensure the source package shadows any installed version
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
-from multimodal_rag.dataset_manager import DatasetManager, _classify_file  # noqa: E402
-from multimodal_rag.input_processing import (  # noqa: E402
+from multimodal_rag.dataset_manager import DatasetManager, _classify_file
+from multimodal_rag.input_processing import (
     EbookProcessor,
     LogProcessor,
     NotebookProcessor,
 )
-from multimodal_rag.utils.logging_utils import setup_logger  # noqa: E402
+from multimodal_rag.utils.logging_utils import setup_logger
 
 setup_logger(level="INFO")
 
@@ -152,8 +152,7 @@ def make_sample_json_log(path: str) -> str:
         },
     ]
     with open(path, "w") as f:
-        for entry in entries:
-            f.write(json.dumps(entry) + "\n")
+        f.writelines(json.dumps(entry) + "\n" for entry in entries)
     return path
 
 

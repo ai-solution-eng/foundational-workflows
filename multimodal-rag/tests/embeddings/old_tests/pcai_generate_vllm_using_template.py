@@ -1,11 +1,12 @@
 from os.path import join as pj
 from pathlib import Path
-import numpy as np
 from pprint import pprint
 
+import numpy as np
 from shared_queries_and_documents import all_inputs
-from multimodal_rag.utils.pcai_models import qwen3_vl_8B
+
 from multimodal_rag.utils.general_tools import cosine_sim
+from multimodal_rag.utils.pcai_models import qwen3_vl_8B
 
 np.set_printoptions(linewidth=120)
 
@@ -51,18 +52,18 @@ def main():
     print("Similarities\n")
     pprint(similarities)
 
-    data_dict = dict(
-        name="pcai_vllm_templated",
-        text_only=vllm_inputs[::3],
-        text_embeddings=text_embeddings,
-        image_only=vllm_inputs[1::3],
-        image_embeddings=image_embeddings,
-        joint=vllm_inputs[2::3],
-        joint_embeddings=joint_embeddings,
-        similarities=similarities,
-        text_joint_similarities=cosine_sim(text_embeddings, joint_embeddings),
-        image_joint_similarities=cosine_sim(image_embeddings, joint_embeddings),
-    )
+    data_dict = {
+        "name": "pcai_vllm_templated",
+        "text_only": vllm_inputs[::3],
+        "text_embeddings": text_embeddings,
+        "image_only": vllm_inputs[1::3],
+        "image_embeddings": image_embeddings,
+        "joint": vllm_inputs[2::3],
+        "joint_embeddings": joint_embeddings,
+        "similarities": similarities,
+        "text_joint_similarities": cosine_sim(text_embeddings, joint_embeddings),
+        "image_joint_similarities": cosine_sim(image_embeddings, joint_embeddings),
+    }
 
     np.save(emb_path, data_dict)  # type: ignore
 

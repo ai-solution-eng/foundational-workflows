@@ -2,7 +2,7 @@ import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from multimodal_rag.utils.logging_utils import logging
 
@@ -39,7 +39,7 @@ class TableProcessor:
 
     chunk_size: int = 8192
     chunk_overlap: int = 0
-    text_splitter: Optional[Any] = None
+    text_splitter: Any | None = None
     rows_per_doc: int = 0
 
     # ------------------------------------------------------------------
@@ -101,12 +101,12 @@ class TableProcessor:
         try:
             import pandas as pd
         except ImportError:
-            raise ImportError("pandas is required for Excel support. " "Install it with: pip install pandas openpyxl")
+            raise ImportError("pandas is required for Excel support. Install it with: pip install pandas openpyxl")
 
         try:
             df = pd.read_excel(path, engine="openpyxl", dtype=str)
         except ImportError:
-            raise ImportError("openpyxl is required for .xlsx files. " "Install it with: pip install openpyxl")
+            raise ImportError("openpyxl is required for .xlsx files. Install it with: pip install openpyxl")
 
         df = df.fillna("").map(self._clean_val)
         rows = df.to_dict(orient="records")
@@ -122,7 +122,7 @@ class TableProcessor:
         try:
             import pandas as pd
         except ImportError:
-            raise ImportError("pandas is required for ODS support. " "Install it with: pip install pandas odfpy")
+            raise ImportError("pandas is required for ODS support. Install it with: pip install pandas odfpy")
 
         try:
             df = pd.read_excel(path, engine="odf", dtype=str)

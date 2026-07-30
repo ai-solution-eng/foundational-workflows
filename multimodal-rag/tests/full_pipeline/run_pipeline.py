@@ -24,11 +24,11 @@ from multimodal_rag.input_processing import (
 )
 from multimodal_rag.utils.logging_utils import setup_logger
 from multimodal_rag.utils.pcai_models import (
+    cohere_transcribe_3_2b,
     deepseek_v4_flash_280B,
+    gemma4_31B,
     qwen3_vl_8B,
     qwen3_vl_reranker_8B,
-    gemma4_31B,
-    cohere_transcribe_3_2b,
 )
 
 setup_logger(level="VERBOSE")

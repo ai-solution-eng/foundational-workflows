@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from multimodal_rag.utils.logging_utils import logging
 
@@ -23,7 +23,7 @@ class OfficeProcessor:
 
     chunk_size: int = 8192
     chunk_overlap: int = 512
-    text_splitter: Optional[Any] = None
+    text_splitter: Any | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -167,8 +167,8 @@ class OfficeProcessor:
     @staticmethod
     def _process_odt(path: str, source: str) -> list[dict[str, Any]]:
         try:
+            from odf import table, text
             from odf.opendocument import load
-            from odf import text, table
         except ImportError:
             raise ImportError("odfpy is required for .odt files. Install with: pip install odfpy")
 
@@ -215,8 +215,9 @@ class OfficeProcessor:
     @staticmethod
     def _process_odp(path: str, source: str) -> list[dict[str, Any]]:
         try:
+            from odf import draw
+            from odf import text as odf_text
             from odf.opendocument import load
-            from odf import draw, text as odf_text
         except ImportError:
             raise ImportError("odfpy is required for .odp files. Install with: pip install odfpy")
 

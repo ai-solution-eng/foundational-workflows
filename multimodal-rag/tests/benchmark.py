@@ -45,7 +45,6 @@ import statistics
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 import httpx
 
@@ -175,7 +174,7 @@ async def run_user(
     top_k: int,
     use_reranker: bool,
     reranker_top_k: int,
-    password: Optional[str],
+    password: str | None,
     duration: float,
     ramp_delay: float,
     stats: BenchmarkStats,
@@ -238,7 +237,7 @@ async def run_user_mcp(
     top_k: int,
     use_reranker: bool,
     reranker_top_k: int,
-    password: Optional[str],
+    password: str | None,
     duration: float,
     ramp_delay: float,
     stats: BenchmarkStats,
@@ -281,7 +280,10 @@ async def run_user_mcp(
     # timeouts). This is needed for internal/dev servers with private CAs.
     client_kwargs: dict = {"url": mcp_url}
     if insecure:
-        from mcp.shared._httpx_utils import MCP_DEFAULT_SSE_READ_TIMEOUT, MCP_DEFAULT_TIMEOUT
+        from mcp.shared._httpx_utils import (
+            MCP_DEFAULT_SSE_READ_TIMEOUT,
+            MCP_DEFAULT_TIMEOUT,
+        )
 
         def _insecure_http_client_factory(headers=None, timeout=None, auth=None):
             kwargs: dict = {"follow_redirects": True, "verify": False}
@@ -300,50 +302,49 @@ async def run_user_mcp(
 
     # One persistent session per user
     try:
-        async with streamablehttp_client(**client_kwargs) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
+        async with streamablehttp_client(**client_kwargs) as (read, write, _), ClientSession(read, write) as session:
+            await session.initialize()
 
-                while time.monotonic() < end_time:
-                    query = rng.choice(queries)
-                    tool_args = {**tool_args_base, "query": query}
-                    t0 = time.monotonic()
-                    try:
-                        result = await asyncio.wait_for(
-                            session.call_tool("search_dataset", tool_args),
-                            timeout=call_timeout,
-                        )
-                        elapsed = time.monotonic() - t0
-                        stats.total += 1
-                        stats.latencies.append(elapsed)
-                        if result.isError:
-                            stats.failed += 1
-                            err_text = ""
-                            for block in result.content:
-                                if hasattr(block, "text"):
-                                    err_text = block.text[:120]
-                                    break
-                            err_key = f"MCP error: {err_text}" if err_text else "MCP error"
-                            stats.errors[err_key] = stats.errors.get(err_key, 0) + 1
-                        else:
-                            stats.success += 1
-                            stats.result_counts.append(1)
-                    except asyncio.TimeoutError:
-                        elapsed = time.monotonic() - t0
-                        stats.total += 1
+            while time.monotonic() < end_time:
+                query = rng.choice(queries)
+                tool_args = {**tool_args_base, "query": query}
+                t0 = time.monotonic()
+                try:
+                    result = await asyncio.wait_for(
+                        session.call_tool("search_dataset", tool_args),
+                        timeout=call_timeout,
+                    )
+                    elapsed = time.monotonic() - t0
+                    stats.total += 1
+                    stats.latencies.append(elapsed)
+                    if result.isError:
                         stats.failed += 1
-                        stats.latencies.append(elapsed)
-                        err_key = f"Timeout (>{call_timeout:g}s)"
+                        err_text = ""
+                        for block in result.content:
+                            if hasattr(block, "text"):
+                                err_text = block.text[:120]
+                                break
+                        err_key = f"MCP error: {err_text}" if err_text else "MCP error"
                         stats.errors[err_key] = stats.errors.get(err_key, 0) + 1
-                    except Exception as exc:
-                        elapsed = time.monotonic() - t0
-                        stats.total += 1
-                        stats.failed += 1
-                        stats.latencies.append(elapsed)
-                        err_key = type(exc).__name__
-                        stats.errors[err_key] = stats.errors.get(err_key, 0) + 1
-                        # Brief pause to avoid tight error loop
-                        await asyncio.sleep(0.5)
+                    else:
+                        stats.success += 1
+                        stats.result_counts.append(1)
+                except TimeoutError:
+                    elapsed = time.monotonic() - t0
+                    stats.total += 1
+                    stats.failed += 1
+                    stats.latencies.append(elapsed)
+                    err_key = f"Timeout (>{call_timeout:g}s)"
+                    stats.errors[err_key] = stats.errors.get(err_key, 0) + 1
+                except Exception as exc:
+                    elapsed = time.monotonic() - t0
+                    stats.total += 1
+                    stats.failed += 1
+                    stats.latencies.append(elapsed)
+                    err_key = type(exc).__name__
+                    stats.errors[err_key] = stats.errors.get(err_key, 0) + 1
+                    # Brief pause to avoid tight error loop
+                    await asyncio.sleep(0.5)
     except Exception as exc:
         # Session creation / initialisation failed
         stats.total += 1
@@ -368,7 +369,7 @@ async def check_health(base_url: str, insecure: bool = False) -> bool:
         return False
 
 
-async def discover_datasets(base_url: str, password: Optional[str] = None, insecure: bool = False) -> list[str]:
+async def discover_datasets(base_url: str, password: str | None = None, insecure: bool = False) -> list[str]:
     """Return a list of dataset names from the server."""
     headers: dict[str, str] = {}
     if password:
@@ -379,7 +380,7 @@ async def discover_datasets(base_url: str, password: Optional[str] = None, insec
         return [ds["name"] for ds in resp.json().get("datasets", [])]
 
 
-def load_queries(queries_file: Optional[str]) -> list[str]:
+def load_queries(queries_file: str | None) -> list[str]:
     """Load queries from a file (one per line) or return defaults."""
     if queries_file is None:
         return DEFAULT_QUERIES
@@ -397,20 +398,27 @@ def load_queries(queries_file: Optional[str]) -> list[str]:
 
 
 async def _run_with_progress(tasks: list, stats: BenchmarkStats) -> None:
-    """Gather *tasks* while printing progress every 5 seconds."""
+    """Gather *tasks* while printing progress every 5 seconds as a table.
+
+    The column header is reprinted every 20 data rows so long runs stay
+    readable when scrolled.
+    """
+    fmt = "  {:>8}  {:>9}  {:>9}  {:>9}  {:>12}"
+    header = fmt.format("elapsed", "requests", "success", "failed", "rate (req/s)")
+    sep = fmt.format("-" * 8, "-" * 9, "-" * 9, "-" * 9, "-" * 12)
+    rows_since_header = 0
 
     async def report_progress() -> None:
+        nonlocal rows_since_header
         while True:
             await asyncio.sleep(5)
             elapsed = time.monotonic() - stats.start_time
-            if elapsed > 0:
-                print(
-                    f"  [{elapsed:6.1f}s] requests={stats.total} "
-                    f"success={stats.success} failed={stats.failed} "
-                    f"rate={stats.total / elapsed:.1f} req/s"
-                )
-            else:
-                print(f"  [{elapsed:6.1f}s] starting ...")
+            if rows_since_header % 20 == 0:
+                print(header)
+                print(sep)
+            rate = f"{stats.total / elapsed:.1f}" if elapsed > 0 else "starting"
+            print(fmt.format(f"{elapsed:.0f}s", stats.total, stats.success, stats.failed, rate))
+            rows_since_header += 1
 
     progress_task = asyncio.create_task(report_progress())
     await asyncio.gather(*tasks)

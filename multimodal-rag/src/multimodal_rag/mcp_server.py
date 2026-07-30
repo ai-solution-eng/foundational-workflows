@@ -20,8 +20,8 @@ import json
 import os
 import threading
 import time
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -156,11 +156,9 @@ def _check_unlocked_or_password(
 # ContextVar set here by the middleware is reliably visible inside the
 # offloaded tool bodies.
 
-_memory_dataset_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("rag_memory_dataset", default=None)
-_memory_password_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "rag_memory_password", default=None
-)
-_opencode_session_id_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+_memory_dataset_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar("rag_memory_dataset", default=None)
+_memory_password_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar("rag_memory_password", default=None)
+_opencode_session_id_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "opencode_session_id", default=None
 )
 
@@ -180,9 +178,9 @@ class _MemoryHeaderMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("type") != "http":
             return await self.app(scope, receive, send)
-        ds: Optional[str] = None
-        pw: Optional[str] = None
-        sid: Optional[str] = None
+        ds: str | None = None
+        pw: str | None = None
+        sid: str | None = None
         for name, value in scope.get("headers") or []:
             if name == b"x-memory-dataset":
                 ds = value.decode("latin-1").strip() or None
@@ -213,12 +211,12 @@ def _resolve_memory_dataset(dataset_name: str | None) -> str:
     return ds
 
 
-def _resolve_memory_password(password: str | None) -> Optional[str]:
+def _resolve_memory_password(password: str | None) -> str | None:
     """Resolve the memory dataset password: explicit arg → request header."""
     return password if password else _memory_password_ctx.get()
 
 
-def _resolve_session_id(existing: str | None = None) -> Optional[str]:
+def _resolve_session_id(existing: str | None = None) -> str | None:
     """Resolve the opencode session ID: explicit arg → request header → env.
 
     Resolution order:
@@ -392,7 +390,7 @@ def _collect_cacheable_paths(query_dict: Any) -> list[tuple[str, str]]:
             continue
         urls = v if isinstance(v, list) else [v]
         for url in urls:
-            path: Optional[str] = None
+            path: str | None = None
             if isinstance(url, str):
                 if url.startswith("file://"):
                     path = url[7:]
@@ -417,7 +415,7 @@ def _lookup_dataset_vector(
     rag: MultimodalRAG,
     dataset_name: str,
     file_path: str,
-) -> Optional[list[float]]:
+) -> list[float] | None:
     """If *file_path* belongs to *dataset_name*, return its stored Qdrant vector.
 
     Returns ``None`` when the path is not under the dataset's files dir,
@@ -489,7 +487,7 @@ def _resolve_query_vector(
     rag: MultimodalRAG,
     dataset_name: str,
     query_dict: Any,
-) -> Optional[list[float]]:
+) -> list[float] | None:
     """Try to reuse a cached/stored embedding for *query_dict*.
 
     Returns the vector on hit, ``None`` on miss (caller falls back to embedding).
@@ -548,7 +546,7 @@ def _resolve_audio_query_vector(
     rag: MultimodalRAG,
     dataset_name: str,
     query_dict: dict[str, Any],
-) -> Optional[list[float]]:
+) -> list[float] | None:
     """Handle audio queries by transcribing via ASR, then embedding the text.
 
     The embedder (Qwen3-VL-Embedding) doesn't support audio, so a bare
@@ -731,9 +729,9 @@ async def _arun_retrieval(
     in parallel (embed HTTP + Qdrant gRPC overlap across requests).
 
     The sync helpers ``_resolve_query_vector`` / ``_resolve_audio_query_vector``
-    (multimodal-only) and ``Postprocessor`` (media conversion) remain sync
-    — they are only exercised by multimodal queries and are fast relative
-    to the embed + retrieve round-trip.
+    (multimodal-only) remain sync — they are only exercised by multimodal
+    queries and are fast relative to the embed + retrieve round-trip.
+    ``Postprocessor.acall`` runs async so it doesn't block the event loop.
     """
     if base_llm_modalities is None:
         base_llm_modalities = ["text"]
@@ -743,7 +741,7 @@ async def _arun_retrieval(
     # the same media twice (covers both "LLM passes back a result URL"
     # and "user uploads the same file again").  On miss we embed
     # up-front and cache the result for next time.
-    query_vector: Optional[list[float]] = None
+    query_vector: list[float] | None = None
     if isinstance(query_dict, dict):
         query_vector = _resolve_query_vector(rag, dataset_name, query_dict)
 
@@ -759,12 +757,29 @@ async def _arun_retrieval(
                 logger.warning("query embedding failed; falling back to retrieve()", exc_info=True)
                 query_vector = None
 
+    # Determine whether the base64 media payloads stored in Qdrant are
+    # needed by any downstream consumer.  They are needed when:
+    #   1. The reranker is enabled (and a reranker model exists), OR
+    #   2. A VLM is configured (Postprocessor uses it for image/video
+    #      description), OR
+    #   3. The base LLM supports image/video natively (media is passed
+    #      through for the LLM to consume directly).
+    # When none apply, heavy base64 image/video keys are excluded from the
+    # Qdrant response to avoid transferring megabytes of data that would
+    # be immediately discarded and replaced with preprocessed_* file refs.
+    need_media = (
+        (use_reranker and rag.reranker is not None)
+        or (rag.vlm is not None)
+        or bool(llm_modalities & {"image", "video"})
+    )
+
     results = await rag.aretrieve(
         query_dict,
         top_k=top_k,
         use_reranker=use_reranker,
         reranker_top_k=reranker_top_k,
         query_vector=query_vector,
+        need_media=need_media,
     )
     if not results:
         return "No results found."
@@ -778,14 +793,7 @@ async def _arun_retrieval(
     )
 
     if needs_conversion:
-        from multimodal_rag import Postprocessor
-
-        postproc = Postprocessor(
-            vlm=rag.vlm,
-            asr=rag.asr,
-            caption_video=rag.caption_video,
-        )
-        postprocessed = postproc(
+        postprocessed = await rag._postprocessor.acall(
             retrieved_docs,
             llm_modalities=llm_modalities,
             query=query,
@@ -895,7 +903,7 @@ async def _arun_retrieval(
                 src = r.get("source") or r.get("original_source") or ""
                 alt = (src.split("/")[-1] if src else f"matched audio {i + 1}")[:60]
                 audio_md_lines.append(
-                    f'<audio controls preload="none" src="{url}" title="{alt}"></audio>' f"\n([🎧 {alt}]({url}))"
+                    f'<audio controls preload="none" src="{url}" title="{alt}"></audio>\n([🎧 {alt}]({url}))'
                 )
     if audio_md_lines:
         context += (
@@ -1220,7 +1228,7 @@ try:
                 doc["audio"] = audio
             doc["source"] = "opencode:memory"
             doc["memory_kind"] = meta.get("kind", "note")
-            doc["memory_ts"] = datetime.now(timezone.utc).isoformat()
+            doc["memory_ts"] = datetime.now(UTC).isoformat()
             if meta:
                 tags = meta.get("tags")
                 if tags:
@@ -1539,7 +1547,7 @@ try:
         and data URLs are returned unchanged (the model server fetches
         them directly).  Returns the (possibly new) URL.
         """
-        path: Optional[str] = None
+        path: str | None = None
         if media_url.startswith("file://"):
             path = media_url[7:]
         elif media_url.startswith("/") and os.path.exists(media_url):
@@ -1607,7 +1615,10 @@ try:
         """
 
         def _impl() -> str:
-            from multimodal_rag.rag_system import _describe_doc, _media_url_to_displayable
+            from multimodal_rag.rag_system import (
+                _describe_doc,
+                _media_url_to_displayable,
+            )
             from multimodal_rag.utils.general_tools import sync_wrapper_safe
 
             dm = get_manager()
@@ -1621,8 +1632,7 @@ try:
 
             # Build a doc dict in the format _describe_doc expects
             path = processed_url
-            if path.startswith("file://"):
-                path = path[7:]
+            path = path.removeprefix("file://")
 
             # Detect modality from URL/path.  When the URL has no
             # recognisable extension (e.g. a bare OWUI file ID like
@@ -1631,7 +1641,7 @@ try:
             from multimodal_rag.dataset_manager import _classify_file
             from multimodal_rag.utils.model_adapters import _detect_media_type
 
-            file_type: Optional[str] = None
+            file_type: str | None = None
             if not path.startswith(("data:", "http")):
                 file_type = _classify_file(path)
                 # Extension-based classification failed → probe the bytes
@@ -1707,7 +1717,10 @@ try:
         """
 
         def _impl() -> str:
-            from multimodal_rag.rag_system import _transcribe_media, _media_url_to_displayable
+            from multimodal_rag.rag_system import (
+                _media_url_to_displayable,
+                _transcribe_media,
+            )
             from multimodal_rag.utils.general_tools import sync_wrapper_safe
 
             dm = get_manager()
@@ -1721,10 +1734,9 @@ try:
             processed_url = _preprocess_media_url(audio_url, dm)
 
             # Check transcript cache (by original file hash)
-            cache_key: Optional[str] = None
+            cache_key: str | None = None
             orig_path = audio_url
-            if orig_path.startswith("file://"):
-                orig_path = orig_path[7:]
+            orig_path = orig_path.removeprefix("file://")
             if os.path.exists(orig_path):
                 file_hash = _hash_file(orig_path)
                 cache_key = f"asr_tool:{file_hash}"

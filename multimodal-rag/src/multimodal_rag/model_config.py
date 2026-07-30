@@ -24,7 +24,7 @@ Roles:  EMBEDDER, RERANKER, VLM, ASR
 
 import json
 import os
-from typing import Any, Optional
+from typing import Any
 
 from multimodal_rag.utils.model_adapters import (
     MultiModalEmbeddings,
@@ -40,20 +40,20 @@ from multimodal_rag.utils.pcai_model_classes import (
 # Defaults (sensible for Qwen3-VL models; override via EXTRA env var)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_MM_KWARGS: dict[str, Any] = dict(
-    fps=1.0,
-    max_frames=64,
-    min_pixels=4096,
-    max_pixels=720 * 720,
-    total_pixels=5 * 720 * 720,
-)
+_DEFAULT_MM_KWARGS: dict[str, Any] = {
+    "fps": 1.0,
+    "max_frames": 64,
+    "min_pixels": 4096,
+    "max_pixels": 720 * 720,
+    "total_pixels": 5 * 720 * 720,
+}
 
 _VLM_MODALITIES = ("text", "image", "video")
 
-_EMBEDDER_INST_KWARGS: dict[str, Any] = dict(
-    tiktoken_enabled=False,
-    check_embedding_ctx_length=False,
-)
+_EMBEDDER_INST_KWARGS: dict[str, Any] = {
+    "tiktoken_enabled": False,
+    "check_embedding_ctx_length": False,
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -87,7 +87,7 @@ def _load_extra(prefix: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def build_embedder(prefix: str = "MODEL_EMBEDDER") -> Optional[EmbeddingModel]:
+def build_embedder(prefix: str = "MODEL_EMBEDDER") -> EmbeddingModel | None:
     # URL is required to enable a role; NAME is optional and, when empty,
     # auto-discovered from the endpoint's /v1/models listing.
     url = _get(prefix, "URL")
@@ -117,7 +117,7 @@ def build_embedder(prefix: str = "MODEL_EMBEDDER") -> Optional[EmbeddingModel]:
     )
 
 
-def build_reranker(prefix: str = "MODEL_RERANKER") -> Optional[RerankerModel]:
+def build_reranker(prefix: str = "MODEL_RERANKER") -> RerankerModel | None:
     # URL is required to enable a role; NAME is optional and, when empty,
     # auto-discovered from the endpoint's /v1/models listing.
     url = _get(prefix, "URL")
@@ -140,7 +140,7 @@ def build_reranker(prefix: str = "MODEL_RERANKER") -> Optional[RerankerModel]:
     )
 
 
-def build_vlm(prefix: str = "MODEL_VLM") -> Optional[ChatModel]:
+def build_vlm(prefix: str = "MODEL_VLM") -> ChatModel | None:
     # URL is required to enable a role; NAME is optional and, when empty,
     # auto-discovered from the endpoint's /v1/models listing.
     url = _get(prefix, "URL")
@@ -158,7 +158,7 @@ def build_vlm(prefix: str = "MODEL_VLM") -> Optional[ChatModel]:
     )
 
 
-def build_asr(prefix: str = "MODEL_ASR") -> Optional[VoiceModel]:
+def build_asr(prefix: str = "MODEL_ASR") -> VoiceModel | None:
     # URL is required to enable a role; NAME is optional and, when empty,
     # auto-discovered from the endpoint's /v1/models listing.
     url = _get(prefix, "URL")
@@ -180,10 +180,10 @@ def build_asr(prefix: str = "MODEL_ASR") -> Optional[VoiceModel]:
 # ---------------------------------------------------------------------------
 
 ModelPack = tuple[
-    Optional[EmbeddingModel],  # embedder
-    Optional[RerankerModel],  # reranker
-    Optional[ChatModel],  # vlm
-    Optional[VoiceModel],  # asr
+    EmbeddingModel | None,  # embedder
+    RerankerModel | None,  # reranker
+    ChatModel | None,  # vlm
+    VoiceModel | None,  # asr
 ]
 
 

@@ -1,6 +1,8 @@
 from glob import glob
-from os.path import join as pj, basename as bn
+from os.path import basename as bn
+from os.path import join as pj
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 
@@ -23,7 +25,7 @@ default_dict = comparisons.pop("vllm_local.npy")
 
 
 class SaveLogAndPrint:
-    all_data: list[str] = []
+    all_data: ClassVar[list[str]] = []
 
     def __call__(self, *str_args) -> None:
         input_str = " ".join(str_args)

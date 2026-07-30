@@ -2,7 +2,7 @@ apiVersion: v2
 name: rag-mcp-server
 description: Multi-modal RAG MCP Server with Qdrant, web frontend, and configurable models
 type: application
-version: 1.5.0
-appVersion: "1.5.0"
+version: 1.6.1
+appVersion: "1.6.1"
 sources:
   - https://github.com/ai-solution-eng/internal-projects/tree/main/multimodal-rag-project

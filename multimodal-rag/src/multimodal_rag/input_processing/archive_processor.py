@@ -2,7 +2,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from multimodal_rag.input_processing.image_processor import ImageProcessor
 from multimodal_rag.input_processing.json_processor import JSONProcessor
@@ -133,7 +133,7 @@ class ArchiveProcessor:
 
     chunk_size: int = 8192
     chunk_overlap: int = 512
-    text_splitter: Optional[Any] = None
+    text_splitter: Any | None = None
     max_depth: int = _MAX_DEPTH
 
     # ------------------------------------------------------------------

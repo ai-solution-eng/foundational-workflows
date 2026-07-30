@@ -9,7 +9,6 @@ uploaded files stored on a PVC at ``/data/datasets/<name>/files/``.
 import base64
 import contextlib
 import hashlib
-import httpx
 import json
 import mimetypes
 import os
@@ -21,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 try:
     import fcntl  # Unix-only; k8s pods are Linux.
 
@@ -29,7 +30,6 @@ except ImportError:  # pragma: no cover - Windows dev only
     fcntl = None  # type: ignore[assignment]
     _HAS_FCNTL = False
 
-from multimodal_rag.rag_system import MultimodalRAG
 from multimodal_rag.input_processing import (
     ArchiveProcessor,
     CodeProcessor,
@@ -47,8 +47,9 @@ from multimodal_rag.input_processing import (
     XMLProcessor,
     YAMLProcessor,
 )
-from multimodal_rag.utils.logging_utils import logging
+from multimodal_rag.rag_system import MultimodalRAG
 from multimodal_rag.utils.general_tools import retry_call
+from multimodal_rag.utils.logging_utils import logging
 
 logger = logging.getLogger(__name__)
 
@@ -298,9 +299,7 @@ def _is_s3_directory_url(url: str) -> bool:
     if key.endswith("/"):
         return True
     # No extension → likely a prefix
-    if "." not in key.rsplit("/", 1)[-1]:
-        return True
-    return False
+    return "." not in key.rsplit("/", 1)[-1]
 
 
 def _list_s3_prefix(s3_url: str) -> list[str]:
@@ -363,9 +362,10 @@ def _download_url(url: str, timeout: int = 120) -> str:
     if url.startswith("s3://"):
         return _download_s3(url, timeout=timeout)
 
-    import httpx
     import tempfile
     from urllib.parse import urlparse
+
+    import httpx
 
     try:
         with httpx.Client(timeout=httpx.Timeout(timeout, connect=30.0), follow_redirects=True) as client:
@@ -433,8 +433,9 @@ def _preprocess_image_file(path: Path, max_pixels: int = _PVC_IMAGE_MAX_PIXELS) 
     returned unchanged.  A new ``*_preprocessed`` file is created
     alongside the original when resizing is needed.
     """
-    from PIL import Image
     from io import BytesIO
+
+    from PIL import Image
 
     from multimodal_rag.input_processing.image_processor import _resize_image
 
@@ -644,9 +645,9 @@ def _split_audio_segments(
     limits.  Segment files are created alongside the original with a
     ``_segment_NNN`` suffix.
     """
+    import json
     import math
     import subprocess as sp
-    import json
 
     if path.stat().st_size <= max_bytes:
         return [path]
@@ -851,7 +852,7 @@ class DatasetManager:
                 self._verify_endpoint(model, role)
             except RuntimeError as exc:
                 logger.warning(
-                    "Optional model '%s' endpoint not reachable — " "system will work without %s capabilities: %s",
+                    "Optional model '%s' endpoint not reachable — system will work without %s capabilities: %s",
                     role,
                     role,
                     exc,
@@ -2078,6 +2079,7 @@ class DatasetManager:
         counts.
         """
         import base64 as _b64
+
         from multimodal_rag.input_processing.image_processor import _resize_image
 
         rag = self._get_rag(dataset_name)
@@ -2128,10 +2130,9 @@ class DatasetManager:
                 # 2. Derive preprocessed_image from source if missing
                 pi = meta.get("preprocessed_image")
                 src = meta.get("source")
-                if not pi and src:
-                    if isinstance(src, str) and (src.startswith("file://") or os.path.exists(src)):
-                        meta["preprocessed_image"] = f"file://{src}" if not src.startswith("file://") else src
-                        changed = True
+                if not pi and src and isinstance(src, str) and (src.startswith("file://") or os.path.exists(src)):
+                    meta["preprocessed_image"] = f"file://{src}" if not src.startswith("file://") else src
+                    changed = True
 
                 # 3. Derive original_image / original_video (tier 1)
                 for modality in ("image", "video"):
@@ -2146,7 +2147,7 @@ class DatasetManager:
                             preproc_val = f"file://{src}" if not src.startswith("file://") else src
                         else:
                             continue
-                    path_str = preproc_val[7:] if preproc_val.startswith("file://") else preproc_val
+                    path_str = preproc_val.removeprefix("file://")
                     tier1 = self._derive_tier1_path(path_str)
                     if tier1:
                         meta[orig_key] = f"file://{tier1}"
@@ -2241,6 +2242,7 @@ class DatasetManager:
             top_k=top_k,
             use_reranker=use_reranker,
             reranker_top_k=reranker_top_k,
+            need_media=use_reranker and rag.reranker is not None,
         )
         output = []
         for doc, score in results:
