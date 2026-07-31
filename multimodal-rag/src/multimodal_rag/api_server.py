@@ -147,7 +147,7 @@ QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
 # usage). Empty when the mount is not configured (e.g. sharded Qdrant cluster).
 QDRANT_STORAGE_PATH = os.environ.get("QDRANT_STORAGE_PATH", "")
 RAG_REMOTE = os.environ.get("RAG_REMOTE", "true").lower() in ("true", "1", "yes")
-RAG_CAPTION_VIDEO = os.environ.get("RAG_CAPTION_VIDEO", "false").lower() in (
+RAG_CAPTION_WITH_ASR = os.environ.get("RAG_CAPTION_WITH_ASR", "false").lower() in (
     "true",
     "1",
     "yes",
@@ -182,7 +182,12 @@ def get_manager() -> DatasetManager:
             "1",
             "yes",
         )
-        rag_caption_video = os.environ.get("RAG_CAPTION_VIDEO", "false").lower() in (
+        rag_caption_with_asr = os.environ.get("RAG_CAPTION_WITH_ASR", "false").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+        rag_caption_with_vlm = os.environ.get("RAG_CAPTION_WITH_VLM", "false").lower() in (
             "true",
             "1",
             "yes",
@@ -201,7 +206,8 @@ def get_manager() -> DatasetManager:
             reranker=reranker,
             vlm=vlm,
             asr=asr,
-            caption_video=rag_caption_video,
+            caption_with_asr=rag_caption_with_asr,
+            caption_with_vlm=rag_caption_with_vlm,
             remote=rag_remote,
             dedup_threshold=rag_dedup_threshold,
         )
@@ -411,6 +417,21 @@ async def healthz():
     return {"status": "ok"}
 
 
+@app.get("/api/admin/models")
+async def api_model_availability() -> dict[str, Any]:
+    """Return which optional models (VLM, ASR) are configured.
+
+    Used by the frontend to enable/disable caption checkboxes and default
+    them based on model availability.
+    """
+    dm = await get_manager_async()
+    return {
+        "vlm": dm.vlm is not None,
+        "asr": dm.asr is not None,
+        "reranker": dm.reranker is not None,
+    }
+
+
 @app.get("/readyz")
 async def readyz():
     """Readiness probe — checks that the manager is up and Qdrant is reachable.
@@ -443,10 +464,15 @@ async def api_create_dataset(body: dict[str, Any] = Body(...)):
 
     Request body::
 
-        {"name": "my-dataset", "description": "...", "caption_video": false, "password": "secret"}
+        {"name": "my-dataset", "description": "...", "caption_with_asr": false, "caption_with_vlm": false, "keep_originals": true, "password": "secret"}
 
-    ``caption_video`` (default ``false``) controls whether audio tracks
+    ``caption_with_asr`` (default ``false``) controls whether audio tracks
     from uploaded videos are transcribed during ingestion.
+    ``caption_with_vlm`` (default ``false``) controls whether images/videos
+    are described by the VLM during ingestion (enriching text for the
+    embedder and enabling VLM-skip at retrieval for generic queries).
+    ``keep_originals`` (default ``true``) controls whether original
+    full-quality files are kept on disk after preprocessing.
     ``password`` is optional — if set, all read operations on the dataset
     will require it.
     """
@@ -454,7 +480,9 @@ async def api_create_dataset(body: dict[str, Any] = Body(...)):
     if not name:
         raise HTTPException(400, "Field 'name' is required")
     description = body.get("description", "")
-    caption_video = body.get("caption_video", False)
+    caption_with_asr = body.get("caption_with_asr", False)
+    caption_with_vlm = body.get("caption_with_vlm", False)
+    keep_originals = body.get("keep_originals", True)
     password = body.get("password") or None
     try:
         dm = await get_manager_async()
@@ -464,7 +492,9 @@ async def api_create_dataset(body: dict[str, Any] = Body(...)):
             dm.create_dataset,
             name,
             description,
-            bool(caption_video),
+            bool(caption_with_asr),
+            bool(caption_with_vlm),
+            bool(keep_originals),
             password,
         )
         return {"status": "ok", "dataset": meta}

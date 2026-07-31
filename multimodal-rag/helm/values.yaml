@@ -2,7 +2,7 @@
 replicaCount: 1
 image:
   repository: andrewbydlon/rag-api-server
-  tag: v1.6.1
+  tag: v1.8.0
   pullPolicy: IfNotPresent
 
 deployment:
@@ -78,7 +78,8 @@ s3:
 
 # -- RAG parameters -----------------------------------------------------------
 rag:
-  captionVideo: false  # Transcribe video audio tracks via ASR
+  captionWithAsr: false  # Caption video audio tracks via ASR at ingest
+  captionWithVlm: false  # Caption images/videos via VLM at ingest (enables VLM-skip at retrieval)
   remote: false         # Use remote model URLs (vs in-cluster .svc.cluster.local)
   dedupThreshold: 0.995  # Cosine similarity above which a doc is considered a duplicate (0.0–1.0)
 

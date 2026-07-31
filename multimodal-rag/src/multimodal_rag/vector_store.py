@@ -54,13 +54,17 @@ class VectorStore:
     raw cosine similarity (higher = more similar) for both backends.
     """
 
-    def similarity_search_with_score_by_vector(self, embedding: list[float], k: int) -> list[tuple[Document, float]]:
+    def similarity_search_with_score_by_vector(
+        self, embedding: list[float], k: int, need_media: bool = True
+    ) -> list[tuple[Document, float]]:
         raise NotImplementedError
 
     async def aadd_documents(self, documents: list[Document], **kwargs: Any) -> list[str]:
         raise NotImplementedError
 
-    async def asimilarity_search_with_relevance_scores(self, query: str, k: int) -> list[tuple[Document, float]]:
+    async def asimilarity_search_with_relevance_scores(
+        self, query: str, k: int, need_media: bool = True
+    ) -> list[tuple[Document, float]]:
         raise NotImplementedError
 
 
@@ -83,7 +87,9 @@ class InMemoryVectorStore(VectorStore):
             ids.append(doc_id)
         return ids
 
-    def similarity_search_with_score_by_vector(self, embedding: list[float], k: int) -> list[tuple[Document, float]]:
+    def similarity_search_with_score_by_vector(
+        self, embedding: list[float], k: int, need_media: bool = True
+    ) -> list[tuple[Document, float]]:
         entries = [(s["document"], s["vector"]) for s in self.store.values() if s.get("vector") is not None]
         if not entries:
             return []
@@ -96,9 +102,11 @@ class InMemoryVectorStore(VectorStore):
         top = np.argsort(sims)[-k:][::-1]
         return [(docs[i], float(sims[i])) for i in top]
 
-    async def asimilarity_search_with_relevance_scores(self, query: str, k: int) -> list[tuple[Document, float]]:
+    async def asimilarity_search_with_relevance_scores(
+        self, query: str, k: int, need_media: bool = True
+    ) -> list[tuple[Document, float]]:
         emb = await self.embedding.aembed_query(query)
-        return self.similarity_search_with_score_by_vector(emb, k)
+        return self.similarity_search_with_score_by_vector(emb, k, need_media=need_media)
 
 
 class _QdrantBatcher:
@@ -226,7 +234,9 @@ class QdrantVectorStore(VectorStore):
             weakref.WeakKeyDictionary()
         )
 
-    def similarity_search_with_score_by_vector(self, embedding: list[float], k: int) -> list[tuple[Document, float]]:
+    def similarity_search_with_score_by_vector(
+        self, embedding: list[float], k: int, need_media: bool = True
+    ) -> list[tuple[Document, float]]:
         from qdrant_client.models import QueryRequest
 
         responses = self._client.query_batch_points(

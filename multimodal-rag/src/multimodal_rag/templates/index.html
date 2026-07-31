@@ -341,8 +341,14 @@
       <input type="text" id="ds-desc" placeholder="e.g. My research paper collection" autocomplete="off">
     </div>
     <div class="form-group" style="margin-top:10px">
-      <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400">
-        Caption Video <input type="checkbox" id="ds-caption-video">
+      <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400" title="Transcribe audio tracks from videos via ASR at ingest time.">
+        Caption with ASR <input type="checkbox" id="ds-caption-asr">
+      </label>
+      <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400;margin-left:16px" title="Generate VLM descriptions of images/videos at ingest time. Enables VLM-skip at retrieval for generic queries.">
+        Caption with VLM <input type="checkbox" id="ds-caption-vlm">
+      </label>
+      <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400;margin-left:16px" title="Keep original full-quality files on disk after preprocessing. Uncheck to save disk space (preprocessed copies are retained).">
+        Keep originals <input type="checkbox" id="ds-keep-originals" checked>
       </label>
     </div>
     <div class="form-group" style="margin-top:10px">
@@ -425,13 +431,13 @@
           <label for="search-topk">Top K</label>
           <input type="number" id="search-topk" value="10" min="1" max="100">
         </div>
-        <div style="flex:0 0 80px">
+        <div style="flex:0 0 80px" id="search-reranker-topk-wrap">
           <label for="search-reranker-topk">Rerank K</label>
           <input type="number" id="search-reranker-topk" value="3" min="1" max="50">
         </div>
       </div>
       <div style="margin-top:8px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem">
+        <label id="search-reranker-wrap" style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem">
           <input type="checkbox" id="search-reranker"> Use reranker
         </label>
         <button class="btn btn-primary btn-sm" onclick="searchDataset()">Search</button>
@@ -539,11 +545,13 @@ async function createDataset() {
   const name = input.value.trim();
   if (!name) { toast('Enter a dataset name', 'error'); return; }
   const desc = document.getElementById('ds-desc').value.trim();
-  const captionVideo = document.getElementById('ds-caption-video').checked;
+  const captionWithAsr = document.getElementById('ds-caption-asr').checked;
+  const captionWithVlm = document.getElementById('ds-caption-vlm').checked;
+  const keepOriginals = document.getElementById('ds-keep-originals').checked;
   const pw = document.getElementById('ds-password').value.trim();
   input.disabled = true;
   try {
-    const body = { name, caption_video: captionVideo };
+    const body = { name, caption_with_asr: captionWithAsr, caption_with_vlm: captionWithVlm, keep_originals: keepOriginals };
     if (desc) body.description = desc;
     if (pw) body.password = pw;
     await api('POST', '/api/datasets', body);
@@ -1618,7 +1626,37 @@ if (isManage) {
   _healthInterval = setInterval(pollHealth, 10000);
 } else {
   if (_healthInterval) { clearInterval(_healthInterval); _healthInterval = null; }
+  initCaptionCheckboxes();
   listDatasets();
+}
+
+// Fetch model availability and set up caption checkboxes + reranker UI
+async function initCaptionCheckboxes() {
+  const asrCheckbox = document.getElementById('ds-caption-asr');
+  const vlmCheckbox = document.getElementById('ds-caption-vlm');
+  try {
+    const resp = await api('GET', '/api/admin/models');
+    const hasVlm = resp.vlm === true;
+    const hasAsr = resp.asr === true;
+    const hasReranker = resp.reranker === true;
+    // ASR checkbox: default checked if ASR model present, disabled if not
+    asrCheckbox.checked = hasAsr;
+    asrCheckbox.disabled = !hasAsr;
+    asrCheckbox.parentElement.style.opacity = hasAsr ? '1' : '0.5';
+    asrCheckbox.parentElement.style.cursor = hasAsr ? 'pointer' : 'not-allowed';
+    // VLM checkbox: default checked if VLM model present, disabled if not
+    vlmCheckbox.checked = hasVlm;
+    vlmCheckbox.disabled = !hasVlm;
+    vlmCheckbox.parentElement.style.opacity = hasVlm ? '1' : '0.5';
+    vlmCheckbox.parentElement.style.cursor = hasVlm ? 'pointer' : 'not-allowed';
+    // Reranker: hide checkbox + Rerank K input when no reranker model
+    if (!hasReranker) {
+      document.getElementById('search-reranker-wrap').style.display = 'none';
+      document.getElementById('search-reranker-topk-wrap').style.display = 'none';
+    }
+  } catch (e) {
+    // If endpoint unavailable, leave checkboxes unchecked + enabled
+  }
 }
 </script>
 </body>

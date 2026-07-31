@@ -83,19 +83,17 @@ def _qdrant_quantization_config():
 
     always_ram = os.environ.get("QDRANT_QUANTIZATION_ALWAYS_RAM", "true").lower() in ("true", "1", "yes")
 
-    kwargs = dict(
-        type=ScalarType.INT8,
-        quantile=0.99,
-        always_ram=always_ram,
-    )
-
     if mode not in ("int8", "scalar", "true", "1", ""):
         logger.warning("Unknown QDRANT_QUANTIZATION='%s', falling back to int8", mode)
 
     from qdrant_client.models import ScalarQuantization, ScalarQuantizationConfig, ScalarType
 
     return ScalarQuantization(
-        scalar=ScalarQuantizationConfig(**kwargs),
+        scalar=ScalarQuantizationConfig(
+            type=ScalarType.INT8,
+            quantile=0.99,
+            always_ram=always_ram,
+        ),
     )
 
 
@@ -307,12 +305,17 @@ async def _describe_doc(
     vlm: ChatModel,
     system_prompt: str,
     log_timing: bool = False,
+    max_media_per_prompt: int = 4,
 ) -> str:
     """Describe images/videos in *doc_dict* via *vlm*.
 
     Builds OpenAI-compatible content parts from source info, text, an
     optional user query, and any image/video URLs (converted from
     ``file://`` to data URLs).  Returns the VLM's text response.
+
+    When the document has more than *max_media_per_prompt* media items,
+    they are split across multiple VLM calls and the descriptions
+    concatenated (the VLM endpoint limits images per prompt).
 
     When *log_timing* is True, logs the elapsed time and media count at
     verbose level.
@@ -325,33 +328,64 @@ async def _describe_doc(
         if val is not None:
             source_info += f"[{key}]: {val}\n"
 
-    content_parts: list[dict[str, Any]] = []
-    if source_info:
-        content_parts.append({"type": "text", "text": source_info.strip()})
-    text = doc_dict.get("text", "")
-    if text:
-        content_parts.append({"type": "text", "text": text})
-    q_text = query if isinstance(query, str) else (query.get("text", "") if isinstance(query, dict) else "")
-    if q_text:
-        content_parts.append({"type": "text", "text": f"User query: {q_text}"})
-
-    n_media = 0
+    # Collect all media URLs as data URLs
+    image_urls: list[str] = []
     for url in _as_url_list(doc_dict.get("image", [])):
         data_url = _file_url_to_data_url(url)
         if data_url and not data_url.startswith("file://"):
-            content_parts.append({"type": "image_url", "image_url": {"url": data_url}})
-            n_media += 1
+            image_urls.append(data_url)
+    video_urls: list[str] = []
     for url in _as_url_list(doc_dict.get("video", [])):
         data_url = _file_url_to_data_url(url)
         if data_url and not data_url.startswith("file://"):
-            content_parts.append({"type": "video_url", "video_url": {"url": data_url}})
-            n_media += 1
+            video_urls.append(data_url)
 
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": content_parts or ""},
-    ]
-    response = await vlm.llm_async_chat_function_call(messages)
+    all_media = [("image_url", u) for u in image_urls] + [("video_url", u) for u in video_urls]
+    n_media = len(all_media)
+
+    # Build the text-only content parts (shared across all calls)
+    text_parts: list[dict[str, Any]] = []
+    if source_info:
+        text_parts.append({"type": "text", "text": source_info.strip()})
+    text = doc_dict.get("text", "")
+    if text:
+        text_parts.append({"type": "text", "text": text})
+    q_text = query if isinstance(query, str) else (query.get("text", "") if isinstance(query, dict) else "")
+    if q_text:
+        text_parts.append({"type": "text", "text": f"User query: {q_text}"})
+
+    if n_media <= max_media_per_prompt:
+        # Single call — all media fits
+        content_parts = list(text_parts)
+        for media_type, url in all_media:
+            content_parts.append({"type": media_type, media_type: {"url": url}})
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content_parts or ""},
+        ]
+        response = await vlm.llm_async_chat_function_call(messages)
+    else:
+        # Split media across multiple VLM calls, concatenate descriptions
+        descriptions: list[str] = []
+        for i in range(0, n_media, max_media_per_prompt):
+            batch = all_media[i : i + max_media_per_prompt]
+            content_parts = list(text_parts)
+            if n_media > max_media_per_prompt:
+                content_parts.append(
+                    {
+                        "type": "text",
+                        "text": f"(Describing images {i + 1}-{min(i + max_media_per_prompt, n_media)} of {n_media})",
+                    }
+                )
+            for media_type, url in batch:
+                content_parts.append({"type": media_type, media_type: {"url": url}})
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content_parts or ""},
+            ]
+            resp = await vlm.llm_async_chat_function_call(messages)
+            descriptions.append(resp.choices[0].message.content)
+        response_descriptions = descriptions
 
     if log_timing:
         logger.verbose(  # type: ignore[attr-defined]
@@ -359,7 +393,64 @@ async def _describe_doc(
             time.monotonic() - t0,
             n_media,
         )  # type: ignore[attr-defined]
+    if n_media > max_media_per_prompt:
+        return "\n\n".join(response_descriptions)
     return response.choices[0].message.content
+
+
+# ---------------------------------------------------------------------------
+# Query classification — does the query ask for specific visual details?
+# ---------------------------------------------------------------------------
+
+# Keywords/patterns that indicate the user is asking about something specific
+# about an image/video that a general caption might not cover.  When a
+# pre-caption exists and the query does NOT match any of these, the
+# Postprocessor can skip the VLM call and reuse the ingest-time caption.
+_VLM_SPECIFIC_PATTERNS: list[tuple[str, str]] = [
+    # Spatial / location
+    (
+        "spatial",
+        r"\b(top|bottom|left|right|corner|behind|in front|above|below|center|centre|middle|background|foreground|next to|between)\b",
+    ),
+    # Counting / quantity
+    ("count", r"\b(how many|count|number of|how much)\b"),
+    # Color
+    ("color", r"\b(what color|colour|color of|colour of)\b"),
+    # Text in image
+    ("text", r"\b(what (does|do).*say|read the|text on|sign says|sign say|label|writing|what.*written)\b"),
+    # Presence / existence
+    ("presence", r"\b(is there|are there|do you see|can you see|does it (contain|have|show))\b"),
+    # Specific detail
+    ("detail", r"\b(zoom|look (closely|carefully)|specifically|exactly|precisely)\b"),
+    # Comparison
+    ("comparison", r"\b(difference|compare|versus|vs\.?|unlike)\b"),
+]
+
+
+def _query_needs_vlm(query: str | dict[str, Any] | None) -> bool:
+    """Return True if *query* asks for specific visual details about media.
+
+    Used by the Postprocessor to decide whether to re-run the VLM at
+    retrieval time or reuse an existing ingest-time caption.
+
+    A query "needs VLM" when it references spatial locations, counts,
+    colors, text in the image, presence of specific objects, or other
+    specific details that a general caption may not cover.  Generic
+    queries like "describe this image" or "show me photos of mountains"
+    do NOT need VLM — the pre-caption is sufficient.
+    """
+    if not query:
+        return False
+    q_text = query if isinstance(query, str) else (query.get("text", "") if isinstance(query, dict) else "")
+    if not q_text:
+        return False
+    import re
+
+    q_lower = q_text.lower()
+    for _label, pattern in _VLM_SPECIFIC_PATTERNS:
+        if re.search(pattern, q_lower):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +479,8 @@ class Preprocessor:
 
     vlm: ChatModel | None = None
     asr: VoiceModel | None = None
-    caption_video: bool = False
+    caption_with_asr: bool = False
+    caption_with_vlm: bool = False
     chunk_size: int = 128
 
     def __call__(
@@ -404,7 +496,11 @@ class Preprocessor:
 
     @cached_property
     def caption(self) -> bool:
-        return self.caption_video and self.asr is not None
+        return self.caption_with_asr and self.asr is not None
+
+    @cached_property
+    def caption_img(self) -> bool:
+        return self.caption_with_vlm and self.vlm is not None
 
     async def acall(
         self,
@@ -447,6 +543,7 @@ class Preprocessor:
 
             # -- video not supported → VLM description (+ optional ASR) -----
             video_needs_vlm = "video" not in target_modalities and media["video"]
+            video_captioned = False
             if video_needs_vlm:
                 if self.vlm is not None:
                     vlm_tasks.append(self._describe(d, query=query))
@@ -456,10 +553,22 @@ class Preprocessor:
             # -- video supported, but its audio track ignored by embedder ----
             elif "audio" not in target_modalities and self.caption:
                 asr_tasks.extend([self._transcribe(url) for url in media["video"]])
+            # -- video supported, but VLM caption requested ------------------
+            if not video_needs_vlm and media["video"] and self.caption_img and self.vlm is not None:
+                vlm_tasks.append(self._describe(d, query=query))
+                video_captioned = True
 
             # -- image not supported → VLM description ----------------------
-            if "image" not in target_modalities and media["image"] and self.vlm is not None:
+            # When the embedder doesn't support images, describe and drop.
+            # When caption_with_vlm is on (and embedder DOES support images),
+            # describe but KEEP the image for the embedder.
+            image_needs_vlm = "image" not in target_modalities and media["image"]
+            image_captioned = False
+            if image_needs_vlm and self.vlm is not None:
                 vlm_tasks.append(self._describe(d, query=query))
+            elif self.caption_img and media["image"]:
+                vlm_tasks.append(self._describe(d, query=query))
+                image_captioned = True
 
             asr_results = list(await asyncio.gather(*asr_tasks)) if asr_tasks else []
             vlm_results = list(await asyncio.gather(*vlm_tasks)) if vlm_tasks else []
@@ -473,10 +582,10 @@ class Preprocessor:
 
             # -- VLM results (in order: video describe, image describe) -----
             vlm_idx = 0
-            if video_needs_vlm and self.vlm is not None:
+            if (video_needs_vlm or video_captioned) and self.vlm is not None:
                 text_parts.append(f"[Video description]: {vlm_results[vlm_idx]}")
                 vlm_idx += 1
-            if "image" not in target_modalities and media["image"] and self.vlm is not None:
+            if (image_needs_vlm or image_captioned) and self.vlm is not None:
                 text_parts.append(f"[Image description]: {vlm_results[vlm_idx]}")
                 vlm_idx += 1
 
@@ -528,7 +637,7 @@ class Postprocessor:
 
     vlm: ChatModel | None = None
     asr: VoiceModel | None = None
-    caption_video: bool = False
+    caption_with_asr: bool = False
 
     def __call__(
         self,
@@ -584,9 +693,26 @@ class Postprocessor:
             has_audio_transcript = "[Audio transcription]:" in text or "[Caption]:" in text
 
             # -- image / video not supported → VLM description --------------
-            needs_vlm = ("image" not in llm_modalities and media["image"]) or (
-                "video" not in llm_modalities and media["video"]
-            )
+            # When the LLM doesn't support image/video natively, we need to
+            # convert them to text.  But if an ingest-time caption already
+            # exists in the text (from caption_with_vlm / caption_with_asr), and
+            # the user's query doesn't ask for specific visual details, we
+            # can reuse that caption and skip the VLM call entirely.
+            has_image_caption = "[Image description]:" in text
+            has_video_caption = "[Video description]:" in text
+            query_is_specific = _query_needs_vlm(query)
+
+            image_needs_vlm = "image" not in llm_modalities and media["image"]
+            video_needs_vlm = "video" not in llm_modalities and media["video"]
+
+            # Skip VLM for images if a pre-caption exists and query is generic
+            if image_needs_vlm and has_image_caption and not query_is_specific:
+                image_needs_vlm = False
+            # Skip VLM for videos if a pre-caption exists and query is generic
+            if video_needs_vlm and has_video_caption and not query_is_specific:
+                video_needs_vlm = False
+
+            needs_vlm = image_needs_vlm or video_needs_vlm
             if needs_vlm and self.vlm is not None:
                 vlm_tasks.append(self._describe(d, query=query))
 
@@ -596,7 +722,7 @@ class Postprocessor:
             # (marker "[Video audio transcription]:" present in text).
             has_video_caption = "[Video audio transcription]:" in text
             if (
-                self.caption_video
+                self.caption_with_asr
                 and "video" not in llm_modalities
                 and media["video"]
                 and self.asr is not None
@@ -609,7 +735,7 @@ class Postprocessor:
 
             # -- ASR results (video caption only — audio handled above) ----
             if (
-                self.caption_video
+                self.caption_with_asr
                 and "video" not in llm_modalities
                 and media["video"]
                 and self.asr is not None
@@ -686,7 +812,8 @@ class MultimodalRAG:
     reranker: RerankerModel | None = None
     vlm: ChatModel | None = None
     asr: VoiceModel | None = None
-    caption_video: bool = False
+    caption_with_asr: bool = False
+    caption_with_vlm: bool = False
     preprocess: bool = True
     preprocess_chunk_size: int = 128
     dedup_threshold: float = 0.995
@@ -706,16 +833,17 @@ class MultimodalRAG:
                 if m is not None:
                     m.remote()
 
-        if self.caption_video:
+        if self.caption_with_asr:
             assert self.asr is not None, "To caption video, an `asr` model must be provided"
 
         self._preprocessor = Preprocessor(
             vlm=self.vlm,
             asr=self.asr,
-            caption_video=self.caption_video,
+            caption_with_asr=self.caption_with_asr,
+            caption_with_vlm=self.caption_with_vlm,
             chunk_size=self.preprocess_chunk_size,
         )
-        self._postprocessor = Postprocessor(vlm=self.vlm, asr=self.asr, caption_video=False)
+        self._postprocessor = Postprocessor(vlm=self.vlm, asr=self.asr, caption_with_asr=False)
 
         vs = self.vector_store
         if isinstance(vs, dict):
@@ -809,7 +937,7 @@ class MultimodalRAG:
             ("reranker", _mn(self.reranker) if self.reranker else "(none)"),
             ("vlm", _mn(self.vlm) if self.vlm else "(none)"),
             ("asr", _mn(self.asr) if self.asr else "(none)"),
-            ("caption_video", str(self.caption_video)),
+            ("caption_with_asr", str(self.caption_with_asr)),
             ("preprocess", str(self.preprocess)),
             ("remote", str(self.remote)),
             ("vector_store", _vs(self.vector_store)),
@@ -1203,6 +1331,43 @@ class MultimodalRAG:
 
         return out
 
+    def _split_image_chunks(self, docs: list[str | dict[str, Any]], max_images: int = 4) -> list[str | dict[str, Any]]:
+        """Split documents with too many images into multiple sub-docs.
+
+        The Qwen3-VL-Embedding endpoint limits each prompt to 4 images.
+        When a document (e.g. a PDF page with many images) exceeds this,
+        it is split into N sub-docs — each with the same text but a
+        different subset of <=4 images.  Each sub-doc gets its own Qdrant
+        point so all images are searchable.
+
+        Splits are balanced via ``list_chunker(optimize=True)`` so that
+        images are distributed as evenly as possible (e.g. 5 -> [3, 2],
+        9 -> [3, 3, 3]) rather than greedily filling the first chunks and
+        leaving a small remainder.
+        """
+        if max_images <= 0:
+            return list(docs)
+        out: list[str | dict[str, Any]] = []
+        for doc in docs:
+            if not isinstance(doc, dict):
+                out.append(doc)
+                continue
+            images = doc.get("image")
+            if not images:
+                out.append(doc)
+                continue
+            img_list = images if isinstance(images, list) else [images]
+            if len(img_list) <= max_images:
+                out.append(doc)
+                continue
+            # Balance images across chunks (e.g. 5 -> [3, 2], 9 -> [3, 3, 3])
+            for i, group in enumerate(list_chunker(img_list, max_images, optimize=True)):
+                entry = dict(doc)
+                entry["image"] = list(group)
+                entry["chunk_index"] = i
+                out.append(entry)
+        return out
+
     def _batch_find_duplicates(
         self,
         vs: VectorStore,
@@ -1332,6 +1497,10 @@ class MultimodalRAG:
 
             # ── 0c. Split long audio transcriptions into chunks ─────────────
             sub = self._split_audio_chunks(sub)
+
+            # ── 0c2. Split docs with too many images (vLLM limit: 4/prompt) ─
+            max_images = int(os.environ.get("EMBEDDING_MAX_IMAGES_PER_PROMPT", "4"))
+            sub = self._split_image_chunks(sub, max_images=max_images)
 
             # ── 0d. Replace audio payloads with file references ─────────────
             sub = [_replace_audio(d) if isinstance(d, dict) else d for d in sub]
@@ -1719,7 +1888,7 @@ class MultiModalRAGSystem:
     ----------
     llm:
         Chat model used for generation (and optional routing).
-    embedder, reranker, vlm, asr, caption_video, preprocess,
+    embedder, reranker, vlm, asr, caption_with_asr, preprocess,
     preprocess_chunk_size, vector_store, remote:
         Forwarded directly to :class:`MultimodalRAG`.
     """
@@ -1731,7 +1900,8 @@ class MultiModalRAGSystem:
         reranker: RerankerModel | None = None,
         vlm: ChatModel | None = None,
         asr: VoiceModel | None = None,
-        caption_video: bool = False,
+        caption_with_asr: bool = False,
+        caption_with_vlm: bool = False,
         preprocess: bool = True,
         preprocess_chunk_size: int = 128,
         vector_store: VectorStore | dict[str, Any] | None = None,
@@ -1740,14 +1910,15 @@ class MultiModalRAGSystem:
         self.llm = llm
         if remote:
             self.llm.remote()
-        if caption_video:
+        if caption_with_asr:
             assert asr is not None, "To caption video, an `asr` model must be provided"
         self._rag = MultimodalRAG(
             embedder=embedder,
             reranker=reranker,
             vlm=vlm,
             asr=asr,
-            caption_video=caption_video,
+            caption_with_asr=caption_with_asr,
+            caption_with_vlm=caption_with_vlm,
             preprocess=preprocess,
             preprocess_chunk_size=preprocess_chunk_size,
             vector_store=vector_store,
@@ -1800,12 +1971,12 @@ class MultiModalRAGSystem:
         self._rag.asr = val
 
     @property
-    def caption_video(self):
-        return self._rag.caption_video
+    def caption_with_asr(self):
+        return self._rag.caption_with_asr
 
-    @caption_video.setter
-    def caption_video(self, val):
-        self._rag.caption_video = val
+    @caption_with_asr.setter
+    def caption_with_asr(self, val):
+        self._rag.caption_with_asr = val
 
     @property
     def preprocess(self):

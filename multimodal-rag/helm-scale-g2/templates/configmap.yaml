@@ -26,7 +26,8 @@ data:
   MODEL_ASR_URL: {{ .Values.models.asr.url | quote }}
   MODEL_ASR_EXTRA: {{ .Values.models.asr.extra | toJson | quote }}
   # RAG pipeline
-  RAG_CAPTION_VIDEO: {{ .Values.rag.captionVideo | quote }}
+  RAG_CAPTION_WITH_ASR: {{ .Values.rag.captionWithAsr | quote }}
+  RAG_CAPTION_WITH_VLM: {{ .Values.rag.captionWithVlm | quote }}
   RAG_REMOTE: {{ .Values.rag.remote | quote }}
   RAG_DEDUP_THRESHOLD: {{ .Values.rag.dedupThreshold | quote }}
   RAG_DEFER_COUNT_SYNC: {{ .Values.rag.deferCountSync | quote }}
@@ -51,6 +52,7 @@ data:
   # Dynamic embedding query batcher (search path)
   EMBEDDING_QUERY_BATCH_SIZE: {{ .Values.app.embeddingQueryBatchSize | quote }}
   EMBEDDING_QUERY_BATCH_WAIT_MS: {{ .Values.app.embeddingQueryBatchWaitMs | quote }}
+  EMBEDDING_MAX_IMAGES_PER_PROMPT: {{ .Values.app.embeddingMaxImagesPerPrompt | quote }}
   # Dynamic Qdrant query batcher (search path)
   QDRANT_QUERY_BATCH_SIZE: {{ .Values.app.qdrantQueryBatchSize | quote }}
   QDRANT_QUERY_BATCH_WAIT_MS: {{ .Values.app.qdrantQueryBatchWaitMs | quote }}

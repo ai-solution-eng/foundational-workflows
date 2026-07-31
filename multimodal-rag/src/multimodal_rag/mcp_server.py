@@ -271,6 +271,16 @@ def get_manager() -> DatasetManager:
             "yes",
         )
         rag_dedup_threshold = float(os.environ.get("RAG_DEDUP_THRESHOLD", "0.995"))
+        rag_caption_with_asr = os.environ.get("RAG_CAPTION_WITH_ASR", "false").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+        rag_caption_with_vlm = os.environ.get("RAG_CAPTION_WITH_VLM", "false").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
 
         from multimodal_rag.model_config import build_all
 
@@ -284,6 +294,8 @@ def get_manager() -> DatasetManager:
             reranker=reranker,
             vlm=vlm,
             asr=asr,
+            caption_with_asr=rag_caption_with_asr,
+            caption_with_vlm=rag_caption_with_vlm,
             remote=rag_remote,
             dedup_threshold=rag_dedup_threshold,
         )
@@ -979,7 +991,11 @@ try:
             lines = ["Available datasets:"]
             for ds in datasets:
                 desc = ds.get("description", "")
-                caption = " [caption_video]" if ds.get("caption_video") else ""
+                caption = ""
+                if ds.get("caption_with_asr"):
+                    caption += " [asr]"
+                if ds.get("caption_with_vlm"):
+                    caption += " [vlm]"
                 lock = " [password]" if ds.get("has_password") else ""
                 unlocked = " [unlocked]" if _is_unlocked(ds["name"]) else ""
                 lines.append(

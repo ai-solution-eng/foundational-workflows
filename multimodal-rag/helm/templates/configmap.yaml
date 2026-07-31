@@ -26,7 +26,8 @@ data:
   MODEL_ASR_URL: {{ .Values.models.asr.url | quote }}
   MODEL_ASR_EXTRA: {{ .Values.models.asr.extra | toJson | quote }}
   # RAG pipeline
-  RAG_CAPTION_VIDEO: {{ .Values.rag.captionVideo | quote }}
+  RAG_CAPTION_WITH_ASR: {{ .Values.rag.captionWithAsr | quote }}
+  RAG_CAPTION_WITH_VLM: {{ .Values.rag.captionWithVlm | quote }}
   RAG_REMOTE: {{ .Values.rag.remote | quote }}
   RAG_DEDUP_THRESHOLD: {{ .Values.rag.dedupThreshold | quote }}
   # Media base URL (for PVC-to-HTTP conversion in MCP search results)

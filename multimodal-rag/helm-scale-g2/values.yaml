@@ -8,7 +8,7 @@
 replicaCount: 2
 image:
   repository: andrewbydlon/rag-api-server
-  tag: v1.6.1
+  tag: v1.8.0
   pullPolicy: IfNotPresent
 
 deployment:
@@ -38,6 +38,8 @@ app:
   # of added latency per query.
   embeddingQueryBatchSize: 128
   embeddingQueryBatchWaitMs: 200
+  # Max images per embedding prompt (vLLM model limit, set in deployment args).
+  embeddingMaxImagesPerPrompt: 4
   # Dynamic Qdrant query batcher for concurrent similarity searches.
   # Collects queries arriving within the wait window and sends them as a
   # single query_batch_points gRPC call. Short window (5ms) since the
@@ -122,7 +124,8 @@ s3:
 
 # -- RAG parameters -----------------------------------------------------------
 rag:
-  captionVideo: false  # Transcribe video audio tracks via ASR
+  captionWithAsr: false  # Transcribe video audio tracks via ASR
+  captionWithVlm: false  # VLM-describe images/videos at ingest (enables VLM-skip at retrieval)
   remote: false         # Use remote model URLs (vs in-cluster .svc.cluster.local)
   dedupThreshold: 0.995  # Cosine similarity above which a doc is considered a duplicate (0.0–1.0)
   # When true, get_dataset() does NOT auto-sync document_count from Qdrant

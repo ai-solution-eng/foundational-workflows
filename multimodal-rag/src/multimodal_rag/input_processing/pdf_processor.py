@@ -16,6 +16,53 @@ def _collapse_whitespace(text: str) -> str:
     return text.strip()
 
 
+def _strip_chart_noise(text: str) -> str:
+    """Remove numeric axis-label and chart-value noise from extracted text.
+
+    PDF text extraction from plot-heavy pages produces runs of bare numbers
+    (axis ticks like ``0 100 200 300 400 500``, chart values like
+    ``35 90.0 70 87.5``) that dilute the semantic content of the chunk and
+    hurt embedding quality.  This function detects runs of 3+ consecutive
+    numeric tokens and removes them, preserving word tokens (including
+    mixed alphanumeric like ``GPQA``, ``AIME25``, ``2025a``) that may be
+    interspersed within the noise.
+
+    A token is considered "numeric" if it matches any of:
+
+    - Bare integers / decimals: ``42``, ``3.14``, ``0.5``
+    - Negative numbers: ``-10``, ``-0.5``
+    - Percentages: ``85%``, ``-2.3%``
+    - Numbers with thousands separators: ``1,000``, ``-2,500.50``
+    - Scientific notation: ``1e-5``, ``3.14E+10``
+
+    Tokens with **alphabetic** suffixes (``100ms``, ``16K``, ``2025a``) are
+    preserved — they carry semantic meaning that aids retrieval.
+    """
+    tokens = text.split()
+    if len(tokens) < 8:
+        return text
+
+    # Numeric token: optional sign, digits with optional comma separators,
+    # optional decimal part, optional exponent, optional percent sign.
+    _NUM_RE = re.compile(r"-?\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:[eE][+-]?\d+)?%?$")
+
+    result: list[str] = []
+    num_run: list[str] = []
+
+    for token in tokens:
+        if _NUM_RE.match(token):
+            num_run.append(token)
+        else:
+            if len(num_run) <= 2:
+                result.extend(num_run)
+            num_run.clear()
+            result.append(token)
+    if len(num_run) <= 2:
+        result.extend(num_run)
+
+    return " ".join(result)
+
+
 def _strip_pdf_artifacts(text: str) -> str:
     """Remove common PDF extraction artifacts from text.
 
@@ -25,6 +72,9 @@ def _strip_pdf_artifacts(text: str) -> str:
 
     Requires 4+ contiguous dots or 2+ spaced dot-pairs to avoid matching
     ellipses (``...``) or decimal points in prose.
+
+    Also removes numeric chart-axis noise (runs of 3+ consecutive
+    purely-numeric tokens) from plot-heavy pages.
     """
     # Spaced dotted leaders with page reference: ". . . . . ii-2"
     text = re.sub(
@@ -42,6 +92,8 @@ def _strip_pdf_artifacts(text: str) -> str:
     )
     # Remaining contiguous dotted leaders: "........"
     text = re.sub(r"\.{4,}", " ", text)
+    # Remove chart axis-label / value noise
+    text = _strip_chart_noise(text)
     return _collapse_whitespace(text)
 
 
@@ -185,8 +237,8 @@ def _is_author_list_chunk(text: str) -> bool:
     # e.g. "John Smith, Jane Doe, and Bob Johnson"
     name_like = 0
     for line in lines:
-        # Must start with a capital letter
-        if not line[0].isupper():
+        # Must be non-empty and start with a capital letter
+        if not line or not line[0].isupper():
             continue
         # Must contain commas with spaces separating capitalized words
         parts = [p.strip() for p in line.split(",")]
@@ -325,6 +377,11 @@ class PDFProcessor:
     # embedding API 400 errors when a page has many small figures.
     _MAX_IMAGES_PER_CHUNK = 20
 
+    # Maximum number of chunks on a page that an image can be attached to.
+    # Spatial proximity matching can associate a large figure with every text
+    # block on the page; this cap prevents embedding the same image many times.
+    _MAX_IMAGE_ASSOCIATIONS = 2
+
     @staticmethod
     def _is_meaningful_image(width: int, height: int) -> bool:
         """Return True if an image is large enough to be a real figure/chart."""
@@ -347,23 +404,57 @@ class PDFProcessor:
         return f"data:{mime};base64,{b64}"
 
     @staticmethod
-    def _ensure_valid_image(doc: Any, xref: int, img_bytes: bytes, ext: str) -> tuple[bytes, str]:
-        """Return image bytes guaranteed to be PIL-readable.
+    def _ensure_valid_image(
+        doc: Any,
+        xref: int,
+        img_bytes: bytes,
+        ext: str,
+        page: Any = None,
+        img_ref: Any = None,
+    ) -> tuple[bytes, str]:
+        """Return image bytes guaranteed to be PIL-readable and non-degenerate.
 
-        Tries PIL first.  If it fails (e.g. JBIG2, JPEG2000, CCITT fax that
-        PIL cannot decode), falls back to ``fitz.Pixmap(doc, xref)`` which
-        renders the image through PyMuPDF's own decoders into a PNG.
+        Tries PIL first.  If PIL fails or the image is degenerate (all-black
+        or all-white, indicating the real content lives in an SMask / soft
+        mask that raw extraction cannot composite), falls back to
+        ``fitz.Pixmap(doc, xref)``.  If that also fails or is degenerate,
+        renders the image's page region via ``page.get_pixmap(clip=...)``
+        which composites image + SMask correctly.
+
+        Parameters
+        ----------
+        page, img_ref:
+            Required for the page-render fallback.  *img_ref* is the full
+            tuple returned by ``page.get_images(full=True)`` whose ``[1]``
+            element is the SMask xref and whose bbox is obtained via
+            ``page.get_image_bbox(img_ref)``.
         """
+        import io as _io
+
+        from PIL import Image as _PIL
+
+        def _is_degenerate(data: bytes) -> bool:
+            """True if the image is all-black or all-white (no visible content)."""
+            try:
+                pil = _PIL.open(_io.BytesIO(data)).convert("RGB")
+                extrema = pil.getextrema()
+                # getextrema() returns [(min,max), ...] for multi-channel,
+                # but (min, max) for single-channel.  Normalise to a list.
+                channels: list[tuple[Any, Any]] = [extrema] if isinstance(extrema[0], (int, float)) else list(extrema)
+                return all(mx == 0 for _, mx in channels) or all(mn == 255 for mn, _ in channels)
+            except Exception:
+                return False
+
+        # 1. Raw extracted bytes (may be degenerate if content is in SMask)
         try:
-            import io as _io
-
-            from PIL import Image as _PIL
-
-            _PIL.open(_io.BytesIO(img_bytes))
-            return img_bytes, ext
+            _PIL.open(_io.BytesIO(img_bytes))  # PIL-readable?
+            if not _is_degenerate(img_bytes):
+                return img_bytes, ext
+            logger.debug("Image xref %d is degenerate (all-black/white), trying fallbacks", xref)
         except Exception:
             logger.debug("Suppressed exception", exc_info=True)
 
+        # 2. fitz.Pixmap (handles CMYK etc. but not SMask compositing)
         try:
             import fitz
 
@@ -372,14 +463,35 @@ class PDFProcessor:
             if pix.n >= 4 or pix.n == 2:
                 pix = fitz.Pixmap(fitz.csRGB, pix)
             png_bytes = pix.tobytes("png")
-            return png_bytes, "png"
+            if not _is_degenerate(png_bytes):
+                return png_bytes, "png"
+            logger.debug("Pixmap for xref %d also degenerate, trying page render", xref)
         except Exception as conv_exc:
             logger.warning(
-                "Pixmap conversion failed for xref %d: %s — using raw bytes",
+                "Pixmap conversion failed for xref %d: %s — trying page render",
                 xref,
                 conv_exc,
             )
-            return img_bytes, ext
+
+        # 3. Page render (composites image + SMask + color spaces correctly)
+        if page is not None and img_ref is not None:
+            try:
+                import fitz
+
+                bbox = page.get_image_bbox(img_ref)
+                if bbox:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=bbox)
+                    png_bytes = pix.tobytes("png")
+                    if not _is_degenerate(png_bytes):
+                        return png_bytes, "png"
+                    logger.warning(
+                        "Page render for xref %d also degenerate — using raw bytes",
+                        xref,
+                    )
+            except Exception as render_exc:
+                logger.warning("Page render failed for xref %d: %s", xref, render_exc)
+
+        return img_bytes, ext
 
     @staticmethod
     def _overlap_text(text: str, num_chars: int, text_splitter=None) -> str:
@@ -404,11 +516,24 @@ class PDFProcessor:
         is used (which itself avoids tiny tails via a 10 % net-new merge and a
         ``chunk_size // 4`` minimum-tail backfill).  The character-based fallback
         applies the same two rules.
+
+        *chunk_overlap* is capped at 80 % of *chunk_size* to prevent infinite
+        loops where the overlap consumes the entire chunk (start never advances).
         """
         if not text:
             return []
         if text_splitter is not None:
             return text_splitter.split_text(text)
+
+        max_overlap = int(chunk_size * 0.8)
+        if chunk_overlap > max_overlap:
+            logger.warning(
+                "chunk_overlap (%d) exceeds 80%% of chunk_size (%d) — capping to %d",
+                chunk_overlap,
+                chunk_size,
+                max_overlap,
+            )
+            chunk_overlap = max_overlap
 
         min_new = max(chunk_size // 10, 1)
         min_tail = max(chunk_size // 4, 1)
@@ -464,13 +589,19 @@ class PDFProcessor:
             text = page.get_text()
 
             images = []
+            seen_xrefs: set[int] = set()
             for img_idx, img_info in enumerate(page.get_images(full=True)):
                 xref = img_info[0]
+                if xref in seen_xrefs:
+                    continue
+                seen_xrefs.add(xref)
                 try:
                     extracted = doc.extract_image(xref)
                     if not self._is_meaningful_image(extracted.get("width", 0), extracted.get("height", 0)):
                         continue
-                    img_bytes, img_ext = self._ensure_valid_image(doc, xref, extracted["image"], extracted["ext"])
+                    img_bytes, img_ext = self._ensure_valid_image(
+                        doc, xref, extracted["image"], extracted["ext"], page=page, img_ref=img_info
+                    )
                     images.append(
                         {
                             "data_url": self._img_to_data_url(img_bytes, img_ext),
@@ -513,7 +644,9 @@ class PDFProcessor:
                 if not self._is_meaningful_image(extracted.get("width", 0), extracted.get("height", 0)):
                     continue
                 bbox = page.get_image_bbox(img_ref)
-                img_bytes, img_ext = self._ensure_valid_image(doc, xref, extracted["image"], extracted["ext"])
+                img_bytes, img_ext = self._ensure_valid_image(
+                    doc, xref, extracted["image"], extracted["ext"], page=page, img_ref=img_ref
+                )
                 image_regions.append(
                     {
                         "bbox": (bbox.x0, bbox.y0, bbox.x1, bbox.y1) if bbox else None,
@@ -584,6 +717,25 @@ class PDFProcessor:
                                 "image_data_url": ir["data_url"],
                             }
                         )
+
+        # Emit standalone image entries for image_regions that didn't match
+        # any dict-block (page.get_images() can report more images than
+        # page.get_text("dict")["blocks"] — e.g. inline images, form XObjects).
+        # Without this, such images are silently dropped if no text block is
+        # nearby.
+        matched_urls = {b["image_data_url"] for b in blocks if b["block_type"] == "image"}
+        for ir in image_regions:
+            if ir["data_url"] not in matched_urls:
+                blocks.append(
+                    {
+                        "page_num": page_num,
+                        "block_num": -1,
+                        "text": "",
+                        "block_type": "image",
+                        "bbox": ir["bbox"],
+                        "image_data_url": ir["data_url"],
+                    }
+                )
 
         return blocks
 
@@ -829,9 +981,21 @@ class PDFProcessor:
 
             if current_text.strip():
                 raw_chunks.append({"text": current_text.strip(), "images": current_images})
+                # Carry overlap TEXT to the next page for context continuity,
+                # but DROP accumulated images — they belong to the page just
+                # emitted.  Without this, images accumulate across every page
+                # the overlap text touches and get mislabelled with the wrong
+                # page number.
+                current_text = ""
+                current_images = []
 
             # -- Emit each chunk with deduplicated images --------------------
             emitted_images: set[str] = set()
+            # Track how many chunks each image has been attached to on this
+            # page.  Cap at _MAX_IMAGE_ASSOCIATIONS to avoid embedding the
+            # same image many times (proximity matching can associate a large
+            # figure with every text block on the page).
+            image_assoc_count: dict[str, int] = {}
             for ch in raw_chunks:
                 # Skip noise chunks: reference lists, author lists, and tables of contents
                 if (
@@ -847,7 +1011,9 @@ class PDFProcessor:
                 for url in ch["images"]:
                     if url not in seen:
                         seen.add(url)
-                        ordered.append(url)
+                        if image_assoc_count.get(url, 0) < self._MAX_IMAGE_ASSOCIATIONS:
+                            ordered.append(url)
+                            image_assoc_count[url] = image_assoc_count.get(url, 0) + 1
 
                 # Cap images per chunk to avoid embedding API limits
                 if len(ordered) > self._MAX_IMAGES_PER_CHUNK:
@@ -855,8 +1021,15 @@ class PDFProcessor:
 
                 emitted_images.update(ordered)
 
+                # Re-run chart-noise filter on the merged chunk text.
+                # _strip_chart_noise runs per text-block during extraction,
+                # but numeric axis-label noise can span multiple small blocks
+                # that individually pass the <8-token guard.  When those
+                # blocks are merged into a chunk, the noise is reassembled.
+                chunk_text = _strip_chart_noise(ch["text"])
+
                 entry: dict[str, Any] = {
-                    "text": ch["text"],
+                    "text": chunk_text,
                     "source": pdf_path,
                     "page": pn,
                 }

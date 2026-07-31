@@ -151,20 +151,20 @@ def _get_async_client(remote: bool = False, base_url: str = "") -> httpx.AsyncCl
         # No running loop — create a short-lived client.  Caller is
         # responsible for closing it.
         return httpx.AsyncClient(
-            verify=False if remote else True,
+            verify=not remote,
             timeout=httpx.Timeout(300.0, connect=30.0),
             limits=_pool_limits_from_env(),
         )
     cache = _async_remote_client_cache if remote else _async_client_cache
     with _async_client_lock:
-        loop_clients: dict = cache.get(loop)
+        loop_clients: dict[str, httpx.AsyncClient] | None = cache.get(loop)
         if loop_clients is None:
             loop_clients = {}
             cache[loop] = loop_clients
         client = loop_clients.get(base_url)
         if client is None:
             client = httpx.AsyncClient(
-                verify=False if remote else True,
+                verify=not remote,
                 timeout=httpx.Timeout(300.0, connect=30.0),
                 limits=_pool_limits_from_env(),
             )

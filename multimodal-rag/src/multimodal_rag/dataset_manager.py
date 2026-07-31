@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +63,75 @@ _DEFER_COUNT_SYNC = os.environ.get("RAG_DEFER_COUNT_SYNC", "false").lower() in (
     "1",
     "yes",
 )
+
+# Optional Redis backend for cross-pod dataset existence caching.
+# When a dataset is created on pod A, pod B's NFS client cache may not
+# see meta.json for several seconds.  Redis provides an immediate
+# existence signal so pod B can retry _read_meta instead of returning 404.
+_REDIS_URL = os.environ.get("REDIS_URL", "")
+_redis_client: Any = None
+_redis_client_lock = threading.Lock()
+
+# How many times to retry _read_meta when Redis says the dataset exists
+# but NFS hasn't propagated yet.
+_DATASET_EXIST_RETRY_COUNT = 4
+_DATASET_EXIST_RETRY_DELAY = 0.5  # seconds
+
+
+def _get_redis() -> Any:
+    """Lazily build a Redis client, cached for the process lifetime."""
+    global _redis_client
+    if not _REDIS_URL:
+        return None
+    if _redis_client is not None:
+        return _redis_client
+    with _redis_client_lock:
+        if _redis_client is not None:
+            return _redis_client
+        try:
+            import redis  # type: ignore[import-untyped]
+
+            _redis_client = redis.from_url(_REDIS_URL, socket_timeout=2.0, socket_connect_timeout=2.0)
+            _redis_client.ping()
+            logger.info("Dataset existence cache: Redis backend connected at %s", _REDIS_URL)
+        except Exception as exc:
+            logger.warning("Dataset existence cache: Redis unavailable (%s); falling back to NFS-only", exc)
+            _redis_client = None
+    return _redis_client
+
+
+def _dataset_exist_key(name: str) -> str:
+    return f"dataset_exists:{name}"
+
+
+def _dataset_exist_set(name: str) -> None:
+    r = _get_redis()
+    if r is not None:
+        try:
+            r.set(_dataset_exist_key(name), "1", ex=86400)  # 24h TTL
+        except Exception:
+            pass
+
+
+def _dataset_exist_delete(name: str) -> None:
+    r = _get_redis()
+    if r is not None:
+        try:
+            r.delete(_dataset_exist_key(name))
+        except Exception:
+            pass
+
+
+def _dataset_exist_check(name: str) -> bool:
+    """Return True if Redis says the dataset exists (NFS may lag)."""
+    r = _get_redis()
+    if r is None:
+        return False
+    try:
+        return r.exists(_dataset_exist_key(name)) > 0
+    except Exception:
+        return False
+
 
 # Fallback thread locks for platforms without fcntl (Windows dev only).
 _fallback_locks: dict[str, threading.Lock] = {}
@@ -728,7 +798,7 @@ class DatasetManager:
     embedder, reranker, vlm, asr:
         Model instances.  Uses defaults from :mod:`pcai_models` when
         ``None``.
-    caption_video:
+    caption_with_asr:
         Whether to transcribe audio tracks from videos via ASR.
     remote:
         Whether to use remote (cluster) model endpoints.
@@ -743,7 +813,8 @@ class DatasetManager:
         reranker=None,
         vlm=None,
         asr=None,
-        caption_video: bool = False,
+        caption_with_asr: bool = False,
+        caption_with_vlm: bool = False,
         remote: bool = True,
         dedup_threshold: float = 0.995,
     ):
@@ -792,7 +863,8 @@ class DatasetManager:
         self.reranker = reranker
         self.vlm = vlm
         self.asr = asr
-        self.caption_video = caption_video
+        self.caption_with_asr = caption_with_asr
+        self.caption_with_vlm = caption_with_vlm
         self.remote = remote
         self.dedup_threshold = dedup_threshold
 
@@ -888,17 +960,30 @@ class DatasetManager:
         self,
         name: str,
         description: str = "",
-        caption_video: bool = False,
+        caption_with_asr: bool = False,
+        caption_with_vlm: bool = False,
+        keep_originals: bool = True,
         password: str | None = None,
     ) -> dict[str, Any]:
         """Create a new dataset.
 
         Parameters
         ----------
-        caption_video:
+        caption_with_asr:
             Whether to transcribe audio tracks from videos during
             preprocessing.  Set per-dataset — applies to all files and
             documents added to this dataset.
+        caption_with_vlm:
+            Whether to generate VLM descriptions of images/videos during
+            preprocessing (even when the embedder supports them natively).
+            Descriptions enrich the text and are reused at retrieval time
+            for generic queries, avoiding a VLM call.
+        keep_originals:
+            Whether to keep original (full-quality) files on disk after
+            preprocessing.  When False, the original is deleted once a
+            preprocessed copy exists, saving disk space.  The Qdrant
+            ``original_image``/``original_video`` references are also
+            removed.  Default True.
         password:
             Optional password to protect read access to the dataset.
             Stored as a PBKDF2-SHA256 hash.
@@ -913,7 +998,9 @@ class DatasetManager:
         meta: dict[str, Any] = {
             "name": name,
             "description": description,
-            "caption_video": caption_video,
+            "caption_with_asr": caption_with_asr,
+            "caption_with_vlm": caption_with_vlm,
+            "keep_originals": keep_originals,
             "created": datetime.now().isoformat(),
             "document_count": 0,
         }
@@ -921,9 +1008,12 @@ class DatasetManager:
             meta["password_hash"] = _hash_password(password)
         self._write_meta(name, meta)
 
+        # Signal dataset existence to other pods via Redis (NFS cache bypass)
+        _dataset_exist_set(name)
+
         # Pre-create the Qdrant collection by initialising the RAG instance
         self._get_rag(name)
-        logger.info("Created dataset '%s' (caption_video=%s)", name, caption_video)
+        logger.info("Created dataset '%s' (caption_with_asr=%s)", name, caption_with_asr)
         return self._strip_password(meta)
 
     def has_password(self, name: str) -> bool:
@@ -977,6 +1067,10 @@ class DatasetManager:
             import shutil
 
             shutil.rmtree(dataset_dir)
+
+        # Invalidate Redis existence cache so other pods don't retry
+        _dataset_exist_delete(name)
+
         logger.info("Deleted dataset '%s'", name)
 
     def list_datasets(self) -> list[dict[str, Any]]:
@@ -1001,10 +1095,27 @@ class DatasetManager:
         ``sync_count`` is ignored when ``RAG_DEFER_COUNT_SYNC`` is set, so
         reads never trigger a Qdrant round-trip + meta.json write under the
         scale deployment.
+
+        When Redis is available and signals that the dataset exists, this
+        method retries ``_read_meta`` a few times with short delays to
+        bridge the NFS close-to-open cache propagation gap between pods.
         """
         meta = self._read_meta(name)
         if not meta:
-            raise FileNotFoundError(f"Dataset '{name}' not found")
+            # NFS cache may not have propagated meta.json from another pod.
+            # If Redis says the dataset exists, retry with short delays.
+            if _dataset_exist_check(name):
+                logger.debug(
+                    "Dataset '%s' not visible on NFS yet but Redis confirms existence — retrying",
+                    name,
+                )
+                for _ in range(_DATASET_EXIST_RETRY_COUNT):
+                    time.sleep(_DATASET_EXIST_RETRY_DELAY)
+                    meta = self._read_meta(name)
+                    if meta:
+                        break
+            if not meta:
+                raise FileNotFoundError(f"Dataset '{name}' not found")
         if sync_count and not _DEFER_COUNT_SYNC:
             self._sync_count_from_qdrant(name, meta)
         return self._strip_password(meta)
@@ -1015,7 +1126,7 @@ class DatasetManager:
             meta = self._read_meta(name)
             if not meta:
                 raise FileNotFoundError(f"Dataset '{name}' not found")
-            for key in ("description", "caption_video"):
+            for key in ("description", "caption_with_asr", "caption_with_vlm", "keep_originals"):
                 if key in updates:
                     meta[key] = updates[key]
             self._write_meta(name, meta)
@@ -1289,6 +1400,11 @@ class DatasetManager:
                     batch_files_list.append((fname, 1, file_type))
                     file_total = 1
 
+                    # Delete original if keep_originals=False
+                    if dst_str != original_dst and not self._get_keep_originals(dataset_name):
+                        self._delete_original_file(dataset_name, original_dst, [], "original_image")
+                        doc.pop("original_image", None)
+
                 elif file_type == "video":
                     original_dst = dst_str
                     dst = _preprocess_video_file(dst)
@@ -1331,6 +1447,13 @@ class DatasetManager:
                         batch_files_list.append((fname, len(vid_batch), file_type))
                     current_score = 0.0
                     file_total = vid_chunk_count
+
+                    # Delete original if keep_originals=False
+                    if dst_str != original_dst and not self._get_keep_originals(dataset_name):
+                        self._delete_original_file(dataset_name, original_dst, [], "original_video")
+                        for vd in batch_docs:
+                            if isinstance(vd, dict):
+                                vd.pop("original_video", None)
 
                 elif file_type == "audio":
                     segments = _split_audio_segments(dst)
@@ -1604,6 +1727,11 @@ class DatasetManager:
             ids = rag.add_to_vector_store([doc])
             self._strip_media_payloads(rag, ids, store_url)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
+
+            # Delete original if keep_originals=False
+            if not source_url and source_str != original_path and not self._get_keep_originals(dataset_name):
+                self._delete_original_file(dataset_name, original_path, ids, "original_image")
+
             return {"type": "image", "chunks": len(ids), "stored_ids": ids}
 
         elif file_type == "video":
@@ -1630,6 +1758,11 @@ class DatasetManager:
                 self._increment_count(dataset_name, len(ids), file_type=file_type)
             else:
                 ids = []
+
+            # Delete original if keep_originals=False
+            if original_url and not self._get_keep_originals(dataset_name):
+                self._delete_original_file(dataset_name, original_path, ids, "original_video")
+
             return {"type": "video", "chunks": len(ids), "stored_ids": ids}
 
         elif file_type == "audio":
@@ -2055,6 +2188,67 @@ class DatasetManager:
             return str(tier1)
         return None
 
+    def _delete_original_file(
+        self,
+        dataset_name: str,
+        original_path: str,
+        doc_ids: list[str],
+        tier1_key: str,
+    ) -> None:
+        """Delete a tier-1 original file and remove its Qdrant reference.
+
+        Called after preprocessing succeeds when ``keep_originals=False``.
+        Only deletes the file if it exists and is distinct from the
+        preprocessed copy.  Also removes the ``original_image`` /
+        ``original_video`` key from the Qdrant payloads and updates
+        the dedup hash index.
+        """
+        p = Path(original_path)
+        if not p.exists():
+            return
+
+        # Delete the file
+        try:
+            p.unlink()
+            logger.info("Deleted original file (keep_originals=False): %s", original_path)
+        except Exception:
+            logger.debug("Failed to delete original file %s", original_path, exc_info=True)
+            return
+
+        # Remove from dedup hash index
+        files_dir = self._dataset_dir(dataset_name) / "files"
+        hashes_path = files_dir / ".hashes.json"
+        if hashes_path.exists():
+            with _cross_process_lock(files_dir / ".hashes.lock"):
+                try:
+                    with open(hashes_path) as f:
+                        hash_index = json.load(f)
+                    # Remove any entry pointing at this file
+                    stale = [k for k, v in hash_index.items() if v == original_path]
+                    for k in stale:
+                        del hash_index[k]
+                    with open(hashes_path, "w") as f:
+                        json.dump(hash_index, f)
+                except Exception:
+                    logger.debug("Failed to update .hashes.json", exc_info=True)
+
+        # Remove original_* key from Qdrant payloads
+        try:
+            rag = self._get_rag(dataset_name)
+            vs = rag.vector_store
+            assert vs is not None and not isinstance(vs, dict)
+            client = vs._client  # type: ignore[attr-defined]
+            coll = vs.collection_name  # type: ignore[attr-defined]
+
+            for doc_id in doc_ids:
+                client.set_payload(
+                    collection_name=coll,
+                    payload={tier1_key: None},
+                    points=[doc_id],
+                )
+        except Exception:
+            logger.debug("Failed to remove %s from Qdrant payloads", tier1_key, exc_info=True)
+
     def migrate_tier_schema(
         self,
         dataset_name: str,
@@ -2281,6 +2475,11 @@ class DatasetManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _get_keep_originals(self, dataset_name: str) -> bool:
+        """Read the keep_originals flag from dataset metadata (default True)."""
+        meta = self._read_meta(dataset_name) or {}
+        return meta.get("keep_originals", True)
+
     def _get_rag(self, dataset_name: str) -> MultimodalRAG:
         """Return (or create and cache) a MultimodalRAG for *dataset_name*."""
         # Fast path — no lock needed once cached
@@ -2293,13 +2492,15 @@ class DatasetManager:
             if rag is not None:
                 return rag
             meta = self._read_meta(dataset_name) or {}
-            ds_caption_video = meta.get("caption_video", self.caption_video)
+            ds_caption_with_asr = meta.get("caption_with_asr", self.caption_with_asr)
+            ds_caption_with_vlm = meta.get("caption_with_vlm", self.caption_with_vlm)
             rag = MultimodalRAG(
                 embedder=self.embedder,
                 reranker=self.reranker,
                 vlm=self.vlm,
                 asr=self.asr,
-                caption_video=ds_caption_video,
+                caption_with_asr=ds_caption_with_asr,
+                caption_with_vlm=ds_caption_with_vlm,
                 remote=self.remote,
                 dedup_threshold=self.dedup_threshold,
                 vector_store={

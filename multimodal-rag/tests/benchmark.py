@@ -285,7 +285,11 @@ async def run_user_mcp(
             MCP_DEFAULT_TIMEOUT,
         )
 
-        def _insecure_http_client_factory(headers=None, timeout=None, auth=None):
+        def _insecure_http_client_factory(
+            headers: dict[str, str] | None = None,
+            timeout: httpx.Timeout | None = None,
+            auth: httpx.Auth | None = None,
+        ) -> httpx.AsyncClient:
             kwargs: dict = {"follow_redirects": True, "verify": False}
             kwargs["timeout"] = (
                 timeout
