@@ -173,6 +173,28 @@ spec:
               readOnly: true
             {{- end }}
           resources: {{ toYaml .Values.resources.app | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.mcp.port }}
+            failureThreshold: 60
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.mcp.port }}
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.mcp.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
         {{- end }}
 
       volumes:

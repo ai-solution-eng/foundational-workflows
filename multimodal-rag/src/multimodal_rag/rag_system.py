@@ -1505,29 +1505,56 @@ class MultimodalRAG:
             # ── 0d. Replace audio payloads with file references ─────────────
             sub = [_replace_audio(d) if isinstance(d, dict) else d for d in sub]
 
-            # ── 1. Embed this sub-batch ──────────────────────────────────────
+            # ── 0e. Create text-only twins for multimodal docs ──────────────
+            # A multimodal embedding (text + images) can be dominated by the
+            # image content, burying the text signal so text queries don't
+            # match.  For each multimodal doc that also has text, create a
+            # text-only twin: same text + metadata, no media, tagged with
+            # ``_twin=True`` so it can be deduplicated at retrieval when both
+            # the twin and the multimodal original appear in results.
+            twin_docs: list[str | dict[str, Any]] = []
+            twin_parent_ids: list[int] = []  # index into sub
+            for idx, doc in enumerate(sub):
+                if not isinstance(doc, dict):
+                    continue
+                text = (doc.get("text") or "").strip()
+                if not text:
+                    continue
+                has_media = any(doc.get(k) for k in ("image", "video", "audio"))
+                if not has_media:
+                    continue
+                twin = {k: v for k, v in doc.items() if k not in ("image", "video", "audio")}
+                twin["_twin"] = True
+                twin_docs.append(twin)
+                twin_parent_ids.append(idx)
+
+            # ── 1. Embed this sub-batch (multimodal + text-only twins) ──────
             t1 = time.monotonic()
             sub_embs = await self.embed.aembed_documents(sub)
+            if twin_docs:
+                twin_embs = await self.embed.aembed_documents(twin_docs)
+                sub_embs.extend(twin_embs)
             t_embed_total += time.monotonic() - t1
 
             # Guard against silent data loss: if the embedding API returns
             # fewer/more vectors than documents, zip() would silently
             # truncate.  Log at error level and align to the shorter length.
-            if len(sub_embs) != len(sub):
+            all_docs = list(sub) + list(twin_docs)
+            if len(sub_embs) != len(all_docs):
                 logger.error(
                     "Embedding count mismatch: %d docs → %d embeddings. "
                     "Truncating to %d — %d document(s) will be DROPPED.",
-                    len(sub),
+                    len(all_docs),
                     len(sub_embs),
-                    min(len(sub), len(sub_embs)),
-                    abs(len(sub) - len(sub_embs)),
+                    min(len(all_docs), len(sub_embs)),
+                    abs(len(all_docs) - len(sub_embs)),
                 )
-                min_len = min(len(sub), len(sub_embs))
-                sub = sub[:min_len]
+                min_len = min(len(all_docs), len(sub_embs))
+                all_docs = all_docs[:min_len]
                 sub_embs = sub_embs[:min_len]
 
             # ── 2. Build Document payloads ──────────────────────────────────
-            sub_docs = self._to_documents(sub)
+            sub_docs = self._to_documents(all_docs)
 
             # ── 2b. Deduplicate ─────────────────────────────────────────────
             if deduplicate and sub_embs:
@@ -1543,7 +1570,7 @@ class MultimodalRAG:
                 sub_docs = [d for d, dup in zip(sub_docs, results) if not dup]
                 sub_embs = [e for e, dup in zip(sub_embs, results) if not dup]
                 if skipped:
-                    logger.info("Dedup: skipped %d of %d document(s)", skipped, len(sub))
+                    logger.info("Dedup: skipped %d of %d document(s)", skipped, len(all_docs))
 
             if not sub_docs:
                 continue
@@ -1621,6 +1648,98 @@ class MultimodalRAG:
         results: list[tuple[Any, float]],
     ) -> list[tuple[Any, float]]:
         return sync_wrapper_safe(self._arerank_results, {"query": query, "results": results})
+
+    @staticmethod
+    def _dedup_twins(results: list[tuple[Any, float]]) -> list[tuple[Any, float]]:
+        """Remove duplicate results so downstream compute and LLM context isn't wasted.
+
+        Two dedup passes:
+
+        1. **Twin vs parent**: text-only twins (tagged ``_twin=True``) that
+           share the same ``(source, page, chunk_index)`` as a multimodal
+           parent are dropped — the parent carries the images.
+
+        2. **Text-content dedup**: if two results have identical text
+           (e.g. overlapping chunks from cross-page carry), keep only the
+           higher-scoring one.  When one is a twin and the other isn't,
+           prefer the non-twin (multimodal) version regardless of score.
+        """
+        if not results:
+            return results
+
+        def _dedup_key(doc: Any) -> tuple | None:
+            if isinstance(doc, dict):
+                src = doc.get("source", "")
+                page = doc.get("page")
+                ci = doc.get("chunk_index")
+                if src:
+                    return (src, page, ci)
+            return None
+
+        # ── Pass 1: drop twins whose multimodal parent is also present ──
+        parent_keys: set[tuple] = set()
+        for doc, _ in results:
+            if isinstance(doc, dict) and doc.get("_twin"):
+                continue
+            key = _dedup_key(doc)
+            if key is not None:
+                parent_keys.add(key)
+
+        pass1: list[tuple[Any, float]] = []
+        for doc, score in results:
+            if isinstance(doc, dict) and doc.get("_twin"):
+                key = _dedup_key(doc)
+                if key is not None and key in parent_keys:
+                    continue
+            pass1.append((doc, score))
+
+        # ── Pass 2: dedup by text content, keep best score ─────────────
+        # When a twin and non-twin share the same text, prefer the non-twin
+        # (it has images).  Otherwise keep the higher-scoring entry.
+        import hashlib as _hashlib
+
+        best_by_text: dict[str, tuple[Any, float, bool]] = {}
+        for doc, score in pass1:
+            if isinstance(doc, dict):
+                text = (doc.get("text") or "").strip()
+            elif isinstance(doc, str):
+                text = doc.strip()
+            else:
+                text = str(doc).strip()
+            if not text:
+                continue
+            text_hash = _hashlib.md5(text.encode()).hexdigest()
+            is_twin = isinstance(doc, dict) and doc.get("_twin", False)
+            if text_hash not in best_by_text:
+                best_by_text[text_hash] = (doc, score, is_twin)
+            else:
+                _, _, existing_is_twin = best_by_text[text_hash]
+                # Replace if: current is non-twin and existing is twin,
+                # or current scores higher and twin-status is equal
+                if not is_twin and existing_is_twin or is_twin == existing_is_twin and score > best_by_text[text_hash][1]:
+                    best_by_text[text_hash] = (doc, score, is_twin)
+
+        # Preserve original order (first occurrence wins ties)
+        seen_hashes: set[str] = set()
+        deduped: list[tuple[Any, float]] = []
+        for doc, score in pass1:
+            if isinstance(doc, dict):
+                text = (doc.get("text") or "").strip()
+            elif isinstance(doc, str):
+                text = doc.strip()
+            else:
+                text = str(doc).strip()
+            if not text:
+                deduped.append((doc, score))
+                continue
+            text_hash = _hashlib.md5(text.encode()).hexdigest()
+            if text_hash in seen_hashes:
+                continue
+            seen_hashes.add(text_hash)
+            # Only keep if this doc is the best for its text hash
+            best_doc, best_score, _ = best_by_text[text_hash]
+            deduped.append((best_doc, best_score))
+        return deduped
 
     async def _arerank_results(
         self,
@@ -1718,6 +1837,14 @@ class MultimodalRAG:
                     need_media=need_media,
                 )
             results = [(self._extract_doc(doc), score) for doc, score in docs_and_scores]
+
+        # ── Deduplicate text-only twins ─────────────────────────────────
+        # When both a twin (text-only) and its multimodal parent appear in
+        # the results, drop the twin — the parent has the images the user
+        # needs.  Twins are identified by the ``_twin`` metadata flag.
+        # Dedup key: (source, page, chunk_index) so twins of different
+        # sub-chunks from the same page are not collapsed.
+        results = self._dedup_twins(results)
 
         if use_reranker and self.reranker is None:
             logger.warning(

@@ -35,7 +35,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from multimodal_rag.dataset_manager import DatasetManager
 from multimodal_rag.utils.general_tools import sync_pool
@@ -337,6 +337,76 @@ def _unlock_cache_set(dataset: str, cid: str, password: str) -> None:
         _UNLOCK_CACHE[(dataset, cid)] = (time.monotonic() + _UNLOCK_TTL, password)
 
 
+# ---------------------------------------------------------------------------
+# Password-failure throttling (brute-force mitigation)
+# ---------------------------------------------------------------------------
+
+_PW_FAIL_WINDOW = float(os.environ.get("PW_FAIL_WINDOW", "300.0"))  # seconds
+_PW_MAX_FAILURES = max(1, int(os.environ.get("PW_MAX_FAILURES", "10")))
+_pw_fail_buckets: dict[str, list[float]] = {}
+_pw_fail_lock = threading.Lock()
+
+
+def _pw_failure_count(cid: str) -> int:
+    now = time.monotonic()
+    with _pw_fail_lock:
+        lst = _pw_fail_buckets.get(cid)
+        if not lst:
+            return 0
+        lst[:] = [t for t in lst if now - t < _PW_FAIL_WINDOW]
+        return len(lst)
+
+
+def _pw_record_failure(cid: str) -> None:
+    now = time.monotonic()
+    with _pw_fail_lock:
+        lst = _pw_fail_buckets.setdefault(cid, [])
+        lst[:] = [t for t in lst if now - t < _PW_FAIL_WINDOW]
+        lst.append(now)
+        if len(_pw_fail_buckets) > 10_000:
+            stale = [k for k, v in _pw_fail_buckets.items() if not v]
+            for k in stale:
+                _pw_fail_buckets.pop(k, None)
+
+
+def _pw_reset_failures(cid: str) -> None:
+    with _pw_fail_lock:
+        _pw_fail_buckets.pop(cid, None)
+
+
+def _check_pw_throttle(cid: str) -> None:
+    if _pw_failure_count(cid) >= _PW_MAX_FAILURES:
+        raise HTTPException(429, "Too many password attempts — try again later.")
+
+
+# ---------------------------------------------------------------------------
+# Short-lived media tokens (shared secret with the MCP server)
+# ---------------------------------------------------------------------------
+
+_MEDIA_TOKEN_SECRET = os.environ.get("MEDIA_TOKEN_SECRET", "")
+_MEDIA_TOKEN_TTL = max(60, int(os.environ.get("MEDIA_TOKEN_TTL", "3600")))
+
+
+def _verify_media_token(dataset_name: str, rel_path: str, token: str) -> bool:
+    """True if *token* is an unexpired HMAC authorising ``{dataset}/{rel_path}``."""
+    import hashlib
+    import hmac
+
+    if not _MEDIA_TOKEN_SECRET:
+        return False
+    try:
+        expiry_s, sig = token.split(".", 1)
+        expiry = int(expiry_s)
+    except (ValueError, TypeError):
+        return False
+    now = int(time.time())
+    if expiry < now or expiry > now + _MEDIA_TOKEN_TTL + 300:
+        return False
+    msg = f"{dataset_name}:{rel_path}:{expiry}".encode()
+    expected = hmac.new(_MEDIA_TOKEN_SECRET.encode(), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
 def _require_dataset_password(
     dm: DatasetManager,
     name: str,
@@ -351,13 +421,17 @@ def _require_dataset_password(
     """
     if not dm.has_password(name):
         return
+    cid = _unlock_client_id(request) if request is not None else "unknown"
 
     # 1. If a password was supplied, verify and cache it
     if password:
+        _check_pw_throttle(cid)
         if dm.verify_password(name, password):
+            _pw_reset_failures(cid)
             if request is not None:
-                _unlock_cache_set(name, _unlock_client_id(request), password)
+                _unlock_cache_set(name, cid, password)
             return
+        _pw_record_failure(cid)
         raise HTTPException(403, f"Incorrect password for dataset '{name}'")
 
     # 2. Check the unlock cache (trust the cached password without
@@ -370,6 +444,7 @@ def _require_dataset_password(
         if cached is not None:
             return
 
+    _check_pw_throttle(cid)
     raise HTTPException(401, f"Dataset '{name}' is password protected")
 
 
@@ -381,6 +456,43 @@ app = FastAPI(
     title="Multimodal RAG Dataset Manager",
     version="1.0.0",
 )
+
+# Optional API-key authentication for the REST API.  Enabled by setting
+# RAG_API_KEY.  When set, every request must present either the
+# ``X-RAG-Api-Key`` header or ``Authorization: Bearer <key>``.  Liveness /
+# readiness probes, the HTML frontend pages, dataset media serving (which is
+# password/token protected anyway) and staged-file serving are exempt.
+# With the key set, interactive docs (/docs) are effectively disabled.
+_RAG_API_KEY = os.environ.get("RAG_API_KEY", "")
+
+_PUBLIC_PATHS = frozenset({"/healthz", "/readyz", "/favicon.png", "/", "/manage"})
+
+
+def _is_public_path(path: str) -> bool:
+    if path in _PUBLIC_PATHS:
+        return True
+    # Media/file serving is protected by the dataset password or media tokens.
+    if path.startswith("/api/datasets/") and "/files/" in path:
+        return True
+    if path.startswith("/api/staging/"):
+        return path != "/api/staging"
+    return False
+
+
+@app.middleware("http")
+async def _api_key_auth(request: Request, call_next):
+    if not _RAG_API_KEY or _is_public_path(request.url.path):
+        return await call_next(request)
+    key = request.headers.get("X-RAG-Api-Key") or ""
+    if not key:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            key = auth[len("Bearer "):]
+    import secrets
+
+    if secrets.compare_digest(key, _RAG_API_KEY):
+        return await call_next(request)
+    return JSONResponse({"detail": "Missing or invalid API key"}, status_code=401)
 
 
 @app.on_event("startup")
@@ -548,14 +660,17 @@ async def api_unlock_dataset(name: str, request: Request, body: dict[str, Any] =
     if not password:
         raise HTTPException(400, "Field 'password' is required")
 
+    cid = _unlock_client_id(request)
+    _check_pw_throttle(cid)
     if not dm.verify_password(name, password):
+        _pw_record_failure(cid)
         raise HTTPException(403, f"Incorrect password for dataset '{name}'")
+    _pw_reset_failures(cid)
 
     ttl = body.get("ttl", _UNLOCK_TTL)
     if not isinstance(ttl, int) or ttl < 60 or ttl > 86400:
         raise HTTPException(400, "TTL must be between 60 and 86400 seconds")
 
-    cid = _unlock_client_id(request)
     with _UNLOCK_CACHE_LOCK:
         _UNLOCK_CACHE[(name, cid)] = (time.monotonic() + ttl, password)
 
@@ -993,20 +1108,28 @@ async def api_serve_file(
     filepath: str,
     request: Request,
     password: str = Query(""),
+    token: str = Query(""),
     x_dataset_password: str | None = Header(None, alias="X-Dataset-Password"),
 ):
     """Serve a stored file from a dataset's files directory.
 
-    Accepts the password via the ``X-Dataset-Password`` header or the
-    ``password`` query parameter (the latter is used when the browser
-    loads media in ``<img>`` / ``<video>`` / ``<audio>`` tags which
-    cannot set custom headers).
+    Accepts the password via the ``X-Dataset-Password`` header, the
+    ``password`` query parameter (for ``<img>/<video>/<audio>`` tags which
+    cannot set custom headers), or a short-lived HMAC ``token`` minted by
+    the MCP server when ``MEDIA_TOKEN_SECRET`` is configured.
     """
     dm = await get_manager_async()
-    try:
-        _require_dataset_password(dm, name, password or x_dataset_password or None, request)
-    except FileNotFoundError:
-        raise HTTPException(404, f"Dataset '{name}' not found")
+    if token:
+        # A media token fully authorises this specific file — no password check.
+        if not _verify_media_token(name, filepath, token):
+            raise HTTPException(403, "Invalid or expired media token")
+    else:
+        try:
+            _require_dataset_password(dm, name, password or x_dataset_password or None, request)
+        except FileNotFoundError:
+            raise HTTPException(404, f"Dataset '{name}' not found")
+
+    from urllib.parse import quote
 
     from fastapi.responses import FileResponse
 
@@ -1019,7 +1142,21 @@ async def api_serve_file(
         raise HTTPException(403, "Invalid file path")
     if not file_path.is_file():
         raise HTTPException(404, "File not found")
-    return FileResponse(str(file_path))
+
+    # Only evergreen media MIME types may render inline.  SVG (image/svg+xml),
+    # HTML, JSON, etc. are forced to `attachment` so a crafted uploaded file
+    # cannot execute script in the origin when a frontend embeds it.
+    media_type, _ = mimetypes.guess_type(str(file_path))
+    inline = (
+        media_type is not None
+        and media_type.split("/")[0] in ("image", "video", "audio")
+        and media_type != "image/svg+xml"
+    )
+    headers: dict[str, str] = {}
+    if not inline:
+        safe_name = quote(file_path.name, safe="")
+        headers["Content-Disposition"] = f'attachment; filename*=UTF-8\'\'{safe_name}'
+    return FileResponse(str(file_path), headers=headers)
 
 
 # -- Staging (transient media handoff for MCP tools) -------------------------
@@ -1035,7 +1172,10 @@ _sweep_lock = threading.Lock()
 
 def _staging_root() -> Path:
     """Return (creating if needed) the staging directory under DATA_PATH."""
-    d = Path(DATA_PATH) / "staging"
+    # Read DATA_PATH from the environment on every call — the CLI may set it
+    # after this module is imported (see main()), and a module-level constant
+    # would silently point at the wrong mount.
+    d = Path(os.environ.get("DATA_PATH", "/data")) / "staging"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -1048,7 +1188,7 @@ def _sweep_staging() -> None:
     O(uploads), and every filesystem error is suppressed so a sweep never
     raises into the caller.
     """
-    base = Path(DATA_PATH) / "staging"
+    base = Path(os.environ.get("DATA_PATH", "/data")) / "staging"
     if not base.exists():
         return
     cutoff = time.time() - _STAGING_TTL
@@ -1307,7 +1447,7 @@ async def api_staging_serve(staging_id: str):
     """
     if not _is_valid_staging_id(staging_id):
         raise HTTPException(400, "Invalid staging id")
-    sub = Path(DATA_PATH) / "staging" / staging_id
+    sub = Path(os.environ.get("DATA_PATH", "/data")) / "staging" / staging_id
     if not sub.is_dir():
         raise HTTPException(404, "Staged file not found or expired")
     files = [f for f in sub.iterdir() if f.is_file()]

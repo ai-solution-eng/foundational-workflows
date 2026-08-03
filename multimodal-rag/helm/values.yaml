@@ -2,7 +2,7 @@
 replicaCount: 1
 image:
   repository: andrewbydlon/rag-api-server
-  tag: v1.8.0
+  tag: v1.9.0
   pullPolicy: IfNotPresent
 
 deployment:
@@ -131,6 +131,24 @@ resources:
 
 # -- Environment variables (extra) --------------------------------------------
 extraEnv: {}
+
+# -- Security hardening (optional, opt-in) -----------------------------------
+# Every guard is OFF / permissive by default so the chart behaves exactly as
+# before — flip a value to enable the corresponding protection.
+
+security:
+  apiKey: ""
+  mediaTokenSecret: ""
+  mediaTokenTtl: 3600
+  ingestAllowHosts: ""
+  blockPrivateHosts: false
+  maxDownloadBytes: 536870912
+  archiveMaxTotalBytes: 2147483648
+  archiveMaxMemberBytes: 1073741824
+  archiveMaxEntries: 10000
+  mediaAllowPathPrefixes: "/data/datasets:/data/staging"
+  pwMaxFailures: 10
+  pwFailWindow: 300
 
 # -- PCAI ---------------------------------------------------------------------
 ezua:

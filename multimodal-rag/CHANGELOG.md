@@ -1,0 +1,75 @@
+# Changelog
+
+All notable changes to this project are tracked here. Format loosely follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [Unreleased] — audit-hardening series (targets v1.9.0)
+
+Committed as three waves over the `checkpoint-pre-audit-fixes` baseline.
+
+### Wave 1 — MCP/REST hardening (no behavior change by default)
+
+- **MCP tool-limit clamps** (`search_dataset`, `search_memory`): `top_k` is
+  coerced into `[1, 100]` and `reranker_top_k` into `[1, min(50, top_k)]`,
+  preventing a single tool call from ballooning into a huge
+  Qdrant/VLM/memory request. Non-integer or `<=0` values raise a `ToolError`.
+- **Per-client unlock scoping**: the MCP server's dataset unlock cache is now
+  keyed by the caller's identity (auth-proxy headers → `X-Forwarded-For`;
+  otherwise a shared `"default"`), so unlocking a dataset no longer opens it
+  for every MCP client on the pod. Configurable size cap via `UNLOCK_CACHE_MAX`.
+- **Bounded caches**: `_query_emb_cache`, `_file_hash_cache`,
+  `_asr_transcript_cache` are capped (`QUERY_EMB_CACHE_MAX`,
+  `FILE_HASH_CACHE_MAX`, `ASR_TRANSCRIPT_CACHE_MAX`) and evict LRU-style so a
+  long-running server never accumulates unbounded memory.
+- **Single-query dataset-vector lookup**: replaced the per-field Qdrant
+  scrolls (up to 10 round-trips) with one OR-filtered scroll.
+- **Media output escaping**: filenames/labels in the generated markdown
+  image/audio/document blocks are escaped to prevent crafted filenames from
+  breaking out of markup.
+- **File serving**: non-media files (and SVG) are served with
+  `Content-Disposition: attachment` instead of inline, mitigating stored-XSS.
+- **Staging `DATA_PATH` fix**: the staging/sweep/serve paths now resolve
+  `DATA_PATH` from the environment at call time, fixing `--data-path` in CLI mode.
+
+### Wave 2 — ingestion + transport guards (opt-in via env)
+
+- **Download size caps**: remote and S3 ingests stream to disk and abort past
+  `MAX_REMOTE_DOWNLOAD_BYTES` (`Content-Length` pre-check + streamed check).
+- **URL policy**: `INGEST_ALLOW_HOSTS` allowlist and
+  `INGEST_BLOCK_PRIVATE_HOSTS` private-range block for http(s) ingestion.
+- **Archive-bomb bounds**: `ARCHIVE_MAX_TOTAL_BYTES`, `ARCHIVE_MAX_MEMBER_BYTES`,
+  `ARCHIVE_MAX_ENTRIES` are audited from the archive headers *before*
+  extraction (recursively for nested archives).
+- **Media path allowlist**: `MEDIA_ALLOW_PATH_PREFIXES` constrains which
+  `file://` / local paths the MCP media tools read.
+- **Signed media tokens**: when `MEDIA_TOKEN_SECRET` is set, media URLs carry
+  a short-lived HMAC `?token=<expiry>.<sig>` (TTL `MEDIA_TOKEN_TTL`) instead
+  of the clear dataset password; the file-serving endpoint validates tokens.
+- **REST API auth**: `RAG_API_KEY` enables `Bearer`/`X-RAG-Api-Key`
+  enforcement over `/api/*`, with probes/pages/media-serving exemptions.
+- **Password throttling**: per-identity failure counters
+  (`PW_MAX_FAILURES` / `PW_FAIL_WINDOW`) rate-limit unlock/verify/search flows.
+
+### Post-audit follow-ups
+
+- **MCP sidecar probes**: the MCP server now serves `/healthz` (SSE and
+  streamable-http transports) and the Helm deployment configures
+  startup/liveness/readiness probes for the sidecar container.
+- **Hash-index cache**: `.hashes.json` reads are mtime-cached per process so
+  large file sets are not re-read/re-parsed on every upload.
+
+### Known limitations / future work
+
+- The RAG `need_media` flag is still on for *every* search when a VLM is
+  configured, even when ingest-time captions let the Postprocessor skip the
+  VLM call (the skip happens after the payload transfer). A two-pass fetch
+  (lightweight first, then re-fetch only the docs that will actually hit the
+  VLM) would eliminate the residual traffic — deferred.
+- `.hashes.json` is kept as a JSON + fcntl format (not SQLite) because the
+  RWX PVC is NFS-backed, where in-process SQLite locking is unreliable.
+
+## [1.8.1] — previous release
+
+Text-only twins for multimodal documents at retrieval de-duplication, `keep_originals`
+flag, VLM captioning of videos when `caption_with_vlm` is enabled, and
+4-image VLM batching fixes. See git history for details.

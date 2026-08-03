@@ -96,3 +96,38 @@ kubectl port-forward deployment/rag-mcp-server 8000:8000
 The image does not bundle any ML models — it connects to remote model
 endpoints (embedder, reranker, VLM, ASR) configured at runtime via
 environment variables. See `documentation/DEPLOYMENT.md` for details.
+
+---
+
+## Security hardening (opt-in)
+
+The core server is **unauthenticated by default** and is designed to sit
+behind an ingress auth proxy (Istio + oauth2-proxy). For additional,
+opt-in protection (per-process env vars, or first-class [Helm
+`security` values]), set any of the following:
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `RAG_API_KEY` | Require `Authorization: Bearer <key>` (or `X-RAG-Api-Key`) on all `/api/*` routes (health/probes, frontend pages, and media serving stay open; `/docs` is effectively disabled). | unset (no auth) |
+| `MEDIA_TOKEN_SECRET` | Secret shared by API + MCP so returned media URLs carry short-lived HMAC `?token=` (expiry `MEDIA_TOKEN_TTL`) instead of the dataset `?password=` in the clear. | unset (legacy `?password=`) |
+| `INGEST_ALLOW_HOSTS` | Comma-separated host allowlist for `/batch-urls` http(s) ingestion (`.example.com` matches subdomains). | unset (all hosts) |
+| `INGEST_BLOCK_PRIVATE_HOSTS` | Reject http(s) URLs (ingest) that resolve to private/loopback/link-local ranges. | `false` |
+| `MAX_REMOTE_DOWNLOAD_BYTES` | Cap per remote/S3 download (streamed, aborted past this). | 536870912 |
+| `ARCHIVE_MAX_TOTAL_BYTES` / `ARCHIVE_MAX_MEMBER_BYTES` / `ARCHIVE_MAX_ENTRIES` | Zip/tar/rar unpacked-size caps (incl. nested archives). | 2 GiB / 1 GiB / 10000 |
+| `MEDIA_ALLOW_PATH_PREFIXES` | Allowlist of `file://` prefixes the MCP `describe_media`/`transcribe_audio`/audio-query tools may read (`:`-separated). | unset (unrestricted) |
+| `PW_MAX_FAILURES` / `PW_FAIL_WINDOW` | Password-failure throttle (returns 429 per identity). | 10 / 300 s |
+| `QUERY_EMB_CACHE_MAX`, `FILE_HASH_CACHE_MAX`, `ASR_TRANSCRIPT_CACHE_MAX`, `UNLOCK_CACHE_MAX` | Bounded sizes for the in-process caches. | 4096 / 4096 / 512 / 4096 |
+
+All defaults preserve the pre-1.9 behaviour. `helm/`, `helm-scale/` and
+`helm-scale-g2/` ship a `security:` values block wired to these flags, e.g.:
+
+```bash
+helm upgrade multimodal-rag ./helm \
+  --set security.mediaTokenSecret="$RANDOM" \
+  --set security.apiKey="change-me" \
+  --set security.blockPrivateHosts=true
+```
+
+> Keep deployment secret material (e.g. `helm/.values.yaml`, which contains
+> Kubernetes service-account tokens) out of version control — it is not
+> covered by `.gitignore`.

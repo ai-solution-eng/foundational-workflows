@@ -167,6 +167,48 @@ def _cross_process_lock(lock_path: Path):
             yield
 
 
+# ---------------------------------------------------------------------------
+# .hashes.json read/write helpers with an in-process cache
+# ---------------------------------------------------------------------------
+# The index maps a file SHA-256 to its stored path and can grow large; caching
+# it per-Path (invalidated on mtime change) avoids re-reading + re-parsing the
+# whole JSON for every uploaded file while preserving cross-pod correctness
+# (the mtime check picks up writes made by other pods under the fcntl lock).
+_hash_index_cache: dict[Path, tuple[int, dict[str, str]]] = {}
+_hash_index_cache_lock = threading.Lock()
+
+
+def _load_hash_index(hashes_path: Path) -> dict[str, str]:
+    """Return the parsed hash index for *hashes_path* (mtime-cached)."""
+    mtime = hashes_path.stat().st_mtime_ns if hashes_path.exists() else 0
+    with _hash_index_cache_lock:
+        cached = _hash_index_cache.get(hashes_path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+
+    index: dict[str, str] = {}
+    if mtime:
+        try:
+            index = json.loads(hashes_path.read_text())
+        except Exception:
+            logger.debug("Unable to parse %s — starting empty", hashes_path, exc_info=True)
+            index = {}
+    with _hash_index_cache_lock:
+        _hash_index_cache[hashes_path] = (mtime, index)
+        if len(_hash_index_cache) > 100:  # bound across many datasets
+            _hash_index_cache.pop(next(iter(_hash_index_cache)), None)
+    return index
+
+
+def _write_hash_index(hashes_path: Path, index: dict[str, str]) -> None:
+    """Atomically persist *index* to *hashes_path* and refresh the cache."""
+    tmp = hashes_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(index, indent=2))
+    os.replace(tmp, hashes_path)
+    with _hash_index_cache_lock:
+        _hash_index_cache[hashes_path] = (hashes_path.stat().st_mtime_ns, dict(index))
+
+
 # Supported file extensions mapped to a media type label
 _IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"})
 _VIDEO_EXTS = frozenset({".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"})
@@ -329,10 +371,26 @@ def _download_s3(s3_url: str, timeout: int = 120) -> str:
     def _fetch() -> bytes:
         s3 = _get_s3_client()
         resp = s3.get_object(Bucket=bucket, Key=key)
-        return resp["Body"].read()
+        body = resp["Body"]
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            buf = body.read(1 << 20)
+            if not buf:
+                break
+            total += len(buf)
+            if _MAX_REMOTE_DOWNLOAD_BYTES > 0 and total > _MAX_REMOTE_DOWNLOAD_BYTES:
+                raise ValueError(
+                    f"Download of {s3_url} exceeds MAX_REMOTE_DOWNLOAD_BYTES "
+                    f"({_MAX_REMOTE_DOWNLOAD_BYTES} bytes)"
+                )
+            chunks.append(buf)
+        return b"".join(chunks)
 
     try:
         content = retry_call(_fetch, max_attempts=3, base_delay=2.0, connection_delay=10.0)
+    except ValueError:
+        raise
     except Exception as e:
         raise ValueError(f"Failed to download {s3_url}: {e}")
 
@@ -423,26 +481,101 @@ def _expand_urls(raw_urls: list[str]) -> list[str]:
     return expanded
 
 
+# ---------------------------------------------------------------------------
+# Remote-URL download guards (SSRF + size)
+# ---------------------------------------------------------------------------
+
+# Hard cap on a single remote/S3 download in bytes.  Streams are aborted past
+# this bound so a mislabelled/malicious URL cannot exhaust memory or fill the
+# PVC.  ``0`` disables the cap.
+_MAX_REMOTE_DOWNLOAD_BYTES = max(0, int(os.environ.get("MAX_REMOTE_DOWNLOAD_BYTES", str(512 * 1024 * 1024))))
+
+# Optional comma-separated allowlist of hosts for http(s) ingest.  An entry
+# like ``.minio.svc.cluster.local`` matches the zone and subdomains.  Empty
+# = all hosts allowed (default, backward compatible).
+_INGEST_ALLOW_HOSTS = tuple(
+    h.strip().lower() for h in os.environ.get("INGEST_ALLOW_HOSTS", "").split(",") if h.strip()
+)
+
+# Optional private-range block (DNS + literal-IP).  Defaults to disabled so
+# legit in-cluster ingestions (MinIO, internal S3) keep working; operators
+# enable it for fully-public deployments.
+_INGEST_BLOCK_PRIVATE = os.environ.get("INGEST_BLOCK_PRIVATE_HOSTS", "false").lower() in ("1", "true", "yes")
+
+
+def _host_matches_allowlist(host: str) -> bool:
+    host = host.lower()
+    for pat in _INGEST_ALLOW_HOSTS:
+        if pat.startswith("."):
+            if host == pat[1:] or host.endswith(pat):
+                return True
+        elif host == pat:
+            return True
+    return False
+
+
+def _host_is_private(host: str) -> bool:
+    """Return True if *host* is or resolves to a private/loopback/link-local address."""
+    import ipaddress
+    import socket
+
+    hostname = host.rsplit(":", 1)[0].strip("[]")
+    if hostname == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved
+    try:
+        addrinfos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return True  # unresolved — safest to treat as suspicious when blocking is on
+    for info in addrinfos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            return True
+    return False
+
+
+def _check_url_policy(url: str) -> None:
+    """Raise :class:`ValueError` if *url* violates the configured URL policy."""
+    if not url.startswith(("http://", "https://")):
+        return
+    from urllib.parse import urlparse
+
+    host = urlparse(url).hostname or ""
+    if _INGEST_ALLOW_HOSTS and not _host_matches_allowlist(host):
+        raise ValueError(
+            f"URL host '{host}' is not allowed by INGEST_ALLOW_HOSTS"
+            + (f"={','.join(_INGEST_ALLOW_HOSTS)}" if _INGEST_ALLOW_HOSTS else "")
+        )
+    if _INGEST_BLOCK_PRIVATE and _host_is_private(host):
+        raise ValueError(
+            f"URL host '{host}' resolves to a private/internal address (INGEST_BLOCK_PRIVATE_HOSTS=true)"
+        )
+
+
 def _download_url(url: str, timeout: int = 120) -> str:
     """Download a remote file to a temp location and return the local path.
 
     Supports HTTP(S) and S3 URLs.  The temp file retains the URL's basename
     and extension so that ``_classify_file`` can identify the type correctly.
+    Bytes are streamed to disk and aborted once
+    ``MAX_REMOTE_DOWNLOAD_BYTES`` is exceeded.
     """
     if url.startswith("s3://"):
         return _download_s3(url, timeout=timeout)
 
+    _check_url_policy(url)
     import tempfile
     from urllib.parse import urlparse
 
     import httpx
-
-    try:
-        with httpx.Client(timeout=httpx.Timeout(timeout, connect=30.0), follow_redirects=True) as client:
-            response = client.get(url)
-            response.raise_for_status()
-    except Exception as e:
-        raise ValueError(f"Failed to download {url}: {e}")
 
     parsed = urlparse(url)
     basename = Path(parsed.path).name or "download"
@@ -451,12 +584,40 @@ def _download_url(url: str, timeout: int = 120) -> str:
 
     tmp = tempfile.NamedTemporaryFile(prefix=f"{stem}_", suffix=suffix, delete=False)
     try:
-        tmp.write(response.content)
-        tmp_path = tmp.name
+        try:
+            with httpx.Client(
+                timeout=httpx.Timeout(timeout, connect=30.0), follow_redirects=True
+            ) as client, client.stream("GET", url) as response:
+                response.raise_for_status()
+                content_length = int(response.headers.get("content-length") or 0)
+                if _MAX_REMOTE_DOWNLOAD_BYTES > 0 and content_length > _MAX_REMOTE_DOWNLOAD_BYTES:
+                    raise ValueError(
+                        f"Download of {url} exceeds MAX_REMOTE_DOWNLOAD_BYTES "
+                        f"({content_length} > {_MAX_REMOTE_DOWNLOAD_BYTES} bytes)"
+                    )
+                written = 0
+                for chunk in response.iter_bytes():
+                    written += len(chunk)
+                    if _MAX_REMOTE_DOWNLOAD_BYTES > 0 and written > _MAX_REMOTE_DOWNLOAD_BYTES:
+                        raise ValueError(
+                            f"Download of {url} exceeds MAX_REMOTE_DOWNLOAD_BYTES "
+                            f"({_MAX_REMOTE_DOWNLOAD_BYTES} bytes)"
+                        )
+                    tmp.write(chunk)
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"Failed to download {url}: {e}")
+    except BaseException:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        raise
+    else:
+        return tmp.name
     finally:
         tmp.close()
-
-    return tmp_path
 
 
 # ---------------------------------------------------------------------------
@@ -1067,6 +1228,10 @@ class DatasetManager:
             import shutil
 
             shutil.rmtree(dataset_dir)
+
+        # Drop any cached hash index for the deleted files dir.
+        with _hash_index_cache_lock:
+            _hash_index_cache.pop(self._dataset_dir(name) / "files" / ".hashes.json", None)
 
         # Invalidate Redis existence cache so other pods don't retry
         _dataset_exist_delete(name)
@@ -2221,14 +2386,12 @@ class DatasetManager:
         if hashes_path.exists():
             with _cross_process_lock(files_dir / ".hashes.lock"):
                 try:
-                    with open(hashes_path) as f:
-                        hash_index = json.load(f)
+                    hash_index = _load_hash_index(hashes_path)
                     # Remove any entry pointing at this file
                     stale = [k for k, v in hash_index.items() if v == original_path]
                     for k in stale:
                         del hash_index[k]
-                    with open(hashes_path, "w") as f:
-                        json.dump(hash_index, f)
+                    _write_hash_index(hashes_path, hash_index)
                 except Exception:
                     logger.debug("Failed to update .hashes.json", exc_info=True)
 
@@ -2613,10 +2776,7 @@ class DatasetManager:
         # hash entries and corrupt dedup.
         hash_index_path = files_dir / ".hashes.json"
         with _cross_process_lock(files_dir / ".hashes.lock"):
-            if hash_index_path.exists():
-                hash_index = json.loads(hash_index_path.read_text())
-            else:
-                hash_index = {}
+            hash_index = _load_hash_index(hash_index_path)
 
             # Check for existing file with same hash
             if file_hash in hash_index:
@@ -2638,8 +2798,5 @@ class DatasetManager:
 
             shutil.copy2(source_path, dest)
             hash_index[file_hash] = str(dest)
-            # Atomic write so a crash never leaves a truncated index.
-            tmp = hash_index_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(hash_index, indent=2))
-            os.replace(tmp, hash_index_path)
+            _write_hash_index(hash_index_path, hash_index)
             return dest

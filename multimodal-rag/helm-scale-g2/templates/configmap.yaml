@@ -36,6 +36,18 @@ data:
   # S3 / MinIO endpoint (not sensitive — just a URL).  Optional: leave
   # empty to use the default boto3 credential chain (IAM, ~/.aws/…).
   S3_ENDPOINT_URL: {{ (.Values.s3.endpointUrl) | default "" | quote }}
+
+  # -- Security hardening (opt-in; see .Values.security) ----------------------
+  INGEST_ALLOW_HOSTS: {{ .Values.security.ingestAllowHosts | default "" | quote }}
+  INGEST_BLOCK_PRIVATE_HOSTS: {{ .Values.security.blockPrivateHosts | default false | quote }}
+  MAX_REMOTE_DOWNLOAD_BYTES: {{ int (.Values.security.maxDownloadBytes | default 536870912) | quote }}
+  ARCHIVE_MAX_TOTAL_BYTES: {{ int (.Values.security.archiveMaxTotalBytes | default 2147483648) | quote }}
+  ARCHIVE_MAX_MEMBER_BYTES: {{ int (.Values.security.archiveMaxMemberBytes | default 1073741824) | quote }}
+  ARCHIVE_MAX_ENTRIES: {{ int (.Values.security.archiveMaxEntries | default 10000) | quote }}
+  MEDIA_ALLOW_PATH_PREFIXES: {{ .Values.security.mediaAllowPathPrefixes | default "" | quote }}
+  MEDIA_TOKEN_TTL: {{ int (.Values.security.mediaTokenTtl | default 3600) | quote }}
+  PW_MAX_FAILURES: {{ int (.Values.security.pwMaxFailures | default 10) | quote }}
+  PW_FAIL_WINDOW: {{ int (.Values.security.pwFailWindow | default 300) | quote }}
   # -- Scale tuning ----------------------------------------------------------
   # Per-worker thread pool for blocking RAG work
   SYNC_POOL_SIZE: {{ .Values.app.syncPoolSize | quote }}

@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_ARCHIVE_EXTS = frozenset({".zip", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".tbz2", ".txz", ".rar"})
 _MAX_DEPTH = 3
 
+# ---------------------------------------------------------------------------
+# Archive-bomb guards: total uncompressed budget, per-member cap, entry cap.
+# The declared (uncompressed) member sizes are inspected BEFORE extracting, so
+# a crafted archive cannot fill the disk / memory in the extraction step.
+# ---------------------------------------------------------------------------
+_ARCHIVE_MAX_TOTAL_BYTES = max(0, int(os.environ.get("ARCHIVE_MAX_TOTAL_BYTES", str(2 * 1024 * 1024 * 1024))))
+_ARCHIVE_MAX_MEMBER_BYTES = max(0, int(os.environ.get("ARCHIVE_MAX_MEMBER_BYTES", str(1024 * 1024 * 1024))))
+_ARCHIVE_MAX_ENTRIES = max(0, int(os.environ.get("ARCHIVE_MAX_ENTRIES", "10000")))
+
 
 def _is_archive(path: str) -> bool:
     return Path(path).suffix.lower() in _SUPPORTED_ARCHIVE_EXTS
@@ -149,6 +158,7 @@ class ArchiveProcessor:
             Document dicts from all contained files, with ``source``
             pointing to the original archive path.
         """
+        self._check_bounds(archive_path)
         archive_source = source or str(archive_path)
         extract_dir = tempfile.mkdtemp(prefix="mmrag_archive_")
         try:
@@ -162,6 +172,84 @@ class ArchiveProcessor:
             import shutil
 
             shutil.rmtree(extract_dir, ignore_errors=True)
+
+    def _process_nested_archive(self, path: str, archive_source: str, depth: int) -> list[dict[str, Any]]:
+        # Bounds check applies to nested archives too — otherwise a crafted
+        # nested bomb could bypass the top-level guard.
+        self._check_bounds(path)
+        nested_dir = tempfile.mkdtemp(prefix="mmrag_nested_")
+        try:
+            self._extract(path, nested_dir)
+            return self._process_dir(nested_dir, archive_source, depth + 1)
+        except Exception as e:
+            logger.warning("Failed to extract nested archive %s: %s", path, e)
+            return []
+        finally:
+            import shutil
+
+            shutil.rmtree(nested_dir, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # Bounds checking (archive-bomb guard)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_bounds(path: str) -> None:
+        """Raise ``ValueError`` if the archive's declared sizes exceed the caps.
+
+        The uncompressed sizes in the member headers are audited BEFORE any
+        extraction so a crafted zip/tar/rar cannot fill the PVC.  Bounds are
+        configured via ``ARCHIVE_MAX_TOTAL_BYTES`` / ``ARCHIVE_MAX_MEMBER_BYTES``
+        / ``ARCHIVE_MAX_ENTRIES`` (0 disables a check).
+        """
+        if _ARCHIVE_MAX_TOTAL_BYTES <= 0 and _ARCHIVE_MAX_MEMBER_BYTES <= 0 and _ARCHIVE_MAX_ENTRIES <= 0:
+            return
+        ext = Path(path).suffix.lower()
+        total = 0
+        count = 0
+
+        def _account(size: int) -> None:
+            nonlocal total, count
+            count += 1
+            if _ARCHIVE_MAX_ENTRIES > 0 and count > _ARCHIVE_MAX_ENTRIES:
+                raise ValueError(
+                    f"Archive {path} contains more than ARCHIVE_MAX_ENTRIES ({_ARCHIVE_MAX_ENTRIES}) entries"
+                )
+            if _ARCHIVE_MAX_MEMBER_BYTES > 0 and size > _ARCHIVE_MAX_MEMBER_BYTES:
+                raise ValueError(f"Archive member exceeds ARCHIVE_MAX_MEMBER_BYTES ({size} bytes)")
+            total += size
+            if _ARCHIVE_MAX_TOTAL_BYTES > 0 and total > _ARCHIVE_MAX_TOTAL_BYTES:
+                raise ValueError(
+                    f"Archive total exceeds ARCHIVE_MAX_TOTAL_BYTES ({_ARCHIVE_MAX_TOTAL_BYTES} bytes)"
+                )
+
+        if ext == ".zip":
+            import zipfile
+
+            with zipfile.ZipFile(path) as zf:
+                for info in zf.infolist():
+                    _account(info.file_size)
+        elif ext == ".rar":
+            # Pre-scan only when the pure-python reader is available; the
+            # unrar-CLI fallback rejects ".." itself but has no size guard.
+            try:
+                import rarfile
+
+                with rarfile.RarFile(path) as rf:
+                    for member in rf.infolist():
+                        _account(getattr(member, "file_size", 0) or 0)
+            except Exception:
+                logger.warning("rar bounds check unavailable (%s) — extracting without size guard", path)
+        else:
+            # tar / tar.gz / tar.bz2 / tar.xz (+ .tgz/.tbz2/.txz)
+            import tarfile
+
+            mode: Any = {"gz": "r:gz", "tgz": "r:gz", "bz2": "r:bz2", "tbz2": "r:bz2", "xz": "r:xz", "txz": "r:xz"}.get(
+                ext.lstrip("."), "r:"
+            )
+            with tarfile.open(path, mode) as tf:
+                for member in tf.getmembers():
+                    _account(member.size)
 
     # ------------------------------------------------------------------
     # Extraction
@@ -238,19 +326,6 @@ class ArchiveProcessor:
                     file_docs = self._process_single_file(full_path, archive_source)
                     docs.extend(file_docs)
         return docs
-
-    def _process_nested_archive(self, path: str, archive_source: str, depth: int) -> list[dict[str, Any]]:
-        nested_dir = tempfile.mkdtemp(prefix="mmrag_nested_")
-        try:
-            self._extract(path, nested_dir)
-            return self._process_dir(nested_dir, archive_source, depth + 1)
-        except Exception as e:
-            logger.warning("Failed to extract nested archive %s: %s", path, e)
-            return []
-        finally:
-            import shutil
-
-            shutil.rmtree(nested_dir, ignore_errors=True)
 
     def _process_single_file(self, path: str, archive_source: str) -> list[dict[str, Any]]:
         file_type = _classify_ext(path)

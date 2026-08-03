@@ -16,12 +16,14 @@ import concurrent.futures
 import contextvars
 import functools
 import hashlib
+import html
 import json
 import os
 import threading
 import time
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlencode
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -40,6 +42,64 @@ QDRANT_HOST = os.environ.get("QDRANT_HOST", "")
 QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
 RAG_REMOTE = os.environ.get("RAG_REMOTE", "true").lower() in ("true", "1", "yes")
 MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "")
+
+# ---------------------------------------------------------------------------
+# Media token signing (shared secret with the API server).
+# When MEDIA_TOKEN_SECRET is set, the media URLs surfaced to the LLM carry a
+# short-lived HMAC ``?token=...`` instead of the dataset password verbatim.
+# ---------------------------------------------------------------------------
+
+_MEDIA_TOKEN_SECRET = os.environ.get("MEDIA_TOKEN_SECRET", "")
+_MEDIA_TOKEN_TTL = max(60, int(os.environ.get("MEDIA_TOKEN_TTL", "3600")))
+
+
+def _sign_media_token(dataset_name: str, rel_path: str, expiry: int | None = None) -> str:
+    """Mint an expiring HMAC token authorising ``{dataset_name}/{rel_path}``."""
+    import hashlib
+    import hmac
+
+    expiry = expiry or (int(time.time()) + _MEDIA_TOKEN_TTL)
+    msg = f"{dataset_name}:{rel_path}:{expiry}".encode()
+    sig = hmac.new(_MEDIA_TOKEN_SECRET.encode(), msg, hashlib.sha256).hexdigest()
+    return f"{expiry}.{sig}"
+
+
+def _media_url_suffix(dataset_name: str, rel_path: str, legacy_password: str | None) -> str:
+    """Return the URL query suffix for a converted media URL.
+
+    Prefers a short-lived media token when ``MEDIA_TOKEN_SECRET`` is configured;
+    otherwise falls back to appending the clear dataset password (legacy).
+    """
+    if _MEDIA_TOKEN_SECRET:
+        return "?" + urlencode({"token": _sign_media_token(dataset_name, rel_path)})
+    if legacy_password:
+        return f"?password={legacy_password}"
+    return ""
+
+
+# Optional allowlist of prefixes for ``file://`` / local-path media read by the
+# MCP tools (describe_media, transcribe_audio, audio queries).  When set, paths
+# outside the allowed prefixes are ignored instead of being read into the model
+# endpoints.  Prefixes are colon-separated (os.pathsep), e.g.
+#   MEDIA_ALLOW_PATH_PREFIXES=/data/datasets:/data/staging
+_MEDIA_ALLOW_PATH_PREFIXES: tuple[str, ...] = tuple(
+    os.path.normpath(p).rstrip(os.sep) for p in os.environ.get("MEDIA_ALLOW_PATH_PREFIXES", "").split(os.pathsep) if p.strip()
+)
+
+
+def _media_path_allowed(raw: str) -> bool:
+    """True if *raw* (a file:// or local path) is inside an allowed prefix."""
+    if not _MEDIA_ALLOW_PATH_PREFIXES:
+        return True
+    p = raw.removeprefix("file://")
+    try:
+        resolved = os.path.realpath(p)
+    except Exception:
+        return False
+    for prefix in _MEDIA_ALLOW_PATH_PREFIXES:
+        if resolved == prefix or resolved.startswith(prefix + os.sep):
+            return True
+    return False
 
 # ---------------------------------------------------------------------------
 # Thread pool for offloading blocking tool bodies off the MCP event loop.
@@ -74,34 +134,60 @@ async def _offload(fn: Any, *args: Any, **kwargs: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Unlock cache: dataset_name -> (expiry_timestamp, password)
+# Unlock cache: (dataset_name, client) -> (expiry_timestamp, password)
 # Allows providing the password once and skipping it for subsequent
 # operations within the TTL window (default 30 minutes).
+#
+# The cache is scoped by *client identity* (see ``_MemoryHeaderMiddleware``:
+# oauth2-proxy identity headers, else X-Forwarded-For, else a shared
+# "default") so that one MCP caller unlocking a dataset does not implicitly
+# unlock it for every other caller on the pod.  Under a non-authenticated
+# deployment all requests collapse to the same identity, preserving the
+# legacy behaviour.
 # ---------------------------------------------------------------------------
 
-_unlocked: dict[str, tuple[float, str]] = {}
+_unlocked: dict[tuple[str, str], tuple[float, str]] = {}
 _unlocked_lock = threading.Lock()
 
 _UNLOCK_TTL = int(os.environ.get("UNLOCK_TTL", "1800"))  # seconds, default 30 min
 
+# Hard upper bound on unlock-cache entries to protect against unbounded growth
+# from a large number of distinct client identities.
+_MAX_UNLOCK_ENTRIES = max(1, int(os.environ.get("UNLOCK_CACHE_MAX", "4096")))
+
+
+def _bounded_cache_put(cache: dict, key: Any, value: Any, max_entries: int) -> None:
+    """Insert into *cache*, evicting the oldest entry when over *max_entries*.
+
+    Plain dicts are insertion-ordered, and we re-insert on every put, so the
+    evicted key is the least-recently-used.  Callers must hold the cache's
+    lock.
+    """
+    cache.pop(key, None)
+    cache[key] = value
+    if len(cache) > max_entries:
+        cache.pop(next(iter(cache)))
+
 
 def _is_unlocked(dataset_name: str) -> str | None:
-    """Return the cached password if *dataset_name* is still unlocked, else None."""
+    """Return the cached password if *dataset_name* is still unlocked (for this client), else None."""
+    key = (dataset_name, _unlock_client_id())
     with _unlocked_lock:
-        entry = _unlocked.get(dataset_name)
+        entry = _unlocked.get(key)
         if entry is None:
             return None
         expiry, pw = entry
         if time.monotonic() >= expiry:
-            del _unlocked[dataset_name]
+            del _unlocked[key]
             return None
         return pw
 
 
-def _cache_unlock(dataset_name: str, password: str) -> None:
-    """Cache the password for *dataset_name* for _UNLOCK_TTL seconds."""
+def _cache_unlock(dataset_name: str, password: str, ttl: int | None = None) -> None:
+    """Cache the password for *dataset_name* (for this client) for *ttl* seconds."""
+    key = (dataset_name, _unlock_client_id())
     with _unlocked_lock:
-        _unlocked[dataset_name] = (time.monotonic() + _UNLOCK_TTL, password)
+        _bounded_cache_put(_unlocked, key, (time.monotonic() + (ttl or _UNLOCK_TTL), password), _MAX_UNLOCK_ENTRIES)
 
 
 def _check_unlocked_or_password(
@@ -161,6 +247,31 @@ _memory_password_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVa
 _opencode_session_id_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "opencode_session_id", default=None
 )
+# Authenticated client identity used to scope the unlock cache so one MCP
+# caller's unlock does not open the dataset for every caller on the pod.
+_client_id_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar("rag_client_id", default=None)
+
+# Request headers that carry an authenticated identity injected by the
+# auth proxy (e.g. oauth2-proxy).  Order matters — first header wins.
+_AUTH_IDENTITY_HEADERS = (
+    b"x-auth-request-email",
+    b"x-auth-request-user",
+    b"x-email",
+    b"x-user",
+)
+
+
+def _unlock_client_id() -> str:
+    """Return the per-request client identity used to scope the unlock cache.
+
+    Prefers an auth-proxy identity header captured by ``_MemoryHeaderMiddleware``,
+    then falls back to ``X-Forwarded-For`` (first hop), and finally to a
+    shared ``"default"`` identity for non-authenticated deployments.
+    """
+    cid = _client_id_ctx.get()
+    if cid:
+        return cid
+    return "default"
 
 
 class _MemoryHeaderMiddleware:
@@ -170,6 +281,7 @@ class _MemoryHeaderMiddleware:
       * ``X-Memory-Dataset``     → memory dataset name
       * ``X-Dataset-Password``   → memory dataset password
       * ``X-Opencode-Session-ID``→ opencode session ID (auto-tagged on memories)
+      * Auth-proxy headers       → client identity (unlock-cache scoping)
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -181,6 +293,7 @@ class _MemoryHeaderMiddleware:
         ds: str | None = None
         pw: str | None = None
         sid: str | None = None
+        cid: str | None = None
         for name, value in scope.get("headers") or []:
             if name == b"x-memory-dataset":
                 ds = value.decode("latin-1").strip() or None
@@ -188,15 +301,30 @@ class _MemoryHeaderMiddleware:
                 pw = value.decode("latin-1").strip() or None
             elif name == b"x-opencode-session-id":
                 sid = value.decode("latin-1").strip() or None
+        for name, value in scope.get("headers") or []:
+            if name in _AUTH_IDENTITY_HEADERS:
+                cid = value.decode("latin-1").strip() or None
+                if cid:
+                    break
+        # No auth-proxy header — fall back to the first X-Forwarded-For hop.
+        if not cid:
+            for name, value in scope.get("headers") or []:
+                if name == b"x-forwarded-for":
+                    first = value.decode("latin-1").split(",", 1)[0].strip()
+                    if first:
+                        cid = first
+                    break
         ds_tok = _memory_dataset_ctx.set(ds)
         pw_tok = _memory_password_ctx.set(pw)
         sid_tok = _opencode_session_id_ctx.set(sid)
+        cid_tok = _client_id_ctx.set(cid)
         try:
             await self.app(scope, receive, send)
         finally:
             _memory_dataset_ctx.reset(ds_tok)
             _memory_password_ctx.reset(pw_tok)
             _opencode_session_id_ctx.reset(sid_tok)
+            _client_id_ctx.reset(cid_tok)
 
 
 def _resolve_memory_dataset(dataset_name: str | None) -> str:
@@ -349,6 +477,21 @@ def _prefer_preprocessed_media(doc: Any) -> Any:
     return d
 
 
+def _escape_markdown_attr(value: str) -> str:
+    """Neutralize characters that could break out of a markdown/HTML context.
+
+    ``alt`` / link labels and URLs can contain user-controlled filenames
+    (``]()\"``, newlines).  Escaping keeps a crafted dataset filename from
+    injecting markup/XSS when a frontend renders the tool's suggested
+    markdown.  Like ``html.escape``, ``&<>"`` are encoded; ``]`` ``[`` ``(``
+    are stripped so they cannot close a markdown link early.
+    """
+    value = html.escape(value, quote=True)
+    for ch in ("[", "]", "(", ")"):
+        value = value.replace(ch, "")
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Query-embedding cache + dataset-vector lookup
 # ---------------------------------------------------------------------------
@@ -371,6 +514,13 @@ def _prefer_preprocessed_media(doc: Any) -> Any:
 _query_emb_cache: dict[str, list[float]] = {}
 _query_emb_cache_lock = threading.Lock()
 
+# Size caps for the in-process caches.  These are plain dicts (insertion
+# ordered) trimmed via ``_bounded_cache_put`` so a long-running server never
+# accumulates unbounded memory from unique query files / ASR transcripts.
+_MAX_QUERY_EMB_CACHE = max(1, int(os.environ.get("QUERY_EMB_CACHE_MAX", "4096")))
+_MAX_FILE_HASH_CACHE = max(1, int(os.environ.get("FILE_HASH_CACHE_MAX", "4096")))
+_MAX_ASR_TRANSCRIPT_CACHE = max(1, int(os.environ.get("ASR_TRANSCRIPT_CACHE_MAX", "512")))
+
 _file_hash_cache: dict[str, str] = {}
 _file_hash_cache_lock = threading.Lock()
 
@@ -387,7 +537,7 @@ def _hash_file(path: str) -> str:
             h.update(chunk)
     digest = h.hexdigest()
     with _file_hash_cache_lock:
-        _file_hash_cache[path] = digest
+        _bounded_cache_put(_file_hash_cache, path, digest, _MAX_FILE_HASH_CACHE)
     return digest
 
 
@@ -408,7 +558,7 @@ def _collect_cacheable_paths(query_dict: Any) -> list[tuple[str, str]]:
                     path = url[7:]
                 elif url.startswith("/") and os.path.exists(url):
                     path = url
-            if path and os.path.exists(path):
+            if path and os.path.exists(path) and _media_path_allowed(path):
                 paths.append((k, path))
     return paths
 
@@ -463,34 +613,37 @@ def _lookup_dataset_vector(
         "metadata.original_audio",
     )
 
-    for field in fields_to_check:
-        try:
-            from qdrant_client.models import FieldCondition, Filter, MatchAny
+    try:
+        from qdrant_client.models import FieldCondition, Filter, MatchAny
 
-            results, _ = client.scroll(
-                coll,
-                limit=1,
-                with_payload=False,
-                with_vectors=True,
-                scroll_filter=Filter(must=[FieldCondition(key=field, match=MatchAny(any=possible_values))]),
-            )
-            if not results:
-                continue
-            vec = results[0].vector
-            if vec is None:
-                continue
-            # Named vectors come back as a dict; unnamed as a list.
-            if isinstance(vec, dict):
-                if vector_name and vector_name in vec:
-                    return vec[vector_name]
-                for v in vec.values():
-                    if isinstance(v, list):
-                        return v
-            elif isinstance(vec, list):
-                return vec
-        except Exception:
-            logger.debug("Qdrant vector lookup failed for field %s", field, exc_info=True)
+        # A single scroll with an OR (`should`) over all candidate fields —
+        # faster than one Qdrant round-trip per field.
+        results, _ = client.scroll(
+            coll,
+            limit=1,
+            with_payload=False,
+            with_vectors=True,
+            scroll_filter=Filter(
+                should=[FieldCondition(key=field, match=MatchAny(any=possible_values)) for field in fields_to_check]
+            ),
+        )
+        if not results:
             return None
+        vec = results[0].vector
+        if vec is None:
+            return None
+        # Named vectors come back as a dict; unnamed as a list.
+        if isinstance(vec, dict):
+            if vector_name and vector_name in vec:
+                return vec[vector_name]
+            for v in vec.values():
+                if isinstance(v, list):
+                    return v
+        elif isinstance(vec, list):
+            return vec
+    except Exception:
+        logger.debug("Qdrant vector lookup failed", exc_info=True)
+        return None
 
     return None
 
@@ -540,7 +693,7 @@ def _cache_query_vector(
     model_name = rag.embedder.model_name
     cache_key = _compute_query_cache_key(query_dict, model_name, paths)
     with _query_emb_cache_lock:
-        _query_emb_cache[cache_key] = vector
+        _bounded_cache_put(_query_emb_cache, cache_key, vector, _MAX_QUERY_EMB_CACHE)
     logger.info("query vector: cached for future reuse (%d media file(s))", len(paths))
 
 
@@ -550,8 +703,6 @@ def _cache_query_vector(
 
 _asr_transcript_cache: dict[str, str] = {}
 _asr_transcript_cache_lock = threading.Lock()
-
-_STAGING_AUDIO_PATH_PREFIX = f"{os.environ.get('DATA_PATH', '/data')}/staging/"
 
 
 def _resolve_audio_query_vector(
@@ -592,7 +743,7 @@ def _resolve_audio_query_vector(
             path = url
         else:
             continue
-        if os.path.exists(path):
+        if os.path.exists(path) and _media_path_allowed(path):
             audio_paths.append(path)
 
     if not audio_paths:
@@ -637,7 +788,7 @@ def _resolve_audio_query_vector(
             transcript = sync_wrapper_safe(_transcribe_media, {"url": f"file://{path}", "asr": rag.asr})
             if transcript:
                 with _asr_transcript_cache_lock:
-                    _asr_transcript_cache[file_hash] = transcript
+                    _bounded_cache_put(_asr_transcript_cache, file_hash, transcript, _MAX_ASR_TRANSCRIPT_CACHE)
                 transcripts.append(transcript)
                 logger.info("audio query: ASR transcribed %s (%d chars)", path[-60:], len(transcript))
         except Exception:
@@ -866,17 +1017,21 @@ async def _arun_retrieval(
         pvc_prefix = f"{data_path}/datasets/{dataset_name}/files/"
         file_prefix = f"file://{pvc_prefix}"
         api_prefix = f"{media_base_url}/api/datasets/{dataset_name}/files/"
-        # For password-protected datasets, append ?password= so the
-        # browser can fetch media in <img>/<video>/<audio> tags (which
-        # can't set custom headers).  The file-serving endpoint accepts
-        # the password via this query parameter.
-        pw_suffix = f"?password={verified_password}" if verified_password else ""
+
+        def _suffix_for(rel_path: str) -> str:
+            # Media URLs carry either a short-lived HMAC token (when
+            # MEDIA_TOKEN_SECRET is set) or the legacy clear ?password= so
+            # `<img>/<video>/<audio>` (which cannot set headers) can fetch
+            # protected media.  The file-serving endpoint accepts both.
+            return _media_url_suffix(dataset_name, rel_path, verified_password)
 
         def _convert(val: str) -> str:
             if val.startswith(file_prefix):
-                return api_prefix + val[len(file_prefix) :] + pw_suffix
+                rel = val[len(file_prefix) :]
+                return api_prefix + rel + _suffix_for(rel)
             if val.startswith(pvc_prefix):
-                return api_prefix + val[len(pvc_prefix) :] + pw_suffix
+                rel = val[len(pvc_prefix) :]
+                return api_prefix + rel + _suffix_for(rel)
             return val
 
         def _convert_dict(d: dict[str, Any]) -> dict[str, Any]:
@@ -895,7 +1050,7 @@ async def _arun_retrieval(
         for url in urls:
             if isinstance(url, str) and url.startswith(("http://", "https://")):
                 src = r.get("source") or r.get("original_source") or ""
-                alt = (src.split("/")[-1] if src else f"matched image {i + 1}")[:60]
+                alt = _escape_markdown_attr((src.split("/")[-1] if src else f"matched image {i + 1}")[:60])
                 image_md_lines.append(f"![{alt}]({url})")
     if image_md_lines:
         context += (
@@ -913,9 +1068,10 @@ async def _arun_retrieval(
         for url in urls:
             if isinstance(url, str) and url.startswith(("http://", "https://")):
                 src = r.get("source") or r.get("original_source") or ""
-                alt = (src.split("/")[-1] if src else f"matched audio {i + 1}")[:60]
+                alt = _escape_markdown_attr((src.split("/")[-1] if src else f"matched audio {i + 1}")[:60])
                 audio_md_lines.append(
-                    f'<audio controls preload="none" src="{url}" title="{alt}"></audio>\n([🎧 {alt}]({url}))'
+                    f'<audio controls preload="none" src="{html.escape(url, quote=True)}" title="{alt}"></audio>\n'
+                    f"([🎧 {alt}]({url}))"
                 )
     if audio_md_lines:
         context += (
@@ -941,7 +1097,7 @@ async def _arun_retrieval(
         page = r.get("page")
         if page:
             label += f" (p. {page})"
-        doc_link_lines.append(f"- [📄 {label}]({src})")
+        doc_link_lines.append(f"- [📄 {_escape_markdown_attr(label)}]({src})")
     if doc_link_lines:
         context += (
             "\n\nMatched documents — include these links in your response "
@@ -961,6 +1117,25 @@ async def _arun_retrieval(
 # ---------------------------------------------------------------------------
 # MCP tools
 # ---------------------------------------------------------------------------
+
+
+def _clamp_tool_limit(value: Any, name: str, maximum: int, default: int = 1) -> int:
+    """Coerce an MCP tool limit to an int clamped within ``[default, maximum]``.
+
+    Tool callers (LLM agents) can pass arbitrary values, so every paging /
+    ranking limit is normalised here to prevent absurd values (e.g. a
+    ``top_k`` of 10**9) from ballooning a single request into a Qdrant /
+    VLM / memory disaster.  Non-integer input raises ``ToolError``; values
+    clammed to ``maximum``.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ToolError(f"'{name}' must be an integer.")
+    if n < default:
+        raise ToolError(f"'{name}' must be at least {default}.")
+    return min(n, maximum)
+
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -1040,8 +1215,7 @@ try:
                 return f"Dataset '{dataset_name}' is not password protected — nothing to unlock."
             if not dm.verify_password(dataset_name, password):
                 raise ToolError(f"Incorrect password for dataset '{dataset_name}'.")
-            with _unlocked_lock:
-                _unlocked[dataset_name] = (time.monotonic() + ttl, password)
+            _cache_unlock(dataset_name, password, ttl=ttl)
             return (
                 f"Dataset '{dataset_name}' unlocked for {ttl // 60} minutes "
                 f"(until approximately "
@@ -1116,6 +1290,10 @@ try:
             return rag, verified_password
 
         rag, verified_password = await _offload(_setup)
+
+        # Clamp paging/ranking params to safe bounds (see _clamp_tool_limit).
+        top_k = _clamp_tool_limit(top_k, "top_k", maximum=100)
+        reranker_top_k = _clamp_tool_limit(reranker_top_k, "reranker_top_k", maximum=min(50, top_k))
 
         # -- Build multimodal query dict --
         query_dict: str | dict[str, Any] = query
@@ -1338,6 +1516,10 @@ try:
             return rag, ds_name, verified_pw
 
         rag, ds_name, verified_pw = await _offload(_setup)
+
+        # Clamp paging/ranking params to safe bounds (see _clamp_tool_limit).
+        top_k = _clamp_tool_limit(top_k, "top_k", maximum=100)
+        reranker_top_k = _clamp_tool_limit(reranker_top_k, "reranker_top_k", maximum=min(50, top_k))
 
         # -- Build multimodal query dict --
         query_dict: str | dict[str, Any] = query
@@ -1573,6 +1755,9 @@ try:
 
         if not os.path.exists(path):
             return media_url
+        if not _media_path_allowed(path):
+            logger.warning("media preprocess skipped: path outside MEDIA_ALLOW_PATH_PREFIXES")
+            return media_url
 
         from pathlib import Path
 
@@ -1781,7 +1966,7 @@ try:
             # Cache for future calls
             if cache_key:
                 with _asr_transcript_cache_lock:
-                    _asr_transcript_cache[cache_key] = transcript
+                    _bounded_cache_put(_asr_transcript_cache, cache_key, transcript, _MAX_ASR_TRANSCRIPT_CACHE)
 
             displayable = _media_url_to_displayable(audio_url)
             return json.dumps(
@@ -1804,6 +1989,22 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
+
+
+def _with_mcp_health(app: ASGIApp) -> ASGIApp:
+    """Attach a minimal ``/healthz`` route to the MCP ASGI app.
+
+    The MCP sidecar has no liveness probe today; a Healthz endpoint lets the
+    Helm chart restart a wedged MCP process.  ``FastMCP`` returns the wrapped
+    Starlette app, which supports adding routes directly.
+    """
+    from starlette.responses import JSONResponse
+
+    async def _healthz(request: object) -> JSONResponse:
+        return JSONResponse({"status": "ok"})
+
+    app.add_route("/healthz", _healthz)  # type: ignore[attr-defined]
+    return app
 
 
 def main() -> None:
@@ -1836,11 +2037,12 @@ def main() -> None:
         logger.info("Starting MCP SSE server on %s:%s", args.host, args.port)
         app = mcp.sse_app()
         app.add_middleware(_MemoryHeaderMiddleware)
-        uvicorn.run(app, host=args.host, port=args.port)
+        uvicorn.run(_with_mcp_health(app), host=args.host, port=args.port)
     elif args.transport == "streamable-http":
         logger.info("Starting MCP streamable-http server on %s:%s", args.host, args.port)
         app = mcp.streamable_http_app()
         app.add_middleware(_MemoryHeaderMiddleware)
+        app = _with_mcp_health(app)
         uvicorn.run(app, host=args.host, port=args.port)
 
 
