@@ -53,7 +53,7 @@ token in the `Authorization` header:
 | `search_dataset(dataset_name, query, image?, video?, audio?, top_k?, use_reranker?, reranker_top_k?, base_llm_modalities?, password?, media_base_url?)` | Full multimodal retrieval with post-processing | yes | if protected |
 | `get_dataset_files(dataset_name, file_path?, limit?, offset?, password?)` | List or retrieve files in a dataset | yes | if protected |
 | `get_dataset_info(dataset_name, password?)` | Dataset metadata | yes | if protected |
-| `describe_media(media_url, query?)` | Standalone VLM description of an image/video (no dataset needed) | — | — |
+| `describe_media(media_url, query?, media_type?)` | Standalone VLM description of an image/video (no dataset needed) | — | — |
 | `transcribe_audio(audio_url, max_seconds?)` | Standalone ASR transcription (no dataset needed) | — | — |
 | `add_memory(text, image?, video?, audio?, metadata?, dataset_name?, password?)` | Store a memory into the caller's memory dataset | optional¹ | optional¹ |
 | `search_memory(query, image?, video?, audio?, top_k?, use_reranker?, reranker_top_k?, base_llm_modalities?, dataset_name?, password?)` | Recall from the caller's memory dataset | optional¹ | optional¹ |

@@ -19,6 +19,7 @@ import hashlib
 import html
 import json
 import os
+import re
 import threading
 import time
 from datetime import UTC, datetime
@@ -100,6 +101,138 @@ def _media_path_allowed(raw: str) -> bool:
         if resolved == prefix or resolved.startswith(prefix + os.sep):
             return True
     return False
+
+
+def _classify_by_url_extension(url: str) -> str | None:
+    """Classify an http(s) URL by the extension in its *path* (ignoring the
+    query string / fragment).  ``https://x/y.jpg?hmac=...`` → ``image``.
+
+    Returns ``None`` when the path has no recognisable media extension.
+    """
+    from urllib.parse import urlsplit
+
+    from multimodal_rag.dataset_manager import _classify_file
+
+    path = urlsplit(url).path
+    if not path or path.endswith("/"):
+        return None
+    ft = _classify_file(path)
+    return ft if ft in ("image", "video") else None
+
+
+def _classify_media_bytes(header: bytes, content_type: str = "") -> str | None:
+    """Classify a media blob as ``'image'``/``'video'``/``None`` from its
+    ``Content-Type`` and magic bytes."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct.startswith("image/"):
+        return "image"
+    if ct.startswith("video/"):
+        return "video"
+    if header.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a", b"BM")):
+        return "image"
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return "image"
+    if len(header) >= 8 and header[4:8] == b"ftyp":
+        return "video"
+    if header.startswith(b"\x1a\x45\xdf\xa3"):  # Matroska / WebM
+        return "video"
+    if header.startswith((b"\x00\x00\x01\xba", b"\x00\x00\x01\xb3")):  # MPEG vid
+        return "video"
+    return None
+
+
+def _probe_remote_media_type(url: str, timeout: float = 25.0) -> str | None:
+    """Best-effort classify a remote URL over the network.
+
+    Only the response headers plus the first chunk are consumed (the stream
+    is closed immediately), so this never downloads the full resource.  Used
+    as a fallback when the URL has no recognisable extension, e.g. a CDN or
+    unversioned endpoint.
+    """
+    import httpx
+
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client, client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "")
+            first = next(resp.iter_bytes(), b"")
+            return _classify_media_bytes(first, content_type)
+    except Exception:
+        logger.debug("remote media probe failed for %s", url[:120], exc_info=True)
+        return None
+
+
+def _classify_media_type(ref: str) -> str | None:
+    """Best-effort classify *ref* (data:/http(s)/file/local) as image|video|None.
+
+    Order of operations (cheapest first):
+      1. ``data:`` MIME prefix
+      2. URL *path* extension (query/fragment ignored) — definitive for URLs
+         like ``…/photo.jpg?token=…``
+      3. remote probe (Content-Type + magic bytes of the first chunk) for
+         extension-less URLs
+      4. local file extension, then magic-byte sniffing for bare/staged paths
+    """
+    from multimodal_rag.dataset_manager import _classify_file
+
+    if ref.startswith("data:"):
+        mime = ref.split(",", 1)[0].split(";", 1)[0].removeprefix("data:").strip().lower()
+        if mime.startswith("image/"):
+            return "image"
+        if mime.startswith("video/"):
+            return "video"
+        return None
+
+    if ref.startswith(("http://", "https://")):
+        ft = _classify_by_url_extension(ref)
+        if ft is not None:
+            return ft
+        return _probe_remote_media_type(ref)
+
+    # File: extension first, then magic bytes for extension-less files.
+    local = ref.removeprefix("file://")
+    ft = _classify_file(local)
+    if ft in ("image", "video"):
+        return ft
+    if os.path.exists(local):
+        try:
+            from multimodal_rag.utils.model_adapters import _detect_media_type
+
+            mime = _detect_media_type(local)
+            if mime.startswith("image/"):
+                return "image"
+            if mime.startswith("video/"):
+                return "video"
+        except Exception:
+            logger.debug("magic-byte detection failed for %s", local[-60:], exc_info=True)
+    return None
+
+
+# Word-boundary hints used to infer the expected modality from the caller's
+# *query* text (e.g. "can you describe the image?" → image).  Only used as a
+# low-confidence fallback when URL/extension detection cannot decide.
+_IMAGE_HINT_RE = re.compile(r"\b(?:image|images|photo|photos|picture|pictures|screenshot|screenshots|imagery)\b")
+_VIDEO_HINT_RE = re.compile(r"\b(?:video|videos|clip|footage|movie|film|recording)\b")
+
+
+def _infer_media_type_from_query(query: str | None) -> str | None:
+    """Best-effort 'image'/'video'/'None' from the language of *query*.
+
+    Returns ``None`` when the query mentions neither/both equally, so the
+    caller can fall back to stronger signals.
+    """
+    if not query:
+        return None
+    q = query.lower()
+    n_image = len(_IMAGE_HINT_RE.findall(q))
+    n_video = len(_VIDEO_HINT_RE.findall(q))
+    if n_image and not n_video:
+        return "image"
+    if n_video and not n_image:
+        return "video"
+    if n_image and n_video:
+        return "image" if n_image > n_video else ("video" if n_video > n_image else None)
+    return None
 
 # ---------------------------------------------------------------------------
 # Thread pool for offloading blocking tool bodies off the MCP event loop.
@@ -1797,6 +1930,7 @@ try:
     async def describe_media(
         media_url: str,
         query: str = "",
+        media_type: str = "",
     ) -> str:
         """Describe an image or video using the vision-language model (VLM).
 
@@ -1813,6 +1947,13 @@ try:
         query:
             Optional question about the media — the VLM will answer it
             instead of giving a generic description.
+        media_type:
+            Optional expected modality hint: ``"image"`` or ``"video"``.
+            When empty (default) the tool detects the type automatically
+            from the URL/path (extension, Content-Type/magic bytes) and,
+            failing that, infers it from *query* wording (e.g. "describe
+            the image").  Pass this explicitly when you *know* the media
+            type and the URL/path is ambiguous.
         """
 
         def _impl() -> str:
@@ -1835,36 +1976,33 @@ try:
             path = processed_url
             path = path.removeprefix("file://")
 
-            # Detect modality from URL/path.  When the URL has no
-            # recognisable extension (e.g. a bare OWUI file ID like
-            # ``file://74a2ab6c-…``), fall back to magic-byte detection
-            # via ``_detect_media_type``.
-            from multimodal_rag.dataset_manager import _classify_file
-            from multimodal_rag.utils.model_adapters import _detect_media_type
+            # Detect modality.  The caller's *explicit* ``media_type`` hint wins; then
+            # URL/path detection (extension → Content-Type/magic bytes); then a
+            # low-confidence inference from *query* wording ("describe the
+            # image"); finally the legacy "image"/"video" substring heuristic.
+            hint = media_type.strip().lower()
+            if hint not in ("", "image", "video"):
+                raise ToolError("'media_type' must be 'image' or 'video' when provided.")
 
-            file_type: str | None = None
-            if not path.startswith(("data:", "http")):
-                file_type = _classify_file(path)
-                # Extension-based classification failed → probe the bytes
-                if file_type not in ("image", "video") and os.path.exists(path):
-                    try:
-                        detected_mime = _detect_media_type(path)
-                        if detected_mime.startswith("image/"):
-                            file_type = "image"
-                        elif detected_mime.startswith("video/"):
-                            file_type = "video"
-                    except Exception:
-                        logger.debug("magic-byte detection failed for %s", path[-60:], exc_info=True)
+            file_type = hint if hint else _classify_media_type(path)
 
-            if file_type == "image" or "image" in processed_url.lower():
+            if file_type is None:
+                file_type = _infer_media_type_from_query(query)
+            if file_type is None:
+                if "image" in processed_url.lower():
+                    file_type = "image"
+                elif "video" in processed_url.lower():
+                    file_type = "video"
+
+            if file_type == "image":
                 doc_dict: dict[str, Any] = {"text": "", "image": processed_url}
-            elif file_type == "video" or "video" in processed_url.lower():
+            elif file_type == "video":
                 doc_dict = {"text": "", "video": processed_url}
             else:
                 raise ToolError(
                     f"Could not determine if '{processed_url[:60]}' is an image or video. "
-                    "Ensure the URL has a recognisable extension (.jpg, .png, .mp4, …) "
-                    "or that the file is a supported image/video format."
+                    "Ensure the URL has a recognisable extension (.jpg, .png, .mp4, …), "
+                    "pass media_type='image'/'video', or phrase the query to say what it is."
                 )
 
             system_prompt = (
@@ -1887,6 +2025,7 @@ try:
                 {
                     "description": description,
                     "media_url": displayable,
+                    "media_type": file_type,
                     "markdown": f"![media]({displayable})" if is_image else "",
                 },
                 indent=2,

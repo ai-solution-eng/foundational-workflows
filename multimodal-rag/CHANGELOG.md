@@ -55,6 +55,16 @@ Committed as three waves over the `checkpoint-pre-audit-fixes` baseline.
 - **MCP sidecar probes**: the MCP server now serves `/healthz` (SSE and
   streamable-http transports) and the Helm deployment configures
   startup/liveness/readiness probes for the sidecar container.
+- **`describe_media` modality detection**: URLs are classified by their
+  *path* extension (query/fragment ignored), so `…/photo.jpg?hmac=…` is
+  recognised as an image even though the string does not end in `.jpg`; for
+  extension-less CDN URLs it falls back to a bounded network probe
+  (Content-Type + first-chunk magic bytes), and extension-less local files /
+  `data:` URLs are sniffed via magic bytes / MIME prefix. A new optional
+  `media_type` parameter ("image"/"video") lets the caller force the
+  expected modality, and the query wording (e.g. "describe the image") is
+  used as a low-confidence hint when detection is ambiguous. The response
+  now reports the resolved `media_type`.
 - **Hash-index cache**: `.hashes.json` reads are mtime-cached per process so
   large file sets are not re-read/re-parsed on every upload.
 
