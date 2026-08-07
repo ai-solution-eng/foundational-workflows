@@ -2,6 +2,7 @@ import asyncio
 import base64
 import io
 import os
+import re
 import threading
 import weakref
 from collections.abc import Awaitable, Callable
@@ -15,12 +16,14 @@ from openai import AsyncOpenAI, OpenAI
 try:
     from agents import Agent, set_tracing_disabled
     from agents.mcp import MCPServerStreamableHttp
+    from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
     from agents.models.openai_responses import OpenAIResponsesModel
 except ImportError:
     Agent = None  # type: ignore[assignment, misc]
     set_tracing_disabled = None  # type: ignore[assignment]
     MCPServerStreamableHttp = None  # type: ignore[assignment, misc]
     OpenAIResponsesModel = None  # type: ignore[assignment, misc]
+    OpenAIChatCompletionsModel = None  # type: ignore[assignment, misc]
 
 from .general_tools import sync_wrapper_safe
 from .logging_utils import logging
@@ -33,52 +36,39 @@ _MLIS_PAGE = "https://mlis.pcai-se-ai-application.hst.rdlabs.hpecorp.net/ui/depl
 _NOT_DEPLOYED = ""
 
 
-def _pool_limits_from_env(default_max_connections: int | None = 30) -> httpx.Limits:
+def _pool_limits_from_env() -> httpx.Limits:
     """Build httpx connection-pool limits from env vars.
 
-    Async clients default to ``max_connections=30`` (matching the original
-    single-replica chart).  The sync ``_SHARED_REMOTE_HTTP_CLIENT`` calls
-    this with ``default_max_connections=None`` to preserve its original
-    unlimited behaviour.  The scale chart raises both via
-    ``MODEL_POOL_MAX_CONNECTIONS`` so the embedder — on every search's
-    critical path — is not the bottleneck at high concurrency.
+    Defaults (30 / 10) match the original single-replica chart.  The
+    scale chart raises these so the embedder — on every search's critical
+    path — is not the bottleneck at high concurrency.
     """
-    raw = os.environ.get("MODEL_POOL_MAX_CONNECTIONS")
-    max_conn: int | None
-    if raw:
-        try:
-            max_conn = int(raw)
-        except (TypeError, ValueError):
-            max_conn = default_max_connections
-    else:
-        max_conn = default_max_connections
+    try:
+        max_conn = int(os.environ.get("MODEL_POOL_MAX_CONNECTIONS", "30"))
+    except (TypeError, ValueError):
+        max_conn = 30
     try:
         max_keepalive = int(os.environ.get("MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS", "10"))
     except (TypeError, ValueError):
         max_keepalive = 10
     return httpx.Limits(
-        max_connections=max_conn if max_conn and max_conn > 0 else None,
+        max_connections=max(1, max_conn),
         max_keepalive_connections=max(1, max_keepalive),
         keepalive_expiry=120.0,
     )
 
 
 # Sync clients are thread-safe and can be shared globally.
-# The sync remote client preserves the original unlimited max_connections
-# (only keepalive is capped) so it never becomes a bottleneck for one-off
-# model-discovery calls.
 _SHARED_HTTP_CLIENT = httpx.Client()
 _SHARED_REMOTE_HTTP_CLIENT = httpx.Client(
     verify=False,
-    limits=_pool_limits_from_env(default_max_connections=None),
+    limits=_pool_limits_from_env(),
 )
 
 # Async clients must be bound to a single event loop.
-# We cache one per (running loop, endpoint base_url) so that each model
-# endpoint (embedder, reranker, VLM, ...) gets its own connection pool
-# — a backlog of slow reranker calls can't starve the fast embedder path.
-# The outer WeakKeyDictionary is keyed by loop (auto-evicts on loop GC);
-# the inner dict is keyed by base_url.
+# We cache one per running loop (keyed by the loop object itself, not
+# id(loop), to avoid id() recycling after GC hands a stale client to a
+# fresh loop).  WeakKeyDictionary auto-evicts when the loop is GC'd.
 _async_client_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _async_remote_client_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _async_client_lock = threading.Lock()
@@ -134,15 +124,7 @@ def discover_model_name(base_url: str, api_key: str = "", remote: bool = True) -
     return ""
 
 
-def _get_async_client(remote: bool = False, base_url: str = "") -> httpx.AsyncClient:
-    """Return a cached ``httpx.AsyncClient`` for *base_url* on the running loop.
-
-    Each (event loop, endpoint) pair gets its own connection pool so a
-    slow endpoint (e.g. the reranker) cannot exhaust connections needed
-    by a fast one (e.g. the embedder).  When *base_url* is empty a
-    fallback shared pool is used (back-compat for callers that don't
-    specify an endpoint).
-    """
+def _get_async_client(remote: bool = False) -> httpx.AsyncClient:
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -157,18 +139,14 @@ def _get_async_client(remote: bool = False, base_url: str = "") -> httpx.AsyncCl
         )
     cache = _async_remote_client_cache if remote else _async_client_cache
     with _async_client_lock:
-        loop_clients: dict[str, httpx.AsyncClient] | None = cache.get(loop)
-        if loop_clients is None:
-            loop_clients = {}
-            cache[loop] = loop_clients
-        client = loop_clients.get(base_url)
+        client = cache.get(loop)
         if client is None:
             client = httpx.AsyncClient(
                 verify=not remote,
                 timeout=httpx.Timeout(300.0, connect=30.0),
                 limits=_pool_limits_from_env(),
             )
-            loop_clients[base_url] = client
+            cache[loop] = client
         return client
 
 
@@ -180,7 +158,30 @@ __all__ = [
     "ToolDefinition",
     "VoiceModel",
     "discover_model_name",
+    "strip_tool_markers",
 ]
+
+_TOOL_CALL_BLOCK = re.compile(r"<\|?\s*tool_call\s*\|?>.*$", re.DOTALL)
+_INTERNAL_FILE_REF = re.compile(r"(?im)^[ \t]*input_files?\.[0-9\w\-.]+[.\w]*\s*$")
+_GENERIC_ANGLE = re.compile(r"<\|[a-z_]+\|>")
+
+
+def strip_tool_markers(text: str) -> str:
+    """Remove agent-token artifacts left by tool-calling models.
+
+    Models tuned for function calling (e.g. the Gemma VLM) sometimes emit
+    synthetic ``<|tool_call|>…`` wrappers and internal file refs such as
+    ``input_file_0.png`` instead of a plain answer.  Strip those before the
+    text reaches the caller so a "summarize the image" call returns clean
+    prose.
+    """
+    if not text:
+        return text
+    text = _TOOL_CALL_BLOCK.sub("", text)
+    text = _INTERNAL_FILE_REF.sub("", text)
+    text = _GENERIC_ANGLE.sub("", text)
+    return text.strip()
+
 
 input_modalities = Literal["text", "audio", "image", "video"]
 messages_dtype = str | dict[str, Any] | list[dict[str, Any]]
@@ -202,7 +203,9 @@ class ToolDefinition:
     handler: Callable[[dict[str, Any]], Awaitable[Any]]
 
 
-async def _get_mcp_servers(mcp_servers: dict[str, dict[str, Any]]) -> list[MCPServerStreamableHttp]:
+async def _get_mcp_servers(
+    mcp_servers: dict[str, dict[str, Any]],
+) -> list[MCPServerStreamableHttp]:
     """Build and connect one MCPServerStreamableHttp per entry in the
     {name: {url, headers, transport}} config dict. Each server is returned
     already connected; the caller is responsible for calling cleanup() on
@@ -224,7 +227,23 @@ async def _get_mcp_servers(mcp_servers: dict[str, dict[str, Any]]) -> list[MCPSe
             }
             if cfg.get("headers"):
                 params["headers"] = cfg["headers"]
-            server = MCPServerStreamableHttp(params=params, name=name)  # type: ignore[arg-type]
+            # The openai-agents SDK hardcodes a 5s MCP session read timeout (*)
+            # and a 5s httpx request timeout (**) unless overridden. Real tool
+            # calls (SQL queries, k8s ops, ...) routinely exceed that, surfacing
+            # as "Timed out while waiting for response to ClientRequest. Waited
+            # 5.0 seconds." Allow an optional per-server `timeout` (seconds) in
+            # the tool config, falling back to a saner default. We apply it to
+            # both the ClientSession read timeout and the underlying httpx
+            # request so neither layer cancels slow tool calls.
+            #   (*)  MCPServerStreamableHttp.client_session_timeout_seconds
+            #   (**) MCPServerStreamableHttp.params["timeout"]
+            request_timeout = float(cfg.get("timeout", 30))
+            params.setdefault("timeout", request_timeout)
+            server = MCPServerStreamableHttp(
+                params=params,
+                name=name,
+                client_session_timeout_seconds=request_timeout,
+            )  # type: ignore[arg-type]
             await server.connect()
             servers.append(server)
         except Exception as e:
@@ -403,7 +422,7 @@ class BaseModel:
 
     @cached_property
     def http_async_client(self):
-        return _get_async_client(remote=self.model_usage == "remote", base_url=self.base_url)
+        return _get_async_client(remote=self.model_usage == "remote")
 
     @cached_property
     def model(self):
@@ -412,7 +431,7 @@ class BaseModel:
     def build_model(self, **kwargs):
         if self.model_instantiation_class is None:
             raise ValueError(
-                "model_instantiation_class is not set. The old langchain-based "
+                "model_instantiation_class is not set. The langchain-based defaults "
                 "(ChatOpenAI / OpenAIEmbeddings) were removed; pass an explicit "
                 "callable (e.g. MultiModalEmbeddings) or use `.client` / "
                 "`.async_client` for direct OpenAI API access."
@@ -476,6 +495,13 @@ class ChatModel(BaseModel):
         "llm_async_response_function",
     )
 
+    # Which OpenAI-compatible transport the Agents SDK should use.
+    #   "chat-completions" (default) — /chat/completions; the only reliable
+    #        tool-calling path on SGLang/vLLM (their /v1/responses rejects
+    #        tool-result round-trips with a 400 validation error).
+    #   "responses" — /v1/responses via OpenAIResponsesModel (e.g. real OpenAI).
+    transport: str = "chat-completions"
+
     @cached_property
     def model(self):
         m = super().model
@@ -483,12 +509,68 @@ class ChatModel(BaseModel):
 
     @staticmethod
     def _fix_chat_inputs(messages: messages_dtype) -> list[dict[str, Any]]:
+        """Normalise arbitrary caller input into OpenAI chat messages.
+
+        Handles:
+        * a plain string  -> ``[{"role":"user","content": str}]``
+        * message dicts (with role/content) -> kept, empty/Nones fixed
+        * tool-style dicts like ``{"text": ..., "image": ...}`` -> wrapped as
+          a user message with a proper ``content`` array (so the VLM actually
+          sees the image instead of re-emitting a tool call for it).
+        """
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
         elif isinstance(messages, dict):
             messages = [messages]
 
-        return messages
+        def _parts_for(raw: Any) -> Any:
+            """Convert a text/str-or-{text,image,...} value into content parts."""
+            if isinstance(raw, str):
+                return raw
+            if isinstance(raw, dict):
+                has_img = any(k in raw for k in ("image", "image_url", "video"))
+                has_text = bool(raw.get("text"))
+                if has_img or has_text:
+                    parts: list[dict[str, Any]] = []
+                    if has_text:
+                        parts.append({"type": "text", "text": str(raw["text"])})
+                    urls: list[str] = []
+                    for k in ("image", "image_url"):
+                        v = raw.get(k)
+                        if v is None:
+                            continue
+                        items = v if isinstance(v, list) else [v]
+                        for it in items:
+                            if isinstance(it, dict):
+                                it = it.get("url", "")
+                            if it:
+                                urls.append(str(it))
+                    for u in urls:
+                        parts.append({"type": "image_url", "image_url": {"url": u}})
+                    return parts
+                return raw
+            return raw
+
+        fixed: list[dict[str, Any]] = []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            if "role" in m and ("content" in m or "image" in m or "text" in m):
+                m2 = {**m, "role": m.get("role") or "user"}
+                content = m2.get("content")
+                if content is None or (isinstance(content, list) and not content):
+                    m2["content"] = ""
+                elif isinstance(content, dict):
+                    m2["content"] = _parts_for(content)
+                elif "image" in m2 or "image_url" in m2 or "text" in m2:
+                    m2["content"] = _parts_for(m2)
+                    for k in ("image", "image_url", "text"):
+                        m2.pop(k, None)
+                fixed.append(m2)
+            else:
+                # role-less input: wrap as a user message.
+                fixed.append({"role": "user", "content": _parts_for(m)})
+        return fixed
 
     @cached_property
     def llm_chat_function(self) -> Callable:
@@ -531,40 +613,55 @@ class ChatModel(BaseModel):
         # which fails behind the PCAI firewall and adds noise to logs.
         # set_tracing_disabled is process-global; safe to call repeatedly.
         set_tracing_disabled(True)
-        model_obj = OpenAIResponsesModel(model=self.model_name, openai_client=self.async_client)
+        # SGLang/vLLM tool-calling is battle-tested over Chat Completions;
+        # their Responses API (/v1/responses) cannot round-trip tool results
+        # — follow-up turns that include output_text/input_text content parts
+        # get rejected with "26 validation errors for ChatCompletionRequest"
+        # (HTTP 400). Default to the Chat Completions model; set
+        # `llmTransport: "responses"` in config to fall back to the Responses
+        # API (e.g. against the real OpenAI API).
+        if self.transport == "chat-completions":
+            model_obj = OpenAIChatCompletionsModel(model=self.model_name, openai_client=self.async_client)
+        else:
+            model_obj = OpenAIResponsesModel(model=self.model_name, openai_client=self.async_client)
         if not tool_json:
             return Agent(name=self.model_name, model=model_obj)
         servers = await _get_mcp_servers(tool_json)
         return Agent(name=self.model_name, model=model_obj, mcp_servers=servers)  # type: ignore[arg-type]
 
     def to_mcp_tools(self) -> list[ToolDefinition]:
-        """Expose this chat model as a single ``respond`` tool using the
-        OpenAI Responses API (``responses.create``).
+        """Expose this chat model as a single ``respond`` tool.
+
+        Uses the Chat Completions API (``/chat/completions``) — compatible
+        with the PCAI/vLLM serving endpoints — instead of the Responses API,
+        which those endpoints reject.
 
         The handler always does a single non-looping call — tool-calling
         agent loops are handled by the orchestration layer, not here.
         """
 
         async def _respond(arguments: dict[str, Any]) -> dict[str, Any]:
+            messages = self._fix_chat_inputs(arguments["input"])
+            if arguments.get("instructions"):
+                messages = [{"role": "system", "content": arguments["instructions"]}] + messages
             params: dict[str, Any] = {
                 "model": self.model_name,
-                "input": arguments["input"],
+                "messages": messages,
             }
-            if "instructions" in arguments:
-                params["instructions"] = arguments["instructions"]
             for k in ("temperature", "max_output_tokens", "top_p"):
                 if k in arguments:
                     params[k] = arguments[k]
 
-            response = await self.async_client.responses.create(**params)
+            response = await self.async_client.chat.completions.create(**params)
             usage = None
             if hasattr(response, "usage") and response.usage:
                 usage = {
-                    "input_tokens": getattr(response.usage, "input_tokens", None),
-                    "output_tokens": getattr(response.usage, "output_tokens", None),
+                    "input_tokens": getattr(response.usage, "prompt_tokens", None),
+                    "output_tokens": getattr(response.usage, "completion_tokens", None),
                 }
+            text = response.choices[0].message.content if response.choices else ""
             return {
-                "output": response.output_text,
+                "output": strip_tool_markers(text or ""),
                 "model": self.model_name,
                 "usage": usage,
             }
@@ -636,31 +733,29 @@ class VoiceModel(BaseModel):
     )
 
     def __post_init__(self) -> None:
-        # Resolve model_name first (BaseModel auto-discovery via /v1/models),
-        # then seed the lazy voices cache.
+        # Resolve model_name first (BaseModel auto-discovery via /v1/models).
+        # NOTE: ``tts_supported_voices`` is a plain dataclass field — do NOT
+        # shadow it with a cached_property of the same name (that returns the
+        # descriptor object on access, breaking any iteration over the voices).
         super().__post_init__()
-        # Save the init-provided voices as a seed and remove from __dict__
-        # so the cached_property descriptor takes over on first access.
-        # This lets callers do:  tts = VoiceModel(...); tts.remote();
-        # tts.tts_supported_voices  → fetches via remote transport.
-        seed = self.__dict__.pop("tts_supported_voices", set())
-        self._tts_voices_seed: set[str] = seed
 
-    @cached_property  # type: ignore[no-redef]
-    def tts_supported_voices(self) -> set[str]:  # noqa: F811
-        """Available voices, resolved lazily on first access.
+    def _get_available_voices(self) -> set[str]:
+        """Return the TTS voices available for this model.
 
-        If voices were provided at init time they are used directly.
-        Otherwise voices are fetched from ``{base_url}/audio/voices``.
-        Because this is a cached_property listed in ``_cached_properties``,
-        calling ``.remote()`` or ``.local()`` clears the cache so the next
-        access re-fetches with the updated endpoint / transport.
+        Uses voices configured at init time if any; otherwise (and only when
+        verification isn't skipped) fetches them from ``{base_url}/audio/voices``.
+        Only a *resolved* (non-empty) list is memoized into the
+        ``tts_supported_voices`` field — a failed/unreachable fetch stays
+        unmemoized so the next request/access re-checks.  ``.remote()`` /
+        ``.local()`` also clears the field (it's in ``_cached_properties``)
+        so the next access re-fetches with the updated transport.
         """
+        if self.tts_supported_voices:
+            return self.tts_supported_voices
         if self.tts_skip_verify:
             return set()
-        if self._tts_voices_seed:
-            return self._tts_voices_seed
         voices: set[str] = set()
+        url = ""
         try:
             url = f"{self.base_url}/audio/voices"
             headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
@@ -672,9 +767,13 @@ class VoiceModel(BaseModel):
             for v in data.get("uploaded_voices", []):
                 voices.add(v.get("name", "") if isinstance(v, dict) else str(v))
             voices.discard("")
-            logger.info(f"Dynamically fetched {len(voices)} voices from {url}: {sorted(voices)}")
+            if voices:
+                logger.info(f"Dynamically fetched {len(voices)} voices from {url}: {sorted(voices)}")
+                # Only memoize a successful, non-empty result.  Empty here
+                # means it should be re-tried on the next access.
+                self.tts_supported_voices = voices
         except Exception as e:
-            logger.warning(f"Could not fetch voices from {url}: {e}. Voice set will be empty.")
+            logger.warning(f"Could not fetch voices from {url}: {e}. Keeping unsettled.")
         return voices
 
     @cached_property
@@ -737,7 +836,7 @@ class VoiceModel(BaseModel):
                     "voice": voice,
                 }
 
-            voices_str = ", ".join(sorted(self.tts_supported_voices)) or "default"
+            voices_str = ", ".join(sorted(self._get_available_voices())) or "default"
             tools.append(
                 ToolDefinition(
                     name="synthesize",
@@ -804,6 +903,275 @@ class VoiceModel(BaseModel):
             )
 
         return tools
+
+
+@dataclass
+class SpeechFlowModel(BaseModel):
+    """Base-to-speech flow: ASR → chat LLM → TTS.
+
+    Instead of pointing at a single endpoint, this source references
+    three other model sources (by slug): an ASR ``VOICE`` source, a
+    ``CHAT`` source, and a TTS ``VOICE`` source.  It
+    is exposed to agents as one ``audio_chat`` tool that runs the whole
+    pipeline in a single MCP call.
+
+    Result handling (see the ``audio_chat`` tool):
+    * **Default:** the synthesized audio is written to the artifact store
+      and the tool returns a small ``artifact://`` URI + transcript/reply.
+      This keeps large binary blobs out of the caller's context and out of
+      the agent-loop result truncation path.
+    * **Opt-in:** passing ``return_audio_base64=true`` returns the audio
+      inline as base64 instead (for direct consumers that need the bytes).
+    """
+
+    # Slugs of the three model sources this flow composes.
+    asr_slug: str = ""
+    llm_slug: str = ""
+    tts_slug: str = ""
+    # Prompt used for the middle LLM step (override per-call via `system`).
+    system_prompt: str = (
+        "You are a helpful speech assistant. Answer the user's spoken "
+        "request concisely, in the same language they spoke."
+    )
+    # Default TTS voice; the per-call `voice` argument takes precedence.
+    tts_voice: str = ""
+    # MIME type of the synth audio (and thus the artifact handle).
+    content_type: str = "audio/mpeg"
+
+    # Resolved sub-models.  Populated by
+    # orchestration.adapters.build_model_from_source at build time, not
+    # from the stored config (init=False).
+    asr_model: "VoiceModel | None" = field(default=None, init=False, repr=False)
+    llm_model: "ChatModel | None" = field(default=None, init=False, repr=False)
+    tts_model: "VoiceModel | None" = field(default=None, init=False, repr=False)
+
+    _cached_properties: tuple[str, ...] = ()
+    _cached_functions: tuple[str, ...] = ()
+
+    allowable_modalities = ("audio",)
+
+    def __post_init__(self) -> None:
+        # A flow composes other models; it has no endpoint/name of its own,
+        # so skip model-name auto-discovery (BaseModel would otherwise try
+        # GET /v1/models against an empty URL).
+        self.model_name = self.model_name or "speech-flow"
+        super().__post_init__()
+
+    def to_mcp_tools(self) -> list[ToolDefinition]:
+        """Expose the speech flow as a single ``audio_chat`` tool."""
+
+        async def _audio_chat(arguments: dict[str, Any]) -> dict[str, Any]:
+            return await self._run_audio_chat(arguments)
+
+        return [
+            ToolDefinition(
+                name="audio_chat",
+                description=self.description
+                or "Speech-to-speech assistant: transcribes the audio, "
+                "answers with an LLM, and synthesizes the reply as speech.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "audio_base64": {
+                            "type": "string",
+                            "description": "Base64-encoded input audio.",
+                        },
+                        "audio_url": {
+                            "type": "string",
+                            "description": "URL of the input audio to transcribe.",
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "Extra instruction to the LLM, on top of the transcription.",
+                        },
+                        "system": {
+                            "type": "string",
+                            "description": "Override the flow's system prompt for the LLM step.",
+                        },
+                        "voice": {
+                            "type": "string",
+                            "description": "TTS voice override.",
+                        },
+                        "return_audio_base64": {
+                            "type": "boolean",
+                            "description": (
+                                "If true, return the reply audio inline as base64 instead "
+                                "of an artifact:// reference (default: false)."
+                            ),
+                        },
+                    },
+                },
+                handler=_audio_chat,
+            )
+        ]
+
+    async def _run_audio_chat(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Run ASR → LLM → TTS over the input audio.
+
+        Returns a JSON-serializable dict.  Step failures are returned as
+        structured ``{"error": ...}`` results rather than raised, so the
+        caller always gets a traceable outcome.
+        """
+        if self.asr_model is None or self.llm_model is None or self.tts_model is None:
+            return {
+                "error": "flow_unresolved",
+                "message": (
+                    "Speech flow sub-models were not resolved at build time. "
+                    "Check that 'asr_slug', 'llm_slug' and 'tts_slug' point at "
+                    "existing, compatible model sources."
+                ),
+            }
+
+        # -- Input audio -----------------------------------------------------
+        audio_bytes: bytes | None = None
+        audio_b64 = arguments.get("audio_base64")
+        audio_url = arguments.get("audio_url")
+        if audio_b64:
+            try:
+                audio_bytes = base64.b64decode(audio_b64)
+            except (ValueError, TypeError) as exc:
+                return {
+                    "error": "invalid_audio",
+                    "message": f"audio_base64 is not valid base64: {exc}",
+                }
+        elif audio_url:
+            audio_bytes = await self._fetch_audio(audio_url)
+        if not audio_bytes:
+            return {
+                "error": "missing_audio",
+                "message": "Provide one of 'audio_base64' or 'audio_url' with valid audio.",
+            }
+
+        # -- 1. ASR ---------------------------------------------------------
+        try:
+            buf = _NamedBytesIO(audio_bytes)
+            asr_res = await self.asr_model.asr_async_function_call(file=buf)
+            transcript = (asr_res.text or "").strip()
+        except Exception as exc:
+            return {"error": "asr_failed", "message": f"ASR step failed: {exc}"}
+        if not transcript:
+            return {
+                "error": "asr_empty",
+                "message": "No speech was recognized in the audio.",
+            }
+
+        # -- 2. LLM ---------------------------------------------------------
+        system = arguments.get("system") or self.system_prompt
+        user_content = transcript
+        extra = arguments.get("prompt")
+        if extra:
+            user_content = f"{extra}\n\nThe user said:\n{transcript}"
+        try:
+            llm_res = await self.llm_model.async_client.chat.completions.create(
+                model=self.llm_model.model_name,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            reply = (llm_res.choices[0].message.content if llm_res.choices else None) or ""
+            reply = reply.strip()
+        except Exception as exc:
+            return {
+                "error": "llm_failed",
+                "message": f"LLM step failed: {exc}",
+                "transcript": transcript,
+            }
+        if not reply:
+            return {
+                "error": "llm_empty",
+                "message": "The LLM returned an empty reply.",
+                "transcript": transcript,
+            }
+
+        # -- 3. TTS ---------------------------------------------------------
+        voice = arguments.get("voice") or self.tts_voice
+        try:
+            tts_res = await self.tts_model.tts_async_function_call(input=reply, voice=voice)
+            audio_bytes = tts_res.content
+        except Exception as exc:
+            return {
+                "error": "tts_failed",
+                "message": f"TTS step failed: {exc}",
+                "transcript": transcript,
+                "text": reply,
+            }
+
+        models = {
+            "asr": self.asr_model.model_name,
+            "llm": self.llm_model.model_name,
+            "tts": self.tts_model.model_name,
+        }
+
+        # -- Return path: inline base64 (opt-in) or artifact handle --------
+        if bool(arguments.get("return_audio_base64", False)):
+            return {
+                "transcript": transcript,
+                "text": reply,
+                "audio_base64": base64.b64encode(audio_bytes).decode(),
+                "content_type": self.content_type,
+                "models": models,
+            }
+
+        from ..orchestration.context import get_current_context
+
+        ctx = get_current_context()
+        artifact_store = getattr(ctx, "artifact_store", None)
+        if artifact_store is None:
+            return {
+                "error": "artifact_store_unavailable",
+                "message": (
+                    "The artifact store is not available in this context. "
+                    "Either enable it or set return_audio_base64=true."
+                ),
+                "transcript": transcript,
+                "text": reply,
+            }
+
+        try:
+            uri = await artifact_store.write(
+                content=audio_bytes,
+                content_type=self.content_type,
+                operation_id=ctx.operation_id,
+                filename=f"audio_chat-{ctx.operation_id[:8]}{_audio_extension(self.content_type)}",
+            )
+        except Exception as exc:
+            return {
+                "error": "artifact_write_failed",
+                "message": f"Could not persist audio output: {exc}",
+                "transcript": transcript,
+                "text": reply,
+            }
+
+        return {
+            "transcript": transcript,
+            "text": reply,
+            "artifact": str(uri),
+            "content_type": self.content_type,
+            "size_bytes": len(audio_bytes),
+            "models": models,
+        }
+
+    async def _fetch_audio(self, audio_url: str) -> bytes | None:
+        """Download the input audio via the ASR model's async HTTP client."""
+        if self.asr_model is None:
+            return None
+        try:
+            resp = await self.asr_model.http_async_client.get(audio_url, follow_redirects=True)
+            resp.raise_for_status()
+            return resp.content
+        except Exception as exc:
+            logger.warning("Could not fetch audio_url %r: %s", audio_url, exc)
+            return None
+
+
+def _audio_extension(content_type: str) -> str:
+    import mimetypes
+
+    ext = mimetypes.guess_extension(content_type.split(";")[0].strip())
+    if not ext:
+        ext = ".bin"
+    return ext
 
 
 @dataclass(repr=False)

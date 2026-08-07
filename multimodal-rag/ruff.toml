@@ -1,8 +1,9 @@
-# Ruff configuration for the multimodal-rag project.
-# Aligns ruff with the existing black (line-length 120) + flake8 setup.
+# Shared ruff configuration for all PCAI repos (canonical in pcai_utils/).
+# Hardlinked into each repo root as ruff.toml — edit here, propagate everywhere.
 #
-# The rules ignored below are deliberate, code-wide patterns that are risky or
-# undesirable to refactor.  Everything else is fixed in-code.
+# Line-length 120 (was black's). The rules ignored below are deliberate,
+# code-wide patterns that are risky or undesirable to refactor.  Everything
+# else is fixed in-code.
 
 line-length = 120
 target-version = "py312"
@@ -27,3 +28,7 @@ ignore = [
     "S112",    # Best-effort `try/except/continue` (e.g. skipping unreachable Qdrant points).
     "PLW1510",  # Fire-and-forget `subprocess.run` calls; errors handled via try/except or returncode checks.
 ]
+
+[lint.per-file-ignores]
+# Runnable scripts that must set sys.path before importing project modules.
+"src/*/helper_scripts/*" = ["E402"]

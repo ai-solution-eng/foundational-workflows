@@ -220,7 +220,12 @@ def _find_bundled_tokenizer(rel: str) -> Path | None:
         logger.warning("RAG_TOKENIZER_PATH=%s does not exist; ignoring", env_path)
 
     start = Path(__file__).resolve().parent  # multimodal_rag/utils/
-    for parent in (start, start.parent, start.parent.parent, start.parent.parent.parent):
+    for parent in (
+        start,
+        start.parent,
+        start.parent.parent,
+        start.parent.parent.parent,
+    ):
         candidate = parent / rel
         if candidate.exists():
             _TOKENIZER_CACHE[rel] = candidate

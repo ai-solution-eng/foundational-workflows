@@ -16,12 +16,9 @@ __all__ = [
     "fish_s2_pro_4B",
     "gemma4_31B",
     "glm_52_753B",
-    "minimax_2_7_240B",
-    "nemotron_3_super_120B",
     "qwen3_tts_1_7B",
     "qwen3_vl_8B",
     "qwen3_vl_reranker_8B",
-    "qwen35_397B",
     "qwen36_27B",
     "whisper_large_v3_turbo",
 ]
@@ -34,17 +31,6 @@ vlm_modalities: tuple[input_modalities, input_modalities, input_modalities] = (
 )
 
 # LLMs
-qwen35_397B = ChatModel(
-    url_remote=(
-        "https://qwen35-397b-a17b-fp8.project-user-tanguy-pomas.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
-    ),
-    api_key=(
-        "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODA5NDYzOTc0LCJpYXQiOjE3Nzc5Mjc5NzQsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiMTYyM2Y3ODYtNDY4Zi00MzM2LTgyNDgtMmVkMmU5Mjk4NmM2Iiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3Nzc5Mjc5NzQ2NTQiLCJ1aWQiOiI2OWNhNTRiNi01ODlhLTQyYzUtOWJjYi0wNzFkNzNjMDYxNDEifX0sIm5iZiI6MTc3NzkyNzk3NCwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc3NzkyNzk3NDY1NCJ9.DvZhoaIEy8dNwE06Y_3_s23lR_GCdNVc_Kj7qhgT8vfkYmg_UTWxTEmNW5J6SP3ishxd6R4EBI0M_R7yBqWJ1q1q16fzKdmOdoN0dOHBXSWPutcR5WzbwbMHmrjWSEgi68GV-iOAIqFd27gIksL_XkQWfBVpuK16uQ-E8Ph2J3ND0tVwBp09rdEJM2hjeyWHkmtCBqK3zLzhg9zTGFCoHhm7Gl-G2MiLwHOVhQNGvSrBQEGHBTFnGO10InT_eRCz9iMlxk895RNa6NtZfUbeLNFfXMbGt3RkLvHDUmZbMCCktzdEPyP5lFGdaszCTJamKK53-91xdqG8wG_c5KhwSg"  # noqa: E501, RUF100
-    ),
-    currently_deployed=False,
-    allowable_modalities=vlm_modalities,
-)
-
 gemma4_31B = ChatModel(
     model_name="RedHatAI/gemma-4-31B-it-FP8-block",
     url_remote=(
@@ -65,32 +51,15 @@ qwen36_27B = ChatModel(
     currently_deployed=False,
 )
 
-nemotron_3_super_120B = ChatModel(
-    url_remote=(
-        "https://nemotron-3-super-120b-a12b.project-user-tanguy-pomas.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"  # noqa: E501, RUF100
-    ),
-    api_key="",
-    currently_deployed=False,
-)
-
-minimax_2_7_240B = ChatModel(
-    url_remote=(
-        "https://mini-max-m27.project-user-francesco-caliva.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
-    ),
-    api_key=(
-        "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODA5NjkxNDk4LCJpYXQiOjE3NzgxNTU0OTgsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiZWY0NWJiNmYtM2U5Ni00ZWI1LWE0ZjUtNTllMWI0YmJjYTY4Iiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3NzgxNTU0OTg5MDUiLCJ1aWQiOiI0NWJlMGZlZS1kYjUwLTRiNWYtODAzYS03MTk2YWFmMDFkZTUifX0sIm5iZiI6MTc3ODE1NTQ5OCwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc3ODE1NTQ5ODkwNSJ9.Z7lhmVNRJGr8BM1MKlrT36DUUrFEPg5NK86-tHbZtuDH0zQXop2L3bnoSrG7UzLYLBPSGFgdtQywSdWMq2HrUzH2LUcIxAYMQtt3iDBxtuhGCmwET0Xk24Rziql_sNpABGx4DqRP1lu4Ze8R9nDNZhQjUyYkpyObKNXC_3o_bx18HklHhxv8vWiVtEVxcQW8jWUkXrtAfftjD89bznK1XnE9M9LSvVpZIHNFCZ7J-jrXFBE9dvKeRJh_OoP8vDsYdgmJkerKo0K6InlYnxOpiJRKycHZxbOeu3g0Q2mICKo0fYOKbbVYX2oZ-IQf8jKwoOoG9FRU1StnqatDDy-ycw"  # noqa: E501, RUF100
-    ),
-    currently_deployed=False,
-)
-
 deepseek_v4_flash_280B = ChatModel(
+    model_name="deepseek-ai/DeepSeek-V4-Flash-0731",
     url_remote=(
-        "https://deepseek-v4-flash-ab.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
+        "https://deepseek-v4-flash-0731.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
     ),
     api_key=(
-        "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODE1NTc0NzgwLCJpYXQiOjE3ODQwMzg3ODAsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiYmFlYWQzYTItMzEwNi00ZDg0LWEwNWYtNzU2YmZhNWUzOTU0Iiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODQwMzg3Nzc5ODgiLCJ1aWQiOiI4NjU2Y2VjNy1mOTkyLTRhNWItYjc0OS0zN2ViNDdkNWY3ZDQifX0sIm5iZiI6MTc4NDAzODc4MCwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4NDAzODc3Nzk4OCJ9.hXrolm_fG1DD6l4BzqbuwHpS7KW12UjhlwSlKwNqW3MiGu6z8MH-kdEsPZPLh_7RKlnO-CmJsCjglgGfoxmNG63baVWBCdS9xvszmvmGusZ25BVqnFJ_O-kyA4T5_h-EJHhDm9MJGhg9Nq3SvJU5P0gGWxlXuEBziihSTlV5arKAK7Z0UbtNn-MVGLQFyfnjzzIaR-lT3OBFne9fNjWdIiNtrk3dhbDD1r-Hfnk4rQ9BZB4QA8jqYzzGvpy8XO_5Mtm9jUxUhnyoqWRWcG3aYGwm8wQl-2c_FfPykIEEHN6TDqv9wpG9ykvlH5KUHo-9pnCRIfGqhKKtFaJ1DTKm8w"  # noqa: E501, RUF100
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODE3MjI3MzY4LCJpYXQiOjE3ODU2OTEzNjgsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiZTkyOWUyMTktMDRmMC00MzA2LTg3YTktNWFiMzE3YzMyMTNhIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODU2OTEzNjgwODUiLCJ1aWQiOiIxMDEwOGU3Zi01M2Y3LTQ2MjUtYmFhMC1hM2EzNmIwNzQ4MjYifX0sIm5iZiI6MTc4NTY5MTM2OCwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4NTY5MTM2ODA4NSJ9.oDPZ_WE0jRDOMoKcsg1iateGcBx3RZNYzbT-NdgN3-m4E-R3sbz3N49SVauPEGKgdsVUY75GU_Ve4P-oZFU5R762jMS-Ob3NcztftLdpwM28yDZLWGGDciidf0LU58Nz8-awx0kOEwpa-1vtWiVS2aK6BjqccAn7AIeead54Vi8UmC3KWlnOKAZShW6MWjJTNfG414ppH8an5LUPnURpm2qRCVfZRikk7Cr-n5Xgi3xkr8z_5jiVv-45cmyGaqkBV4xL1pz24S6u4o66CQ4L47XPKrzXaeF1ibfFkIExS3rB66qLWuXBSpqsbh-5MPtZobxssXUXCcleypwWrmnX1w"  # noqa: E501, RUF100
     ),
-    currently_deployed=False,
+    currently_deployed=True,
 )
 
 glm_52_753B = ChatModel(
@@ -101,6 +70,7 @@ glm_52_753B = ChatModel(
     api_key=(
         "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODE2Nzc1ODkzLCJpYXQiOjE3ODUyMzk4OTMsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiMDg0NDFhNjAtYTBlZS00MTRhLWIwOTktN2Y4ZDI3OGQ0YWUzIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODUyMzk4OTM0ODYiLCJ1aWQiOiJiMjQ3MTFhNi1lZDE4LTQ2MGEtYjRhZC0yNGY1OTNhNmRhODgifX0sIm5iZiI6MTc4NTIzOTg5Mywic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4NTIzOTg5MzQ4NiJ9.TtvwIRteT2ujgQnAKAZQ-aW-xOo3eSfs_27oFwEUery2mCwcAZf67zzRDebe7sgj7T8zSMfhbNkGacgIrpWtTemiOzxr7cJl-zHCBd3TvwkRIAknd9rT6WWJnOFGlliAutyFy9rsIpl6duRCzJWUftNx1ohgppVY0mavwV7m-hqOfMjFLIUZ5lqszCNCWqoXd-yfBfHWWP4EUYBlb8zu7zCMwWZtfvSdJQjcou7Q6y82G9U5nhDOBo1x3XeJ54wIkiB0OaYSiOpkgFBaukAUq7rthjS4667FRQYCRgNYB6Jc98tOv3XDaIiwPMcgJt6AXUU52Js4fAnV2ECYt5pJRg"  # noqa: E501, RUF100
     ),
+    currently_deployed=False,
 )
 
 _qwen3_vl_mm_proc_kwargs = dict(  # noqa: C408
@@ -122,7 +92,10 @@ qwen3_vl_8B = EmbeddingModel(
         "eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODExNTM2OTU1LCJpYXQiOjE3ODAwMDA5NTUsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiNmIxMTIyNzgtNmMzMi00Zjk5LTk5NWEtNzYzMGZlOWNkODRjIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODAwMDA5NTU3ODUiLCJ1aWQiOiJhNWVlNzA4Ni05NDNhLTQyZTktYjI1ZS1lYzVlYTFhN2RlMzEifX0sIm5iZiI6MTc4MDAwMDk1NSwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4MDAwMDk1NTc4NSJ9.qgYrdEJ8kebRtev6OdbZjVbafGSkbPVev0Qiz3qkQ6f90Br6RXvuQsslYfuyNZLrCwt-6e7B7zAIJCPUDk-VZgmMRSf7iZZcEYAeE9ZCx9gNNNG9mlq7qpz9ztr4d0ltYmxgrLFAYUHCtZu12_XZme2f47iJ4KHU-_VRmwkT3zy2V1VK4OLlU_V9VRtYlQojfp9O2IWnYCZ13OL2hMsxzEXk31RoOEkMKPu57U-ob-pmARIHsC9Z7uOog3vGI3T86KWc3VYfYWM6pYoZ_pfpAc0kahqIocghyrDmGtQyhKo-Zz5RB0uLNbemlNmDjaQV7Y0dccQPRCwu_txCkjb9fQ"  # noqa: E501, RUF100
     ),
     embedding_dim=4096,
-    model_instantiation_kwargs=dict(tiktoken_enabled=False, check_embedding_ctx_length=False),  # noqa: C408
+    model_instantiation_kwargs={
+        "tiktoken_enabled": False,
+        "check_embedding_ctx_length": False,
+    },
     code_chunk_size=8192,
     code_chunk_overlap=512,
     tokenizer_name="Qwen/Qwen3-VL-Embedding-8B",

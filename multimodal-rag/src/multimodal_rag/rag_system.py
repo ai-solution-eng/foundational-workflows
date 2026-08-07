@@ -1716,7 +1716,12 @@ class MultimodalRAG:
                 _, _, existing_is_twin = best_by_text[text_hash]
                 # Replace if: current is non-twin and existing is twin,
                 # or current scores higher and twin-status is equal
-                if not is_twin and existing_is_twin or is_twin == existing_is_twin and score > best_by_text[text_hash][1]:
+                if (
+                    not is_twin
+                    and existing_is_twin
+                    or is_twin == existing_is_twin
+                    and score > best_by_text[text_hash][1]
+                ):
                     best_by_text[text_hash] = (doc, score, is_twin)
 
         # Preserve original order (first occurrence wins ties)

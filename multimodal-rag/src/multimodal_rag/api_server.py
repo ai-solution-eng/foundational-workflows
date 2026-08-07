@@ -487,7 +487,7 @@ async def _api_key_auth(request: Request, call_next):
     if not key:
         auth = request.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
-            key = auth[len("Bearer "):]
+            key = auth[len("Bearer ") :]
     import secrets
 
     if secrets.compare_digest(key, _RAG_API_KEY):
@@ -1155,7 +1155,7 @@ async def api_serve_file(
     headers: dict[str, str] = {}
     if not inline:
         safe_name = quote(file_path.name, safe="")
-        headers["Content-Disposition"] = f'attachment; filename*=UTF-8\'\'{safe_name}'
+        headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{safe_name}"
     return FileResponse(str(file_path), headers=headers)
 
 

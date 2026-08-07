@@ -219,9 +219,7 @@ class ArchiveProcessor:
                 raise ValueError(f"Archive member exceeds ARCHIVE_MAX_MEMBER_BYTES ({size} bytes)")
             total += size
             if _ARCHIVE_MAX_TOTAL_BYTES > 0 and total > _ARCHIVE_MAX_TOTAL_BYTES:
-                raise ValueError(
-                    f"Archive total exceeds ARCHIVE_MAX_TOTAL_BYTES ({_ARCHIVE_MAX_TOTAL_BYTES} bytes)"
-                )
+                raise ValueError(f"Archive total exceeds ARCHIVE_MAX_TOTAL_BYTES ({_ARCHIVE_MAX_TOTAL_BYTES} bytes)")
 
         if ext == ".zip":
             import zipfile

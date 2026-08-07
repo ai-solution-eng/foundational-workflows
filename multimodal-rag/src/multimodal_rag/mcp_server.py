@@ -84,7 +84,9 @@ def _media_url_suffix(dataset_name: str, rel_path: str, legacy_password: str | N
 # endpoints.  Prefixes are colon-separated (os.pathsep), e.g.
 #   MEDIA_ALLOW_PATH_PREFIXES=/data/datasets:/data/staging
 _MEDIA_ALLOW_PATH_PREFIXES: tuple[str, ...] = tuple(
-    os.path.normpath(p).rstrip(os.sep) for p in os.environ.get("MEDIA_ALLOW_PATH_PREFIXES", "").split(os.pathsep) if p.strip()
+    os.path.normpath(p).rstrip(os.sep)
+    for p in os.environ.get("MEDIA_ALLOW_PATH_PREFIXES", "").split(os.pathsep)
+    if p.strip()
 )
 
 
@@ -233,6 +235,7 @@ def _infer_media_type_from_query(query: str | None) -> str | None:
     if n_image and n_video:
         return "image" if n_image > n_video else ("video" if n_video > n_image else None)
     return None
+
 
 # ---------------------------------------------------------------------------
 # Thread pool for offloading blocking tool bodies off the MCP event loop.
@@ -2181,8 +2184,7 @@ def main() -> None:
         logger.info("Starting MCP streamable-http server on %s:%s", args.host, args.port)
         app = mcp.streamable_http_app()
         app.add_middleware(_MemoryHeaderMiddleware)
-        app = _with_mcp_health(app)
-        uvicorn.run(app, host=args.host, port=args.port)
+        uvicorn.run(_with_mcp_health(app), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

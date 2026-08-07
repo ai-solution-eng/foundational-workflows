@@ -381,8 +381,7 @@ def _download_s3(s3_url: str, timeout: int = 120) -> str:
             total += len(buf)
             if _MAX_REMOTE_DOWNLOAD_BYTES > 0 and total > _MAX_REMOTE_DOWNLOAD_BYTES:
                 raise ValueError(
-                    f"Download of {s3_url} exceeds MAX_REMOTE_DOWNLOAD_BYTES "
-                    f"({_MAX_REMOTE_DOWNLOAD_BYTES} bytes)"
+                    f"Download of {s3_url} exceeds MAX_REMOTE_DOWNLOAD_BYTES ({_MAX_REMOTE_DOWNLOAD_BYTES} bytes)"
                 )
             chunks.append(buf)
         return b"".join(chunks)
@@ -493,9 +492,7 @@ _MAX_REMOTE_DOWNLOAD_BYTES = max(0, int(os.environ.get("MAX_REMOTE_DOWNLOAD_BYTE
 # Optional comma-separated allowlist of hosts for http(s) ingest.  An entry
 # like ``.minio.svc.cluster.local`` matches the zone and subdomains.  Empty
 # = all hosts allowed (default, backward compatible).
-_INGEST_ALLOW_HOSTS = tuple(
-    h.strip().lower() for h in os.environ.get("INGEST_ALLOW_HOSTS", "").split(",") if h.strip()
-)
+_INGEST_ALLOW_HOSTS = tuple(h.strip().lower() for h in os.environ.get("INGEST_ALLOW_HOSTS", "").split(",") if h.strip())
 
 # Optional private-range block (DNS + literal-IP).  Defaults to disabled so
 # legit in-cluster ingestions (MinIO, internal S3) keep working; operators
@@ -555,9 +552,7 @@ def _check_url_policy(url: str) -> None:
             + (f"={','.join(_INGEST_ALLOW_HOSTS)}" if _INGEST_ALLOW_HOSTS else "")
         )
     if _INGEST_BLOCK_PRIVATE and _host_is_private(host):
-        raise ValueError(
-            f"URL host '{host}' resolves to a private/internal address (INGEST_BLOCK_PRIVATE_HOSTS=true)"
-        )
+        raise ValueError(f"URL host '{host}' resolves to a private/internal address (INGEST_BLOCK_PRIVATE_HOSTS=true)")
 
 
 def _download_url(url: str, timeout: int = 120) -> str:
@@ -585,9 +580,10 @@ def _download_url(url: str, timeout: int = 120) -> str:
     tmp = tempfile.NamedTemporaryFile(prefix=f"{stem}_", suffix=suffix, delete=False)
     try:
         try:
-            with httpx.Client(
-                timeout=httpx.Timeout(timeout, connect=30.0), follow_redirects=True
-            ) as client, client.stream("GET", url) as response:
+            with (
+                httpx.Client(timeout=httpx.Timeout(timeout, connect=30.0), follow_redirects=True) as client,
+                client.stream("GET", url) as response,
+            ):
                 response.raise_for_status()
                 content_length = int(response.headers.get("content-length") or 0)
                 if _MAX_REMOTE_DOWNLOAD_BYTES > 0 and content_length > _MAX_REMOTE_DOWNLOAD_BYTES:
@@ -600,8 +596,7 @@ def _download_url(url: str, timeout: int = 120) -> str:
                     written += len(chunk)
                     if _MAX_REMOTE_DOWNLOAD_BYTES > 0 and written > _MAX_REMOTE_DOWNLOAD_BYTES:
                         raise ValueError(
-                            f"Download of {url} exceeds MAX_REMOTE_DOWNLOAD_BYTES "
-                            f"({_MAX_REMOTE_DOWNLOAD_BYTES} bytes)"
+                            f"Download of {url} exceeds MAX_REMOTE_DOWNLOAD_BYTES ({_MAX_REMOTE_DOWNLOAD_BYTES} bytes)"
                         )
                     tmp.write(chunk)
         except ValueError:

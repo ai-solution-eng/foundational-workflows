@@ -3,8 +3,6 @@ import os
 from io import BytesIO
 from typing import Any
 
-from vllm.multimodal.utils import fetch_image
-
 __all__ = ["prepare_vllm_inputs"]
 
 
@@ -62,7 +60,8 @@ def prepare_vllm_inputs(
         if isinstance(image, str):
             if image.startswith(("http", "https", "oss")):
                 try:
-                    # TODO: Deal w/ https
+                    from vllm.multimodal.utils import fetch_image
+
                     image_obj = fetch_image(image)
                     multi_modal_data = {"image": image_obj}
                 except Exception as e:

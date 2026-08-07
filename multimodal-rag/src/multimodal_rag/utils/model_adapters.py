@@ -646,7 +646,10 @@ class InputConversion:
     ) -> list[list[dict[str, Any]]] | list[dict[str, Any]]:
         return sync_wrapper_safe(
             self.acall,
-            {"inputs": inputs, "add_conversational_elements": add_conversational_elements},
+            {
+                "inputs": inputs,
+                "add_conversational_elements": add_conversational_elements,
+            },
         )
 
     async def acall(
