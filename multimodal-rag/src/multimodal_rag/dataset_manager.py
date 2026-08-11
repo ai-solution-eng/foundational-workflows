@@ -2654,8 +2654,12 @@ class DatasetManager:
 
         scroll_filter = Filter(
             must=[
-                FieldCondition(key="memory_kind", match=MatchValue(value="session_history")),
-                FieldCondition(key="session_id", match=MatchValue(value=session_id)),
+                FieldCondition(
+                    key="metadata.memory_kind", match=MatchValue(value="session_history")
+                ),
+                FieldCondition(
+                    key="metadata.session_id", match=MatchValue(value=session_id)
+                ),
             ]
         )
 

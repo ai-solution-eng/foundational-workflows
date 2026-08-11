@@ -83,7 +83,9 @@ const MAX_COMMAND = 240 // bash command excerpt
 const MAX_TEXT = 8_000 // per assistant/user message body cap
 const MAX_HISTORY = 150_000 // total history cap (oldest messages trimmed first)
 const POST_TIMEOUT_MS = 20_000 // abort a single memory-server POST after this
-const FLUSH_TIMEOUT_MS = 10_000 // abort the shutdown flush after this total
+// The shutdown flush must be LONGER than POST_TIMEOUT_MS or it gives up
+// before a slow replace+embed POST can finish (the flush aborts the write).
+const FLUSH_TIMEOUT_MS = 45_000 // abort the shutdown flush after this total
 // The MCP server splits long histories into ≤MEMORY_MAX_TOKENS (default 8192)
 // token chunks, each prefixed with the header — so a big payload here just
 // means more retained chunks, not a longer single document.
