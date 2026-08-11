@@ -15,13 +15,17 @@ auto-recall + LLM-distilled writes).
 ## 1. How it works
 
 Both clients write memories into password-protected RAG datasets (one
-Qdrant collection per user). Memories are **LLM-curated** — the model
-(or a separate distillation LLM) decides what's durable enough to
-store, not raw transcripts.
+Qdrant collection per user). On the opencode side memories come from two
+places: a `session-memory-logger` plugin that **automatically stores a
+structured history of each session** (prompts, responses, tool calls,
+file changes), plus the model's own `add_memory` calls for distilled
+decisions, preferences, and gotchas. Open WebUI stores memories via a
+separate distillation LLM. Raw transcripts are never stored verbatim —
+session histories are reconstructed into structured summaries.
 
 | | opencode | Open WebUI |
 |---|---|---|
-| **Write trigger** | Model calls `add_memory` MCP tool (proactive, per `AGENTS.md`) | `outlet()` filter asks a distillation LLM after each reply |
+| **Write trigger** | Auto: `session-memory-logger` plugin writes a structured session history ~45s after the conversation goes quiet (flushed on exit) **and** the model calls `add_memory` for distilled notes | `outlet()` filter asks a distillation LLM after each reply |
 | **Recall trigger** | Model calls `search_memory` MCP tool (proactive, per `AGENTS.md`) | `inlet()` filter auto-searches at conversation start |
 | **Transport** | MCP (streamable-http, stateless) | REST API (direct HTTP from filter) |
 | **Dataset/password** | `{env:}` headers in `opencode.jsonc` | HMAC-derived from SSO `__user__` (or shared valve) |
@@ -61,6 +65,40 @@ Use the two-connection pattern in [`opencode.jsonc`](opencode.jsonc) —
 
 For memory across all projects, copy the memory section of `AGENTS.md`
 into your global `~/.config/opencode/AGENTS.md`.
+
+### Client-side plugins & tools (shipped in this repo)
+
+`documentation/opencode-memory/` ships the opencode-side glue for
+automatic memory as **templates** — they are not auto-loaded, so a clone
+of this repo won't change your opencode until you install them. They are
+no-ops until `RAG_MEMORY_DATASET` is exported:
+
+| File | What it does |
+|---|---|
+| `documentation/opencode-memory/plugins/session-memory-logger.ts` | Watches each session and writes a structured history (`kind: "session_history"`) to the memory dataset — prompts, responses, tool calls, and file changes — ~45s after the conversation goes quiet, and flushes anything pending when opencode exits. |
+| `documentation/opencode-memory/plugins/memory-provenance.ts` | Auto-attaches git + session provenance (HEAD before/after, branch, repo, diff stat, session id) to every `add_memory` call. |
+| `documentation/opencode-memory/tools/session-id.ts` | Exposes a `session-id` tool the model can call to get the current session id for tagging memories. |
+
+Install them into your global opencode config to get automatic memory in
+**every** project:
+
+```bash
+mkdir -p ~/.config/opencode/plugins ~/.config/opencode/tools
+cp documentation/opencode-memory/plugins/*.ts ~/.config/opencode/plugins/
+cp documentation/opencode-memory/tools/*.ts  ~/.config/opencode/tools/
+```
+
+(Plugins load at opencode startup — restart after copying.)
+
+Notes:
+- The session-history plugin talks directly to the memory MCP server over
+  HTTP; it defaults to the `rag-memory` URL from `opencode.jsonc` and can
+  be overridden with `RAG_MEMORY_URL`. It relies on the same private CA
+  opencode already needs to reach these servers (`NODE_EXTRA_CA_CERTS`).
+- Keeping them only in the global config means exactly **one** copy loads;
+  don't also drop them into a project's `.opencode/plugins/` /
+  `.opencode/tools/` or they load twice in that repo (harmless — the
+  server's near-duplicate dedup skips the second write — but wasteful).
 
 ### Verify
 ```bash
@@ -165,6 +203,28 @@ There is **no `delete_memory` tool in v1**. To remove a memory:
 - **Lower to 0.97** — collapses more aggressively, smaller store (risk:
   merges distinct facts that happen to be semantically close).
 
+### Capping memory size (tokens)
+
+Every memory — session histories *and* LLM-curated notes — is split into
+documents of at most **`MEMORY_MAX_TOKENS`** tokens each (MCP container env
+var, default `8192`), mirroring dataset-side text splitting. The split uses
+the bundled tokenizer (`RAG_TOKENIZER_PATH`; falls back to ~4 chars/token).
+The **header is prepended to every chunk**, so each split carries the
+session/provenance info (`session_id` in the payload, header block in the
+text). Split memories are marked with `memory_chunks` / `chunk_index` /
+`chunk_total` / `memory_truncated` payload fields.
+
+Set the budget via `extraEnv` in the helm chart (e.g. `extraEnv:
+{MEMORY_MAX_TOKENS: "8192"}`). Keep it at or below the embedder's context
+window (the image bundles an 8192-token embedding model) so each chunk
+embeds fully.
+
+**Sessions are replaced in place.** When a `session_history` memory is
+re-written (a session grows and is re-flushed), `add_memory` first deletes
+the previous chunks for that session, then stores the new ones — so the
+store keeps **one current history per session** instead of accumulating
+copies every time the session is restarted.
+
 ### Rotating the OWUI `MEMORY_SECRET`
 
 Changing `MEMORY_SECRET` re-derives all per-user passwords. Existing
@@ -179,6 +239,11 @@ API and updating `RAG_MEMORY_PASSWORD` in users' env.
 
 - **opencode:** `opencode mcp list` shows both connections; watch the
   tool-call stream for `rag-memory_search_memory` / `rag-memory_add_memory`.
+  The session-history plugin writes `[session-memory] …` diagnostics to
+  `~/.local/share/opencode/log/session-memory.log` (override the directory
+  with `SESSION_MEMORY_LOG_DIR`) and stores records with
+  `kind: session_history`. The plugin never writes to the terminal — TUI
+  output from plugins would overlap the display.
 - **OWUI:** check the filter logs for `Memory recall: N hit(s)` and
   `Memory stored in 'owui-memory-…': …`. Recall injects a system
   message; writes happen silently in the outlet.
@@ -195,6 +260,7 @@ API and updating `RAG_MEMORY_PASSWORD` in users' env.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | opencode: `ToolError: No memory dataset specified` | `RAG_MEMORY_DATASET` not exported | Export it in the shell that launches opencode |
+| opencode: no `[session-memory]` lines in `session-memory.log` | Plugin not loaded | Plugins load at startup — quit and restart opencode; confirm `documentation/opencode-memory/plugins/session-memory-logger.ts` (or the global copy) exists |
 | opencode: `Incorrect password for dataset` | `RAG_MEMORY_PASSWORD` wrong / stale | Re-verify against the dataset's password |
 | opencode: `rag-memory` connection not listed | URL unreachable / ingress token missing | Check `RAG_INGRESS_TOKEN` and the URL; try `opencode mcp debug rag-memory` |
 | opencode: `Session not found` (404) on MCP calls | Multi-replica deployment running stateful MCP mode (pre-v1.3.0) | Upgrade to v1.3.0+ which enables `stateless_http=True`; see [SCALE.md](SCALE.md) |
@@ -211,6 +277,9 @@ API and updating `RAG_MEMORY_PASSWORD` in users' env.
 |---|---|
 | `src/multimodal_rag/mcp_server.py` | `add_memory` / `search_memory` tools, `_MemoryHeaderMiddleware`, `_run_retrieval` |
 | `openwebui_extension/filter.py` | OWUI inlet (recall) + outlet (distil/store), per-user HMAC, auto-create |
+| `documentation/opencode-memory/plugins/session-memory-logger.ts` | Template — auto-writes a structured per-session history (`kind: session_history`) to the memory dataset |
+| `documentation/opencode-memory/plugins/memory-provenance.ts` | Template — attaches git + session provenance to every `add_memory` call |
+| `documentation/opencode-memory/tools/session-id.ts` | Template — `session-id` custom tool |
 | `documentation/opencode.jsonc` | Two-entry MCP config template for opencode |
 | `documentation/AGENTS.md` | opencode proactive recall/write policy |
 | `documentation/MCP.md` | MCP tool reference + all connection configs |

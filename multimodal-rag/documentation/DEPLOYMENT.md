@@ -13,7 +13,7 @@
 
 ```bash
 # From the repo root
-docker build -t your-registry/rag-api-server:latest .
+docker build -f docker/Dockerfile -t your-registry/rag-api-server:latest .
 
 # Push to your registry
 docker push your-registry/rag-api-server:latest

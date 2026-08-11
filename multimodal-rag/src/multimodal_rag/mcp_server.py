@@ -494,6 +494,108 @@ def _resolve_session_id(existing: str | None = None) -> str | None:
     return existing or _opencode_session_id_ctx.get() or os.environ.get("OPENCODE_SESSION_ID")
 
 
+# ---------------------------------------------------------------------------
+# Memory size budget (cap the token size of each stored memory)
+# ---------------------------------------------------------------------------
+
+_MEMORY_MAX_TOKENS_DEFAULT = 8192
+
+
+def _memory_max_tokens() -> int:
+    """Max token budget per memory text, from ``MEMORY_MAX_TOKENS`` (default 8192)."""
+    try:
+        return max(1, int(os.environ.get("MEMORY_MAX_TOKENS", _MEMORY_MAX_TOKENS_DEFAULT)))
+    except (TypeError, ValueError):
+        return _MEMORY_MAX_TOKENS_DEFAULT
+
+
+_memory_splitters: dict[int, Any] = {}
+
+
+def _memory_splitter(chunk_size: int):
+    """Return a token-count-aware splitter for the given budget (or ``None``).
+
+    The bundled ``tokenizer.json`` is used when available so the count is a
+    real token count; callers fall back to a character-based approximation.
+    """
+    if chunk_size in _memory_splitters:
+        return _memory_splitters[chunk_size]
+    try:
+        from multimodal_rag.utils.token_text_splitter import TokenTextSplitter
+
+        splitter = TokenTextSplitter.from_bundled(
+            chunk_size=chunk_size,
+            chunk_overlap=0,
+        )
+    except Exception:
+        splitter = None
+    if splitter is not None:
+        _memory_splitters[chunk_size] = splitter
+    return splitter
+
+
+def _split_memory_header(text: str) -> tuple[str, str]:
+    """Return ``(header, body)`` for a memory document.
+
+    The header is everything up to (but excluding) the first markdown section
+    heading (``## ...``).  For session histories this is the provenance block
+    (title, session id, git info, file list); for free-form notes there is no
+    header and the whole text is the body.
+    """
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line.startswith("## "):
+            header = "\n".join(lines[:i]).strip()
+            body = "\n".join(lines[i:])
+            return (header + "\n") if header else "", body
+    return "", text
+
+
+def _split_memory_text(text: str, max_tokens: int) -> tuple[list[str], bool]:
+    """Split *text* into memory chunks of at most *max_tokens* tokens each.
+
+    The document header (e.g. the session-history provenance block) is
+    prepended to **every** chunk so each split stays identifiable — the
+    ``session_id`` etc. travels with each chunk.  Uses the same tokenizer
+    logic as dataset-side text splitting; falls back to ~4 chars/token.
+
+    Returns ``(chunks, was_split)`` where each chunk is header + body-slice.
+    """
+    if not text or max_tokens <= 0:
+        return ([text] if text else []), False
+
+    header, body = _split_memory_header(text)
+    if not body:
+        return [text], False
+
+    splitter = _memory_splitter(max_tokens)
+    try:
+        header_tokens = splitter.count_tokens(header) if header and splitter is not None else 0
+    except Exception:
+        header_tokens = 0
+    if not header_tokens:
+        header_tokens = max(0, len(header) // 4)
+
+    content_budget = max(1, max_tokens - header_tokens)
+    body_splitter = _memory_splitter(content_budget)
+    if body_splitter is not None:
+        try:
+            chunks = [c for c in body_splitter.split_text(body) if c]
+            if header:
+                chunks = [header + c for c in chunks]
+            return chunks, len(chunks) > 1
+        except Exception:
+            pass  # fall through to the character-based estimate
+
+    # Character-based fallback: ~4 chars per token.
+    budget_chars = content_budget * 4
+    chunks = [body[i : i + budget_chars] for i in range(0, len(body), budget_chars)]
+    chunks = [c for c in chunks if c]
+    if header:
+        chunks = [header + c for c in chunks]
+    return chunks, len(chunks) > 1
+
+
 def _resolve_and_unlock(
     dm: "DatasetManager",
     dataset_name: str,
@@ -1479,6 +1581,13 @@ try:
         via request headers, so the model does NOT need to pass
         ``dataset_name`` / ``password``.
 
+        The stored text is split into documents of at most ``MEMORY_MAX_TOKENS``
+        tokens each (default 8192), mirroring dataset-side text splitting.
+        The header (session/provenance block) is prepended to **every** chunk,
+        and the payload records ``chunk_index`` / ``chunk_total`` /
+        ``memory_chunks`` / ``memory_truncated`` so split memories are
+        identifiable and each chunk carries the session id.
+
         Parameters
         ----------
         text:
@@ -1546,33 +1655,61 @@ try:
                 )
             _resolve_and_unlock(dm, ds_name, pw)
 
-            # Build the document.  In MultimodalRAG._to_documents every non-
-            # 'text' key becomes Qdrant payload metadata, so the provenance
-            # fields below are stored queryably alongside the embedding.
-            doc: dict[str, Any] = {"text": text}
+            # A session-history memory is replaced in place: delete any prior
+            # chunks for this session so the store keeps ONE current history
+            # per session instead of accumulating copies on every re-flush.
+            sid = meta.get("session_id")
+            if meta.get("kind") == "session_history" and sid:
+                try:
+                    dm.delete_session_history(ds_name, str(sid))
+                except Exception as exc:
+                    raise ToolError(f"Failed to replace existing session history: {exc}") from exc
+
+            # Build the document(s).  In MultimodalRAG._to_documents every
+            # non-'text' key becomes Qdrant payload metadata, so the
+            # provenance fields below are stored queryably alongside the
+            # embedding.  Long memories are split into chunk-sized documents,
+            # each prefixed with the header, so the session info is retained
+            # in every split (like dataset-side text splitting).
+            max_tokens = _memory_max_tokens()
+            chunks, was_split = _split_memory_text(text, max_tokens)
+            if not chunks:
+                chunks = [""]
+
+            base: dict[str, Any] = {"source": "opencode:memory"}
             if image:
-                doc["image"] = image
+                base["image"] = image
             if video:
-                doc["video"] = video
+                base["video"] = video
             if audio:
-                doc["audio"] = audio
-            doc["source"] = "opencode:memory"
-            doc["memory_kind"] = meta.get("kind", "note")
-            doc["memory_ts"] = datetime.now(UTC).isoformat()
+                base["audio"] = audio
+            base["memory_kind"] = meta.get("kind", "note")
+            base["memory_ts"] = datetime.now(UTC).isoformat()
+            base["memory_chunks"] = len(chunks)
+            base["memory_truncated"] = was_split
             if meta:
                 tags = meta.get("tags")
                 if tags:
-                    doc["memory_tags"] = tags
+                    base["memory_tags"] = tags
                 sid = meta.get("session_id")
                 if sid:
-                    doc["session_id"] = sid
+                    base["session_id"] = sid
                 # Carry any other metadata keys through verbatim.
                 for k, v in meta.items():
-                    if k not in ("kind", "tags", "session_id") and k not in doc:
-                        doc[k] = v
+                    if k not in ("kind", "tags", "session_id") and k not in base:
+                        base[k] = v
+
+            docs: list[str | dict[str, Any]] = []
+            for i, chunk_text in enumerate(chunks):
+                doc = dict(base)
+                doc["text"] = chunk_text
+                doc["chunk_index"] = i
+                doc["chunk_total"] = len(chunks)
+                doc["memory_split"] = f"{i + 1}/{len(chunks)}"
+                docs.append(doc)
 
             try:
-                ids = dm.add_documents(ds_name, [doc])
+                ids = dm.add_documents(ds_name, docs)
             except Exception as exc:
                 raise ToolError(f"Failed to store memory: {exc}") from exc
 

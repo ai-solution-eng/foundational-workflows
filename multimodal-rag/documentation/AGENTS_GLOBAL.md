@@ -29,6 +29,11 @@ you have **long-term memory** of past interactions:
   recall feels off.
 
 ## When to WRITE — `rag-memory_add_memory`
+A full record of each session (prompts, responses, tool calls, file
+changes) is captured automatically by the `session-memory-logger` plugin
+(`kind: session_history`), so don't reproduce the session here — only
+durable, distilled facts.
+
 After completing a non-trivial task, store a memory **only if** something
 durable was learned. Worth remembering:
 - A **decision** and its rationale.

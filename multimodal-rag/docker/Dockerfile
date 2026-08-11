@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 # Install all runtime dependencies
-COPY requirements.txt .
+COPY docker/requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-download Qwen tokenizer for token-count chunking

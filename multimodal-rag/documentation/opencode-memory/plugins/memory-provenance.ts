@@ -27,8 +27,8 @@
  *     changes.
  *   - At ``add_memory`` time, the current HEAD ("after" commit) is captured.
  *     If the session committed during its run, ``git_before`` and
- *     ``git_after`` differ; if not, they match and ``git_dirty`` / ``git_diff_stat``
- *     describe the uncommitted working-tree changes.
+ *     ``git_after`` differ; if not, they match and ``git_dirty`` /
+ *     ``git_diff_stat`` describe the uncommitted working-tree changes.
  *   - All git operations are best-effort: if the directory is not a git
  *     repo (or git is unavailable), provenance fields are simply omitted.
  */

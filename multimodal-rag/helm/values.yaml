@@ -2,7 +2,7 @@
 replicaCount: 1
 image:
   repository: andrewbydlon/rag-api-server
-  tag: v1.9.1
+  tag: v1.9.4
   pullPolicy: IfNotPresent
 
 deployment:
@@ -130,6 +130,9 @@ resources:
       cpu: "8"
 
 # -- Environment variables (extra) --------------------------------------------
+# Extra env vars for both the API and MCP containers. e.g.
+#   extraEnv:
+#     MEMORY_MAX_TOKENS: "8192"   # per-memory token cap in add_memory
 extraEnv: {}
 
 # -- Security hardening (optional, opt-in) -----------------------------------

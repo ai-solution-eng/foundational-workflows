@@ -2629,6 +2629,61 @@ class DatasetManager:
         )
         self._decrement_count(dataset_name, 1)
 
+    def delete_session_history(self, dataset_name: str, session_id: str) -> int:
+        """Delete every ``session_history`` document for *session_id*.
+
+        Used by ``add_memory`` so a session's history is **replaced in
+        place**: when a session is re-flushed (e.g. it grew on a later
+        restart), the new chunks supersede the old ones instead of
+        accumulating copies in the store.
+
+        Returns the number of points deleted.
+        """
+        rag = self._get_rag(dataset_name)
+        vs = rag.vector_store
+        assert vs is not None and not isinstance(vs, dict)
+        client = vs._client  # type: ignore[attr-defined]
+        coll = vs.collection_name  # type: ignore[attr-defined]
+
+        from qdrant_client.models import (
+            FieldCondition,
+            Filter,
+            MatchValue,
+            PointIdsList,
+        )
+
+        scroll_filter = Filter(
+            must=[
+                FieldCondition(key="memory_kind", match=MatchValue(value="session_history")),
+                FieldCondition(key="session_id", match=MatchValue(value=session_id)),
+            ]
+        )
+
+        ids: list[Any] = []
+        offset: int | str | None = None
+        while True:
+            pts, offset = client.scroll(
+                coll,
+                limit=100,
+                offset=offset,
+                scroll_filter=scroll_filter,
+                with_payload=False,
+                with_vectors=False,
+            )
+            for p in pts:
+                ids.append(str(p.id))
+            if not offset:
+                break
+
+        if ids:
+            client.delete(
+                collection_name=coll,
+                points_selector=PointIdsList(points=ids),
+                wait=True,
+            )
+            self._decrement_count(dataset_name, len(ids))
+        return len(ids)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
