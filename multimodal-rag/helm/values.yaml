@@ -1,7 +1,7 @@
 # -- Global settings ----------------------------------------------------------
 replicaCount: 1
 image:
-  repository: andrewbydlon/rag-api-server
+  repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
   tag: v1.9.5
   pullPolicy: IfNotPresent
 
