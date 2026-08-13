@@ -26,7 +26,7 @@
   // URL: two options —
   //   1) Via the cluster ingress (production): set RAG_INGRESS_TOKEN and use
   //      https://rag-mcp-server.<YOUR-DOMAIN>/mcp  (the Authorization header below).
-  //   2) Via `kubectl port-forward deployment/rag-mcp-server 8001:8001` (local
+  //   2) Via `kubectl port-forward deployment/rag-mcp-server 8001:9090` (local
   //      testing): comment out the Authorization header and switch the url to
   //      http://localhost:8001/mcp.
   "mcp": {

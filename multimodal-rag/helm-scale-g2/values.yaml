@@ -1,3 +1,7 @@
+---
+# NOTE: MEDIA_TOKEN_SECRET is required for password protected dataset file retrieval. Use:
+#   python -c "import secrets; print(secrets.token_hex(32))"
+# to generate. See security.mediaTokenSecret to fill in the value.
 # -- Global settings ----------------------------------------------------------
 # Generation-2 scale variant: same architecture as helm-scale (gunicorn
 # workers, multi-replica Qdrant, Redis-backed unlock cache) but scaled back
@@ -8,7 +12,7 @@
 replicaCount: 2
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v1.9.5
+  tag: v2.0.4
   pullPolicy: IfNotPresent
 
 deployment:
@@ -229,16 +233,17 @@ antiAffinity:
 # -- Environment variables (extra) --------------------------------------------
 extraEnv: {}
 
-# -- Security hardening (optional, opt-in) -----------------------------------
-# Every guard is OFF / permissive by default so the chart behaves exactly as
-# before — flip a value to enable the corresponding protection.
+# -- Security hardening -------------------------------------------------------
+# `mediaTokenSecret` is REQUIRED: both the API and MCP containers refuse to
+# start without it (media URLs are served via short-lived HMAC tokens, never
+# a clear ?password=). The other guards default to their safe setting.
 
 security:
   apiKey: ""
   mediaTokenSecret: ""
   mediaTokenTtl: 3600
   ingestAllowHosts: ""
-  blockPrivateHosts: false
+  blockPrivateHosts: true
   maxDownloadBytes: 536870912
   archiveMaxTotalBytes: 2147483648
   archiveMaxMemberBytes: 1073741824

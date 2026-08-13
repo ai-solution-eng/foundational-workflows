@@ -46,54 +46,80 @@ MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "")
 
 # ---------------------------------------------------------------------------
 # Media token signing (shared secret with the API server).
-# When MEDIA_TOKEN_SECRET is set, the media URLs surfaced to the LLM carry a
-# short-lived HMAC ``?token=...`` instead of the dataset password verbatim.
+# Media URLs surfaced to the LLM always carry a short-lived HMAC
+# ``?token=...`` scoped to ``{dataset}:{relpath}``.  The legacy
+# ``?password=`` suffix (which leaked the dataset password into URLs, tool
+# output, and logs) is gone.  MEDIA_TOKEN_SECRET is REQUIRED — both servers
+# refuse to start without it (see ``main()``).
 # ---------------------------------------------------------------------------
 
 _MEDIA_TOKEN_SECRET = os.environ.get("MEDIA_TOKEN_SECRET", "")
 _MEDIA_TOKEN_TTL = max(60, int(os.environ.get("MEDIA_TOKEN_TTL", "3600")))
 
+# Storage adds a 32-hex uuid prefix to every file to avoid collisions.  It is
+# stripped from public media URLs so models only have to reproduce the
+# human-readable filename (see ``_short_rel``).  ``glob``-compatible.
+_UUID_PREFIX_RE = re.compile(r"^[0-9a-f]{32}_")
+
 
 def _sign_media_token(dataset_name: str, rel_path: str, expiry: int | None = None) -> str:
-    """Mint an expiring HMAC token authorising ``{dataset_name}/{rel_path}``."""
+    """Mint an expiring HMAC token authorising ``{dataset_name}/{rel_path}``.
+
+    The signature is truncated to 128 bits (32 hex chars) — shorter media
+    URLs are copied more reliably by LLMs when they reproduce suggested
+    markdown, and 128 bits is ample for a token that expires after
+    ``MEDIA_TOKEN_TTL``.
+    """
     import hashlib
     import hmac
 
     expiry = expiry or (int(time.time()) + _MEDIA_TOKEN_TTL)
     msg = f"{dataset_name}:{rel_path}:{expiry}".encode()
-    sig = hmac.new(_MEDIA_TOKEN_SECRET.encode(), msg, hashlib.sha256).hexdigest()
+    sig = hmac.new(_MEDIA_TOKEN_SECRET.encode(), msg, hashlib.sha256).hexdigest()[:32]
     return f"{expiry}.{sig}"
 
 
-def _media_url_suffix(dataset_name: str, rel_path: str, legacy_password: str | None) -> str:
+def _media_url_suffix(dataset_name: str, rel_path: str, legacy_password: str | None = None) -> str:
     """Return the URL query suffix for a converted media URL.
 
-    Prefers a short-lived media token when ``MEDIA_TOKEN_SECRET`` is configured;
-    otherwise falls back to appending the clear dataset password (legacy).
+    Always an expiring HMAC token (``?token=...``); the legacy clear
+    ``?password=`` suffix is no longer emitted so the dataset password never
+    appears in URLs / tool output / logs.  ``MEDIA_TOKEN_SECRET`` is required
+    (enforced at startup), so a token is always mintable here.
     """
-    if _MEDIA_TOKEN_SECRET:
-        return "?" + urlencode({"token": _sign_media_token(dataset_name, rel_path)})
-    if legacy_password:
-        return f"?password={legacy_password}"
-    return ""
+    return "?" + urlencode({"token": _sign_media_token(dataset_name, rel_path)})
 
 
-# Optional allowlist of prefixes for ``file://`` / local-path media read by the
-# MCP tools (describe_media, transcribe_audio, audio queries).  When set, paths
-# outside the allowed prefixes are ignored instead of being read into the model
-# endpoints.  Prefixes are colon-separated (os.pathsep), e.g.
+# Allowlist of prefixes for ``file://`` / local-path media read by the MCP
+# tools (describe_media, transcribe_audio, audio queries).  Paths outside the
+# allowed prefixes are refused (fail-closed).  Prefixes are colon-separated
+# (os.pathsep), e.g.
 #   MEDIA_ALLOW_PATH_PREFIXES=/data/datasets:/data/staging
+# When unset, the default is ``DATA_PATH/datasets`` + ``DATA_PATH/staging``
+# (matching the chart's default layout).  An explicitly empty value allows
+# nothing.
+_DEFAULT_DATA_PATH = os.environ.get("DATA_PATH", "/data")
+_MEDIA_ALLOW_DEFAULT = os.pathsep.join(
+    (
+        os.path.join(_DEFAULT_DATA_PATH, "datasets"),
+        os.path.join(_DEFAULT_DATA_PATH, "staging"),
+    )
+)
 _MEDIA_ALLOW_PATH_PREFIXES: tuple[str, ...] = tuple(
     os.path.normpath(p).rstrip(os.sep)
-    for p in os.environ.get("MEDIA_ALLOW_PATH_PREFIXES", "").split(os.pathsep)
+    for p in os.environ.get("MEDIA_ALLOW_PATH_PREFIXES", _MEDIA_ALLOW_DEFAULT).split(os.pathsep)
     if p.strip()
 )
 
 
 def _media_path_allowed(raw: str) -> bool:
-    """True if *raw* (a file:// or local path) is inside an allowed prefix."""
+    """True if *raw* (a file:// or local path) is inside an allowed prefix.
+
+    With no configured prefixes nothing is allowed (fail-closed).  The env
+    default is ``DATA_PATH``/datasets + ``DATA_PATH``/staging.
+    """
     if not _MEDIA_ALLOW_PATH_PREFIXES:
-        return True
+        return False
     p = raw.removeprefix("file://")
     try:
         resolved = os.path.realpath(p)
@@ -305,6 +331,49 @@ def _bounded_cache_put(cache: dict, key: Any, value: Any, max_entries: int) -> N
         cache.pop(next(iter(cache)))
 
 
+# ---------------------------------------------------------------------------
+# Password-failure throttling for MCP ``unlock_dataset`` (mirrors the API
+# server's guard; the MCP path had no brute-force protection, and each wrong
+# attempt pins an MCP pool thread during PBKDF2 verification).
+# ---------------------------------------------------------------------------
+
+_MCP_PW_FAIL_WINDOW = float(os.environ.get("PW_FAIL_WINDOW", "300.0"))
+_MCP_PW_MAX_FAILURES = max(1, int(os.environ.get("PW_MAX_FAILURES", "10")))
+_mcp_pw_fail_buckets: dict[str, list[float]] = {}
+_mcp_pw_fail_lock = threading.Lock()
+
+
+def _mcp_pw_failure_count(cid: str) -> int:
+    now = time.monotonic()
+    with _mcp_pw_fail_lock:
+        lst = _mcp_pw_fail_buckets.get(cid)
+        if not lst:
+            return 0
+        lst[:] = [t for t in lst if now - t < _MCP_PW_FAIL_WINDOW]
+        return len(lst)
+
+
+def _mcp_pw_check_throttle(cid: str) -> None:
+    if _mcp_pw_failure_count(cid) >= _MCP_PW_MAX_FAILURES:
+        raise ToolError("Too many password attempts — try again later.")
+
+
+def _mcp_pw_record_failure(cid: str) -> None:
+    now = time.monotonic()
+    with _mcp_pw_fail_lock:
+        lst = _mcp_pw_fail_buckets.setdefault(cid, [])
+        lst[:] = [t for t in lst if now - t < _MCP_PW_FAIL_WINDOW]
+        lst.append(now)
+        if len(_mcp_pw_fail_buckets) > 10_000:
+            for k in [k for k, v in _mcp_pw_fail_buckets.items() if not v]:
+                _mcp_pw_fail_buckets.pop(k, None)
+
+
+def _mcp_pw_reset_failures(cid: str) -> None:
+    with _mcp_pw_fail_lock:
+        _mcp_pw_fail_buckets.pop(cid, None)
+
+
 def _is_unlocked(dataset_name: str) -> str | None:
     """Return the cached password if *dataset_name* is still unlocked (for this client), else None."""
     key = (dataset_name, _unlock_client_id())
@@ -442,14 +511,14 @@ class _MemoryHeaderMiddleware:
                 cid = value.decode("latin-1").strip() or None
                 if cid:
                     break
-        # No auth-proxy header — fall back to the first X-Forwarded-For hop.
+        # No auth-proxy header — fall back to the socket peer.  X-Forwarded-For
+        # is deliberately ignored: it is client-supplied and spoofable, so
+        # trusting it would let a caller read another identity's cached
+        # unlock password.
         if not cid:
-            for name, value in scope.get("headers") or []:
-                if name == b"x-forwarded-for":
-                    first = value.decode("latin-1").split(",", 1)[0].strip()
-                    if first:
-                        cid = first
-                    break
+            peer = (scope.get("client") or (None, None))[0]
+            if peer:
+                cid = peer
         ds_tok = _memory_dataset_ctx.set(ds)
         pw_tok = _memory_password_ctx.set(pw)
         sid_tok = _opencode_session_id_ctx.set(sid)
@@ -728,6 +797,19 @@ def _escape_markdown_attr(value: str) -> str:
     for ch in ("[", "]", "(", ")"):
         value = value.replace(ch, "")
     return value
+
+
+def _media_alt_label(url: str, fallback: str) -> str:
+    """Derive a clean, escaped ``alt`` label from a media URL.
+
+    The *path basename only* is used — the query string (``?token=…``) is
+    deliberately dropped so an LLM copying the suggested markdown never sees
+    a truncated ``…JPG?t`` fragment to echo into a broken URL.
+    """
+    from urllib.parse import urlsplit
+
+    basename = urlsplit(url).path.rsplit("/", 1)[-1] if url else ""
+    return _escape_markdown_attr((basename or fallback)[:60])
 
 
 # ---------------------------------------------------------------------------
@@ -1130,9 +1212,10 @@ async def _arun_retrieval(
     in parallel (embed HTTP + Qdrant gRPC overlap across requests).
 
     The sync helpers ``_resolve_query_vector`` / ``_resolve_audio_query_vector``
-    (multimodal-only) remain sync — they are only exercised by multimodal
-    queries and are fast relative to the embed + retrieve round-trip.
-    ``Postprocessor.acall`` runs async so it doesn't block the event loop.
+    (multimodal-only) do blocking I/O (Qdrant scroll, file hashing, ASR) and
+    are offloaded to the MCP thread pool via ``_offload`` so they never stall
+    the event loop.  ``Postprocessor.acall`` runs async so it doesn't block
+    the event loop.
     """
     if base_llm_modalities is None:
         base_llm_modalities = ["text"]
@@ -1142,13 +1225,17 @@ async def _arun_retrieval(
     # the same media twice (covers both "LLM passes back a result URL"
     # and "user uploads the same file again").  On miss we embed
     # up-front and cache the result for next time.
+    # The sync helpers (_resolve_query_vector / _resolve_audio_query_vector)
+    # do blocking I/O — Qdrant scroll, file hashing, and full ASR — so they
+    # are offloaded to the MCP thread pool instead of stalling the event
+    # loop (one slow audio query must not block every concurrent client).
     query_vector: list[float] | None = None
     if isinstance(query_dict, dict):
-        query_vector = _resolve_query_vector(rag, dataset_name, query_dict)
+        query_vector = await _offload(_resolve_query_vector, rag, dataset_name, query_dict)
 
         # Audio: embedder doesn't support audio natively.
         if query_vector is None and query_dict.get("audio"):
-            query_vector = _resolve_audio_query_vector(rag, dataset_name, query_dict)
+            query_vector = await _offload(_resolve_audio_query_vector, rag, dataset_name, query_dict)
 
         if query_vector is None and any(query_dict.get(k) for k in ("image", "video", "audio")):
             try:
@@ -1257,19 +1344,27 @@ async def _arun_retrieval(
         api_prefix = f"{media_base_url}/api/datasets/{dataset_name}/files/"
 
         def _suffix_for(rel_path: str) -> str:
-            # Media URLs carry either a short-lived HMAC token (when
-            # MEDIA_TOKEN_SECRET is set) or the legacy clear ?password= so
+            # Media URLs always carry a short-lived HMAC token so
             # `<img>/<video>/<audio>` (which cannot set headers) can fetch
-            # protected media.  The file-serving endpoint accepts both.
-            return _media_url_suffix(dataset_name, rel_path, verified_password)
+            # protected media without ever exposing the dataset password.
+            return _media_url_suffix(dataset_name, rel_path)
+
+        def _short_rel(rel: str) -> str:
+            # Strip the per-file uuid prefix (``{32-hex}_``) that storage
+            # adds to avoid collisions, so the URL an LLM must reproduce is
+            # just the human-readable filename (e.g. ``DSC01373.JPG``) —
+            # random hex in URLs is exactly what models garble.
+            return _UUID_PREFIX_RE.sub("", rel)
 
         def _convert(val: str) -> str:
             if val.startswith(file_prefix):
                 rel = val[len(file_prefix) :]
-                return api_prefix + rel + _suffix_for(rel)
+                short = _short_rel(rel)
+                return api_prefix + short + _suffix_for(short)
             if val.startswith(pvc_prefix):
                 rel = val[len(pvc_prefix) :]
-                return api_prefix + rel + _suffix_for(rel)
+                short = _short_rel(rel)
+                return api_prefix + short + _suffix_for(short)
             return val
 
         def _convert_dict(d: dict[str, Any]) -> dict[str, Any]:
@@ -1288,13 +1383,20 @@ async def _arun_retrieval(
         for url in urls:
             if isinstance(url, str) and url.startswith(("http://", "https://")):
                 src = r.get("source") or r.get("original_source") or ""
-                alt = _escape_markdown_attr((src.split("/")[-1] if src else f"matched image {i + 1}")[:60])
+                alt = _media_alt_label(url, f"matched image {i + 1}")
                 image_md_lines.append(f"![{alt}]({url})")
     if image_md_lines:
         context += (
             "\n\nMatched images — include these markdown image links "
             "verbatim in your response so the user sees them inline:\n" + "\n".join(image_md_lines)
         )
+        if media_base_url:
+            context += (
+                "\nEach URL above already carries the correct host and a signed "
+                "token. Copy them exactly as printed — do not shorten, re-type, "
+                "or substitute the hostname (e.g. do not invent an "
+                "'example.com' variant); doing so breaks the signed link."
+            )
 
     # -- Append HTML5 audio players for matched audio --
     audio_md_lines: list[str] = []
@@ -1306,7 +1408,7 @@ async def _arun_retrieval(
         for url in urls:
             if isinstance(url, str) and url.startswith(("http://", "https://")):
                 src = r.get("source") or r.get("original_source") or ""
-                alt = _escape_markdown_attr((src.split("/")[-1] if src else f"matched audio {i + 1}")[:60])
+                alt = _media_alt_label(url, f"matched audio {i + 1}")
                 audio_md_lines.append(
                     f'<audio controls preload="none" src="{html.escape(url, quote=True)}" title="{alt}"></audio>\n'
                     f"([🎧 {alt}]({url}))"
@@ -1444,6 +1546,8 @@ try:
         def _impl() -> str:
             if ttl < 60 or ttl > 86400:
                 raise ToolError("TTL must be between 60 seconds and 86400 seconds (24 hours).")
+            cid = _unlock_client_id()
+            _mcp_pw_check_throttle(cid)
             dm = get_manager()
             try:
                 dm.get_dataset(dataset_name)
@@ -1452,7 +1556,9 @@ try:
             if not dm.has_password(dataset_name):
                 return f"Dataset '{dataset_name}' is not password protected — nothing to unlock."
             if not dm.verify_password(dataset_name, password):
+                _mcp_pw_record_failure(cid)
                 raise ToolError(f"Incorrect password for dataset '{dataset_name}'.")
+            _mcp_pw_reset_failures(cid)
             _cache_unlock(dataset_name, password, ttl=ttl)
             return (
                 f"Dataset '{dataset_name}' unlocked for {ttl // 60} minutes "
@@ -1507,12 +1613,13 @@ try:
             ``unlock_dataset``; required otherwise.  When provided this
             also acts as an implicit unlock for future calls.
         media_base_url:
-            External base URL of the API server, e.g.
-            ``"https://rag-mcp-server.example.com"``.
-            When set, ``file://`` PVC paths in results are converted to
-            ``{media_base_url}/api/datasets/{name}/files/{path}`` HTTP URLs
-            so the frontend can fetch media directly without large inline
-            base64 payloads.
+            External base URL of the API server (the value of
+            ``MEDIA_BASE_URL``). When set, ``file://`` PVC paths in results
+            are converted to ``{media_base_url}/api/datasets/{name}/files/
+            {path}`` HTTP URLs so the frontend can fetch media directly
+            without large inline base64 payloads.  Use the exact host seen in
+            the returned ``source`` URLs — never invent or substitute a
+            hostname (there is no valid ``rag-mcp-server.example.com``).
         """
 
         # Sync setup — cheap (cached singleton, meta.json read, cached RAG).
@@ -2029,8 +2136,10 @@ try:
         if not os.path.exists(path):
             return media_url
         if not _media_path_allowed(path):
-            logger.warning("media preprocess skipped: path outside MEDIA_ALLOW_PATH_PREFIXES")
-            return media_url
+            # Fail closed: refuse to read a local file outside the allowed
+            # prefixes (previously this only skipped preprocessing, so the
+            # file was still read by the model endpoint).
+            raise ToolError(f"Media path is outside MEDIA_ALLOW_PATH_PREFIXES: {path}")
 
         from pathlib import Path
 
@@ -2306,6 +2415,17 @@ def main() -> None:
     os.environ["QDRANT_PORT"] = str(args.qdrant_port)
 
     setup_logger(level=args.log_level)
+
+    # Media URLs are secured with an HMAC token that requires a shared secret.
+    # Refuse to start without it rather than falling back to leaking the
+    # dataset password inside ?password= URLs.
+    if not _MEDIA_TOKEN_SECRET:
+        logger.error(
+            "MEDIA_TOKEN_SECRET is required: media URLs are signed with a short-lived "
+            "HMAC token (the legacy ?password= suffix was removed for security). "
+            "Set the shared MEDIA_TOKEN_SECRET env var (helm: security.mediaTokenSecret)."
+        )
+        raise SystemExit(1)
 
     import uvicorn
 

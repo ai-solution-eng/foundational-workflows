@@ -459,19 +459,27 @@ A routing step can optionally skip RAG entirely if the LLM determines it can ans
 
 **Local vs remote models:** `model_usage` flag (`.remote()` / `.local()`) switches between in-cluster service DNS (`.svc.cluster.local`) and external URLs. Remote mode disables SSL verification and uses connection-pooled HTTP clients.
 
-**MCP agent support:** Any `ChatModel` can build a LangChain agent with MCP tools via `agent()` / `aagent()`. Tools are loaded via `MultiServerMCPClient` from `langchain_mcp_adapters`.
+**MCP agent support:** Any `ChatModel` can build an openai-agents SDK agent via `agent()` / `aagent()`. `tool_json` is a `{name: {url, headers, transport?, timeout?}}` dict — each entry is connected as an `MCPServerStreamableHttp`, with an optional per-server `timeout` (seconds, default 30) applied to both the SDK session read timeout and the underlying httpx request so slow tool calls (SQL queries, k8s ops) aren't cancelled at the SDK's 5s default. The underlying OpenAI client defaults to the **Chat Completions API** (`/chat/completions`) because PCAI's SGLang/vLLM endpoints can't round-trip tool results over the Responses API (`/v1/responses` returns a 400 on tool-result follow-ups); set `transport: "responses"` on the source to use `OpenAIResponsesModel` (e.g. against real OpenAI). A model can also be exposed as a single `respond` tool via `to_mcp_tools()`, which uses Chat Completions and strips agent-token artifacts (`<|tool_call|>` wrappers, internal `input_file_*.png` refs) from the output with `strip_tool_markers()`.
+
+**Speech flow:** `SpeechFlowModel` (`pcai_model_classes.py`) composes an ASR `VoiceModel`, a `ChatModel`, and a TTS `VoiceModel` (by source slug) into one `audio_chat` tool that runs the whole ASR → LLM → TTS pipeline in a single MCP call. By default the synthesized reply is written to the artifact store and returned as an `artifact://` URI + transcript/reply; pass `return_audio_base64=true` to get the audio inline as base64 instead. Step failures return structured `{"error": ...}` results rather than raising.
 
 ---
 
 ## API Server
 
-**17 REST endpoints** (`api_server.py`):
+**30 REST endpoints** (`api_server.py`):
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/healthz` | Liveness/readiness |
+| GET | `/healthz` | Liveness |
+| GET | `/readyz` | Readiness |
+| GET | `/api/admin/health` | Full health (model endpoints + Qdrant status) |
+| GET | `/api/admin/models` | Discovered model list (model_name per role) |
 | POST | `/api/datasets` | Create (name, description, caption_video, password) |
 | POST | `/api/datasets/{name}/verify-password` | Verify password → 200/401/403 |
+| POST | `/api/datasets/{name}/unlock` | Unlock (cached, Redis across pods) |
+| POST | `/api/datasets/{name}/lock` | Revoke unlock |
+| POST | `/api/datasets/{name}/media-token` | Mint a short-lived dataset-scoped HMAC token for media URLs |
 | GET | `/api/datasets` | List all |
 | GET | `/api/datasets/{name}` | Get one (uses `X-Dataset-Password` header) |
 | PATCH | `/api/datasets/{name}` | Update metadata (description, caption_video) |
@@ -480,13 +488,18 @@ A routing step can optionally skip RAG entirely if the LLM determines it can ans
 | POST | `/api/datasets/{name}/files` | Single file upload (multipart) |
 | POST | `/api/datasets/{name}/batch-files` | Multi-file upload with **SSE progress streaming** |
 | POST | `/api/datasets/{name}/batch-urls` | S3/HTTP URL ingestion with SSE streaming |
+| GET | `/api/datasets/{name}/upload-status/{job_id}` | Batch job status |
 | GET | `/api/datasets/{name}/search` | Text search (`q`, `top_k`, `use_reranker`, `reranker_top_k`) |
 | POST | `/api/datasets/{name}/search` | Multimodal search (body: text + image/video/audio) |
 | GET | `/api/datasets/{name}/documents` | List stored docs (`limit`, default 50, max 1000) |
 | DELETE | `/api/datasets/{name}/documents/{doc_id}` | Delete single doc |
 | GET | `/api/datasets/{name}/files/{filepath:path}` | Serve stored file (password via header or query) |
+| POST | `/api/staging` | Stage an upload for the MCP tools (returns `file://`/`http://` URLs) |
+| GET | `/api/staging/{staging_id}` | Download a staged file by id |
+| POST | `/api/admin/datasets/{name}/migrate-tier-schema` | Migrate a dataset to the three-tier storage schema |
 | GET | `/api/admin/storage` | PVC disk usage + per-dataset stats |
 | GET | `/` | HTML frontend |
+| GET | `/favicon.png` | Frontend icon |
 | GET | `/manage` | HTML storage management view |
 
 **Search parameters:** `q` (required), `top_k` (1–100, default 10), `use_reranker` (bool, default false), `reranker_top_k` (1–50, default 3).
@@ -506,7 +519,7 @@ Exposes **9 MCP tools** (`mcp_server.py`):
 | `get_dataset_info()` | Returns dataset metadata |
 | `describe_media()` | Standalone VLM description of an image/video (no dataset needed) |
 | `transcribe_audio()` | Standalone ASR transcription of an audio file (no dataset needed) |
-| `add_memory()` | Store an LLM-curated memory into a personal memory dataset. `dataset_name`/`password` optional — resolved from the `X-Memory-Dataset` / `X-Dataset-Password` request headers (or `MEMORY_DATASET` env) so the model does not pass them. Merges provenance metadata (`source`, `memory_kind`, `memory_ts`, `memory_tags`, `session_id`) into the Qdrant payload. |
+| `add_memory()` | Store an LLM-curated memory into a personal memory dataset. `dataset_name`/`password` optional — resolved from the `X-Memory-Dataset` / `X-Dataset-Password` request headers (or `MEMORY_DATASET` env) so the model does not pass them. Merges provenance metadata (`source`, `memory_kind`, `memory_ts`, `memory_tags`, `session_id`) into the Qdrant payload. Long memories are split into docs of at most `MEMORY_MAX_TOKENS` (default 8192) — the header/provenance block is prepended to **every** chunk (`memory_chunks`/`chunk_index`/`chunk_total`/`memory_truncated` payload fields). A `session_history` memory is **replaced in place** (prior chunks for that `session_id` are deleted first) so a session never accumulates stale copies. |
 | `search_memory()` | Recall from the personal memory dataset; same resolution + retrieval/postproc as `search_dataset` (via the shared `_run_retrieval` helper). |
 
 **Long-term memory (opencode):** the `add_memory` / `search_memory` tools back a per-user long-term memory store. An MCP client (e.g. opencode) connects **twice** to the same URL — once as `rag-memory` (sending `X-Memory-Dataset`/`X-Dataset-Password` headers, exposing only `add_memory`/`search_memory`) and once as `rag-knowledge` (exposing the general dataset tools). Per-user isolation is the dataset **password**; the memory headers are read ONLY inside `add_memory`/`search_memory`, so a memory password can never silently unlock another dataset. See `MCP.md`, `MEMORY.md`, `opencode.jsonc`, and `AGENTS.md` for the full pattern.
@@ -529,6 +542,50 @@ Exposes **9 MCP tools** (`mcp_server.py`):
 - Verified via `X-Dataset-Password` header or `?password=` query param (for media tags).
 - API responses strip the hash and add a `has_password` boolean.
 - Methods: `create_dataset(password=)`, `has_password()`, `verify_password()`, `set_password()`.
+
+**Brute-force throttling:** password failures are bucket-limited per client
+identity (`PW_MAX_FAILURES` within `PW_FAIL_WINDOW`, defaults 10 / 300 s).
+The throttle applies to the REST API *and* the MCP `unlock_dataset` tool.
+Client identity comes from auth-proxy headers (`X-Auth-Request-Email` /
+`X-Auth-Request-User`) or the socket peer IP — `X-Forwarded-For` is
+deliberately **not** trusted (client-supplied / spoofable), so an attacker
+can neither bypass the throttle nor read another identity's cached unlock
+password.
+
+**Media tokens (required):** both servers refuse to start without
+`MEDIA_TOKEN_SECRET` (helm: `security.mediaTokenSecret`). Media URLs emitted
+by the MCP server always carry a short-lived HMAC `?token=` (scoped to
+`{dataset}:{relpath}`, TTL `MEDIA_TOKEN_TTL`, default 1 h) — the legacy
+`?password=` suffix was removed so the dataset password never appears in MCP
+output, URLs, or logs. The HTML frontend also uses tokens: it mints a
+dataset-scoped token (`POST /api/datasets/{name}/media-token`, wildcard
+`*` path) and appends it to media URLs, so the password only ever travels in
+the `X-Dataset-Password` request header, never in a URL.
+
+**Local-file allowlist (MCP media):** `describe_media` / `transcribe_audio` /
+audio queries may only read `file://`/local paths under
+`MEDIA_ALLOW_PATH_PREFIXES` (default `DATA_PATH/datasets` +
+`DATA_PATH/staging`); disallowed paths are refused (fail-closed).
+
+**Remote-URL ingest guards (SSRF):**
+- `INGEST_BLOCK_PRIVATE_HOSTS` blocks private/loopback/link-local targets —
+  **on by default**. `s3://` downloads are unaffected (only `http(s)://`).
+- `INGEST_ALLOW_HOSTS` is an authoritative allowlist: listed hosts bypass the
+  private-block (how in-cluster MinIO/internal ingestions are permitted);
+  when set, hosts not listed are rejected.
+- `MAX_URL_REDIRECTS` (default 5) — every redirect hop is re-checked against
+  the policy, so a public URL can't bounce into an internal address.
+- `MAX_REMOTE_DOWNLOAD_BYTES` (default 512 MiB) — streams are aborted past this.
+
+**Upload caps:** multipart uploads (dataset files + staging) abort past
+`MAX_UPLOAD_BYTES` (default 1 GiB). Non-media staged/dataset files are served
+with `Content-Disposition: attachment` so crafted HTML/SVG can't execute in
+the origin. `/api/admin/*` and media/staging serving are exempt from the
+`RAG_API_KEY` gate by explicit route (not prefix matching).
+
+**TLS:** remote model clients default to `verify=False` for PCAI's
+self-signed endpoints; set `REMOTE_CA_BUNDLE` to a `.crt`/`.pem` bundle to
+pin and verify against it instead.
 
 ---
 
@@ -640,7 +697,7 @@ For a typical PDF sub-batch (~60 text + ~4 image docs): **~5 HTTP requests** ins
 MODEL_<ROLE>_NAME       — model name
 MODEL_<ROLE>_URL        — full remote URL
 MODEL_<ROLE>_API_KEY    — API key / service-account token
-MODEL_<ROLE>_CLASS      — "MultiModalEmbeddings" | "MultiModalReranker" | "ChatOpenAI"
+MODEL_<ROLE>_CLASS      — "MultiModalEmbeddings" | "MultiModalReranker" | model-class name
 MODEL_<ROLE>_EXTRA      — JSON of additional constructor kwargs
 ```
 
@@ -659,15 +716,19 @@ Factory functions `build_embedder()`, `build_reranker()`, `build_vlm()`, `build_
 
 | Model | Class | Purpose |
 |-------|-------|---------|
-| `deepseek_v4_flash_280B` | ChatModel | Default text LLM |
-| `qwen35_397B` | ChatModel | Large MoE LLM |
-| `gemma4_31B` | ChatModel | Multimodal VLM (default) |
-| `nemotron_3_super_120B` | ChatModel | LLM (not deployed) |
-| `minimax_2_7_240B` | ChatModel | LLM (not deployed) |
+| `deepseek_v4_flash_280B` | ChatModel | Default text LLM (deployed) |
+| `gemma4_31B` | ChatModel | Multimodal VLM (deployed) |
+| `qwen36_27B` | ChatModel | LLM (not deployed) |
+| `glm_52_753B` | ChatModel | LLM (not deployed) |
 | `qwen3_vl_8B` | EmbeddingModel | Multimodal embeddings (default) |
 | `qwen3_vl_reranker_8B` | RerankerModel | Cross-encoder reranker (default) |
 | `whisper_large_v3_turbo` | VoiceModel | ASR (not deployed) |
 | `cohere_transcribe_3_2b` | VoiceModel | ASR (default) |
-| `qwen3_tts_1_7B` | VoiceModel | TTS with 9 supported voices |
+| `qwen3_tts_1_7B` | VoiceModel | TTS with 9 supported voices (not deployed) |
+| `fish_s2_pro_4B` | VoiceModel | TTS (not deployed) |
+
+`pcai_model_classes.py` also defines the composable `SpeechFlowModel`
+(ASR → LLM → TTS `audio_chat` tool — see [LLM Generation](#llm-generation))
+and helpers such as `strip_tool_markers()`.
 
 **Deployment** (Helm chart): 2-container pod (API server port 8000 + MCP sidecar port 9090), Qdrant StatefulSet with dedicated PVC, PCAI VirtualService on `istio-system/ezaf-gateway` (timeout 660s), AuthorizationPolicy via `oauth2-proxy`, Kyverno pod security policy.

@@ -138,23 +138,6 @@ def _preferred_media(doc: dict[str, Any]) -> dict[str, list[str]]:
     return out
 
 
-def _fetch_media_bytes(url: str, client=None) -> bytes:
-    if url.startswith(("http://", "https://")):
-        if client is not None:
-            resp = client.get(url, follow_redirects=True)
-            resp.raise_for_status()
-            return resp.content
-        import httpx
-
-        with httpx.Client() as c:
-            resp = c.get(url, follow_redirects=True)
-            resp.raise_for_status()
-            return resp.content
-    path = url.removeprefix("file://")
-    with open(path, "rb") as f:
-        return f.read()
-
-
 async def _afetch_media_bytes(url: str, async_client=None) -> bytes:
     if url.startswith(("http://", "https://")):
         if async_client is not None:
@@ -366,17 +349,17 @@ async def _describe_doc(
         response = await vlm.llm_async_chat_function_call(messages)
     else:
         # Split media across multiple VLM calls, concatenate descriptions
+        # (this branch only runs when n_media > max_media_per_prompt).
         descriptions: list[str] = []
         for i in range(0, n_media, max_media_per_prompt):
             batch = all_media[i : i + max_media_per_prompt]
             content_parts = list(text_parts)
-            if n_media > max_media_per_prompt:
-                content_parts.append(
-                    {
-                        "type": "text",
-                        "text": f"(Describing images {i + 1}-{min(i + max_media_per_prompt, n_media)} of {n_media})",
-                    }
-                )
+            content_parts.append(
+                {
+                    "type": "text",
+                    "text": f"(Describing images {i + 1}-{min(i + max_media_per_prompt, n_media)} of {n_media})",
+                }
+            )
             for media_type, url in batch:
                 content_parts.append({"type": media_type, media_type: {"url": url}})
             messages = [
@@ -590,8 +573,11 @@ class Preprocessor:
                 vlm_idx += 1
 
             # -- remaining ASR results (video caption) ----------------------
+            # Marker must match the Postprocessor's check ("[Video audio
+            # transcription]:") so ingest-time captions are reused and the
+            # audio is not re-transcribed at retrieval.
             for transcript in asr_results:
-                text_parts.append(f"[Video audio]: {transcript}")
+                text_parts.append(f"[Video audio transcription]: {transcript}")
 
             d["text"] = "\n".join(p for p in text_parts if p)
             return d
@@ -720,13 +706,13 @@ class Postprocessor:
             # Only for video (audio is handled above via ingest-time text).
             # Skipped when the video's audio was already captioned at ingest
             # (marker "[Video audio transcription]:" present in text).
-            has_video_caption = "[Video audio transcription]:" in text
+            has_video_audio_caption = "[Video audio transcription]:" in text
             if (
                 self.caption_with_asr
                 and "video" not in llm_modalities
                 and media["video"]
                 and self.asr is not None
-                and not has_video_caption
+                and not has_video_audio_caption
             ):
                 asr_tasks.extend([self._transcribe(url) for url in media["video"]])
 
@@ -739,7 +725,7 @@ class Postprocessor:
                 and "video" not in llm_modalities
                 and media["video"]
                 and self.asr is not None
-                and not has_video_caption
+                and not has_video_audio_caption
             ):
                 for transcript in asr_results:
                     caption = f"[Video audio transcription]: {transcript}"
@@ -1274,11 +1260,6 @@ class MultimodalRAG:
         chunk_overlap = self.embedder.chunk_overlap
         text_splitter = self.embedder.text_splitter
 
-        def _over_budget(text: str) -> bool:
-            if text_splitter is not None:
-                return text_splitter.count_tokens(text) > chunk_size
-            return len(text) > chunk_size
-
         def _split(text: str) -> list[str]:
             if text_splitter is not None:
                 return text_splitter.split_text(text)
@@ -1318,11 +1299,18 @@ class MultimodalRAG:
                 out.append(doc)
                 continue
             text = doc.get("text", "")
-            if not text or not _over_budget(text):
+            if not text:
                 out.append(doc)
                 continue
 
+            # Split once (token-counting + splitting in a single pass).  A
+            # single output chunk identical to the input means the doc was
+            # within budget — keep it untouched.
             chunks = _split(text)
+            if not chunks or (len(chunks) == 1 and chunks[0].strip() == text.strip()):
+                out.append(doc)
+                continue
+
             for i, chunk in enumerate(chunks):
                 entry = dict(doc)
                 entry["text"] = chunk
@@ -1642,13 +1630,6 @@ class MultimodalRAG:
         top_indices = np.argsort(scores)[-k:][::-1]
         return [(documents[i], float(scores[i])) for i in top_indices]
 
-    def _rerank_results(
-        self,
-        query: str | dict[str, Any],
-        results: list[tuple[Any, float]],
-    ) -> list[tuple[Any, float]]:
-        return sync_wrapper_safe(self._arerank_results, {"query": query, "results": results})
-
     @staticmethod
     def _dedup_twins(results: list[tuple[Any, float]]) -> list[tuple[Any, float]]:
         """Remove duplicate results so downstream compute and LLM context isn't wasted.
@@ -1765,6 +1746,10 @@ class MultimodalRAG:
         for i, (d, emb_score) in enumerate(results):
             rerank_score = score_by_idx.get(i, 0.0)
             if isinstance(d, dict):
+                # Copy the doc before annotating so we never mutate the
+                # caller's dicts (e.g. the `documents=` path passes the
+                # caller's own objects through here).
+                d = dict(d)
                 d["_embedding_score"] = round(emb_score, 4)
                 d["_reranker_score"] = round(rerank_score, 4)
             paired.append((d, rerank_score))
@@ -1927,10 +1912,7 @@ class MultimodalRAG:
         # -- multimodal: build content parts array ---------------------------
         content_parts: list[dict[str, Any]] = []
 
-        if isinstance(query, dict) and query.get("text"):
-            content_parts.append({"type": "text", "text": "Context documents:"})
-        else:
-            content_parts.append({"type": "text", "text": "Context documents:"})
+        content_parts.append({"type": "text", "text": "Context documents:"})
 
         for doc in postprocessed:
             if isinstance(doc, str):

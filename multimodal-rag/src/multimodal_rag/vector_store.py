@@ -184,17 +184,27 @@ class _QdrantBatcher:
         queries = [(emb, k, need_media) for emb, k, need_media, _ in batch]
         futs = [f for _, _, _, f in batch]
 
-        try:
-            results = await asyncio.get_running_loop().run_in_executor(None, self._search_fn, queries)
-            if len(results) != len(futs):
-                raise RuntimeError(f"Batched Qdrant query returned {len(results)} results for {len(futs)} queries")
-            for fut, result in zip(futs, results):
-                if not fut.done():
-                    fut.set_result(result)
-        except Exception as exc:
-            for fut in futs:
-                if not fut.done():
-                    fut.set_exception(exc)
+        loop = asyncio.get_running_loop()
+        exec_fut = loop.run_in_executor(None, self._search_fn, queries)
+
+        # Settle every caller's future from the executor result — even if the
+        # task that triggered this flush is cancelled (e.g. a client disconnect),
+        # so no queued caller is left hanging forever.
+        def _settle(f: "asyncio.Future[list[list[tuple[Document, float]]]]") -> None:
+            try:
+                results = f.result()
+                if len(results) != len(futs):
+                    raise RuntimeError(f"Batched Qdrant query returned {len(results)} results for {len(futs)} queries")
+                for fut, result in zip(futs, results):
+                    if not fut.done():
+                        fut.set_result(result)
+            except BaseException as exc:  # settle callers regardless
+                for fut in futs:
+                    if not fut.done():
+                        fut.set_exception(exc)
+
+        exec_fut.add_done_callback(_settle)
+        await asyncio.shield(exec_fut)
 
 
 class QdrantVectorStore(VectorStore):

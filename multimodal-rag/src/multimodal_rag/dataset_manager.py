@@ -360,7 +360,12 @@ def _get_s3_client() -> Any:
 
 
 def _download_s3(s3_url: str, timeout: int = 120) -> str:
-    """Download a file from S3 to a temp location and return the local path."""
+    """Download a file from S3 to a temp location and return the local path.
+
+    The object body is streamed to disk in 1 MiB chunks with the same
+    size-cap abort as the HTTP download path, so a large object is never
+    buffered fully in RAM.
+    """
     import tempfile
     from urllib.parse import urlparse
 
@@ -368,38 +373,39 @@ def _download_s3(s3_url: str, timeout: int = 120) -> str:
     bucket = parsed.hostname  # s3://bucket/key → hostname = bucket
     key = parsed.path.lstrip("/")
 
-    def _fetch() -> bytes:
-        s3 = _get_s3_client()
-        resp = s3.get_object(Bucket=bucket, Key=key)
-        body = resp["Body"]
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            buf = body.read(1 << 20)
-            if not buf:
-                break
-            total += len(buf)
-            if _MAX_REMOTE_DOWNLOAD_BYTES > 0 and total > _MAX_REMOTE_DOWNLOAD_BYTES:
-                raise ValueError(
-                    f"Download of {s3_url} exceeds MAX_REMOTE_DOWNLOAD_BYTES ({_MAX_REMOTE_DOWNLOAD_BYTES} bytes)"
-                )
-            chunks.append(buf)
-        return b"".join(chunks)
-
-    try:
-        content = retry_call(_fetch, max_attempts=3, base_delay=2.0, connection_delay=10.0)
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(f"Failed to download {s3_url}: {e}")
-
     basename = Path(key).name or "download"
     suffix = Path(basename).suffix or ""
     stem = Path(basename).stem or "file"
 
     tmp = tempfile.NamedTemporaryFile(prefix=f"{stem}_", suffix=suffix, delete=False)
+    tmp_path = ""
     try:
-        tmp.write(content)
+
+        def _fetch_to() -> None:
+            # Each retry restarts the download from scratch.
+            tmp.seek(0)
+            tmp.truncate()
+            s3 = _get_s3_client()
+            resp = s3.get_object(Bucket=bucket, Key=key)
+            body = resp["Body"]
+            total = 0
+            while True:
+                buf = body.read(1 << 20)
+                if not buf:
+                    break
+                total += len(buf)
+                if _MAX_REMOTE_DOWNLOAD_BYTES > 0 and total > _MAX_REMOTE_DOWNLOAD_BYTES:
+                    raise ValueError(
+                        f"Download of {s3_url} exceeds MAX_REMOTE_DOWNLOAD_BYTES ({_MAX_REMOTE_DOWNLOAD_BYTES} bytes)"
+                    )
+                tmp.write(buf)
+
+        try:
+            retry_call(_fetch_to, max_attempts=3, base_delay=2.0, connection_delay=10.0)
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"Failed to download {s3_url}: {e}")
         tmp_path = tmp.name
     finally:
         tmp.close()
@@ -489,15 +495,21 @@ def _expand_urls(raw_urls: list[str]) -> list[str]:
 # PVC.  ``0`` disables the cap.
 _MAX_REMOTE_DOWNLOAD_BYTES = max(0, int(os.environ.get("MAX_REMOTE_DOWNLOAD_BYTES", str(512 * 1024 * 1024))))
 
+# Max http(s) redirect hops followed during URL ingest (each hop is re-checked
+# against the URL policy).
+_MAX_URL_REDIRECTS = max(1, int(os.environ.get("MAX_URL_REDIRECTS", "5")))
+
 # Optional comma-separated allowlist of hosts for http(s) ingest.  An entry
 # like ``.minio.svc.cluster.local`` matches the zone and subdomains.  Empty
 # = all hosts allowed (default, backward compatible).
 _INGEST_ALLOW_HOSTS = tuple(h.strip().lower() for h in os.environ.get("INGEST_ALLOW_HOSTS", "").split(",") if h.strip())
 
-# Optional private-range block (DNS + literal-IP).  Defaults to disabled so
-# legit in-cluster ingestions (MinIO, internal S3) keep working; operators
-# enable it for fully-public deployments.
-_INGEST_BLOCK_PRIVATE = os.environ.get("INGEST_BLOCK_PRIVATE_HOSTS", "false").lower() in ("1", "true", "yes")
+# Private-range block (DNS + literal-IP).  On by default so remote ingest
+# cannot reach internal/loopback targets (SSRF).  Explicitly-allowlisted
+# hosts (INGEST_ALLOW_HOSTS) bypass the block — set that to keep in-cluster
+# MinIO/internal ingestions working.  ``INGEST_BLOCK_PRIVATE_HOSTS=false``
+# restores the legacy permissive behaviour.
+_INGEST_BLOCK_PRIVATE = os.environ.get("INGEST_BLOCK_PRIVATE_HOSTS", "true").lower() in ("1", "true", "yes")
 
 
 def _host_matches_allowlist(host: str) -> bool:
@@ -546,11 +558,16 @@ def _check_url_policy(url: str) -> None:
     from urllib.parse import urlparse
 
     host = urlparse(url).hostname or ""
-    if _INGEST_ALLOW_HOSTS and not _host_matches_allowlist(host):
-        raise ValueError(
-            f"URL host '{host}' is not allowed by INGEST_ALLOW_HOSTS"
-            + (f"={','.join(_INGEST_ALLOW_HOSTS)}" if _INGEST_ALLOW_HOSTS else "")
-        )
+    # An explicit allowlist is authoritative: hosts not listed are rejected,
+    # and listed hosts are allowed even when they resolve privately (that is
+    # how in-cluster MinIO/internal ingestions are permitted).
+    if _INGEST_ALLOW_HOSTS:
+        if not _host_matches_allowlist(host):
+            raise ValueError(
+                f"URL host '{host}' is not allowed by INGEST_ALLOW_HOSTS"
+                + (f"={','.join(_INGEST_ALLOW_HOSTS)}" if _INGEST_ALLOW_HOSTS else "")
+            )
+        return
     if _INGEST_BLOCK_PRIVATE and _host_is_private(host):
         raise ValueError(f"URL host '{host}' resolves to a private/internal address (INGEST_BLOCK_PRIVATE_HOSTS=true)")
 
@@ -580,25 +597,40 @@ def _download_url(url: str, timeout: int = 120) -> str:
     tmp = tempfile.NamedTemporaryFile(prefix=f"{stem}_", suffix=suffix, delete=False)
     try:
         try:
-            with (
-                httpx.Client(timeout=httpx.Timeout(timeout, connect=30.0), follow_redirects=True) as client,
-                client.stream("GET", url) as response,
-            ):
-                response.raise_for_status()
-                content_length = int(response.headers.get("content-length") or 0)
-                if _MAX_REMOTE_DOWNLOAD_BYTES > 0 and content_length > _MAX_REMOTE_DOWNLOAD_BYTES:
-                    raise ValueError(
-                        f"Download of {url} exceeds MAX_REMOTE_DOWNLOAD_BYTES "
-                        f"({content_length} > {_MAX_REMOTE_DOWNLOAD_BYTES} bytes)"
-                    )
-                written = 0
-                for chunk in response.iter_bytes():
-                    written += len(chunk)
-                    if _MAX_REMOTE_DOWNLOAD_BYTES > 0 and written > _MAX_REMOTE_DOWNLOAD_BYTES:
-                        raise ValueError(
-                            f"Download of {url} exceeds MAX_REMOTE_DOWNLOAD_BYTES ({_MAX_REMOTE_DOWNLOAD_BYTES} bytes)"
-                        )
-                    tmp.write(chunk)
+            # Follow redirects manually so every hop is re-checked against the
+            # URL policy (a public URL must not be able to redirect into an
+            # internal/private address).
+            from urllib.parse import urljoin
+
+            current = url
+            with httpx.Client(timeout=httpx.Timeout(timeout, connect=30.0), follow_redirects=False) as client:
+                for _ in range(_MAX_URL_REDIRECTS):
+                    with client.stream("GET", current) as response:
+                        if response.is_redirect:
+                            location = response.headers.get("location")
+                            if not location:
+                                raise ValueError(f"Redirect from {current} has no Location header")
+                            current = urljoin(current, location)
+                            _check_url_policy(current)
+                            continue
+                        response.raise_for_status()
+                        content_length = int(response.headers.get("content-length") or 0)
+                        if _MAX_REMOTE_DOWNLOAD_BYTES > 0 and content_length > _MAX_REMOTE_DOWNLOAD_BYTES:
+                            raise ValueError(
+                                f"Download of {url} exceeds MAX_REMOTE_DOWNLOAD_BYTES "
+                                f"({content_length} > {_MAX_REMOTE_DOWNLOAD_BYTES} bytes)"
+                            )
+                        written = 0
+                        for chunk in response.iter_bytes():
+                            written += len(chunk)
+                            if _MAX_REMOTE_DOWNLOAD_BYTES > 0 and written > _MAX_REMOTE_DOWNLOAD_BYTES:
+                                raise ValueError(
+                                    f"Download of {url} exceeds MAX_REMOTE_DOWNLOAD_BYTES ({_MAX_REMOTE_DOWNLOAD_BYTES} bytes)"
+                                )
+                            tmp.write(chunk)
+                        break
+                else:
+                    raise ValueError(f"Too many redirects downloading {url}")
         except ValueError:
             raise
         except Exception as e:
@@ -1399,12 +1431,59 @@ class DatasetManager:
 
         file_results: list[dict[str, Any]] = []
         _MB = 2.56 * 1024 * 1024
+        # Byte cap for the idle "keep the consumer fed" handoff: at most this
+        # many bytes of in-memory payload (base64 data URLs) per batch, so a
+        # stack of huge media files can't be pushed into one multi-GB batch.
+        _IDLE_SEND_BYTES = 256 * 1024 * 1024
+
+        def _doc_payload_bytes(doc: Any) -> int:
+            """Estimate the in-memory bytes a doc contributes to a batch."""
+            if isinstance(doc, str):
+                return len(doc)
+            if isinstance(doc, dict):
+                total = len(doc.get("text") or "")
+                for k in ("image", "video", "audio"):
+                    v = doc.get(k)
+                    if isinstance(v, str):
+                        total += len(v)
+                    elif isinstance(v, list):
+                        total += sum(len(x) for x in v if isinstance(x, str))
+                return total
+            return len(str(doc))
 
         # -- Queues for producer-consumer handoff -------------------------------
-        batch_queue: queue.Queue = queue.Queue()
+        # Bounded so a slow embedder can never buffer an unbounded number of
+        # multi-GB batches in RAM: the producer blocks once maxsize are queued.
+        _BATCH_QUEUE_MAX = 2
+        batch_queue: queue.Queue = queue.Queue(maxsize=_BATCH_QUEUE_MAX)
         result_queue: queue.Queue = queue.Queue()
         consumer_busy = threading.Event()
         consumer_error: list[str | None] = [None]
+
+        def _consumer_alive() -> bool:
+            return consumer_error[0] is None
+
+        def _queue_batch(batch_docs_: list, batch_files_list_: list) -> None:
+            """Hand a batch to the consumer, blocking only until it drains.
+
+            If the consumer thread has died, emit terminal error results for
+            the batch's files so the frontend never hangs waiting on them.
+            """
+            if not batch_docs_:
+                return
+            while _consumer_alive():
+                try:
+                    batch_queue.put((batch_docs_, batch_files_list_), timeout=0.5)
+                    return
+                except queue.Full:
+                    continue
+            # Consumer died before this batch was queued.
+            err = consumer_error[0] or "consumer failed"
+            logger.error("Dropping batch (%d files) — consumer thread dead: %s", len(batch_files_list_), err)
+            for fname, _, _ in batch_files_list_:
+                result_queue.put((fname, 0, err))
+                if progress_callback:
+                    progress_callback({"file": fname, "status": "error", "error": err})
 
         def consumer() -> None:
             """Background thread: embed + store batches from the producer."""
@@ -1416,59 +1495,77 @@ class DatasetManager:
                         break
                     consumer_busy.set()
                     docs, batch_files_list = batch
-                    # Mark all files in this batch as embedding (with chunk count)
-                    for fname, count, _ in batch_files_list:
-                        if progress_callback:
-                            progress_callback({"file": fname, "status": "embedding", "chunks": count})
                     try:
+                        # Mark all files in this batch as embedding (with chunk
+                        # count).  Inside the try so a callback failure cannot
+                        # kill the consumer thread.
+                        for fname, count, _ in batch_files_list:
+                            if progress_callback:
+                                progress_callback({"file": fname, "status": "embedding", "chunks": count})
 
-                        def _embed_and_store_batch():
-                            """Embed + store all files in this batch. Raises on failure."""
-                            results = []
-                            offset = 0
-                            for fname, count, file_type_ in batch_files_list:
-                                file_docs = docs[offset : offset + count]
-                                offset += count
-                                ids = rag.add_to_vector_store(file_docs)
+                        # Embed + store each file independently so one bad file
+                        # cannot fail (and then mis-report) every other file in
+                        # the batch.  Per-file retries, per-file outcomes.
+                        per_file: list[tuple[str, int, str | None]] = []
+                        offset = 0
+                        for fname, count, file_type_ in batch_files_list:
+                            file_docs = docs[offset : offset + count]
+                            offset += count
+                            try:
+                                ids = retry_call(
+                                    lambda fd=file_docs: rag.add_to_vector_store(fd),
+                                    max_attempts=3,
+                                    base_delay=2.0,
+                                    connection_delay=10.0,
+                                )
                                 self._strip_media_payloads(rag, ids)
                                 self._increment_count(dataset_name, len(ids), file_type=file_type_)
-                                results.append((fname, len(ids)))
-                            return results
+                                per_file.append((fname, len(ids), None))
+                            except Exception as exc:
+                                logger.warning("Embedding failed for '%s' after 3 attempts: %s", fname, exc)
+                                per_file.append((fname, 0, str(exc)))
 
-                        batch_results = retry_call(
-                            _embed_and_store_batch,
-                            max_attempts=3,
-                            base_delay=2.0,
-                            connection_delay=10.0,
-                        )
-                        for fname, chunk_count in batch_results:
-                            result_queue.put((fname, chunk_count, None))
+                        for fname, chunk_count, err in per_file:
+                            result_queue.put((fname, chunk_count, err))
                             if progress_callback:
-                                progress_callback(
-                                    {
-                                        "file": fname,
-                                        "status": "complete",
-                                        "chunks": chunk_count,
-                                    }
-                                )
+                                if err:
+                                    progress_callback({"file": fname, "status": "error", "error": err})
+                                else:
+                                    progress_callback(
+                                        {
+                                            "file": fname,
+                                            "status": "complete",
+                                            "chunks": chunk_count,
+                                        }
+                                    )
                     except Exception as exc:
-                        logger.warning("Batch embedding failed after 3 attempts: %s", exc)
+                        logger.error("Batch processing failed unexpectedly: %s", exc)
                         for fname, _, _ in batch_files_list:
                             result_queue.put((fname, 0, str(exc)))
                             if progress_callback:
-                                progress_callback(
-                                    {
-                                        "file": fname,
-                                        "status": "error",
-                                        "error": str(exc),
-                                    }
-                                )
+                                progress_callback({"file": fname, "status": "error", "error": str(exc)})
                     finally:
                         consumer_busy.clear()
                         batch_queue.task_done()
             except Exception as exc:
                 logger.error("Consumer thread crashed unexpectedly: %s", exc)
                 consumer_error[0] = str(exc)
+                # Drain the queue: every still-queued batch gets a terminal
+                # error so the frontend never hangs waiting on it.
+                while True:
+                    try:
+                        batch = batch_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if batch is None:
+                        batch_queue.task_done()
+                        break
+                    _, pending_files = batch
+                    for fname, _, _ in pending_files:
+                        result_queue.put((fname, 0, str(exc)))
+                        if progress_callback:
+                            progress_callback({"file": fname, "status": "error", "error": str(exc)})
+                    batch_queue.task_done()
 
         consumer_thread = threading.Thread(target=consumer, daemon=True)
         consumer_thread.start()
@@ -1530,7 +1627,7 @@ class DatasetManager:
                             batch_files_list.append((fname, len(pdf_batch), file_type))
                             pdf_batch = []
 
-                            batch_queue.put((batch_docs, batch_files_list))
+                            _queue_batch(batch_docs, batch_files_list)
                             batch_docs = []
                             batch_files_list = []
                             current_score = 0.0
@@ -1594,7 +1691,7 @@ class DatasetManager:
                             batch_files_list.append((fname, len(vid_batch), file_type))
                             vid_batch = []
 
-                            batch_queue.put((batch_docs, batch_files_list))
+                            _queue_batch(batch_docs, batch_files_list)
                             batch_docs = []
                             batch_files_list = []
                             current_score = 0.0
@@ -1674,18 +1771,34 @@ class DatasetManager:
                 # threshold.  Also send a reasonable chunk when the consumer
                 # is idle so it never sits around waiting.
                 if current_score >= batch_score:
-                    batch_queue.put((batch_docs, batch_files_list))
+                    _queue_batch(batch_docs, batch_files_list)
                     batch_docs = []
                     batch_files_list = []
                     current_score = 0.0
                 elif batch_docs and not consumer_busy.is_set():
-                    # Consumer idle → send up to 10 files to keep it fed
-                    # without flooding it with a huge batch.
+                    # Consumer idle → send a chunk to keep it fed, bounded to
+                    # at most 10 files AND ~_IDLE_SEND_BYTES of in-memory
+                    # payload so huge media files can't form one multi-GB batch.
                     n = min(len(batch_files_list), 10)
-                    send_files = batch_files_list[:n]
-                    keep_files = batch_files_list[n:]
-                    send_doc_count = sum(c for _, c, _ in send_files)
-                    batch_queue.put((batch_docs[:send_doc_count], send_files))
+                    send_doc_count = 0
+                    send_bytes = 0
+                    send_files: list[tuple[str, int, str]] = []
+                    for fname, cnt, file_type_ in batch_files_list[:n]:
+                        file_payload = sum(
+                            _doc_payload_bytes(d) for d in batch_docs[send_doc_count : send_doc_count + cnt]
+                        )
+                        if send_files and send_bytes + file_payload > _IDLE_SEND_BYTES:
+                            break
+                        send_files.append((fname, cnt, file_type_))
+                        send_bytes += file_payload
+                        send_doc_count += cnt
+                    if not send_files:
+                        # Even one file is over the cap — send it anyway so the
+                        # pipeline cannot deadlock on a single huge file.
+                        send_files = batch_files_list[:1]
+                        send_doc_count = sum(c for _, c, _ in send_files)
+                    keep_files = batch_files_list[len(send_files) :]
+                    _queue_batch(batch_docs[:send_doc_count], send_files)
                     batch_docs = batch_docs[send_doc_count:]
                     batch_files_list = keep_files
                     current_score = 0.0
@@ -1701,7 +1814,7 @@ class DatasetManager:
 
         # -- Flush remaining batch and shut down consumer -----------------------
         if batch_docs:
-            batch_queue.put((batch_docs, batch_files_list))
+            _queue_batch(batch_docs, batch_files_list)
         batch_queue.put(None)  # sentinel
         consumer_thread.join()
 
@@ -2654,12 +2767,8 @@ class DatasetManager:
 
         scroll_filter = Filter(
             must=[
-                FieldCondition(
-                    key="metadata.memory_kind", match=MatchValue(value="session_history")
-                ),
-                FieldCondition(
-                    key="metadata.session_id", match=MatchValue(value=session_id)
-                ),
+                FieldCondition(key="metadata.memory_kind", match=MatchValue(value="session_history")),
+                FieldCondition(key="metadata.session_id", match=MatchValue(value=session_id)),
             ]
         )
 

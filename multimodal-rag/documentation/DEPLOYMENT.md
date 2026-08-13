@@ -1,5 +1,29 @@
 # Deployment Guide
 
+---
+
+> **⚠ Required config: `MEDIA_TOKEN_SECRET`**
+>
+> Since v1.9.5, both the API and MCP containers **refuse to start** without
+> `MEDIA_TOKEN_SECRET` set. Media URLs are served via short-lived HMAC
+> tokens (the legacy `?password=` URLs were removed), and this shared secret
+> is what signs/verifies them. Deploying without it crashes both pods.
+>
+> Generate one and set it in the chart before deploying:
+>
+> ```bash
+> python -c "import secrets; print(secrets.token_hex(32))"
+> # helm values: security.mediaTokenSecret="<output>"
+> # or --set security.mediaTokenSecret="<output>"
+> ```
+>
+> Sanity-check a rendered chart locally (no cluster needed):
+> ```bash
+> helm template mm . -f helm/.values.yaml | grep MEDIA_TOKEN_SECRET
+> ```
+
+---
+
 ## Prerequisites
 
 - Docker (or Podman) for building the image
@@ -20,6 +44,8 @@ docker push your-registry/rag-api-server:latest
 ```
 
 > **Note on models**: The image does not bundle any ML models. It connects to remote model endpoints configured at runtime via environment variables. The defaults in `values.yaml` point to models hosted on the PCAI internal cluster.
+>
+> **Default image**: the charts ship with `ghcr.io/ai-solution-eng/multimodal-rag-mcp:v1.9.5` as the default `image.repository`/`image.tag` — override both for your own registry. If you need to build a custom image, the Dockerfile lives at `docker/Dockerfile` and expects the repo root as the build context.
 
 ---
 
@@ -44,7 +70,7 @@ models.embedder.className="MultiModalEmbeddings"
 models.reranker.name="Qwen/Qwen3-VL-Reranker-8B"
 models.reranker.url="https://..."          # required
 models.reranker.className="MultiModalReranker"
-models.vlm.name="google/gemma-4-31B-it"
+models.vlm.name="RedHatAI/gemma-4-31B-it-FP8-block"
 models.vlm.url="https://..."               # required
 models.asr.name="CohereLabs/cohere-transcribe-03-2026"
 models.asr.url="https://..."               # required
@@ -56,12 +82,21 @@ modelSecrets.vlmApiKey="eyJ..."
 modelSecrets.asrApiKey="eyJ..."
 
 # RAG pipeline defaults
-rag.captionVideo=false   # Transcribe video audio during ingestion
-rag.remote=true           # Use remote model URLs
+rag.captionWithAsr=false   # Transcribe video audio tracks via ASR during ingestion
+rag.captionWithVlm=false   # VLM-describe images/videos at ingest (enables VLM-skip at retrieval)
+rag.remote=false           # Use remote model URLs vs in-cluster .svc.cluster.local
 
 # MCP server (sidecar)
 mcp.enabled=true
-mcp.port=8001
+mcp.port=9090
+
+# Security — REQUIRED: a shared secret for short-lived media HMAC tokens.
+# Both the API and MCP servers refuse to start without it (the legacy
+# ?password= media URLs were removed). Also raises the SSRF guard defaults.
+security.mediaTokenSecret="<random-string-shared-by-both-containers>"
+security.mediaTokenTtl=3600
+security.ingestAllowHosts=""       # e.g. ".minio.svc.cluster.local" (bypasses private-block)
+security.blockPrivateHosts=true    # default on — blocks SSRF targets
 
 # PCAI / EZUA (Istio-based ingress)
 ezua.enabled=true
@@ -124,7 +159,7 @@ envsubst < values.yaml > values-resolved.yaml
 helm install multimodal-rag . \
   -f values-resolved.yaml \
   --set image.repository=your-registry/rag-api-server \
-  --set image.tag=v1.3.0 \
+  --set image.tag=v1.9.5 \
   --set models.embedder.url="https://..." \
   --set models.reranker.url="https://..." \
   --set models.vlm.url="https://..." \
@@ -231,7 +266,7 @@ Open WebUI, stdio), and the long-term memory setup, see:
 │                                                      │
 │  ┌──────────────────┐   ┌──────────────────┐        │
 │  │  API Server       │   │  MCP Server       │       │
-│  │  port 8000        │   │  port 8001        │       │
+│  │  port 8000        │   │  port 9090        │       │
 │  │  (REST + Web UI)  │   │  (MCP tools)      │       │
 │  └──────┬───────────┘   └──────┬───────────┘        │
 │         │                      │                     │
@@ -267,7 +302,7 @@ When `ezua.enabled=true` (default), the chart also creates:
 
 ```bash
 helm upgrade multimodal-rag . \
-  --set image.tag=v1.3.0 \
+  --set image.tag=v1.9.5 \
   --reuse-values  # keep existing non-default values
 ```
 
@@ -275,7 +310,7 @@ To change specific values while upgrading:
 
 ```bash
 helm upgrade multimodal-rag . \
-  --set image.tag=v1.3.0 \
+  --set image.tag=v1.9.5 \
   --set persistence.data.size=500Gi
 ```
 

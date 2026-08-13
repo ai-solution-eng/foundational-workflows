@@ -114,6 +114,11 @@ OWUI uses a filter (`openwebui_extension/filter.py`) with an **inlet**
 write after each reply). Memory goes through the RAG REST API directly
 — no MCP needed. Full valve reference: [`openwebui_extension/README.md`](../openwebui_extension/README.md).
 
+> The extension dir also ships two memory-free variants: `filter_no_memory.py`
+> (identical media→MCP routing, no recall/store) and `filter_media_strip.py`
+> (strips image/video/audio parts for text-only LLMs, no RAG at all). Use
+> those when you want media routing without a memory store.
+
 ### Per-user isolation (SSO)
 
 OWUI filter Valves are **global** (admin-configured once), so per-user
@@ -264,6 +269,7 @@ API and updating `RAG_MEMORY_PASSWORD` in users' env.
 | opencode: `Incorrect password for dataset` | `RAG_MEMORY_PASSWORD` wrong / stale | Re-verify against the dataset's password |
 | opencode: `rag-memory` connection not listed | URL unreachable / ingress token missing | Check `RAG_INGRESS_TOKEN` and the URL; try `opencode mcp debug rag-memory` |
 | opencode: `Session not found` (404) on MCP calls | Multi-replica deployment running stateful MCP mode (pre-v1.3.0) | Upgrade to v1.3.0+ which enables `stateless_http=True`; see [SCALE.md](SCALE.md) |
+| Both servers exit at startup: `MEDIA_TOKEN_SECRET is required` | The legacy `?password=` media URLs were removed; the shared HMAC secret isn't set | Set `security.mediaTokenSecret` in the helm chart (shared by both containers) before deploying |
 | OWUI: no memories recalled for a new user | Dataset doesn't exist yet | Set `MEMORY_AUTO_CREATE=true`, or pre-create the user's dataset |
 | OWUI: `Memory store failed` in logs | Derived password ≠ dataset's password (e.g. `MEMORY_SECRET` changed) | Re-create the dataset or restore the old secret |
 | OWUI: distillation never writes | `DISTILL_LLM_*` not set, or replies < `DISTILL_MIN_REPLY_CHARS` | Configure distillation LLM; lower the char threshold if needed |

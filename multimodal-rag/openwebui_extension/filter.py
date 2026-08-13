@@ -23,6 +23,7 @@ import base64
 import hashlib
 import hmac
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -333,6 +334,15 @@ class Filter:
             ge=0,
             description="Skip distillation for assistant replies shorter than "
             "this (trivial exchanges aren't worth storing). 0 = distil all.",
+        )
+        # -- Media URL repair -----------------------------------------------
+        REPAIR_MEDIA_URLS: bool = Field(
+            default=True,
+            description="Repair garbled media URLs in the model's reply: "
+            "match every ``/api/datasets/{name}/files/{file}`` URL the model "
+            "printed against the exact URLs returned by the RAG MCP tool "
+            "results, and substitute the correct host/token.  LLMs often "
+            "mistype long signed URLs; this restores them deterministically.",
         )
 
     def __init__(self):
@@ -869,6 +879,109 @@ class Filter:
             return "\n".join(texts).strip()
         return str(content) if content else ""
 
+    # ── media URL repair ──────────────────────────────────────────────────
+    # LLMs frequently garble long signed media URLs (host typos, dropped hex
+    # chars, renamed query params).  The RAG MCP tool results in the same
+    # conversation contain the *correct* URLs, so the outlet matches every
+    # media URL the model printed against those and substitutes the exact
+    # one — deterministic "copy and paste" independent of model behaviour.
+
+    _MEDIA_URL_RE = re.compile(
+        r"https?://[^\s\"'<>\)\]\}]+/api/datasets/[^/\s]+/files/[^\s\"'<>\)\]\}]+"
+    )
+
+    @classmethod
+    def _collect_correct_media_urls(cls, messages: list[dict]) -> dict[str, str]:
+        """Map ``{dataset}/{file}`` -> the correct full media URL, sourced
+        from tool-result messages (the RAG MCP ``search_dataset`` output)."""
+        correct: dict[str, str] = {}
+        for msg in messages:
+            role = str(msg.get("role", ""))
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = "\n".join(
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and isinstance(p.get("text", ""), str)
+                )
+            if not isinstance(content, str):
+                continue
+            for url in cls._MEDIA_URL_RE.findall(content):
+                url = url.rstrip(".,;:!?)]}")
+                if "?" in url and "token" not in url:
+                    continue  # non-media query (e.g. unrelated link)
+                try:
+                    path = url.split("/api/datasets/", 1)[1]
+                    ds, _, file_part = path.split("/", 2) if path.count("/") >= 2 else (path, "", "")
+                except ValueError:
+                    continue
+                if not file_part:
+                    continue
+                # Only the tool results carry ground-truth URLs.  Never
+                # source from the assistant's own (possibly garbled) reply.
+                if role == "tool":
+                    key = f"{ds}/{file_part.split('?', 1)[0]}"
+                    correct[key] = url
+        return correct
+
+    @classmethod
+    def _repair_media_urls(cls, text: str, correct: dict[str, str]) -> str:
+        """Replace every media URL in *text* whose dataset/file key is known
+        with the exact correct URL (host + token) from the tool results."""
+        if not correct or not text:
+            return text
+
+        def _replacer(match: re.Match) -> str:
+            url = match.group(0).rstrip(".,")
+            if "?" in url and "token" not in url:
+                return match.group(0)
+            path = url.split("?", 1)[0]
+            try:
+                rest = path.split("/api/datasets/", 1)[1]
+                ds, _, file_part = rest.split("/", 2)
+            except (ValueError, IndexError):
+                return match.group(0)
+            if not file_part:
+                return match.group(0)
+            key = f"{ds}/{file_part}"
+            good = correct.get(key)
+            if good and good != url:
+                return good
+            return url
+
+        return cls._MEDIA_URL_RE.sub(_replacer, text)
+
+    @classmethod
+    def _repair_last_assistant_media_urls(cls, messages: list[dict]) -> None:
+        """Rewrite the last assistant message's media URLs in place so the
+        user always sees the exact, correctly-signed URLs from the tool
+        results — no matter how the model garbled them."""
+        if not messages:
+            return
+        correct = cls._collect_correct_media_urls(messages)
+        if not correct:
+            return
+        for msg in reversed(messages):
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                repaired = cls._repair_media_urls(content, correct)
+                if repaired != content:
+                    msg["content"] = repaired
+            elif isinstance(content, list):
+                changed = False
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        t = part.get("text", "")
+                        repaired = cls._repair_media_urls(t, correct)
+                        if repaired != t:
+                            part["text"] = repaired
+                            changed = True
+                if changed:
+                    msg["content"] = content
+            break  # only the latest assistant message is user-visible
+
     # ══════════════════════════════════════════════════════════════════════
     #  inlet  —  called BEFORE the LLM request
     # ══════════════════════════════════════════════════════════════════════
@@ -1183,14 +1296,21 @@ class Filter:
         __model__: Optional[dict] = None,
         **kwargs,
     ) -> dict:
-        """Distil and store a memory from the completed exchange.
+        """Repair garbled media URLs in the model's reply, then distil and
+        store a memory from the completed exchange.
 
         Runs after the LLM has replied and the user has seen the answer.
-        Asks the distillation LLM to extract a durable memory from the
-        user-assistant exchange; if one is produced, stores it in the
-        memory dataset via the RAG REST API.  All of this is invisible to
-        the user (no extra tool calls in the chat, no password in context).
+        Media URLs are matched against the exact URLs in the RAG MCP tool
+        results and corrected deterministically (models often mistype long
+        signed URLs).  The memory distillation asks a second LLM to extract
+        a durable memory; if one is produced it is stored in the memory
+        dataset via the RAG REST API.  All of this is invisible to the user
+        (no extra tool calls in the chat, no password in context).
         """
+        messages: list[dict] = body.get("messages", [])
+        if messages and self.valves.REPAIR_MEDIA_URLS:
+            self._repair_last_assistant_media_urls(messages)
+
         if not self._memory_enabled():
             return body
         if not self.valves.DISTILL_LLM_URL or not self.valves.DISTILL_LLM_MODEL:
@@ -1204,8 +1324,6 @@ class Filter:
         messages: list[dict] = body.get("messages", [])
         if not messages:
             return body
-
-        # Extract the last user message and the last assistant reply.
         user_text = ""
         assistant_text = ""
         for msg in reversed(messages):

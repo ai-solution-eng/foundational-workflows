@@ -26,6 +26,10 @@ The MCP container shares the `/data` PVC with the API server, so
 tools. See [DEPLOYMENT.md](DEPLOYMENT.md) § Architecture for the pod
 layout.
 
+> **`MEDIA_TOKEN_SECRET` is required.** The server refuses to start without
+> it. Converted media URLs always carry a short-lived HMAC `?token=` (never
+> the dataset password), which the API server verifies when serving files.
+
 > **Multi-replica deployments (helm-scale / helm-scale-g2):** the MCP
 > server runs `stateless_http=True` + `json_response=True` so any pod
 > can handle any request — no in-memory session state. Dataset unlock

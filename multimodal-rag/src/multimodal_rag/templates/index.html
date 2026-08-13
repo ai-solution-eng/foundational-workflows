@@ -184,6 +184,26 @@
   .modal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; max-width: 600px; width: 90%; max-height: 80vh; overflow-y: auto; }
   .modal h3 { margin-bottom: 16px; }
 
+  .reader-overlay {
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,.85); display: flex; align-items: center; justify-content: center;
+    z-index: 1100; opacity: 0; pointer-events: none; transition: opacity .2s;
+  }
+  .reader-overlay.show { opacity: 1; pointer-events: auto; }
+  .reader-panel {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    width: 95%; height: 92%; max-width: 1100px; display: flex; flex-direction: column;
+    box-shadow: 0 12px 40px rgba(0,0,0,.6); overflow: hidden;
+  }
+  .reader-header {
+    display: flex; justify-content: space-between; align-items: center; gap: 8px;
+    padding: 12px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  .reader-header .reader-title { font-size: .85rem; color: var(--text-muted); font-weight: 600; }
+  .reader-actions { display: flex; gap: 8px; align-items: center; }
+  .reader-body { flex: 1; overflow-y: auto; padding: 20px 24px; }
+  .reader-body pre { white-space: pre-wrap; word-break: break-all; font-size: .9rem; line-height: 1.5; margin: 0; color: var(--text); }
+
   .theme-toggle {
     display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;
     font-size: .75rem; color: var(--text-muted);
@@ -484,6 +504,28 @@
 let selectedDataset = null;
 let datasets = [];
 let datasetPasswords = {};  // dataset name → password (empty string = no password)
+let mediaTokens = {};       // dataset name → { token, expires } for media ?token= URLs
+
+// Mint (and cache) a short-lived, dataset-scoped media token so <img>/<video>
+// URLs never carry the dataset password in their query string.
+async function ensureMediaToken(name) {
+  if (!datasetPasswords[name]) return '';          // public dataset — no token needed
+  const cached = mediaTokens[name];
+  if (cached && Date.now() < cached.expires) return cached.token;
+  try {
+    const res = await api('POST', `/api/datasets/${name}/media-token`);
+    if (res && res.token) {
+      const ttlMs = (res.ttl_seconds || 3600) * 1000;
+      // Keep a 60s safety margin so tokens aren't used right at expiry.
+      mediaTokens[name] = { token: res.token, expires: Date.now() + ttlMs - 60000 };
+      return res.token;
+    }
+  } catch (e) {
+    // Token unavailable — media links render without a token (they will 403
+    // for protected datasets) rather than leaking the password in the URL.
+  }
+  return '';
+}
 
 // -----------------------------------------------------------------------
 // API helpers
@@ -609,12 +651,15 @@ async function selectDataset(name) {
       try {
         await api('POST', `/api/datasets/${name}/verify-password`, { password: pw });
         datasetPasswords[name] = pw;
+        delete mediaTokens[name];  // invalidate any token minted under the old password
       } catch (e) {
         toast('Incorrect password', 'error');
         datasetPasswords[name] = '';  // mark as attempted
+        delete mediaTokens[name];
       }
     } else {
       datasetPasswords[name] = '';  // user cancelled
+      delete mediaTokens[name];
     }
   }
 }
@@ -1231,15 +1276,17 @@ async function searchDataset() {
       container.innerHTML = '<div class="empty-state">No results found.</div>';
       return;
     }
+    // Pre-mint a media token (once per dataset) so file URLs carry ?token=
+    // instead of the dataset password.
+    const mediaToken = await ensureMediaToken(selectedDataset);
     container.innerHTML = `<div class="results-list">${results.map((r, i) => {
       const c = r.content;
       let mediaHtml = '';
       if (typeof c === 'object' && c !== null) {
-        const _pwSuffix = () => { const pw = datasetPasswords[selectedDataset] || ''; return pw ? '?password=' + encodeURIComponent(pw) : ''; };
         const _fileUrl = (url) => {
           if (!url.startsWith('file://')) return url;
           const base = '/api/datasets/' + selectedDataset + '/files/' + encodeURIComponent(url.replace('file://', '').split('/').pop());
-          return base + _pwSuffix();
+          return mediaToken ? base + '?token=' + encodeURIComponent(mediaToken) : base;
         };
         const _toArr = (v) => Array.isArray(v) ? v : (v ? [v] : []);
         const _isExt = (url, exts) => { const p = url.split('?')[0].toLowerCase(); return exts.some(e => p.endsWith(e)); };
@@ -1299,9 +1346,14 @@ async function searchDataset() {
       return `<div class="result-item" style="position:relative">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
           <span class="score">${_scoreParts.join(' ')}</span>
-          <button onclick="copyText(this)" data-text="${_copyPayload}"
-            style="flex-shrink:0;background:rgba(0,0,0,0.35);color:#fff;border:none;border-radius:4px;padding:2px 8px;font-size:.7rem;cursor:pointer;opacity:0.5;transition:opacity .15s"
-            onmouseover="this.style.opacity='0.9'" onmouseout="this.style.opacity='0.5'" title="Copy to clipboard">📋 Copy</button>
+          <div style="display:flex;gap:6px;flex-shrink:0">
+            <button onclick="copyText(this)" data-text="${_copyPayload}"
+              style="background:rgba(0,0,0,0.35);color:#fff;border:none;border-radius:4px;padding:2px 8px;font-size:.7rem;cursor:pointer;opacity:0.5;transition:opacity .15s"
+              onmouseover="this.style.opacity='0.9'" onmouseout="this.style.opacity='0.5'" title="Copy to clipboard">📋 Copy</button>
+            <button onclick="openTextReader(this)" data-text="${_copyPayload}"
+              style="background:rgba(0,0,0,0.35);color:#fff;border:none;border-radius:4px;padding:2px 8px;font-size:.7rem;cursor:pointer;opacity:0.5;transition:opacity .15s"
+              onmouseover="this.style.opacity='0.9'" onmouseout="this.style.opacity='0.5'" title="Read in fullscreen">⛶ Fullscreen</button>
+          </div>
         </div>
         ${mediaHtml}
         <pre style="margin-top:4px">${escHtml(_text)}</pre>
@@ -1414,6 +1466,44 @@ function copyText(el) {
   } else {
     fallback();
   }
+}
+
+function closeTextReader() {
+  const overlay = document.getElementById('text-reader');
+  if (!overlay) return;
+  overlay.classList.remove('show');
+  overlay.addEventListener('transitionend', () => overlay.remove(), { once: true });
+  setTimeout(() => { if (overlay.parentNode) overlay.remove(); }, 250);
+}
+
+function openTextReader(el) {
+  const raw = el.dataset.text || '';
+  let text;
+  try { text = decodeURIComponent(raw); } catch { text = raw; }
+  if (!text) { toast('Nothing to read', 'error'); return; }
+  closeTextReader();
+  const overlay = document.createElement('div');
+  overlay.className = 'reader-overlay';
+  overlay.id = 'text-reader';
+  overlay.innerHTML = `
+    <div class="reader-panel">
+      <div class="reader-header">
+        <div class="reader-title">Fullscreen reader</div>
+        <div class="reader-actions">
+          <button onclick="copyText(this)" data-text="${encodeURIComponent(text)}"
+            style="background:rgba(0,0,0,0.35);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:.75rem;cursor:pointer" title="Copy to clipboard">📋 Copy</button>
+          <button onclick="closeTextReader()"
+            style="background:rgba(0,0,0,0.35);color:#fff;border:none;border-radius:4px;padding:4px 10px;font-size:.75rem;cursor:pointer" title="Close (Esc)">✕ Close</button>
+        </div>
+      </div>
+      <div class="reader-body"><pre>${escHtml(text)}</pre></div>
+    </div>`;
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) closeTextReader(); });
+  document.addEventListener('keydown', function escClose(e) {
+    if (e.key === 'Escape') { closeTextReader(); document.removeEventListener('keydown', escClose); }
+  });
+  document.body.appendChild(overlay);
+  requestAnimationFrame(() => overlay.classList.add('show'));
 }
 
 function escHtml(s) {

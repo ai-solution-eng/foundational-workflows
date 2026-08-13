@@ -283,16 +283,16 @@ def _unlock_client_id(request: Request) -> str:
 
     Prefers the authenticated user identity injected by oauth2-proxy
     (``X-Auth-Request-Email`` / ``X-Auth-Request-User``), then falls back
-    to ``X-Forwarded-For`` and finally the socket peer — for deployments
-    without an auth proxy.
+    to the socket peer — for deployments without an auth proxy.
+
+    ``X-Forwarded-For`` is deliberately NOT used: it is client-supplied and
+    spoofable, so trusting it would let a caller impersonate another user's
+    unlock cache entry (and its cached plaintext password).
     """
     for header in ("X-Auth-Request-Email", "X-Auth-Request-User", "X-Email", "X-User"):
         val = request.headers.get(header)
         if val:
             return val.strip()
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
     client = request.client
     return client.host if client else "unknown"
 
@@ -325,16 +325,33 @@ def _unlock_cache_get(dataset: str, cid: str) -> str | None:
     return None
 
 
-def _unlock_cache_set(dataset: str, cid: str, password: str) -> None:
+def _unlock_cache_set(dataset: str, cid: str, password: str, ttl: int | None = None) -> None:
     r = _get_redis()
     if r is not None:
         try:
-            r.set(_unlock_cache_key(dataset, cid), password, ex=_UNLOCK_TTL)
+            r.set(_unlock_cache_key(dataset, cid), password, ex=(ttl if ttl is not None else _UNLOCK_TTL))
             return
         except Exception:
             pass
     with _UNLOCK_CACHE_LOCK:
-        _UNLOCK_CACHE[(dataset, cid)] = (time.monotonic() + _UNLOCK_TTL, password)
+        _UNLOCK_CACHE[(dataset, cid)] = (time.monotonic() + (ttl if ttl is not None else _UNLOCK_TTL), password)
+
+
+def _unlock_cache_set_ttl(dataset: str, cid: str, password: str, ttl: int) -> None:
+    """Alias so the unlock endpoint can pass an explicit TTL."""
+    _unlock_cache_set(dataset, cid, password, ttl)
+
+
+def _unlock_cache_del(dataset: str, cid: str) -> bool:
+    """Revoke an unlock (Redis when configured, in-process otherwise)."""
+    r = _get_redis()
+    if r is not None:
+        try:
+            return bool(r.delete(_unlock_cache_key(dataset, cid)))
+        except Exception:
+            return False
+    with _UNLOCK_CACHE_LOCK:
+        return _UNLOCK_CACHE.pop((dataset, cid), None) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -387,8 +404,32 @@ _MEDIA_TOKEN_SECRET = os.environ.get("MEDIA_TOKEN_SECRET", "")
 _MEDIA_TOKEN_TTL = max(60, int(os.environ.get("MEDIA_TOKEN_TTL", "3600")))
 
 
+def _sign_media_token(dataset_name: str, rel_path: str, expiry: int | None = None) -> str:
+    """Mint an expiring HMAC token authorising ``{dataset}/{rel_path}``.
+
+    A ``rel_path`` of ``"*"`` produces a *dataset-scoped* token valid for any
+    file in the dataset (used by the web UI, which cannot mint a token per
+    media URL on every render).
+
+    The signature is truncated to 128 bits (32 hex chars) — shorter media
+    URLs are copied more reliably by LLMs, and 128 bits is ample for a token
+    that expires after ``MEDIA_TOKEN_TTL``.
+    """
+    import hashlib
+    import hmac
+
+    expiry = expiry or (int(time.time()) + _MEDIA_TOKEN_TTL)
+    msg = f"{dataset_name}:{rel_path}:{expiry}".encode()
+    sig = hmac.new(_MEDIA_TOKEN_SECRET.encode(), msg, hashlib.sha256).hexdigest()[:32]
+    return f"{expiry}.{sig}"
+
+
 def _verify_media_token(dataset_name: str, rel_path: str, token: str) -> bool:
-    """True if *token* is an unexpired HMAC authorising ``{dataset}/{rel_path}``."""
+    """True if *token* is an unexpired HMAC authorising ``{dataset}/{rel_path}``.
+
+    Also accepts a dataset-scoped token (minted against ``*``), which grants
+    access to any file under the dataset until it expires.
+    """
     import hashlib
     import hmac
 
@@ -402,9 +443,15 @@ def _verify_media_token(dataset_name: str, rel_path: str, token: str) -> bool:
     now = int(time.time())
     if expiry < now or expiry > now + _MEDIA_TOKEN_TTL + 300:
         return False
-    msg = f"{dataset_name}:{rel_path}:{expiry}".encode()
-    expected = hmac.new(_MEDIA_TOKEN_SECRET.encode(), msg, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, sig)
+    for candidate in (rel_path, "*"):
+        msg = f"{dataset_name}:{candidate}:{expiry}".encode()
+        full = hmac.new(_MEDIA_TOKEN_SECRET.encode(), msg, hashlib.sha256).hexdigest()
+        # Accept the current 32-char (128-bit) signature and the legacy
+        # 64-char full signature so tokens minted before a rolling deploy
+        # keep working until they expire.
+        if hmac.compare_digest(full[:32], sig) or hmac.compare_digest(full, sig):
+            return True
+    return False
 
 
 def _require_dataset_password(
@@ -467,21 +514,41 @@ _RAG_API_KEY = os.environ.get("RAG_API_KEY", "")
 
 _PUBLIC_PATHS = frozenset({"/healthz", "/readyz", "/favicon.png", "/", "/manage"})
 
+# Routes that must stay reachable without the API key, matched by the
+# endpoint function name so future prefix-based routes are NOT silently
+# exempted (the old string-prefix check made any `/api/datasets/*/files/*`
+# or `/api/staging/*` route public, and `/api/staging/` with a trailing
+# slash slipped past the exact-match exclusion).
+_PUBLIC_ENDPOINT_NAMES = frozenset(
+    {
+        "healthz",
+        "readyz",
+        "favicon",
+        "index",
+        "manage",
+        "api_serve_file",  # dataset media (password/token protected)
+        "api_staging_serve",  # staged media (short-lived ids)
+    }
+)
 
-def _is_public_path(path: str) -> bool:
+
+def _is_public_path(path: str, endpoint: Any = None) -> bool:
     if path in _PUBLIC_PATHS:
         return True
-    # Media/file serving is protected by the dataset password or media tokens.
-    if path.startswith("/api/datasets/") and "/files/" in path:
-        return True
-    if path.startswith("/api/staging/"):
-        return path != "/api/staging"
+    if endpoint is not None:
+        name = getattr(endpoint, "__name__", None)
+        if name in _PUBLIC_ENDPOINT_NAMES:
+            return True
     return False
 
 
 @app.middleware("http")
 async def _api_key_auth(request: Request, call_next):
-    if not _RAG_API_KEY or _is_public_path(request.url.path):
+    if not _RAG_API_KEY:
+        return await call_next(request)
+    route = request.scope.get("route")
+    endpoint = getattr(route, "endpoint", None) if route is not None else None
+    if _is_public_path(request.url.path, endpoint):
         return await call_next(request)
     key = request.headers.get("X-RAG-Api-Key") or ""
     if not key:
@@ -514,6 +581,18 @@ async def _eager_init() -> None:
         await loop.run_in_executor(sync_pool, get_manager)
     except Exception as exc:
         logger.warning("DatasetManager startup init failed (will retry on first request): %s", exc)
+
+    # Periodic prune of completed upload jobs so they don't linger forever
+    # when no client polls upload-status (which is the only other prune path).
+    async def _prune_upload_jobs() -> None:
+        while True:
+            await asyncio.sleep(300)  # every 5 minutes
+            try:
+                _upload_jobs.cleanup_old()
+            except Exception:
+                logger.debug("Suppressed exception", exc_info=True)
+
+    asyncio.create_task(_prune_upload_jobs())
 
 
 # ---------------------------------------------------------------------------
@@ -615,7 +694,7 @@ async def api_create_dataset(body: dict[str, Any] = Body(...)):
 
 
 @app.post("/api/datasets/{name}/verify-password")
-async def api_verify_dataset_password(name: str, body: dict[str, Any] = Body(...)):
+async def api_verify_dataset_password(name: str, request: Request, body: dict[str, Any] = Body(...)):
     """Verify a dataset password.
 
     Request body::
@@ -627,7 +706,9 @@ async def api_verify_dataset_password(name: str, body: dict[str, Any] = Body(...
     dm = await get_manager_async()
     try:
         dm.get_dataset(name, sync_count=False)  # ensure dataset exists
-        _require_dataset_password(dm, name, body.get("password", ""))
+        # Pass *request* so the failure throttle is scoped to the client,
+        # not collapsed into the shared "unknown" bucket.
+        _require_dataset_password(dm, name, body.get("password", ""), request)
         return {"status": "ok", "verified": True}
     except FileNotFoundError:
         raise HTTPException(404, f"Dataset '{name}' not found")
@@ -671,8 +752,9 @@ async def api_unlock_dataset(name: str, request: Request, body: dict[str, Any] =
     if not isinstance(ttl, int) or ttl < 60 or ttl > 86400:
         raise HTTPException(400, "TTL must be between 60 and 86400 seconds")
 
-    with _UNLOCK_CACHE_LOCK:
-        _UNLOCK_CACHE[(name, cid)] = (time.monotonic() + ttl, password)
+    # Use the shared cache writer so unlocked state is visible across API
+    # replicas (Redis when configured, in-process otherwise).
+    _unlock_cache_set_ttl(name, cid, password, ttl)
 
     return {
         "status": "ok",
@@ -691,12 +773,32 @@ async def api_lock_dataset(name: str, request: Request):
         raise HTTPException(404, f"Dataset '{name}' not found")
 
     cid = _unlock_client_id(request)
-    with _UNLOCK_CACHE_LOCK:
-        was = _UNLOCK_CACHE.pop((name, cid), None)
+    was = _unlock_cache_del(name, cid)
 
     if was:
         return {"status": "ok", "message": f"Dataset '{name}' locked."}
     return {"status": "ok", "message": f"Dataset '{name}' was not unlocked."}
+
+
+@app.post("/api/datasets/{name}/media-token")
+async def api_media_token(name: str, request: Request):
+    """Mint a short-lived HMAC token for fetching this dataset's media files.
+
+    The caller must be authorised (``X-Dataset-Password`` header, the
+    ``password`` form field, or a prior ``/unlock``).  The returned token is
+    dataset-scoped: it can be appended to ``?token=`` on any
+    ``/api/datasets/{name}/files/...`` URL for ``MEDIA_TOKEN_TTL`` seconds,
+    letting ``<img>/<video>/<audio>`` tags fetch protected media without the
+    dataset password ever appearing in a URL.
+    """
+    dm = await get_manager_async()
+    password = request.query_params.get("password", "")
+    x_password = request.headers.get("X-Dataset-Password", "")
+    try:
+        _require_dataset_password(dm, name, (x_password or password) or None, request)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Dataset '{name}' not found")
+    return {"token": _sign_media_token(name, "*"), "ttl_seconds": _MEDIA_TOKEN_TTL}
 
 
 @app.get("/api/datasets")
@@ -813,12 +915,15 @@ async def api_upload_file(
 
     # Save uploaded file to a temporary location
     suffix = Path(file.filename or "upload").suffix if file.filename else ".bin"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        while chunk := await file.read(1 << 20):  # 1 MiB
-            tmp.write(chunk)
-        tmp_path = tmp.name
-
+    tmp_path = ""
     try:
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        try:
+            await _stream_upload(file, tmp)
+            tmp_path = tmp.name
+        finally:
+            tmp.close()
+
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(sync_pool, dm.add_file, name, tmp_path, file.filename)
         return {"status": "ok", "file": file.filename, **result}
@@ -826,10 +931,16 @@ async def api_upload_file(
         raise HTTPException(400, str(e))
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
     finally:
-        os.unlink(tmp_path)
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                logger.debug("Suppressed exception", exc_info=True)
 
 
 @app.post("/api/datasets/{name}/batch-files")
@@ -853,13 +964,22 @@ async def api_upload_files_batch(
 
     # Write files to temp before starting the background job
     file_entries: list[tuple[str, str]] = []
-    for f in files:
-        suffix = Path(f.filename or "upload").suffix if f.filename else ".bin"
-        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-        while chunk := await f.read(1 << 20):  # 1 MiB
-            tmp.write(chunk)
-        tmp.close()
-        file_entries.append((tmp.name, f.filename or "upload"))
+    try:
+        for f in files:
+            suffix = Path(f.filename or "upload").suffix if f.filename else ".bin"
+            tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+            try:
+                await _stream_upload(f, tmp)
+            finally:
+                tmp.close()
+            file_entries.append((tmp.name, f.filename or "upload"))
+    except BaseException:
+        for p, _ in file_entries:
+            try:
+                os.unlink(p)
+            except Exception:
+                logger.debug("Suppressed exception", exc_info=True)
+        raise
 
     job_id = _upload_jobs.create(name, len(file_entries), source="files")
 
@@ -1109,6 +1229,7 @@ async def api_serve_file(
     request: Request,
     password: str = Query(""),
     token: str = Query(""),
+    t: str = Query("", description="Alias for ``token`` (accepts ``?t=``)"),
     x_dataset_password: str | None = Header(None, alias="X-Dataset-Password"),
 ):
     """Serve a stored file from a dataset's files directory.
@@ -1116,8 +1237,13 @@ async def api_serve_file(
     Accepts the password via the ``X-Dataset-Password`` header, the
     ``password`` query parameter (for ``<img>/<video>/<audio>`` tags which
     cannot set custom headers), or a short-lived HMAC ``token`` minted by
-    the MCP server when ``MEDIA_TOKEN_SECRET`` is configured.
+    the MCP server when ``MEDIA_TOKEN_SECRET`` is configured.  The media
+    token is also accepted via ``?t=`` — LLM-generated markdown occasionally
+    truncates ``token`` to ``t``, and verifying the short alias keeps those
+    links working.
     """
+    if not token and t:
+        token = t
     dm = await get_manager_async()
     if token:
         # A media token fully authorises this specific file — no password check.
@@ -1141,7 +1267,21 @@ async def api_serve_file(
     except ValueError:
         raise HTTPException(403, "Invalid file path")
     if not file_path.is_file():
-        raise HTTPException(404, "File not found")
+        # Short human-readable filename (uuid prefix stripped by the MCP
+        # server): find the stored ``{uuid}_{filepath}`` file.  A dataset
+        # file normally has exactly one uuid-prefixed copy; if several
+        # exist (re-uploaded copies), serve the most recently modified one.
+        import glob as _glob
+
+        candidates = _glob.glob(str(files_dir / f"*_{filepath}"))
+        candidates = [c for c in candidates if os.path.isfile(c) and os.path.basename(c) != filepath]
+        if not candidates:
+            raise HTTPException(404, "File not found")
+        file_path = Path(max(candidates, key=os.path.getmtime))
+        try:
+            file_path.relative_to(files_dir)
+        except ValueError:
+            raise HTTPException(403, "Invalid file path")
 
     # Only evergreen media MIME types may render inline.  SVG (image/svg+xml),
     # HTML, JSON, etc. are forced to `attachment` so a crafted uploaded file
@@ -1160,6 +1300,25 @@ async def api_serve_file(
 
 
 # -- Staging (transient media handoff for MCP tools) -------------------------
+
+
+# Cap on multipart upload bytes (dataset file uploads + staging).  The stream
+# loop aborts past this so a key-holder cannot fill the disk.  0 disables.
+_MAX_UPLOAD_BYTES = max(0, int(os.environ.get("MAX_UPLOAD_BYTES", str(1024 * 1024 * 1024))))
+
+
+async def _stream_upload(file: UploadFile, dest: Any, max_bytes: int = _MAX_UPLOAD_BYTES) -> int:
+    """Stream an UploadFile to *dest*, aborting once *max_bytes* is exceeded.
+
+    Returns the number of bytes written.
+    """
+    written = 0
+    while chunk := await file.read(1 << 20):  # 1 MiB
+        written += len(chunk)
+        if max_bytes > 0 and written > max_bytes:
+            raise HTTPException(413, f"Upload exceeds MAX_UPLOAD_BYTES ({max_bytes} bytes)")
+        dest.write(chunk)
+    return written
 
 
 _STAGING_TTL = int(os.environ.get("STAGING_TTL", "3600"))  # seconds, default 1h
@@ -1377,14 +1536,15 @@ async def api_staging_upload(
     dest = sub / safe_name
     try:
         with open(dest, "wb") as out:
-            while chunk := await file.read(1 << 20):  # 1 MiB
-                out.write(chunk)
+            await _stream_upload(file, out)
     except Exception as exc:
         try:
             dest.unlink(missing_ok=True)
             sub.rmdir()
         except Exception:
             logger.debug("staging upload: cleanup failed", exc_info=True)
+        if isinstance(exc, HTTPException):
+            raise
         raise HTTPException(500, f"Failed to stage uploaded file: {exc}")
 
     # Downscale oversized staged media so the MCP search_dataset tool
@@ -1450,14 +1610,30 @@ async def api_staging_serve(staging_id: str):
     sub = Path(os.environ.get("DATA_PATH", "/data")) / "staging" / staging_id
     if not sub.is_dir():
         raise HTTPException(404, "Staged file not found or expired")
-    files = [f for f in sub.iterdir() if f.is_file()]
+    # Ignore leftover "_preprocessed" siblings (only produced when the atomic
+    # replace failed) and pick a deterministic file.
+    files = sorted(f for f in sub.iterdir() if f.is_file() and not f.name.endswith("_preprocessed"))
     if not files:
         raise HTTPException(404, "Staged file not found or expired")
     target = files[0]
     media_type, _ = mimetypes.guess_type(target.name)
+    from urllib.parse import quote
+
     from fastapi.responses import FileResponse
 
-    return FileResponse(str(target), media_type=media_type or "application/octet-stream")
+    # Non-media types (HTML, SVG, JSON, …) are forced to `attachment` so a
+    # crafted staged file cannot render/execute in the origin — mirrors the
+    # dataset file-serving endpoint.
+    inline = (
+        media_type is not None
+        and media_type.split("/")[0] in ("image", "video", "audio")
+        and media_type != "image/svg+xml"
+    )
+    headers: dict[str, str] = {}
+    if not inline:
+        safe_name = quote(target.name, safe="")
+        headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{safe_name}"
+    return FileResponse(str(target), media_type=media_type or "application/octet-stream", headers=headers)
 
 
 # -- Admin / Management ------------------------------------------------------
@@ -1511,6 +1687,15 @@ async def api_health_stats() -> dict[str, Any]:
     Returns CPU%, memory (RSS vs cgroup limit), file PVC disk usage,
     and Qdrant connection status + total points.
     """
+    # The blocking work (disk_usage, Qdrant HTTP calls, /proc reads) runs in
+    # the sync pool so this frequently-polled endpoint never stalls the
+    # event loop (which would also delay health/readiness probes).
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(sync_pool, _collect_health_stats)
+
+
+def _collect_health_stats() -> dict[str, Any]:
+    """Synchronous helper that does the actual work for /api/admin/health."""
     global _last_cpu_time, _last_wall_time
 
     import shutil
@@ -1544,7 +1729,7 @@ async def api_health_stats() -> dict[str, Any]:
     mem_percent = round(rss_bytes / mem_limit * 100, 1) if mem_limit > 0 else 0.0
 
     # -- File PVC disk ----------------------------------------------------------
-    dm = await get_manager_async()
+    dm = get_manager()
     usage = shutil.disk_usage(str(dm.base_path))
 
     # -- Qdrant status + total points ------------------------------------------
@@ -1845,6 +2030,16 @@ def main():
     os.environ["RAG_REMOTE"] = os.environ.get("RAG_REMOTE", "true")
 
     setup_logger(level=args.log_level)
+
+    # Must share MEDIA_TOKEN_SECRET with the MCP server so protected media is
+    # served via short-lived HMAC tokens (never a clear ?password= URL).
+    if not os.environ.get("MEDIA_TOKEN_SECRET", ""):
+        logger.error(
+            "MEDIA_TOKEN_SECRET is required: media URLs are verified with a short-lived "
+            "HMAC token (the legacy ?password= suffix was removed for security). "
+            "Set the shared MEDIA_TOKEN_SECRET env var (helm: security.mediaTokenSecret)."
+        )
+        raise SystemExit(1)
 
     import uvicorn
 

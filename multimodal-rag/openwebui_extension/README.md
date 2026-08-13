@@ -4,6 +4,20 @@ A filter function for [Open WebUI](https://docs.openwebui.com/) that hands
 unsupported modalities (images, video, audio) to the Multimodal RAG MCP
 tool **without** injecting raw media into the LLM context window.
 
+## Variants
+
+This directory ships **three** filters — pick the one that matches your
+setup:
+
+| File | Media routing | Long-term memory | Use when |
+|------|---------------|------------------|----------|
+| [`filter.py`](filter.py) | Full (stage → MCP hint, `STRIP_MODELS` per-model) | Yes (recall + distillation) | You want both RAG-backed media routing **and** per-user memory |
+| [`filter_no_memory.py`](filter_no_memory.py) | Identical to `filter.py` | **No** (memory valves removed) | You only need the media→MCP routing; no recall/store |
+| [`filter_media_strip.py`](filter_media_strip.py) | **Strip-only** — removes image/video (and optionally audio) parts for text-only LLMs | No | Your text-only LLM errors on media; you don't want RAG staging at all |
+
+All three declare `file_handler = True` so they take control of file
+processing. The rest of this document describes the full `filter.py`.
+
 ## Problem
 
 Open WebUI blocks requests containing modalities (images, video, audio)
@@ -19,9 +33,10 @@ embedding media (or preemptively retrieved RAG text) in the context:
 2. **Stages the media** on the RAG API's staging endpoint and injects only
    a short `file://` URL hint plus the dataset name — **no base64** in the
    LLM context.
-3. Lets the **LLM call the `search_dataset` MCP tool itself** with that
-   URL when it decides retrieval is relevant, so results arrive as tool
-   results (not as silently injected context).
+3. Lets the **LLM call the MCP tools itself** with that URL — `describe_media`
+   to analyse the media, `transcribe_audio` to transcribe it, or
+   `search_dataset` for similar content — so results arrive as tool results
+   (not as silently injected context).
 
 If the RAG MCP is not enabled (`DEFER_TO_MCP = false`), the filter simply
 warns the user and strips the unsupported modality.
@@ -115,7 +130,7 @@ After installing, click the ⚙️ icon next to the filter to configure:
 
 | Valve | Default | Description |
 |-------|---------|-------------|
-| `RAG_API_URL` | `http://rag-api:8000` | Base URL of the Multimodal RAG API (for the staging endpoint + dataset list) |
+| `RAG_API_URL` | `http://rag-mcp-server-api.mm-rag-mcp.svc.cluster.local` | Base URL of the Multimodal RAG API (for the staging endpoint + dataset list) |
 | `DATASET_NAME` | `default` | Fallback injected into the hint only if the filter can't fetch the live dataset list |
 | `ROUTE_IMAGES` | `true` | Hand images off to the MCP tool (false = leave for a vision LLM) |
 | `ROUTE_VIDEO` | `true` | Hand video off to the MCP tool |
@@ -298,13 +313,15 @@ do **not** want to route those through RAG at all, set the matching
    (6 datasets in the current deployment, e.g. `andrew-test-dataset`,
    `stacks-project`, ...).
 3. The image is stripped from the LLM request; only a hint is injected:
-   `<staged image (file:///data/staging/<uuid>/photo.jpg) — available
-   datasets: <list>; call search_dataset(image="<url>",
-   dataset_name="<chosen>") to retrieve context>`.
-4. The LLM picks the most relevant dataset and calls `search_dataset`
-   with the staged `file://` URL.
-5. The MCP server reads the image from the shared PVC and retrieves
-   related context (e.g. _"Image shows a Golden Retriever in a park..."_).
+   a staged-media block listing the exact `file://` URLs, the live dataset
+   list, and the suggested `base_llm_modalities` — telling the LLM it can
+   call `describe_media(media_url=...)`, `transcribe_audio(audio_url=...)`,
+   or `search_dataset(image=..., dataset_name=...)` with those URLs.
+4. The LLM picks the most relevant tool (and dataset) and calls it with
+   the staged `file://` URL.
+5. The MCP server reads the media from the shared PVC and returns the
+   description / transcription / retrieved context (e.g. _"Image shows a
+   Golden Retriever in a park..."_).
 6. The LLM uses that tool result to answer.
 
 ## Troubleshooting
