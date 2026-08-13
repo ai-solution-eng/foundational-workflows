@@ -1,32 +1,33 @@
 {
   "config": {
     "mode": "mcp",
-    "url": "https://rag-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net",
-    "mcp_url": "https://rag-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net/mcp",
-    "dataset": "andrew-bydlon-test-dataset",
-    "N": 20,
+    "url": "http://rag-mcp-server-api.mm-rag-mcp.svc.cluster.local",
+    "mcp_url": "http://rag-mcp-server-mcp.mm-rag-mcp.svc.cluster.local:9090/mcp",
+    "dataset": "andrew-test-dataset",
+    "N": 100,
     "duration": 30.0,
     "ramp_up": 5.0,
     "top_k": 10,
     "use_reranker": true,
     "reranker_top_k": 5,
     "num_queries": 40,
-    "insecure": true
+    "insecure": false,
+    "call_timeout": 120.0
   },
   "results": {
-    "total_requests": 90,
-    "successful": 90,
+    "total_requests": 212,
+    "successful": 212,
     "failed": 0,
     "success_rate_pct": 100.0,
-    "duration_s": 38.41,
-    "response_rate_rps": 2.34,
+    "duration_s": 63.07,
+    "response_rate_rps": 3.36,
     "latency_ms": {
-      "min": 1004.88,
-      "mean": 7301.61,
-      "median": 7829.94,
-      "p95": 9091.48,
-      "p99": 15399.8,
-      "max": 16350.86
+      "min": 1187.76,
+      "mean": 22044.11,
+      "median": 26776.37,
+      "p95": 33177.41,
+      "p99": 34353.76,
+      "max": 34663.8
     },
     "avg_results_per_query": 1,
     "status_codes": {},

@@ -1,32 +1,33 @@
 {
   "config": {
     "mode": "mcp",
-    "url": "https://rag-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net",
-    "mcp_url": "https://rag-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net/mcp",
-    "dataset": "stack-project",
-    "N": 20,
+    "url": "http://rag-mcp-server-api.mm-rag-mcp.svc.cluster.local",
+    "mcp_url": "http://rag-mcp-server-mcp.mm-rag-mcp.svc.cluster.local:9090/mcp",
+    "dataset": "stacks-project",
+    "N": 100,
     "duration": 30.0,
     "ramp_up": 5.0,
     "top_k": 10,
     "use_reranker": false,
     "reranker_top_k": 3,
     "num_queries": 40,
-    "insecure": true
+    "insecure": false,
+    "call_timeout": 120.0
   },
   "results": {
-    "total_requests": 180,
-    "successful": 180,
+    "total_requests": 1650,
+    "successful": 1650,
     "failed": 0,
     "success_rate_pct": 100.0,
-    "duration_s": 36.39,
-    "response_rate_rps": 4.95,
+    "duration_s": 36.29,
+    "response_rate_rps": 45.47,
     "latency_ms": {
-      "min": 289.81,
-      "mean": 3472.98,
-      "median": 3963.28,
-      "p95": 4091.16,
-      "p99": 4619.4,
-      "max": 5446.07
+      "min": 324.51,
+      "mean": 1838.86,
+      "median": 1821.76,
+      "p95": 2720.82,
+      "p99": 3372.7,
+      "max": 3695.52
     },
     "avg_results_per_query": 1,
     "status_codes": {},

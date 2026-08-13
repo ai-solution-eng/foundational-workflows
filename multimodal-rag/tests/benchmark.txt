@@ -1,36 +1,36 @@
-Run these for performance metrics. Each uses MCP mode (the path opencode uses), --insecure for the internal HPE CA, and saves JSON.
+Run these for performance metrics. Each uses MCP mode (the path opencode uses), for the internal HPE CA, and saves JSON.
 
-1. Multimodal dataset — andrew-bydlon-test-dataset (664 docs), no reranker:
-python3 tests/benchmark.py --mode mcp \
-  --url https://rag-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net/mcp \
-  --api-url https://rag-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net \
-  --dataset andrew-bydlon-test-dataset \
-  --N 20 --duration 30 --ramp-up 5 --top-k 10 --insecure \
-  --output tests/benchmark_results/mm_no_reranker.json
+1. Multimodal dataset — andrew-test-dataset (664 docs), no reranker:
+python3 benchmark.py --mode mcp \
+  --url http://rag-mcp-server-mcp.mm-rag-mcp.svc.cluster.local:9090/mcp \
+  --api-url http://rag-mcp-server-api.mm-rag-mcp.svc.cluster.local \
+  --dataset andrew-test-dataset \
+  --N 100 --duration 30 --ramp-up 5 --top-k 10 \
+  --output mm_no_reranker.json
 
 2. Multimodal dataset — with reranker (measures cross-encoder latency cost):
-python3 tests/benchmark.py --mode mcp \
-  --url https://rag-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net/mcp \
-  --api-url https://rag-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net \
-  --dataset andrew-bydlon-test-dataset \
-  --N 20 --duration 30 --ramp-up 5 --top-k 10 --use-reranker --reranker-top-k 5 --insecure \
-  --output tests/benchmark_results/mm_reranker.json
+python3 benchmark.py --mode mcp \
+  --url http://rag-mcp-server-mcp.mm-rag-mcp.svc.cluster.local:9090/mcp \
+  --api-url http://rag-mcp-server-api.mm-rag-mcp.svc.cluster.local \
+  --dataset andrew-test-dataset \
+  --N 100 --duration 30 --ramp-up 5 --top-k 10 --use-reranker --reranker-top-k 5 \
+  --output mm_reranker.json
 
 3. Text-only dataset — stack-project (10,500 docs), no reranker:
-python3 tests/benchmark.py --mode mcp \
-  --url https://rag-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net/mcp \
-  --api-url https://rag-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net \
+python3 benchmark.py --mode mcp \
+  --url http://rag-mcp-server-mcp.mm-rag-mcp.svc.cluster.local:9090/mcp \
+  --api-url http://rag-mcp-server-api.mm-rag-mcp.svc.cluster.local \
   --dataset stack-project \
-  --N 20 --duration 30 --ramp-up 5 --top-k 10 --insecure \
-  --output tests/benchmark_results/text_no_reranker.json
+  --N 100 --duration 30 --ramp-up 5 --top-k 10 \
+  --output text_no_reranker.json
 
 4. Text-only dataset — with reranker:
-python3 tests/benchmark.py --mode mcp \
-  --url https://rag-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net/mcp \
-  --api-url https://rag-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net \
+python3 benchmark.py --mode mcp \
+  --url http://rag-mcp-server-mcp.mm-rag-mcp.svc.cluster.local:9090/mcp \
+  --api-url http://rag-mcp-server-api.mm-rag-mcp.svc.cluster.local \
   --dataset stack-project \
-  --N 20 --duration 30 --ramp-up 5 --top-k 10 --use-reranker --reranker-top-k 5 --insecure \
-  --output tests/benchmark_results/text_reranker.json
+  --N 100 --duration 30 --ramp-up 5 --top-k 10 --use-reranker --reranker-top-k 5 \
+  --output text_reranker.json
 
 Notes:
 - I confirmed the dataset names via the MCP server: the text-only one is stack-project (you wrote stacks-project).

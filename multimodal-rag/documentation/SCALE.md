@@ -1,14 +1,14 @@
-# Scaling: the `helm-scale/` and `helm-scale-g2/` charts
+# Scaling: the `helm-scale-medium/` and `helm-scale-large/` charts
 
 The base `helm/` chart runs a single API replica with a single Qdrant
-instance — optimised for simplicity. The `helm-scale/` chart trades that
-for horizontal capacity. This document explains every layer of the scale
-chart and how it achieves its goal.
+instance — optimised for simplicity. The `helm-scale-large/` chart trades
+that for horizontal capacity. This document explains every layer of the
+scale chart and how it achieves its goal.
 
-A third variant, `helm-scale-g2/`, reuses the scale-chart architecture
-(gunicorn workers, multi-replica Qdrant, Redis unlock cache) but dials the
-replica counts and per-container resources back so it can be tested as a
-drop-in replacement on a cluster sized for the base chart. The
+A medium variant, `helm-scale-medium/`, reuses the scale-chart
+architecture (gunicorn workers, multi-replica Qdrant, Redis unlock cache)
+but dials the replica counts and per-container resources back so it can be
+tested as a drop-in replacement on a cluster sized for the base chart. The
 [Resource requirements](#resource-requirements) section compares all three.
 
 ## 1. Multiple API replicas + load balancing
@@ -165,21 +165,21 @@ is also annotated with `helm.sh/resource-policy: keep` so it survives
 
 ## Summary table
 
-| Dimension | Base chart (`helm/`) | Scale chart (`helm-scale/`) |
-|---|---|---|
-| API replicas | 1 | 4 |
-| Server | `uvicorn` (1 event loop) | `gunicorn` + 4 `UvicornWorker`s |
-| Qdrant | 1 instance (HTTP) | 3-node cluster (gRPC, sharded) |
-| Qdrant client timeout | none | 30s hard |
-| Unlock cache | in-process dict | Redis (cross-pod) |
-| Unlock identity | client IP | authenticated user (oauth2-proxy) |
-| Count sync on read | every call | deferred (admin-only) |
-| Sync thread pool | 12 | 64 per worker |
-| MCP thread pool | 64 (default) | 64 (explicit) |
-| Model HTTP pool | 30 connections | 200 connections |
-| Pod anti-affinity | no | yes (spread across nodes) |
-| File PVC | 50Gi RWMany | 100Gi RWMany |
-| Qdrant PVC | 50Gi RWMany (shareable) | 100Gi RWOnce per replica |
+| Dimension | Base chart (`helm/`) | Medium chart (`helm-scale-medium/`) | Large chart (`helm-scale-large/`) |
+|---|---|---|---|
+| API replicas | 1 | 2 | 4 |
+| Server | `uvicorn` (1 event loop) | `gunicorn` + 2 `UvicornWorker`s | `gunicorn` + 4 `UvicornWorker`s |
+| Qdrant | 1 instance (HTTP) | 2-node cluster (gRPC, sharded) | 3-node cluster (gRPC, sharded) |
+| Qdrant client timeout | none | 30s | 30s |
+| Unlock cache | in-process dict | Redis (cross-pod) | Redis (cross-pod) |
+| Unlock identity | client IP | authenticated user (oauth2-proxy) | authenticated user (oauth2-proxy) |
+| Count sync on read | every call | deferred (admin-only) | deferred (admin-only) |
+| Sync thread pool | 12 | 32 per worker | 64 per worker |
+| MCP thread pool | 64 (default) | 32 (explicit) | 64 (explicit) |
+| Model HTTP pool | 30 connections | 100 connections | 200 connections |
+| Pod anti-affinity | no | yes (spread across nodes) | yes (spread across nodes) |
+| File PVC | 50Gi RWMany | 50Gi RWMany | 100Gi RWMany |
+| Qdrant PVC | 50Gi RWMany (shareable) | 25Gi RWOnce per replica | 100Gi RWOnce per replica |
 
 ## Resource requirements
 
@@ -197,18 +197,18 @@ Each API pod runs **two** containers (`rag-api-server` +
 | Component | Chart | Replicas | Per-unit req | Per-unit lim | Storage |
 |---|---|---|---|---|---|
 | **App** (2 ctr/pod) | `helm/` | 1 | 4 Gi / 4 cpu | 16 Gi / 8 cpu | — |
-| | `helm-scale/` | 4 | 8 Gi / 4 cpu | 16 Gi / 8 cpu | — |
-| | `helm-scale-g2/` | 2 | 5 Gi / 3 cpu | 16 Gi / 6 cpu | — |
+| | `helm-scale-medium/` | 2 | 5 Gi / 3 cpu | 16 Gi / 6 cpu | — |
+| | `helm-scale-large/` | 4 | 8 Gi / 4 cpu | 16 Gi / 8 cpu | — |
 | **Qdrant** | `helm/` | 1 | 16 Gi / 4 cpu | 32 Gi / 8 cpu | 50 Gi |
-| | `helm-scale/` | 3 | 16 Gi / 4 cpu | 32 Gi / 8 cpu | 100 Gi × 3 |
-| | `helm-scale-g2/` | 2 | 10 Gi / 3 cpu | 20 Gi / 6 cpu | 25 Gi × 2 |
+| | `helm-scale-medium/` | 2 | 10 Gi / 3 cpu | 20 Gi / 6 cpu | 25 Gi × 2 |
+| | `helm-scale-large/` | 3 | 16 Gi / 4 cpu | 32 Gi / 8 cpu | 100 Gi × 3 |
 | **Redis** | `helm/` | — | — | — | — |
-| | `helm-scale/` | 1 | 256 Mi / 100 m | 512 Mi / 500 m | — |
-| | `helm-scale-g2/` | 1 | 256 Mi / 100 m | 512 Mi / 500 m | — |
+| | `helm-scale-medium/` | 1 | 256 Mi / 100 m | 512 Mi / 500 m | — |
+| | `helm-scale-large/` | 1 | 256 Mi / 100 m | 512 Mi / 500 m | — |
 
 ### Cluster-wide totals
 
-| | `helm/` (base) | `helm-scale-g2/` | `helm-scale/` |
+| | `helm/` (base) | `helm-scale-medium/` | `helm-scale-large/` |
 |---|---|---|---|
 | **Req memory** | 20 Gi | 30.25 Gi (+51 %) | 80.25 Gi (+301 %) |
 | **Req CPU** | 8.0 | 12.1 (+51 %) | 28.1 (+251 %) |
@@ -216,7 +216,7 @@ Each API pod runs **two** containers (`rag-api-server` +
 | **Lim CPU** | 16.0 | 24.5 (+53 %) | 56.5 (+253 %) |
 | **PVC total** | 100 Gi | 100 Gi (+0 %) | 400 Gi (+300 %) |
 
-Percentages are relative to the base chart. The g2 variant is tuned so
+Percentages are relative to the base chart. The medium variant is tuned so
 that **total requests are ~50 % above the base chart** while **total PVC
 stays at 100 Gi** — the data PVC is unchanged at 50 Gi (no resize needed
 on upgrade) and the two Qdrant PVCs are 25 Gi each (replacing the base
@@ -224,7 +224,7 @@ chart's single 50 Gi Qdrant PVC).
 
 ### PVC layout
 
-| PVC | `helm/` | `helm-scale-g2/` | `helm-scale/` |
+| PVC | `helm/` | `helm-scale-medium/` | `helm-scale-large/` |
 |---|---|---|---|
 | Data (RWX, shared) | 50 Gi | 50 Gi | 100 Gi |
 | Qdrant (RWO, per-replica) | 50 Gi × 1 | 25 Gi × 2 | 100 Gi × 3 |
@@ -240,10 +240,83 @@ the StatefulSet `volumeClaimTemplates` and are **not** kept on uninstall.
 > and its PVC must be deleted before `helm upgrade`; Qdrant vectors are
 > lost and must be re-indexed. The data PVC is unaffected.
 
-## Design principle
+## Benchmarks
 
-The base chart optimizes for simplicity (single process, shared Qdrant
-PVC, no external dependencies), while the scale chart trades that for
-horizontal capacity — adding replicas, clustering Qdrant, introducing
-Redis for shared state, and eliminating per-request cross-replica write
-contention.
+On our SE G2 cluster, with the helm-scale-medium chart, I was able to achieve about 50 requests / second with top_k=10 retrieval from N=100 (emulated) concurrent users. This is up from around 10 without dynamic batching on the base helm chart, or 4 in a very mutimodal dataset (pre-caching base descriptions).
+
+```
+(base) andrew-bydlon@rag-throughput-0:~$ python3 benchmark.py   --mode mcp   --url http://rag-mcp-server-mcp.mm-rag-mcp.svc.cluster.local:9090/mcp   --api-url http://rag-mcp-server-api.mm-rag-mcp.svc.cluster.local   --dataset andrew-test-dataset   --N 100 --duration 120 --top-k 10   --call-timeout 60 
+Checking server health at http://rag-mcp-server-api.mm-rag-mcp.svc.cluster.local ... OK
+Query pool: 40 queries
+
+============================================================
+  BENCHMARK CONFIGURATION
+============================================================
+  Mode:            MCP
+  MCP endpoint:    http://rag-mcp-server-mcp.mm-rag-mcp.svc.cluster.local:9090/mcp
+  REST API:        http://rag-mcp-server-api.mm-rag-mcp.svc.cluster.local
+  Dataset:         andrew-test-dataset
+  Users (N):       100
+  Duration:        120.0s
+  Ramp-up:         5.0s
+  Top K:           10
+  Reranker:        OFF
+  Queries:         40
+  Password:        none
+  TLS verify:      ON
+  Call timeout:    60s
+============================================================
+
+Launching 100 concurrent users (mcp mode) ...
+   elapsed   requests    success     failed  rate (req/s)
+  --------  ---------  ---------  ---------  ------------
+      5.1s         52         52          0          10.3
+     10.1s        305        305          0          30.3
+     15.1s        573        573          0          38.0
+     20.1s        802        802          0          40.0
+     25.1s       1097       1097          0          43.7
+     30.1s       1356       1356          0          45.0
+     35.1s       1659       1659          0          47.2
+     40.1s       1924       1924          0          47.9
+     45.1s       2139       2139          0          47.4
+     50.2s       2401       2401          0          47.9
+     55.2s       2638       2638          0          47.8
+     60.2s       2907       2907          0          48.3
+     65.2s       3201       3201          0          49.1
+     70.2s       3412       3412          0          48.6
+     75.2s       3617       3617          0          48.1
+     80.2s       3862       3862          0          48.2
+     85.2s       4160       4160          0          48.8
+     90.2s       4413       4413          0          48.9
+     95.2s       4662       4662          0          49.0
+    100.2s       4932       4932          0          49.2
+   elapsed   requests    success     failed  rate (req/s)
+  --------  ---------  ---------  ---------  ------------
+    105.2s       5226       5226          0          49.7
+    110.2s       5461       5461          0          49.5
+    115.2s       5734       5734          0          49.8
+    120.2s       5996       5996          0          49.9
+    125.2s       6220       6220          0          49.7
+
+============================================================
+  BENCHMARK RESULTS
+============================================================
+  Duration:            127.08s
+  Total requests:      6267
+  Successful:          6267
+  Failed:              0
+  Success rate:        100.0%
+  Response rate:       49.32 req/s
+
+  Latency (ms):
+    min:     325.04
+    mean:    1921.83
+    median:  1893.31
+    p95:     2938.42
+    p99:     3511.81
+    max:     5021.09
+
+  Avg results/query:   1
+============================================================
+```
+

@@ -6,7 +6,7 @@ docs, and more), embed them into a joint multimodal vector space, and
 retrieve at query time with optional cross-encoder reranking — all
 exposed via a REST API, an HTML frontend, and an MCP server.
 
-<div align="center"><img src="./documentation/rag_system_flow-1.png" width="700" alt="RAG system flow"></div>
+<div align="center"><img src="./documentation/rag_system_flow-1.png" width="700" alt="RAG system flow: dataset building (left) feeding a shared vector store, queried by query-time retrieval (right), with dynamic batching annotations throughout"></div>
 
 ---
 
