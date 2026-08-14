@@ -12,6 +12,8 @@ Or via Python::
 
 import argparse
 import asyncio
+import datetime
+import json
 import mimetypes
 import os
 import random
@@ -37,7 +39,7 @@ from fastapi import (
 )
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from multimodal_rag.dataset_manager import DatasetManager
+from multimodal_rag.dataset_manager import DatasetManager, _cross_process_lock
 from multimodal_rag.utils.general_tools import sync_pool
 from multimodal_rag.utils.logging_utils import logging, setup_logger
 
@@ -135,6 +137,69 @@ class _UploadJobTracker:
 
 
 _upload_jobs = _UploadJobTracker()
+
+# ---------------------------------------------------------------------------
+# Upload history (persisted per-file log shown on the Manage page)
+# ---------------------------------------------------------------------------
+# Each completed upload/ingestion job appends one entry per processed file so
+# the Manage page can show a table of what was uploaded and when.  The log
+# lives under DATA_PATH (the shared RWX PVC) so it survives restarts and is
+# visible across pods; a cross-process fcntl lock serializes appends.
+
+
+def _upload_history_path() -> Path:
+    return Path(os.environ.get("DATA_PATH", "/data")) / "upload_history.json"
+
+
+def _load_upload_history() -> list[dict[str, Any]]:
+    p = _upload_history_path()
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        logger.debug("Unable to parse upload history — starting empty", exc_info=True)
+        return []
+
+
+def _save_upload_history(entries: list[dict[str, Any]]) -> None:
+    p = _upload_history_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic write: temp file + os.replace() so a crash mid-write never leaves
+    # a truncated history file.
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(entries, indent=2, default=str), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def _record_upload_history(dataset_name: str, files: list[dict[str, Any]], source: str) -> None:
+    """Persist one entry per processed file (name, outcome, timestamp)."""
+    if not files:
+        return
+    now = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    with _cross_process_lock(_upload_history_path().with_suffix(".lock")):
+        entries = _load_upload_history()
+        for f in files:
+            err = f.get("error")
+            chunks = f.get("chunks") or 0
+            status = "error" if err else ("ok" if chunks > 0 else "skipped")
+            entries.append(
+                {
+                    "timestamp": now,
+                    "dataset": dataset_name,
+                    "file": f.get("file") or "unknown",
+                    "chunks": chunks,
+                    "status": status,
+                    "source": source,
+                    "error": err,
+                }
+            )
+        # Bound the file size — keep only the newest 2000 entries.
+        if len(entries) > 2000:
+            entries = entries[-2000:]
+        _save_upload_history(entries)
+
 
 # ---------------------------------------------------------------------------
 # Application config from environment
@@ -926,6 +991,11 @@ async def api_upload_file(
 
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(sync_pool, dm.add_file, name, tmp_path, file.filename)
+        _record_upload_history(
+            name,
+            [{"file": file.filename, "chunks": result.get("chunks", 0)}],
+            "files",
+        )
         return {"status": "ok", "file": file.filename, **result}
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -991,8 +1061,14 @@ async def api_upload_files_batch(
 
             r = dm.add_files_batch(name, file_entries, progress_callback=cb)
             _upload_jobs.complete(job_id, r)
+            _record_upload_history(name, r.get("files") or [], "files")
         except Exception as exc:
             _upload_jobs.fail(job_id, str(exc))
+            _record_upload_history(
+                name,
+                [{"file": orig, "chunks": 0, "error": str(exc)} for _, orig in file_entries],
+                "files",
+            )
         finally:
             # Clean up temp files
             for p, _ in file_entries:
@@ -1040,8 +1116,14 @@ async def api_upload_urls_batch(
 
             r = dm.add_urls_batch(name, urls, progress_callback=cb)
             _upload_jobs.complete(job_id, r)
+            _record_upload_history(name, r.get("files") or [], "urls")
         except Exception as exc:
             _upload_jobs.fail(job_id, str(exc))
+            failed_files = [
+                {"file": Path(url.split("?")[0].rstrip("/")).name or "file", "chunks": 0, "error": str(exc)}
+                for url in urls
+            ]
+            _record_upload_history(name, failed_files, "urls")
 
     loop = asyncio.get_running_loop()
     loop.run_in_executor(None, _process)
@@ -1956,6 +2038,42 @@ def _build_storage_stats(dm: DatasetManager) -> dict[str, Any]:
         "total_datasets": len(datasets),
         "total_documents": total_docs,
     }
+
+
+@app.get("/api/admin/upload-history")
+async def api_upload_history(
+    dataset: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=2000),
+) -> dict[str, Any]:
+    """List persisted upload history, newest first.
+
+    Optional ``dataset`` filters to a single dataset.  ``limit`` caps the
+    number of entries returned (default 50, max 2000).
+    """
+    entries = _load_upload_history()
+    if dataset:
+        entries = [e for e in entries if e.get("dataset") == dataset]
+    entries = sorted(entries, key=lambda e: str(e.get("timestamp", "")), reverse=True)
+    return {"history": entries[:limit], "count": len(entries[:limit])}
+
+
+@app.delete("/api/admin/upload-history")
+async def api_clear_upload_history(dataset: str | None = Query(None)) -> dict[str, Any]:
+    """Clear persisted upload history, optionally for a single dataset."""
+    lock_path = _upload_history_path().with_suffix(".lock")
+    with _cross_process_lock(lock_path):
+        if dataset is None:
+            removed = len(_load_upload_history())
+            p = _upload_history_path()
+            if p.exists():
+                os.unlink(p)
+            return {"status": "ok", "removed": removed}
+        entries = _load_upload_history()
+        remaining = [e for e in entries if e.get("dataset") != dataset]
+        removed = len(entries) - len(remaining)
+        if removed:
+            _save_upload_history(remaining)
+        return {"status": "ok", "removed": removed}
 
 
 @app.post("/api/admin/datasets/{name}/migrate-tier-schema")

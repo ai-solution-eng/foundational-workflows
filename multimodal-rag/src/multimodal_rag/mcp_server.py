@@ -1478,22 +1478,12 @@ def _clamp_tool_limit(value: Any, name: str, maximum: int, default: int = 1) -> 
 
 
 try:
-    from mcp.server.fastmcp import FastMCP
-    from mcp.server.fastmcp.exceptions import ToolError
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
     from mcp.server.transport_security import TransportSecuritySettings
 
-    # Stateless + JSON-response mode: each HTTP request is self-contained
-    # (no in-memory session tracking), so any pod in a multi-replica
-    # Deployment can handle any request. This is required for horizontal
-    # scaling — the default stateful mode stores sessions in-process, so a
-    # request routed to a different pod than the one that initialized the
-    # session fails with "Session not found".
-    mcp = FastMCP(
-        "multimodal-rag",
-        stateless_http=True,
-        json_response=True,
-        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-    )
+    mcp = MCPServer("multimodal-rag")
+    _mcp_transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
     @mcp.tool()
     async def list_datasets() -> str:
@@ -2434,12 +2424,23 @@ def main() -> None:
         mcp.run(transport="stdio")
     elif args.transport == "sse":
         logger.info("Starting MCP SSE server on %s:%s", args.host, args.port)
-        app = mcp.sse_app()
+        app = mcp.sse_app(transport_security=_mcp_transport_security)
         app.add_middleware(_MemoryHeaderMiddleware)
         uvicorn.run(_with_mcp_health(app), host=args.host, port=args.port)
     elif args.transport == "streamable-http":
         logger.info("Starting MCP streamable-http server on %s:%s", args.host, args.port)
-        app = mcp.streamable_http_app()
+        # Stateless + JSON-response mode: each HTTP request is self-contained
+        # (no in-memory session tracking), so any pod in a multi-replica
+        # Deployment can handle any request. This is required for horizontal
+        # scaling — the default stateful mode stores sessions in-process, so a
+        # request routed to a different pod than the one that initialized the
+        # session fails with "Session not found". (In MCP 2.0 the protocol is
+        # natively stateless; these flags keep 2025-era clients consistent.)
+        app = mcp.streamable_http_app(
+            json_response=True,
+            stateless_http=True,
+            transport_security=_mcp_transport_security,
+        )
         app.add_middleware(_MemoryHeaderMiddleware)
         uvicorn.run(_with_mcp_health(app), host=args.host, port=args.port)
 

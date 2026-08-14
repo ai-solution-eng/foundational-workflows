@@ -11,6 +11,7 @@ from functools import cached_property, partial
 from typing import Any, Literal
 
 import httpx
+import httpx2
 from openai import AsyncOpenAI, OpenAI
 
 try:
@@ -295,13 +296,13 @@ async def _get_mcp_servers(
 
 def _streamable_http_factory(
     headers: dict[str, str] | None = None,
-    timeout: httpx.Timeout | None = None,
-    auth: httpx.Auth | None = None,
-) -> httpx.AsyncClient:
-    """httpx client factory for MCPServerStreamableHttp that disables TLS
-    verification - required for the PCAI ingress which serves self-signed
-    certs. Mirrors the default factory signature so it can be dropped in
-    via params['httpx_client_factory']."""
+    timeout: httpx2.Timeout | None = None,
+    auth: httpx2.Auth | None = None,
+) -> httpx2.AsyncClient:
+    """httpx2 client factory for MCPServerStreamableHttp (MCP Python SDK v2)
+    that disables TLS verification - required for the PCAI ingress which
+    serves self-signed certs. Mirrors the default factory signature so it
+    can be dropped in via params['httpx_client_factory']."""
     kwargs: dict = {"follow_redirects": False, "verify": False}
     if timeout is not None:
         kwargs["timeout"] = timeout
@@ -309,7 +310,7 @@ def _streamable_http_factory(
         kwargs["headers"] = headers
     if auth is not None:
         kwargs["auth"] = auth
-    return httpx.AsyncClient(**kwargs)
+    return httpx2.AsyncClient(**kwargs)
 
 
 class _NamedBytesIO(io.BytesIO):

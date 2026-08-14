@@ -417,7 +417,7 @@ class PDFProcessor:
         Tries PIL first.  If PIL fails or the image is degenerate (all-black
         or all-white, indicating the real content lives in an SMask / soft
         mask that raw extraction cannot composite), falls back to
-        ``fitz.Pixmap(doc, xref)``.  If that also fails or is degenerate,
+        ``pymupdf.Pixmap(doc, xref)``.  If that also fails or is degenerate,
         renders the image's page region via ``page.get_pixmap(clip=...)``
         which composites image + SMask correctly.
 
@@ -454,14 +454,14 @@ class PDFProcessor:
         except Exception:
             logger.debug("Suppressed exception", exc_info=True)
 
-        # 2. fitz.Pixmap (handles CMYK etc. but not SMask compositing)
+        # 2. pymupdf.Pixmap (handles CMYK etc. but not SMask compositing)
         try:
-            import fitz
+            import pymupdf
 
-            pix = fitz.Pixmap(doc, xref)
+            pix = pymupdf.Pixmap(doc, xref)
             # CMYK (n==4) or 5+ component (CMYK+alpha) → RGB
             if pix.n >= 4 or pix.n == 2:
-                pix = fitz.Pixmap(fitz.csRGB, pix)
+                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
             png_bytes = pix.tobytes("png")
             if not _is_degenerate(png_bytes):
                 return png_bytes, "png"
@@ -476,11 +476,11 @@ class PDFProcessor:
         # 3. Page render (composites image + SMask + color spaces correctly)
         if page is not None and img_ref is not None:
             try:
-                import fitz
+                import pymupdf
 
                 bbox = page.get_image_bbox(img_ref)
                 if bbox:
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=bbox)
+                    pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), clip=bbox)
                     png_bytes = pix.tobytes("png")
                     if not _is_degenerate(png_bytes):
                         return png_bytes, "png"
@@ -577,11 +577,11 @@ class PDFProcessor:
           {page_num, text, images: [{data_url, index}]}
         """
         try:
-            import fitz
+            import pymupdf
         except ImportError:
-            raise ImportError("PyMuPDF (fitz) is required. pip install PyMuPDF")
+            raise ImportError("PyMuPDF is required. pip install PyMuPDF")
 
-        doc = fitz.open(pdf_path)
+        doc = pymupdf.open(pdf_path)
         pages = []
 
         for page_num in range(len(doc)):
@@ -748,11 +748,11 @@ class PDFProcessor:
           bbox, nearby_images (list of data URLs)
         """
         try:
-            import fitz
+            import pymupdf
         except ImportError:
-            raise ImportError("PyMuPDF (fitz) is required. pip install PyMuPDF")
+            raise ImportError("PyMuPDF is required. pip install PyMuPDF")
 
-        doc = fitz.open(pdf_path)
+        doc = pymupdf.open(pdf_path)
         blocks = []
 
         for page_num in range(len(doc)):
@@ -869,9 +869,9 @@ class PDFProcessor:
         chunks while later pages are still being extracted.
         """
         try:
-            import fitz
+            import pymupdf
         except ImportError:
-            raise ImportError("PyMuPDF (fitz) is required. pip install PyMuPDF")
+            raise ImportError("PyMuPDF is required. pip install PyMuPDF")
 
         def _exceeds_budget(text: str) -> bool:
             if text_splitter is not None:
@@ -884,7 +884,7 @@ class PDFProcessor:
                 return text_splitter.count_tokens(combined) > chunk_size
             return len(a) + len(b) + 1 > chunk_size
 
-        doc = fitz.open(pdf_path)
+        doc = pymupdf.open(pdf_path)
 
         # Overlap state carries across pages
         current_text = ""

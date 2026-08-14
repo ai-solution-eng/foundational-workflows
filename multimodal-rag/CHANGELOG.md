@@ -52,6 +52,15 @@ Committed as three waves over the `checkpoint-pre-audit-fixes` baseline.
 
 ### Post-audit follow-ups
 
+- **PyMuPDF import migration**: PDF extraction now uses `import pymupdf`
+  instead of the deprecated `fitz`, silencing the "`fitz` API is
+  deprecated" startup warning (PyMuPDF ≥ 1.24 exposes the new module under
+  `pymupdf`).
+- **`qdrant-client` floor pinned to ≥1.19**: the gRPC auth interceptor only
+  guards its deprecated `asyncio.iscoroutinefunction()` call since 1.19;
+  older releases emit a `DeprecationWarning` once per Qdrant search on
+  Python 3.14 (re-logged at INFO by the MCP SDK). `qdrant-client>=1.19.0,<2`
+  prevents a future build from regressing to a warning-spamming release.
 - **MCP sidecar probes**: the MCP server now serves `/healthz` (SSE and
   streamable-http transports) and the Helm deployment configures
   startup/liveness/readiness probes for the sidecar container.

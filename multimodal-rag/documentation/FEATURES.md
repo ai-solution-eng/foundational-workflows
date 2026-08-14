@@ -66,7 +66,7 @@ The migration is idempotent and:
 
 ### PDF — Page-by-Page Text + Chart/Figure Extraction + Noise Filtering
 
-**Library:** PyMuPDF (`fitz`)
+**Library:** PyMuPDF (`pymupdf`)
 
 **Three extraction levels:**
 
@@ -654,7 +654,7 @@ For a typical PDF sub-batch (~60 text + ~4 image docs): **~5 HTTP requests** ins
 |-----|--------|
 | **All-image page flush** | Pages with only images (no text blocks) now flush `current_text`/`current_images` before `continue` — cross-page overlap was silently dropped |
 | **`_MAX_IMAGES_PER_CHUNK` cap fix** | Images beyond the 20-per-chunk cap are now re-emitted as standalone chunks instead of silently lost |
-| **CMYK → RGB conversion** | `n==4` (CMYK) images now converted to RGB via `fitz.Pixmap(fitz.csRGB, pix)` — was producing unreadable CMYK PNGs |
+| **CMYK → RGB conversion** | `n==4` (CMYK) images now converted to RGB via `pymupdf.Pixmap(pymupdf.csRGB, pix)` — was producing unreadable CMYK PNGs |
 | **`_extract_page_blocks` exception logging** | Image extraction failures now log a warning with image index and page number instead of silent `pass` |
 | **Bbox float comparison** | Image block matching uses `_bbox_close()` with 1.0pt tolerance instead of exact float equality |
 | **Degenerate image filtering** | Images <10×10px or <1000 total pixels filtered out; max 20 images per chunk — fixes 400 errors from hundreds of 541×1 horizontal-rule images |

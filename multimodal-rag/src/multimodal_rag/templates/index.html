@@ -336,6 +336,21 @@
       <div style="text-align:center;padding:20px"><span class="spinner"></span></div>
     </div>
   </div>
+
+  <!-- Upload history (names + timestamps of uploaded files) -->
+  <div class="card" style="margin-top:16px">
+    <div class="card-header">
+      <h2>Upload History</h2>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input type="text" id="history-filter" placeholder="Filter by dataset or file..." style="width:240px;font-size:.8rem;padding:6px 10px" oninput="loadUploadHistory()">
+        <button class="btn btn-outline btn-sm" onclick="loadUploadHistory()">Refresh</button>
+        <button class="btn btn-outline btn-sm" onclick="clearUploadHistory()">Clear</button>
+      </div>
+    </div>
+    <div id="upload-history-table" style="font-size:.85rem">
+      <div style="text-align:center;padding:20px"><span class="spinner"></span></div>
+    </div>
+  </div>
 </div>
 
 <div id="main-view">
@@ -416,7 +431,10 @@
         <input type="file" id="file-input" multiple hidden onchange="handleFiles(this.files)">
       </div>
       <div id="upload-status" style="margin-top:12px"></div>
-      <button id="retry-btn" onclick="retryFailed()" style="display:none;margin-top:8px;font-size:.8rem;padding:4px 12px;border-radius:4px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer">↻ Retry Failed</button>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <button id="clear-upload-btn" onclick="clearUploadList()" title="Clear the uploaded-file list below" style="display:none;font-size:.8rem;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer">✕ Clear List</button>
+        <button id="retry-btn" onclick="retryFailed()" style="display:none;font-size:.8rem;padding:4px 12px;border-radius:4px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer">↻ Retry Failed</button>
+      </div>
     </div>
 
     <!-- Text Tab -->
@@ -693,6 +711,8 @@ dropZone.addEventListener('drop', e => {
 
 // Track files for retry: [{name, file, done: bool, ok: bool}]
 let _retryFiles = [];
+let _uploadSeq = 0;       // monotonic counter for unique per-file status lines
+let _uploadsActive = 0;   // in-flight batch uploads (disables Clear while busy)
 
 function _updateRetryButton() {
   const btn = document.getElementById('retry-btn');
@@ -705,10 +725,31 @@ function _updateRetryButton() {
   }
 }
 
+function _updateClearButton() {
+  const btn = document.getElementById('clear-upload-btn');
+  const status = document.getElementById('upload-status');
+  if (!btn || !status) return;
+  const hasContent = status.childElementCount > 0;
+  btn.style.display = hasContent ? 'inline-block' : 'none';
+  btn.disabled = _uploadsActive > 0;
+}
+
+function clearUploadList() {
+  if (_uploadsActive > 0) { toast('Wait for the current uploads to finish', 'error'); return; }
+  document.getElementById('upload-status').innerHTML = '';
+  _retryFiles = [];
+  _updateRetryButton();
+  _updateClearButton();
+}
+
 async function handleFiles(files) {
   if (!selectedDataset) { toast('Select a dataset first', 'error'); return; }
   const status = document.getElementById('upload-status');
   const fileArray = Array.from(files);
+  if (fileArray.length === 0) return;
+
+  _uploadsActive++;
+  _updateClearButton();
 
   // Register these files for potential retry (skip ones already tracked as done+ok)
   for (const f of fileArray) {
@@ -726,28 +767,32 @@ async function handleFiles(files) {
   summary.textContent = `Uploading ${fileArray.length} file(s)...`;
   status.appendChild(summary);
 
-  // Show all files as uploading
+  // Show all files as uploading.  Each line gets a unique key so files that
+  // share a name (re-uploads, same file picked twice) each keep their own
+  // status line instead of the first match stealing the updates.
+  const lineKeys = new Map(); // File object -> unique line key
   for (const file of fileArray) {
+    const key = `f${++_uploadSeq}`;
+    lineKeys.set(file, key);
     const line = document.createElement('div');
     line.style.marginTop = '4px';
     line.style.display = 'flex';
     line.style.alignItems = 'center';
     line.style.gap = '8px';
-    line.setAttribute('data-fname', file.name);
+    line.setAttribute('data-file-key', key);
     line.innerHTML = `<span style="color:var(--text-muted);width:16px;flex-shrink:0">📤</span> ${escHtml(file.name)}`;
     status.appendChild(line);
   }
+  _updateClearButton();
 
   const start = Date.now();
   let totalChunks = 0;
-  let _fileChunkTotal = {};
-  let _fileChunkExpected = {};
+  const _fileChunkTotal = {};
+  const _fileChunkExpected = {};
 
-  // Helper: update a file's status line
-  function _updateFileLine(fname, html) {
-    const matchLine = Array.from(status.querySelectorAll('div[data-fname]')).find(
-      el => el.getAttribute('data-fname') === fname
-    );
+  // Helper: update a file's status line by its unique key
+  function _updateFileLine(fileKey, html) {
+    const matchLine = status.querySelector(`div[data-file-key="${fileKey}"]`);
     if (matchLine) matchLine.innerHTML = html;
   }
 
@@ -761,6 +806,7 @@ async function handleFiles(files) {
   const fileQueue = [...fileArray];
 
   async function uploadOne(file) {
+    const fileKey = lineKeys.get(file);
     const fd = new FormData();
     fd.append('files', file);
     const pw = datasetPasswords[selectedDataset] || '';
@@ -774,20 +820,20 @@ async function handleFiles(files) {
       if (!resp.ok) {
         let errMsg = `HTTP ${resp.status}`;
         try { const e = await resp.json(); errMsg = e.detail || e.message || errMsg; } catch {}
-        _updateFileLine(file.name, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(file.name)} — ${escHtml(errMsg)}`);
+        _updateFileLine(fileKey, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(file.name)} — ${escHtml(errMsg)}`);
         const rt = _retryFiles.find(r => r.name === file.name);
         if (rt) { rt.done = true; rt.ok = false; }
         return;
       }
       const { job_id } = await resp.json();
-      _updateFileLine(file.name, `<span style="color:var(--accent);width:16px;flex-shrink:0">📦</span> ${escHtml(file.name)} <span style="color:var(--text-muted);font-size:.75rem">uploaded</span>`);
-      await pollJob(job_id, file.name, _updateFileLine, _fileChunkTotal, _fileChunkExpected,
+      _updateFileLine(fileKey, `<span style="color:var(--accent);width:16px;flex-shrink:0">📦</span> ${escHtml(file.name)} <span style="color:var(--text-muted);font-size:.75rem">uploaded</span>`);
+      await pollJob(job_id, file.name, fileKey, _updateFileLine, _fileChunkTotal, _fileChunkExpected,
         (fname, chunks) => { totalChunks += chunks; _updateSummary(); },
         (fname) => { const rt = _retryFiles.find(r => r.name === fname); if (rt) { rt.done = true; rt.ok = true; } },
         (fname) => { const rt = _retryFiles.find(r => r.name === fname); if (rt) { rt.done = true; rt.ok = false; } }
       );
     } catch (e) {
-      _updateFileLine(file.name, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(file.name)} — ${escHtml(e.message)}`);
+      _updateFileLine(fileKey, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(file.name)} — ${escHtml(e.message)}`);
       const rt = _retryFiles.find(r => r.name === file.name);
       if (rt) { rt.done = true; rt.ok = false; }
     }
@@ -813,11 +859,13 @@ async function handleFiles(files) {
   summary.innerHTML = `<span style="color:var(--green)">Done</span> — ${totalChunks.toLocaleString()} chunk(s) stored from ${fileArray.length} file(s)`;
   toast(`Uploaded ${fileArray.length} file(s), ${totalChunks.toLocaleString()} chunk(s)`);
   _updateRetryButton();
+  _uploadsActive--;
+  _updateClearButton();
   listDatasets();
 }
 
 // Poll an upload job until completion
-async function pollJob(jobId, fileLabel, updateLine, chunkTotals, chunkExpected, onComplete, onOk, onFail) {
+async function pollJob(jobId, fileLabel, fileKey, updateLine, chunkTotals, chunkExpected, onComplete, onOk, onFail) {
   const POLL_INTERVAL = 2000;
   let lastEventIdx = 0;
 
@@ -832,28 +880,28 @@ async function pollJob(jobId, fileLabel, updateLine, chunkTotals, chunkExpected,
         for (let i = lastEventIdx; i < events.length; i++) {
           const data = events[i];
           if (data.status === 'preprocessing') {
-            updateLine(fileLabel, `<span style="color:var(--text-muted);width:16px;flex-shrink:0">⚙</span> ${escHtml(fileLabel)}`);
+            updateLine(fileKey, `<span style="color:var(--text-muted);width:16px;flex-shrink:0">⚙</span> ${escHtml(fileLabel)}`);
           } else if (data.status === 'preprocessed') {
-            if (data.total) chunkExpected[fileLabel] = data.total;
-            updateLine(fileLabel, `<span style="color:var(--accent);width:16px;flex-shrink:0">◐</span> ${escHtml(fileLabel)}`);
+            if (data.total) chunkExpected[fileKey] = data.total;
+            updateLine(fileKey, `<span style="color:var(--accent);width:16px;flex-shrink:0">◐</span> ${escHtml(fileLabel)}`);
           } else if (data.status === 'embedding') {
-            const soFar = chunkTotals[fileLabel] || 0;
-            const exp = chunkExpected[fileLabel];
+            const soFar = chunkTotals[fileKey] || 0;
+            const exp = chunkExpected[fileKey];
             let chunkInfo;
             if (soFar > 0 && exp) chunkInfo = `${soFar.toLocaleString()} / (est.) ${exp.toLocaleString()} chunks embedded…`;
             else if (soFar > 0) chunkInfo = `${soFar.toLocaleString()} chunks embedded…`;
             else chunkInfo = 'embedding…';
-            updateLine(fileLabel, `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> ${escHtml(fileLabel)} <span style="color:var(--text-muted);font-size:.75rem">${chunkInfo}</span>`);
+            updateLine(fileKey, `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> ${escHtml(fileLabel)} <span style="color:var(--text-muted);font-size:.75rem">${chunkInfo}</span>`);
           } else if (data.status === 'complete' && data.chunks !== undefined) {
-            chunkTotals[fileLabel] = (chunkTotals[fileLabel] || 0) + (data.chunks || 0);
-            const fileTotal = chunkTotals[fileLabel];
+            chunkTotals[fileKey] = (chunkTotals[fileKey] || 0) + (data.chunks || 0);
+            const fileTotal = chunkTotals[fileKey];
             const color = fileTotal > 0 ? 'var(--green)' : 'var(--text-muted)';
             const icon = fileTotal > 0 ? '✓' : '⏭';
             const label = fileTotal > 0 ? `${fileTotal.toLocaleString()} chunk(s)` : 'already in dataset';
-            updateLine(fileLabel, `<span style="color:${color};width:16px;flex-shrink:0">${icon}</span> ${escHtml(fileLabel)} — ${label}`);
+            updateLine(fileKey, `<span style="color:${color};width:16px;flex-shrink:0">${icon}</span> ${escHtml(fileLabel)} — ${label}`);
             onComplete(fileLabel, data.chunks || 0);
           } else if (data.status === 'error') {
-            updateLine(fileLabel, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(fileLabel)} — ${escHtml(data.error || 'failed')}`);
+            updateLine(fileKey, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(fileLabel)} — ${escHtml(data.error || 'failed')}`);
           }
         }
         lastEventIdx = events.length;
@@ -864,7 +912,7 @@ async function pollJob(jobId, fileLabel, updateLine, chunkTotals, chunkExpected,
           return;
         } else if (job.status === 'error') {
           if (onFail) onFail(fileLabel);
-          updateLine(fileLabel, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(fileLabel)} — ${escHtml(job.error || 'failed')}`);
+          updateLine(fileKey, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(fileLabel)} — ${escHtml(job.error || 'failed')}`);
           resolve();
           return;
         }
@@ -1681,8 +1729,71 @@ async function loadManageStats() {
 }
 
 // -----------------------------------------------------------------------
-// Theme toggle
+// Upload history (Manage page)
 // -----------------------------------------------------------------------
+
+async function loadUploadHistory() {
+  const container = document.getElementById('upload-history-table');
+  if (!container) return;
+  const filter = ((document.getElementById('history-filter') || {}).value || '').trim().toLowerCase();
+  try {
+    const data = await api('GET', '/api/admin/upload-history?limit=200');
+    let rows = data.history || [];
+    if (filter) {
+      rows = rows.filter(h =>
+        (h.dataset || '').toLowerCase().includes(filter) ||
+        (h.file || '').toLowerCase().includes(filter)
+      );
+    }
+    if (rows.length === 0) {
+      container.innerHTML = '<div class="empty-state">No uploads recorded yet.</div>';
+      return;
+    }
+    container.innerHTML = `
+      <table style="width:100%;font-size:.85rem;border-collapse:collapse">
+        <thead>
+          <tr style="text-align:left;color:var(--text-muted)">
+            <th style="padding:8px;border-bottom:1px solid var(--border)">When</th>
+            <th style="padding:8px;border-bottom:1px solid var(--border)">Dataset</th>
+            <th style="padding:8px;border-bottom:1px solid var(--border)">File</th>
+            <th style="padding:8px;border-bottom:1px solid var(--border)">Result</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map(r => {
+            const when = r.timestamp ? new Date(r.timestamp).toLocaleString() : '—';
+            let resultHtml;
+            if (r.status === 'error') {
+              resultHtml = `<span style="color:var(--red)">✗ ${escHtml(r.error || 'failed')}</span>`;
+            } else if (r.chunks > 0) {
+              resultHtml = `<span style="color:var(--green)">✓ ${r.chunks.toLocaleString()} chunk(s)</span>`;
+            } else {
+              resultHtml = `<span style="color:var(--text-muted)">⏭ already in dataset</span>`;
+            }
+            return `<tr>
+              <td style="padding:8px;border-bottom:1px solid var(--border);white-space:nowrap;color:var(--text-muted)">${escHtml(when)}</td>
+              <td style="padding:8px;border-bottom:1px solid var(--border)">${escHtml(r.dataset || '')}</td>
+              <td style="padding:8px;border-bottom:1px solid var(--border);word-break:break-all">${escHtml(r.file || '')}</td>
+              <td style="padding:8px;border-bottom:1px solid var(--border)">${resultHtml}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  } catch (e) {
+    container.innerHTML = `<div style="color:var(--red)">${escHtml(e.message)}</div>`;
+  }
+}
+
+async function clearUploadHistory() {
+  if (!confirm('Clear all upload history? This cannot be undone.')) return;
+  try {
+    const res = await api('DELETE', '/api/admin/upload-history');
+    await loadUploadHistory();
+    toast(`Upload history cleared (${res.removed || 0} entrie${res.removed === 1 ? '' : 's'})`);
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
 
 function toggleTheme() {
   const html = document.documentElement;
@@ -1712,6 +1823,7 @@ document.getElementById('manage-view').style.display = isManage ? 'block' : 'non
 document.getElementById('main-view').style.display = isManage ? 'none' : 'block';
 if (isManage) {
   loadManageStats();
+  loadUploadHistory();
   pollHealth();
   _healthInterval = setInterval(pollHealth, 10000);
 } else {

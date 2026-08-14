@@ -47,6 +47,7 @@ import time
 from dataclasses import dataclass, field
 
 import httpx
+import httpx2
 
 # ---------------------------------------------------------------------------
 # Default query pool — diverse, sensible queries that work across datasets
@@ -257,8 +258,8 @@ async def run_user_mcp(
     *duration* while ``asyncio.gather`` waits for stragglers.  Timed-out
     calls are recorded as failures.
     """
-    from mcp.client.session import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
+    from mcp import Client
+    from mcp.client.streamable_http import streamable_http_client
 
     rng = random.Random(user_id)
 
@@ -275,53 +276,33 @@ async def run_user_mcp(
     if password:
         tool_args_base["password"] = password
 
-    # When --insecure is set, inject a custom httpx client factory that
-    # disables TLS verification while preserving MCP defaults (redirects,
-    # timeouts). This is needed for internal/dev servers with private CAs.
-    client_kwargs: dict = {"url": mcp_url}
+    # When --insecure is set, build an httpx2 client that disables TLS
+    # verification while preserving MCP defaults (redirects, timeouts).
+    # MCP Python SDK v2 requires an httpx2 client for the HTTP transport.
+    client_kwargs: dict = {"url": mcp_url, "terminate_on_close": False}
     if insecure:
-        from mcp.shared._httpx_utils import (
-            MCP_DEFAULT_SSE_READ_TIMEOUT,
-            MCP_DEFAULT_TIMEOUT,
+        client_kwargs["http_client"] = httpx2.AsyncClient(
+            follow_redirects=True,
+            verify=False,
+            timeout=httpx2.Timeout(30.0, read=300.0),
         )
-
-        def _insecure_http_client_factory(
-            headers: dict[str, str] | None = None,
-            timeout: httpx.Timeout | None = None,
-            auth: httpx.Auth | None = None,
-        ) -> httpx.AsyncClient:
-            kwargs: dict = {"follow_redirects": True, "verify": False}
-            kwargs["timeout"] = (
-                timeout
-                if timeout is not None
-                else httpx.Timeout(MCP_DEFAULT_TIMEOUT, read=MCP_DEFAULT_SSE_READ_TIMEOUT)
-            )
-            if headers is not None:
-                kwargs["headers"] = headers
-            if auth is not None:
-                kwargs["auth"] = auth
-            return httpx.AsyncClient(**kwargs)
-
-        client_kwargs["httpx_client_factory"] = _insecure_http_client_factory
 
     # One persistent session per user
     try:
-        async with streamablehttp_client(**client_kwargs) as (read, write, _), ClientSession(read, write) as session:
-            await session.initialize()
-
+        async with Client(streamable_http_client(**client_kwargs)) as client:
             while time.monotonic() < end_time:
                 query = rng.choice(queries)
                 tool_args = {**tool_args_base, "query": query}
                 t0 = time.monotonic()
                 try:
                     result = await asyncio.wait_for(
-                        session.call_tool("search_dataset", tool_args),
+                        client.call_tool("search_dataset", tool_args),
                         timeout=call_timeout,
                     )
                     elapsed = time.monotonic() - t0
                     stats.total += 1
                     stats.latencies.append(elapsed)
-                    if result.isError:
+                    if result.is_error:
                         stats.failed += 1
                         err_text = ""
                         for block in result.content:
