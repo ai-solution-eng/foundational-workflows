@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import os
+import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -136,6 +137,29 @@ def _preferred_media(doc: dict[str, Any]) -> dict[str, list[str]]:
         else:
             out[k] = _as_url_list(doc.get(k))
     return out
+
+
+# -- Text-only twin gating -----------------------------------------------------
+# A text-only twin is only useful when the document carries *real* extracted
+# text (e.g. a PDF page).  Documents whose text is merely a media placeholder
+# ("[Image: DSC01391.JPG]") or an ingest-time VLM/ASR caption ("[Image
+# description]: …", "[Audio transcription]: …") have nothing meaningful for a
+# text-only embedding to capture, so they should NOT get a twin.
+_CAPTION_LINE_RE = re.compile(
+    r"\[\s*(?:Image description|Video description|Audio transcription|Video audio transcription)\s*\][^\n]*(?:\n(?!\s*(?:Image description|Video description|Audio transcription|Video audio transcription)\s*\]).*)*",
+    re.IGNORECASE,
+)
+_MEDIA_PLACEHOLDER_RE = re.compile(
+    r"\[\s*(?:Image|Video|Audio)\s*:[^\]]*\]\s*(?:\([^)]*\))?",
+    re.IGNORECASE,
+)
+
+
+def _has_real_text(text: str) -> bool:
+    """True if *text* contains any content beyond captions/placeholders."""
+    remaining = _CAPTION_LINE_RE.sub("", text)
+    remaining = _MEDIA_PLACEHOLDER_RE.sub("", remaining)
+    return bool(remaining.strip())
 
 
 async def _afetch_media_bytes(url: str, async_client=None) -> bytes:
@@ -1496,11 +1520,22 @@ class MultimodalRAG:
             # ── 0e. Create text-only twins for multimodal docs ──────────────
             # A multimodal embedding (text + images) can be dominated by the
             # image content, burying the text signal so text queries don't
-            # match.  For each multimodal doc that also has text, create a
-            # text-only twin: same text + metadata, no media, tagged with
+            # match.  For each multimodal doc that also has *real* text, create
+            # a text-only twin: same text + metadata, tagged with
             # ``_twin=True`` so it can be deduplicated at retrieval when both
             # the twin and the multimodal original appear in results.
-            twin_docs: list[str | dict[str, Any]] = []
+            #
+            # The twin is embedded WITHOUT media (pure text embedding), but its
+            # stored payload KEEPS the image/video so the media is still
+            # retrievable when only the twin matches a query.
+            #
+            # Twins are only created when the text is real extracted content
+            # (e.g. a PDF page).  Documents whose text is only a media
+            # placeholder ("[Image: DSC01391.JPG]") or an ingest-time VLM/ASR
+            # caption ("[Image description]: …") get no twin — there is
+            # nothing meaningful for a text-only embedding to capture.
+            twin_embed_docs: list[dict[str, Any]] = []
+            twin_store_docs: list[dict[str, Any]] = []
             twin_parent_ids: list[int] = []  # index into sub
             for idx, doc in enumerate(sub):
                 if not isinstance(doc, dict):
@@ -1511,23 +1546,31 @@ class MultimodalRAG:
                 has_media = any(doc.get(k) for k in ("image", "video", "audio"))
                 if not has_media:
                     continue
-                twin = {k: v for k, v in doc.items() if k not in ("image", "video", "audio")}
-                twin["_twin"] = True
-                twin_docs.append(twin)
+                if not _has_real_text(text):
+                    continue
+                # Embedding input: text-only (media stripped).
+                embed_twin = {k: v for k, v in doc.items() if k not in ("image", "video", "audio")}
+                embed_twin["_twin"] = True
+                twin_embed_docs.append(embed_twin)
+                # Stored payload: media retained so the twin stays retrievable
+                # with its image/video reference.
+                store_twin = dict(doc)
+                store_twin["_twin"] = True
+                twin_store_docs.append(store_twin)
                 twin_parent_ids.append(idx)
 
             # ── 1. Embed this sub-batch (multimodal + text-only twins) ──────
             t1 = time.monotonic()
             sub_embs = await self.embed.aembed_documents(sub)
-            if twin_docs:
-                twin_embs = await self.embed.aembed_documents(twin_docs)
+            if twin_embed_docs:
+                twin_embs = await self.embed.aembed_documents(twin_embed_docs)
                 sub_embs.extend(twin_embs)
             t_embed_total += time.monotonic() - t1
 
             # Guard against silent data loss: if the embedding API returns
             # fewer/more vectors than documents, zip() would silently
             # truncate.  Log at error level and align to the shorter length.
-            all_docs = list(sub) + list(twin_docs)
+            all_docs = list(sub) + list(twin_store_docs)
             if len(sub_embs) != len(all_docs):
                 logger.error(
                     "Embedding count mismatch: %d docs → %d embeddings. "

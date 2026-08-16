@@ -12,7 +12,7 @@
 replicaCount: 2
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v2.1.0
+  tag: v2.1.2
   pullPolicy: IfNotPresent
 
 deployment:
@@ -95,7 +95,7 @@ models:
     className: "MultiModalReranker"
     extra: {}
   vlm:
-    name: "RedHatAI/gemma-4-31B-it-FP8-block"
+    name: "Qwen/Qwen3.8-27B-FP8"
     url: ""
     extra: {}
   asr:
