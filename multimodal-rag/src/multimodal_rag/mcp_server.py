@@ -56,6 +56,27 @@ MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "")
 _MEDIA_TOKEN_SECRET = os.environ.get("MEDIA_TOKEN_SECRET", "")
 _MEDIA_TOKEN_TTL = max(60, int(os.environ.get("MEDIA_TOKEN_TTL", "3600")))
 
+# Periodic embedder liveness monitor (same env vars as the API server).
+# The embedder is the only required model; it is probed in the background
+# and /healthz flips to 503 only after _MODEL_HEALTH_FAIL_THRESHOLD
+# consecutive failures so a transient blip does not trigger a k8s restart.
+_MODEL_HEALTH_INTERVAL = float(os.environ.get("MODEL_HEALTH_INTERVAL", "60"))
+_MODEL_HEALTH_FAIL_THRESHOLD = int(os.environ.get("MODEL_HEALTH_FAIL_THRESHOLD", "3"))
+
+_model_health: dict[str, Any] = {
+    "embedder": {
+        "status": "unknown",
+        "last_check": None,
+        "error": None,
+        "consecutive_failures": 0,
+    }
+}
+
+# Optional ``:``-separated directories of mounted ConfigMap/Secret files
+# (one file per env key).  When set, the watcher live-reloads the model
+# configuration when these files change — no pod rollout required.
+CONFIG_DIR = os.environ.get("CONFIG_DIR", "")
+
 # Storage adds a 32-hex uuid prefix to every file to avoid collisions.  It is
 # stripped from public media URLs so models only have to reproduce the
 # human-readable filename (see ``_short_rel``).  ``glob``-compatible.
@@ -759,6 +780,107 @@ async def get_manager_async() -> DatasetManager:
 
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(sync_pool, get_manager)
+
+
+def _model_health_loop() -> None:
+    """Probe the required embedder endpoint every ``_MODEL_HEALTH_INTERVAL``.
+
+    Runs in a daemon thread (``_start_model_health_thread``) because the MCP
+    server is launched via ``uvicorn.run``, which owns the event loop.
+    Updates ``_model_health`` so the MCP ``/readyz`` reflects embedder
+    reachability without re-checking synchronously.  Only needed in the
+    HTTP transports (the /healthz and /readyz routes only exist there).
+    """
+    while True:
+        time.sleep(_MODEL_HEALTH_INTERVAL)
+        try:
+            dm = get_manager()
+        except Exception:
+            # Not initialised yet — leave /readyz green; the first real
+            # tool call will retry init.
+            continue
+        if _model_health["embedder"]["status"] == "unknown":
+            # Manager init already verified the embedder once, so seed the
+            # monitor as healthy until the first periodic probe disagrees.
+            _model_health["embedder"].update(
+                {
+                    "status": "healthy",
+                    "last_check": datetime.now(UTC).isoformat(),
+                    "error": None,
+                    "consecutive_failures": 0,
+                }
+            )
+        try:
+            dm._verify_endpoint(dm.embedder, "embedder")
+            error = None
+        except Exception as exc:
+            error = str(exc)
+        embedder = _model_health["embedder"]
+        if error is None:
+            embedder.update(
+                {
+                    "status": "healthy",
+                    "last_check": datetime.now(UTC).isoformat(),
+                    "error": None,
+                    "consecutive_failures": 0,
+                }
+            )
+        else:
+            embedder["status"] = "unhealthy"
+            embedder["last_check"] = datetime.now(UTC).isoformat()
+            embedder["error"] = error
+            embedder["consecutive_failures"] += 1
+            logger.warning(
+                "Embedder endpoint unreachable (%d/%d checks) — %s",
+                embedder["consecutive_failures"],
+                _MODEL_HEALTH_FAIL_THRESHOLD,
+                error,
+            )
+
+
+def _start_model_health_thread() -> None:
+    """Launch the periodic embedder probe in a daemon thread."""
+    threading.Thread(target=_model_health_loop, daemon=True, name="model-health").start()
+
+
+def _reload_models() -> None:
+    """Rebuild the model objects from freshly-applied config (see api_server)."""
+    from multimodal_rag.model_config import build_all
+
+    embedder, reranker, vlm, asr = build_all()
+    if embedder is None:
+        logger.warning("Config reload produced no embedder — keeping previous configuration")
+        return
+    dm = get_manager()
+    try:
+        dm._verify_endpoint(embedder, "embedder")
+    except Exception as exc:
+        logger.error("Config reload aborted — new embedder unreachable: %s", exc)
+        return
+    with dm._rag_cache_lock:
+        dm.embedder, dm.reranker, dm.vlm, dm.asr = embedder, reranker, vlm, asr
+        dm._rag_cache.clear()
+    dm._embedder_verified.clear()
+    dm._embedder_dim_cache.clear()
+    _model_health["embedder"].update(
+        {
+            "status": "unknown",
+            "last_check": None,
+            "error": None,
+            "consecutive_failures": 0,
+        }
+    )
+    logger.info("MCP model configuration reloaded from %s", CONFIG_DIR)
+
+
+def _start_config_watcher() -> None:
+    """Apply mounted config files and start the live-reload watcher."""
+    if not CONFIG_DIR:
+        return
+    from multimodal_rag.model_config import apply_config_dirs, start_config_watcher
+
+    apply_config_dirs(CONFIG_DIR)
+    start_config_watcher(CONFIG_DIR, _reload_models)
 
 
 def _prefer_preprocessed_media(doc: Any) -> Any:
@@ -2370,18 +2492,34 @@ except ImportError:
 
 
 def _with_mcp_health(app: ASGIApp) -> ASGIApp:
-    """Attach a minimal ``/healthz`` route to the MCP ASGI app.
+    """Attach ``/healthz`` (liveness) and ``/readyz`` (readiness) routes.
 
-    The MCP sidecar has no liveness probe today; a Healthz endpoint lets the
-    Helm chart restart a wedged MCP process.  ``FastMCP`` returns the wrapped
-    Starlette app, which supports adding routes directly.
+    ``FastMCP`` returns the wrapped Starlette app, which supports adding
+    routes directly.  ``/healthz`` is pure process liveness (no model
+    checks — the embedder is always a remote vLLM/SGLang service, and
+    restarting this pod cannot bring it back).  ``/readyz`` returns 503
+    when the required embedder endpoint has been unreachable for the last
+    ``_MODEL_HEALTH_FAIL_THRESHOLD`` consecutive background checks, so an
+    embedder outage drops the sidecar out of rotation without a restart
+    loop.  The periodic probe runs in a daemon thread
+    (``_start_model_health_thread``), not uvicorn's event loop.
     """
     from starlette.responses import JSONResponse
 
     async def _healthz(request: object) -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
+    async def _readyz(request: object) -> JSONResponse:
+        embedder = _model_health["embedder"]
+        if embedder["consecutive_failures"] >= _MODEL_HEALTH_FAIL_THRESHOLD:
+            return JSONResponse(
+                {"status": "unhealthy", "detail": f"Embedder endpoint unreachable: {embedder['error']}"},
+                status_code=503,
+            )
+        return JSONResponse({"status": "ready"})
+
     app.add_route("/healthz", _healthz)  # type: ignore[attr-defined]
+    app.add_route("/readyz", _readyz)  # type: ignore[attr-defined]
     return app
 
 
@@ -2421,11 +2559,14 @@ def main() -> None:
 
     if args.transport == "stdio":
         logger.info("Starting MCP stdio server")
+        _start_config_watcher()
         mcp.run(transport="stdio")
     elif args.transport == "sse":
         logger.info("Starting MCP SSE server on %s:%s", args.host, args.port)
         app = mcp.sse_app(transport_security=_mcp_transport_security)
         app.add_middleware(_MemoryHeaderMiddleware)
+        _start_config_watcher()
+        _start_model_health_thread()
         uvicorn.run(_with_mcp_health(app), host=args.host, port=args.port)
     elif args.transport == "streamable-http":
         logger.info("Starting MCP streamable-http server on %s:%s", args.host, args.port)
@@ -2442,6 +2583,8 @@ def main() -> None:
             transport_security=_mcp_transport_security,
         )
         app.add_middleware(_MemoryHeaderMiddleware)
+        _start_config_watcher()
+        _start_model_health_thread()
         uvicorn.run(_with_mcp_health(app), host=args.host, port=args.port)
 
 

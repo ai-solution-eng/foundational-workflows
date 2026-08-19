@@ -62,6 +62,15 @@ Each Qdrant replica gets its own PVC via `volumeClaimTemplates` with
 `ReadWriteOnce` (per-pod storage), and larger resources: `16Gi–32Gi`
 memory, `4–8` CPU (`values.yaml` → `resources.qdrant`).
 
+Because the per-replica Qdrant PVCs are **not** mounted on the API pod
+(in the base chart they are mounted read-only so `/api/admin/health` can
+report exact usage), the management page instead surfaces per-replica
+**shard placement** plus the configured per-replica size
+(`QDRANT_PVC_SIZE` = `persistence.qdrant.size`) from Qdrant's `/cluster`
+API. This gives a storage-spread estimate (which replicas hold how many
+shards × PVC size) without exec/kubectl. For exact bytes per replica use
+`kubectl exec <qdrant-N> -- df -h /qdrant/storage`.
+
 ## 4. Redis-backed cross-pod unlock cache
 
 `templates/redis.yaml` + `templates/configmap.yaml`

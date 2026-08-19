@@ -473,8 +473,9 @@ A routing step can optionally skip RAG entirely if the LLM determines it can ans
 |--------|------|---------|
 | GET | `/healthz` | Liveness |
 | GET | `/readyz` | Readiness |
-| GET | `/api/admin/health` | Full health (model endpoints + Qdrant status) |
+| GET | `/api/admin/health` | Full health (model endpoints, Qdrant status + per-replica shard placement, PVC) |
 | GET | `/api/admin/models` | Discovered model list (model_name per role) |
+| GET | `/api/admin/connections` | Live-check every configured model endpoint (`/v1/models`) → per-role `healthy` / `not_provided` / `unhealthy` |
 | POST | `/api/datasets` | Create (name, description, caption_video, password) |
 | POST | `/api/datasets/{name}/verify-password` | Verify password → 200/401/403 |
 | POST | `/api/datasets/{name}/unlock` | Unlock (cached, Redis across pods) |
@@ -484,6 +485,7 @@ A routing step can optionally skip RAG entirely if the LLM determines it can ans
 | GET | `/api/datasets/{name}` | Get one (uses `X-Dataset-Password` header) |
 | PATCH | `/api/datasets/{name}` | Update metadata (description, caption_video) |
 | DELETE | `/api/datasets/{name}` | Delete dataset + Qdrant collection |
+| POST | `/api/admin/datasets/{name}/recreate` | Rebuild a dataset from its on-disk files with the current embedder (drops the old collection, re-embeds) |
 | POST | `/api/datasets/{name}/documents` | Add raw text/dict docs |
 | POST | `/api/datasets/{name}/files` | Single file upload (multipart) |
 | POST | `/api/datasets/{name}/batch-files` | Multi-file upload with **SSE progress streaming** |
@@ -493,6 +495,7 @@ A routing step can optionally skip RAG entirely if the LLM determines it can ans
 | POST | `/api/datasets/{name}/search` | Multimodal search (body: text + image/video/audio) |
 | GET | `/api/datasets/{name}/documents` | List stored docs (`limit`, default 50, max 1000) |
 | DELETE | `/api/datasets/{name}/documents/{doc_id}` | Delete single doc |
+| GET | `/api/datasets/{name}/export` | Download full dataset backup as `.tar.gz` (meta.json + documents.jsonl + files/) |
 | GET | `/api/datasets/{name}/files/{filepath:path}` | Serve stored file (password via header or query) |
 | POST | `/api/staging` | Stage an upload for the MCP tools (returns `file://`/`http://` URLs) |
 | GET | `/api/staging/{staging_id}` | Download a staged file by id |
@@ -562,6 +565,35 @@ dataset-scoped token (`POST /api/datasets/{name}/media-token`, wildcard
 `*` path) and appends it to media URLs, so the password only ever travels in
 the `X-Dataset-Password` request header, never in a URL.
 
+**Model connectivity monitoring:** the embedder is the only *required* model,
+so it is probed automatically every `MODEL_HEALTH_INTERVAL` seconds (default
+60) in the background. The result (`healthy` / `unhealthy`, last check time,
+error) is exposed via `/api/admin/health` under `models.embedder` and shown on
+the management page. The embedder gate drives the **readiness** probes, not
+liveness: `/readyz` (API) and the MCP sidecar's `/readyz` return 503 after
+`MODEL_HEALTH_FAIL_THRESHOLD` (default 3) consecutive failures, dropping the
+pod out of Service rotation without a restart loop — the embedder is always a
+remote vLLM/SGLang endpoint, and a pod restart cannot bring it back. The
+management page's "Test connections" button additionally runs an on-demand
+live check of **every** configured model (`GET /api/admin/connections`) with
+three states: healthy (green), not provided (yellow), unhealthy (red).
+Optional models (reranker, VLM, ASR) that are configured but unreachable only
+log a warning — the system degrades without them.
+
+**Hot model-config reload (no rollout):** model URLs/names/keys are normally
+injected via env vars (`envFrom`), which are frozen at container start. The
+charts additionally mount the `-config` ConfigMap and `-model-keys` Secret as
+**file volumes** (`/etc/rag/config:/etc/rag/secrets`, one file per env key)
+and set `CONFIG_DIR`. A daemon watcher in both the API and MCP sidecar
+re-applies those files into `os.environ` every `CONFIG_RELOAD_INTERVAL`
+seconds (default 15) and, on change, rebuilds the four model objects and
+invalidates the RAG cache — kubelet propagates a ConfigMap/Secret edit to the
+mounted files within ~1s, so a model swap takes effect **without a rollout
+restart**. The new embedder is verified against its `/v1/models` before being
+swapped; if unreachable the old configuration is kept and the error logged.
+When `CONFIG_DIR` is unset (e.g. local runs) behaviour is unchanged — a
+rollout is required.
+
 **Local-file allowlist (MCP media):** `describe_media` / `transcribe_audio` /
 audio queries may only read `file://`/local paths under
 `MEDIA_ALLOW_PATH_PREFIXES` (default `DATA_PATH/datasets` +
@@ -624,6 +656,10 @@ When `S3_ENDPOINT_URL` is unset, the default boto3 credential chain (IAM roles, 
 **Endpoint verification** (at startup): all 4 model endpoints (embedder, reranker, vlm, asr) are pinged via OpenAI-compatible `GET /v1/models`. Raises `RuntimeError` if unreachable.
 
 **Admin storage stats:** `/api/admin/storage` returns PVC disk usage (total/used/free/utilization) and per-dataset breakdowns with file-type sub-items (docs + bytes per type). Runs in a thread pool (via `run_in_executor`) so health/readiness probes stay responsive during large collection scans. File-type backfill uses paginated Qdrant scroll (256 points at a time, capped at 50k) with `PayloadSelectorInclude` to fetch only `metadata.source` instead of full payloads — preventing memory spikes and event-loop blocking that previously caused pod crashes on the management page.
+
+**Qdrant cluster storage view:** `/api/admin/health` additionally reports `qdrant.cluster` — per-replica shard placement from Qdrant's `/cluster` API plus the configured per-replica PVC size (chart sets `QDRANT_PVC_SIZE` from `persistence.qdrant.size`). For a sharded cluster (scale charts, one RWO PVC per replica, none mounted on the API pod) the management page's Qdrant card shows shard counts per replica and total shards instead of "disk usage unavailable"; the single-replica chart keeps showing exact PVC usage via the read-only mount. Exact on-disk bytes per replica are not exposed by Qdrant's API, so this view is for storage-spread awareness, not byte accounting (use `kubectl exec ... df -h /qdrant/storage` or kubelet volume metrics for exact bytes).
+
+**Embedder fingerprint + recreate guard:** each dataset records the embedder model + vector dimension in `meta.json` (`embedder_model`, `embedder_dim`) the first time it is touched. After an embedder change the guard compares the configured embedder against the stored fingerprint and fails loudly (HTTP 409 / `EmbedderMismatchError`) on ingest/search instead of silently mixing vectors — dimension mismatch (collection can't accept the vectors) or same-dimension-different-model (semantically incompatible) both raise. There is **no automatic re-embedding**; rebuild via the "Recreate" button on the management page or `POST /api/admin/datasets/{name}/recreate`, which drops the old collection and re-ingests the dataset's on-disk originals with the current embedder (async; poll `GET /api/datasets/{name}/upload-status/{job_id}`).
 
 ---
 

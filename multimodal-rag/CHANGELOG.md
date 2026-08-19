@@ -76,6 +76,17 @@ Committed as three waves over the `checkpoint-pre-audit-fixes` baseline.
   now reports the resolved `media_type`.
 - **Hash-index cache**: `.hashes.json` reads are mtime-cached per process so
   large file sets are not re-read/re-parsed on every upload.
+- **Model connectivity monitoring**: the embedder is probed in the background
+  every `MODEL_HEALTH_INTERVAL` (default 60 s); `/api/admin/health` exposes
+  `models.embedder` status. The embedder gate drives the **readiness** probes
+  (`/readyz` on the API and a new `/readyz` on the MCP sidecar, which the Helm
+  charts now use for the MCP readiness probe) after
+  `MODEL_HEALTH_FAIL_THRESHOLD` (default 3) consecutive failures — liveness is
+  untouched, so a remote vLLM/SGLang embedder outage drops the pod out of
+  rotation without a restart loop. A new `GET /api/admin/connections` endpoint
+  live-checks every configured model (`healthy` / `not_provided` /
+  `unhealthy`), and the management page gained a "Test connections" button
+  plus a live embedder status indicator.
 
 ### Known limitations / future work
 

@@ -19,7 +19,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -53,6 +53,17 @@ from multimodal_rag.utils.general_tools import retry_call
 from multimodal_rag.utils.logging_utils import logging
 
 logger = logging.getLogger(__name__)
+
+
+class EmbedderMismatchError(ValueError):
+    """Raised when a dataset's stored vectors were built with a different
+    embedder than the one currently configured.
+
+    Existing vectors are incompatible with the current embedder (different
+    model and/or dimension), so the dataset must be recreated before it can
+    be ingested into or searched again.
+    """
+
 
 # When True, get_dataset()/list_datasets() skip the per-call Qdrant count
 # sync (which writes meta.json on every read). Counts are still maintained
@@ -1062,6 +1073,12 @@ class DatasetManager:
         self._rag_cache: dict[str, MultimodalRAG] = {}
         self._rag_cache_lock = threading.Lock()
 
+        # Embedder fingerprint support: current embedder's vector dimension
+        # (probed once per embedder object) and the set of datasets whose
+        # collection has already been verified compatible this process.
+        self._embedder_dim_cache: dict[int, int | None] = {}
+        self._embedder_verified: set[str] = set()
+
         # Note: per-dataset meta.json locking is handled by
         # _get_meta_lock() which returns a cross-process file lock
         # (fcntl.flock on a .meta.lock sidecar file).  No in-process
@@ -1117,6 +1134,41 @@ class DatasetManager:
                     role,
                     exc,
                 )
+
+    def check_model_connections(self) -> list[dict[str, Any]]:
+        """Live-check every configured model endpoint via ``/v1/models``.
+
+        Returns one entry per role with a three-state status:
+        ``healthy`` (reachable), ``not_provided`` (not configured), or
+        ``unhealthy`` (configured but unreachable).  Never raises.
+        """
+        results: list[dict[str, Any]] = []
+        for role, model in (
+            ("embedder", self.embedder),
+            ("reranker", self.reranker),
+            ("vlm", self.vlm),
+            ("asr", self.asr),
+        ):
+            entry: dict[str, Any] = {
+                "role": role,
+                "status": "not_provided",
+                "model_name": None,
+                "url": None,
+                "error": None,
+            }
+            if model is None:
+                results.append(entry)
+                continue
+            entry["model_name"] = model.model_name
+            entry["url"] = model.url_remote.rstrip("/")
+            try:
+                self._verify_endpoint(model, role)
+                entry["status"] = "healthy"
+            except Exception as exc:
+                entry["status"] = "unhealthy"
+                entry["error"] = str(exc)
+            results.append(entry)
+        return results
 
     # ------------------------------------------------------------------
     # Dataset lifecycle
@@ -1239,7 +1291,7 @@ class DatasetManager:
     def delete_dataset(self, name: str) -> None:
         """Delete a dataset and its Qdrant collection."""
         self._validate_name(name)
-        rag = self._get_rag(name)
+        rag = self._get_rag(name, check_embedder=False)
         try:
             vs = rag.vector_store
             assert vs is not None and not isinstance(vs, dict)
@@ -1264,6 +1316,100 @@ class DatasetManager:
         _dataset_exist_delete(name)
 
         logger.info("Deleted dataset '%s'", name)
+
+    def _list_recreate_files(self, dataset_name: str) -> list[tuple[str, str]]:
+        """Return ``(path, name)`` pairs of the original files to rebuild.
+
+        Rebuild candidates are the files recorded in ``.hashes.json`` (the
+        dedup index of uploaded originals), falling back to any regular file
+        in the dataset's ``files/`` directory that is not a derived artifact
+        (``*_preprocessed*``, ``*_segment_NNN*``, ``{hash}_image`` /
+        ``{hash}_audio`` media, dotfiles).  Returns an empty list when the
+        dataset has nothing to rebuild.
+        """
+        files_dir = self._dataset_dir(dataset_name) / "files"
+        if not files_dir.is_dir():
+            return []
+        seen: set[str] = set()
+        entries: list[tuple[str, str]] = []
+
+        # 1. Originals recorded in the upload dedup index
+        hash_index_path = files_dir / ".hashes.json"
+        if hash_index_path.exists():
+            for dest in (_load_hash_index(hash_index_path) or {}).values():
+                p = Path(dest)
+                if p.exists() and str(p) not in seen:
+                    seen.add(str(p))
+                    entries.append((str(p), p.name))
+
+        # 2. Fallback: any plausible original file
+        derived = re.compile(r"^[0-9a-f]{32}_(?:image|audio|video)\b")
+        for f in sorted(files_dir.iterdir()):
+            if not f.is_file() or f.name.startswith("."):
+                continue
+            name = f.name
+            if name in (".hashes.json",) or name.endswith(".lock"):
+                continue
+            if "_preprocessed" in name or re.search(r"_segment_\d+", name):
+                continue
+            if derived.search(name):
+                continue
+            if str(f) not in seen:
+                seen.add(str(f))
+                entries.append((str(f), name))
+        return entries
+
+    def recreate_dataset(
+        self,
+        dataset_name: str,
+        file_entries: list[tuple[str, str]] | None = None,
+        progress_callback: Any | None = None,
+    ) -> dict[str, Any]:
+        """Rebuild a dataset's Qdrant collection from its on-disk originals.
+
+        Drops the existing collection (old vectors are incompatible with the
+        currently configured embedder), resets the document counters and
+        embedder fingerprint, then re-ingests the dataset's original files
+        with the **current** embedder.  Useful after an embedder swap.
+
+        ``file_entries`` is an optional ``[(path, name)]`` list; when omitted
+        it is derived from :meth:`_list_recreate_files`.  Returns the batch
+        result from :meth:`add_files_batch`.
+        """
+        if file_entries is None:
+            file_entries = self._list_recreate_files(dataset_name)
+        if not file_entries:
+            return {"status": "ok", "file_count": 0, "files": []}
+
+        # Drop the old collection + cached RAG instance (bypass the embedder
+        # guard — this is the recovery path for a mismatch).
+        try:
+            rag = self._get_rag(dataset_name, check_embedder=False)
+            vs = rag.vector_store
+            if vs is not None and not isinstance(vs, dict):
+                client = vs._client  # type: ignore[attr-defined]
+                client.delete_collection(vs.collection_name)  # type: ignore[attr-defined]
+        except Exception:
+            logger.debug("Suppressed exception while dropping collection", exc_info=True)
+        self._rag_cache.pop(dataset_name, None)
+        self._embedder_verified.discard(dataset_name)
+
+        # Reset counters + fingerprint so the fresh collection re-records.
+        with self._get_meta_lock(dataset_name):
+            meta = self._read_meta(dataset_name) or {}
+            meta["document_count"] = 0
+            meta.pop("file_type_counts", None)
+            meta.pop("embedder_model", None)
+            meta.pop("embedder_dim", None)
+            meta.pop("embedder_updated_at", None)
+            self._write_meta(dataset_name, meta)
+
+        logger.info(
+            "Recreating dataset '%s' from %d file(s)",
+            dataset_name,
+            len(file_entries),
+        )
+        return self.add_files_batch(dataset_name, file_entries, progress_callback=progress_callback)
 
     def list_datasets(self) -> list[dict[str, Any]]:
         """Return metadata for all existing datasets (password hash stripped)."""
@@ -2727,6 +2873,38 @@ class DatasetManager:
         rag = self._get_rag(dataset_name)
         return rag.list_documents(limit=limit)
 
+    def stream_all_documents(
+        self,
+        dataset_name: str,
+        emit: Callable[[dict[str, Any]], None],
+        batch_size: int = 500,
+    ) -> None:
+        """Stream every document in a dataset (id + payload) to *emit*.
+
+        Uses paginated Qdrant scroll so arbitrarily large collections are
+        exported without holding all points in memory.  Each call emits a
+        ``{"id": …, "payload": …}`` dict.
+        """
+        rag = self._get_rag(dataset_name)
+        vs = rag.vector_store
+        if vs is None or isinstance(vs, dict):
+            return
+        client = vs._client  # type: ignore[attr-defined]
+        coll = vs.collection_name  # type: ignore[attr-defined]
+        offset = None
+        while True:
+            pts, offset = client.scroll(
+                coll,
+                limit=batch_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in pts:
+                emit({"id": str(pt.id), "payload": pt.payload})
+            if offset is None:
+                break
+
     def delete_document(self, dataset_name: str, doc_id: str) -> None:
         """Delete a single document from a dataset by its point ID."""
         rag = self._get_rag(dataset_name)
@@ -2806,37 +2984,120 @@ class DatasetManager:
         meta = self._read_meta(dataset_name) or {}
         return meta.get("keep_originals", True)
 
-    def _get_rag(self, dataset_name: str) -> MultimodalRAG:
-        """Return (or create and cache) a MultimodalRAG for *dataset_name*."""
+    def _get_rag(self, dataset_name: str, check_embedder: bool = True) -> MultimodalRAG:
+        """Return (or create and cache) a MultimodalRAG for *dataset_name*.
+
+        With ``check_embedder=True`` (default), the dataset's stored
+        embedder fingerprint is verified against the currently configured
+        embedder once per process; a mismatch raises :class:`EmbedderMismatchError`.
+        Pass ``False`` for operations that must work regardless (e.g. delete,
+        recreate).
+        """
         # Fast path — no lock needed once cached
         rag = self._rag_cache.get(dataset_name)
-        if rag is not None:
-            return rag
-        with self._rag_cache_lock:
-            # Double-check after acquiring the lock
-            rag = self._rag_cache.get(dataset_name)
-            if rag is not None:
-                return rag
-            meta = self._read_meta(dataset_name) or {}
-            ds_caption_with_asr = meta.get("caption_with_asr", self.caption_with_asr)
-            ds_caption_with_vlm = meta.get("caption_with_vlm", self.caption_with_vlm)
-            rag = MultimodalRAG(
-                embedder=self.embedder,
-                reranker=self.reranker,
-                vlm=self.vlm,
-                asr=self.asr,
-                caption_with_asr=ds_caption_with_asr,
-                caption_with_vlm=ds_caption_with_vlm,
-                remote=self.remote,
-                dedup_threshold=self.dedup_threshold,
-                vector_store={
-                    "qdrant_host": self.qdrant_host,
-                    "qdrant_port": self.qdrant_port,
-                    "collection_name": dataset_name,
-                },
+        if rag is None:
+            with self._rag_cache_lock:
+                # Double-check after acquiring the lock
+                rag = self._rag_cache.get(dataset_name)
+                if rag is None:
+                    meta = self._read_meta(dataset_name) or {}
+                    ds_caption_with_asr = meta.get("caption_with_asr", self.caption_with_asr)
+                    ds_caption_with_vlm = meta.get("caption_with_vlm", self.caption_with_vlm)
+                    rag = MultimodalRAG(
+                        embedder=self.embedder,
+                        reranker=self.reranker,
+                        vlm=self.vlm,
+                        asr=self.asr,
+                        caption_with_asr=ds_caption_with_asr,
+                        caption_with_vlm=ds_caption_with_vlm,
+                        remote=self.remote,
+                        dedup_threshold=self.dedup_threshold,
+                        vector_store={
+                            "qdrant_host": self.qdrant_host,
+                            "qdrant_port": self.qdrant_port,
+                            "collection_name": dataset_name,
+                        },
+                    )
+                    self._rag_cache[dataset_name] = rag
+        if check_embedder and dataset_name not in self._embedder_verified:
+            self._assert_embedder_compatible(dataset_name)
+            self._embedder_verified.add(dataset_name)
+        return rag
+
+    # ------------------------------------------------------------------
+    # Embedder fingerprint
+    # ------------------------------------------------------------------
+
+    def _embedder_dimension(self) -> int | None:
+        """Vector dimension produced by the current embedder (probed once)."""
+        if self.embedder is None:
+            return None
+        key = id(self.embedder)
+        if key not in self._embedder_dim_cache:
+            try:
+                vec = self.embedder.model.embed_query("")
+                self._embedder_dim_cache[key] = len(vec) if isinstance(vec, (list, tuple)) else None
+            except Exception:
+                self._embedder_dim_cache[key] = None
+        return self._embedder_dim_cache[key]
+
+    def _assert_embedder_compatible(self, dataset_name: str) -> None:
+        """Record the embedder fingerprint for a dataset and, when one
+        already exists, fail loudly if the current embedder no longer matches.
+
+        The fingerprint is recorded the first time a dataset is touched so
+        that a later embedder swap is detected.  No embedding call is made
+        when a matching fingerprint already exists (verified once per
+        dataset per process).
+        """
+        stored_dim = None
+        stored_name = ""
+        meta = self._read_meta(dataset_name) or {}
+        if meta:
+            stored_dim = meta.get("embedder_dim")
+            stored_name = meta.get("embedder_model") or ""
+
+        cur_name = (getattr(self.embedder, "model_name", "") or "") if self.embedder else ""
+        cur_dim = self._embedder_dimension()
+
+        if not stored_dim and not stored_name:
+            # First time — record the fingerprint (dataset newly created or
+            # predating this guard).
+            self._write_embedder_fingerprint(dataset_name)
+            return
+
+        if (
+            stored_dim
+            and cur_dim is not None
+            and int(stored_dim) != cur_dim
+        ):
+            raise EmbedderMismatchError(
+                f"Dataset '{dataset_name}' was indexed with embedder "
+                f"{stored_name!r} (dim {stored_dim}); the currently configured "
+                f"embedder is {cur_name!r} (dim {cur_dim}). Existing vectors "
+                "are incompatible — recreate the dataset to rebuild it "
+                "(POST /api/admin/datasets/{name}/recreate)."
             )
-            self._rag_cache[dataset_name] = rag
-            return rag
+        if stored_name and cur_name and stored_name != cur_name:
+            # Same dimension, different model — semantically incompatible.
+            raise EmbedderMismatchError(
+                f"Dataset '{dataset_name}' was indexed with embedder "
+                f"{stored_name!r} but the currently configured embedder is "
+                f"{cur_name!r} (same dim {cur_dim}). Existing vectors are "
+                "semantically incompatible — recreate the dataset to rebuild it "
+                "(POST /api/admin/datasets/{name}/recreate)."
+            )
+
+    def _write_embedder_fingerprint(self, dataset_name: str) -> None:
+        """Persist the current embedder's model name + dimension to meta.json."""
+        with self._get_meta_lock(dataset_name):
+            meta = self._read_meta(dataset_name)
+            if not meta:
+                return
+            meta["embedder_model"] = (getattr(self.embedder, "model_name", "") or "") if self.embedder else ""
+            meta["embedder_dim"] = self._embedder_dimension()
+            meta["embedder_updated_at"] = datetime.now().isoformat()
+            self._write_meta(dataset_name, meta)
 
     def _dataset_dir(self, name: str) -> Path:
         return self.datasets_path / name

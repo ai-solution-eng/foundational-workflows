@@ -38,6 +38,8 @@ spec:
               value: "true"
             - name: QDRANT__CLUSTER__P2P__PORT
               value: "6335"
+            - name: QDRANT__TELEMETRY__DETAIL_LEVEL
+              value: "full"
             - name: POD_NAME
               valueFrom:
                 fieldRef:

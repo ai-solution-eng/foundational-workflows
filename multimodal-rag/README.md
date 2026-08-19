@@ -63,6 +63,7 @@ immediately searchable via MCP tools and vice versa.
 | Document | What it covers |
 |---|---|
 | **[USAGE.md](USAGE.md)** | HTML frontend usage + programmatic Python API |
+| **[documentation/API.md](documentation/API.md)** | REST API reference with `curl`/Python examples — create datasets, add/delete files |
 | **[documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md)** | Build the image, install the helm chart, verify, troubleshoot |
 | **[documentation/MCP.md](documentation/MCP.md)** | All 9 MCP tools + connection configs for opencode, Claude Desktop, OWUI, stdio |
 | **[documentation/MEMORY.md](documentation/MEMORY.md)** | Long-term memory setup per client (opencode + Open WebUI), multi-user isolation, operations |
@@ -118,6 +119,8 @@ opt-in protection (per-process env vars, or first-class [Helm
 | `ARCHIVE_MAX_TOTAL_BYTES` / `ARCHIVE_MAX_MEMBER_BYTES` / `ARCHIVE_MAX_ENTRIES` | Zip/tar/rar unpacked-size caps (incl. nested archives). | 2 GiB / 1 GiB / 10000 |
 | `MEDIA_ALLOW_PATH_PREFIXES` | Allowlist of `file://` prefixes the MCP `describe_media`/`transcribe_audio`/audio-query tools may read (`:`-separated). | unset (unrestricted) |
 | `PW_MAX_FAILURES` / `PW_FAIL_WINDOW` | Password-failure throttle (returns 429 per identity). | 10 / 300 s |
+| `MODEL_HEALTH_INTERVAL` / `MODEL_HEALTH_FAIL_THRESHOLD` | Background embedder liveness probe: interval in seconds, and consecutive failures before `/healthz` returns 503. | 60 / 3 |
+| `CONFIG_DIR` | `:`-separated dirs of mounted ConfigMap/Secret files (one file per env key). When set, model config is **live-reloaded** on file change — no rollout needed (charts mount `-config` and `-model-keys` at `/etc/rag/config:/etc/rag/secrets`). The new embedder is verified before swap; an unreachable one is rejected and the old config is kept. | unset (env-only, rollout required) |
 | `QUERY_EMB_CACHE_MAX`, `FILE_HASH_CACHE_MAX`, `ASR_TRANSCRIPT_CACHE_MAX`, `UNLOCK_CACHE_MAX` | Bounded sizes for the in-process caches. | 4096 / 4096 / 512 / 4096 |
 
 All defaults preserve the pre-1.9 behaviour. `helm/`, `helm-scale/` and

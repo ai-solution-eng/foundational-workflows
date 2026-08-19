@@ -150,7 +150,8 @@ _CAPTION_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 _MEDIA_PLACEHOLDER_RE = re.compile(
-    r"\[\s*(?:Image|Video|Audio)\s*:[^\]]*\]\s*(?:\([^)]*\))?",
+    r"\[\s*(?:Image|Video|Audio)\s*:[^\]]*\]\s*(?:\([^)]*\))?"
+    r"(?:\s*\[\s*\d+(?:\.\d+)?\s*s\s*(?:-|–|—)\s*\d+(?:\.\d+)?\s*s\s*\])?",
     re.IGNORECASE,
 )
 

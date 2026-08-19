@@ -22,8 +22,13 @@ Environment variable convention (each model role has its own prefix)::
 Roles:  EMBEDDER, RERANKER, VLM, ASR
 """
 
+import hashlib
 import json
+import logging
 import os
+import threading
+import time
+from pathlib import Path
 from typing import Any
 
 from multimodal_rag.utils.model_adapters import (
@@ -35,6 +40,8 @@ from multimodal_rag.utils.pcai_model_classes import (
     RerankerModel,
     VoiceModel,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Defaults (sensible for Qwen3-VL models; override via EXTRA env var)
@@ -199,3 +206,99 @@ def build_all() -> ModelPack:
         build_vlm("MODEL_VLM"),
         build_asr("MODEL_ASR"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Hot config reload from mounted ConfigMap/Secret volumes
+# ---------------------------------------------------------------------------
+#
+# Kubernetes env vars (``envFrom``) are snapshotted at container start, so a
+# ConfigMap/Secret edit does NOT change them in a running pod.  To support
+# no-rollout model swaps the charts additionally mount the ConfigMap + model
+# Secret as *file volumes*: kubelet updates those files (config propagate ~1s
+# after change), and this watcher detects the change and rebuilds the model
+# objects live.
+
+
+def _config_files(dirs: str) -> list[Path]:
+    files: list[Path] = []
+    for d in dirs.split(":"):
+        p = Path(d)
+        if not p.is_dir():
+            continue
+        try:
+            for f in sorted(p.iterdir()):
+                if f.is_file() and not f.name.startswith("."):
+                    files.append(f)
+        except OSError:
+            continue
+    return files
+
+
+def apply_config_dirs(dirs: str) -> dict[str, str]:
+    """Merge every file in ``:``-separated *dirs* into ``os.environ``.
+
+    Mounted ConfigMaps/Secrets expose one file per key (file name = env var
+    name, file content = value).  Returns the merged mapping that was applied.
+    """
+    merged: dict[str, str] = {}
+    for f in _config_files(dirs):
+        try:
+            merged[f.name] = f.read_text(encoding="utf-8").rstrip("\r\n")
+        except OSError:
+            continue
+    for key, value in merged.items():
+        os.environ[key] = value
+    return merged
+
+
+def _config_snapshot(dirs: str) -> str:
+    digest = hashlib.sha256()
+    for f in _config_files(dirs):
+        digest.update(f.name.encode("utf-8", "replace"))
+        digest.update(b"=")
+        try:
+            digest.update(f.read_bytes())
+        except OSError:
+            continue
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def start_config_watcher(dirs: str, reload_fn: Any, interval: float | None = None) -> None:
+    """Poll *dirs* in a daemon thread and call ``reload_fn()`` when changed.
+
+    ``reload_fn`` receives no arguments; it should swap in newly built model
+    objects.  The watcher applies the file values to ``os.environ`` (via
+    :func:`apply_config_dirs`) *before* invoking it, so ``build_all()`` sees
+    the fresh values.  A failed ``reload_fn`` is logged and the previous
+    configuration is kept; polling continues.  No-op when *dirs* is empty.
+    The poll interval defaults to ``CONFIG_RELOAD_INTERVAL`` (15 s) unless an
+    explicit *interval* is given.
+    """
+    if not dirs:
+        return
+    if interval is None:
+        interval = float(os.environ.get("CONFIG_RELOAD_INTERVAL", "15.0"))
+    last = {"snapshot": _config_snapshot(dirs)}
+
+    def _loop() -> None:
+        while True:
+            time.sleep(interval)
+            try:
+                snapshot = _config_snapshot(dirs)
+            except Exception:
+                continue
+            if snapshot == last["snapshot"]:
+                continue
+            last["snapshot"] = snapshot
+            try:
+                apply_config_dirs(dirs)
+                reload_fn()
+                logger.info("Hot-reloaded model configuration from %s", dirs)
+            except Exception:
+                logger.exception("Config reload failed — keeping previous configuration")
+
+    thread = threading.Thread(target=_loop, daemon=True, name="config-watcher")
+    thread.start()
+    logger.info("Config watcher active on %s (poll %.0fs)", dirs, interval)

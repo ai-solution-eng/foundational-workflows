@@ -3,13 +3,10 @@
 #   python -c "import secrets; print(secrets.token_hex(32))"
 # to generate. See security.mediaTokenSecret to fill in the value.
 # -- Global settings ----------------------------------------------------------
-# Generation-2 scale variant: same architecture as helm-scale (gunicorn
-# workers, multi-replica Qdrant, Redis-backed unlock cache) but scaled back
-# to 2 app replicas + 2-node Qdrant so total requests are ~50% above the
-# single-replica chart and total PVC stays at 100Gi. Intended as a drop-in
-# replacement test on the current cluster. See helm-scale/ for the full-scale
-# (4x3) deployment intended for a larger cluster.
-replicaCount: 2
+# Scale variant: multiple API replicas + gunicorn workers, multi-replica
+# Qdrant, optional Redis for cross-pod unlock cache. See helm/ for the
+# original single-replica chart.
+replicaCount: 4
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
   tag: v2.2.1
@@ -24,17 +21,16 @@ deployment:
 app:
   # Run the API server under gunicorn with UvicornWorker so each pod runs
   # `workers` event loops (one per process). Each worker gets its own
-  # `sync_pool`, so effective concurrency = replicaCount * workers *
-  # syncPoolSize. Halved vs helm-scale (2 workers, pools of 32) to match
-  # the smaller replica count: 2 pods * 2 workers * 32 = 128 concurrent.
-  workers: 2
+  # `sync_pool`, so effective concurrency ≈ replicaCount * workers *
+  # syncPoolSize.
+  workers: 4
   # Per-worker thread pool for blocking RAG work (embedding, Qdrant, file
   # processing). Falls back to 12 if unset (matches the single-replica
   # chart).
-  syncPoolSize: 32
+  syncPoolSize: 64
   # MCP server sync tools are converted to async + offloaded to a thread
   # pool of this size (per pod). Keep >= syncPoolSize to avoid starving.
-  mcpPoolSize: 32
+  mcpPoolSize: 64
   # Dynamic query batcher for concurrent text-only search embeddings.
   # Collects queries arriving within the wait window and sends them as a
   # single /v1/embeddings call (vLLM processes batched input in one forward
@@ -53,20 +49,17 @@ app:
 
 
 # -- Persistence ---------------------------------------------------------------
-# Total PVC budget held at 100Gi to match the single-replica chart:
-#   data PVC (shared, RWX)  = 50Gi  (unchanged from helm/ - no resize needed)
-#   qdrant PVCs (RWO)       = 2 x 25Gi = 50Gi  (replaces the old single 50Gi)
 persistence:
   data:
-    size: 50Gi
+    size: 40Gi
     storageClass: "gl4f-filesystem"
     accessMode: ReadWriteMany
   qdrant:
     size: 25Gi
     storageClass: "gl4f-filesystem"
     accessMode: ReadWriteOnce   # per-pod volume via volumeClaimTemplates
-    # Disabled: Qdrant runs as a sharded cluster with one PVC per replica,
-    # so there is no single PVC to mount on the API pods.
+    # Disabled in the scale chart: Qdrant runs as a sharded cluster with one
+    # PVC per replica, so there is no single PVC to mount on the API pods.
     mountReadOnly: false
 
 
@@ -76,47 +69,45 @@ persistence:
 # className, and optional extra kwargs (serialised as JSON into the ConfigMap).
 # API keys are set separately via `modelSecrets` (Kubernetes Secret).
 # Set url to "" to disable a component.
+# Generated from multimodal_rag/utils/pcai_models.py
 models:
   embedder:
-    name: "Qwen/Qwen3-VL-Embedding-8B"
-    url: ""
-    className: "MultiModalEmbeddings"
+    name: Qwen/Qwen3-VL-Embedding-8B
+    url: https://qwen3-vl-embedding-8b.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+    className: MultiModalEmbeddings
     extra:
       embedding_dim: 4096
       chunk_size: 2048
       chunk_overlap: 256
       code_chunk_size: 8192
       code_chunk_overlap: 512
-      tokenizer_name: "Qwen/Qwen3-VL-Embedding-8B"
-      tokenizer_type: "HuggingFace"
+      tokenizer_name: Qwen/Qwen3-VL-Embedding-8B
+      tokenizer_type: HuggingFace
   reranker:
-    name: "Qwen/Qwen3-VL-Reranker-8B"
-    url: ""
-    className: "MultiModalReranker"
+    name: Qwen/Qwen3-VL-Reranker-8B
+    url: https://qwen3-vl-reranker-8b.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
+    className: MultiModalReranker
     extra: {}
   vlm:
-    name: "Qwen/Qwen3.8-27B-FP8"
-    url: ""
+    name: Qwen/Qwen3.8-27B-FP8
+    url: https://qwen-38-27b.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
     extra: {}
   asr:
-    name: "CohereLabs/cohere-transcribe-03-2026"
-    url: ""
+    name: CohereLabs/cohere-transcribe-03-2026
+    url: https://cohere-transcribe-03-2026.project-user-andrew-bydlon.serving.pcai-se-ai-application.hst.rdlabs.hpecorp.net
     extra: {}
-
-# -- Model API keys (sensitive) -----------------------------------------------
-# These are stored in a Kubernetes Secret, not the ConfigMap.
-# Provide via --set or a separate encrypted values file.
 modelSecrets:
-  embedderApiKey: ""
-  rerankerApiKey: ""
-  vlmApiKey: ""
-  asrApiKey: ""
+  embedderApiKey: eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODExNTM2OTU1LCJpYXQiOjE3ODAwMDA5NTUsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiNmIxMTIyNzgtNmMzMi00Zjk5LTk5NWEtNzYzMGZlOWNkODRjIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODAwMDA5NTU3ODUiLCJ1aWQiOiJhNWVlNzA4Ni05NDNhLTQyZTktYjI1ZS1lYzVlYTFhN2RlMzEifX0sIm5iZiI6MTc4MDAwMDk1NSwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4MDAwMDk1NTc4NSJ9.qgYrdEJ8kebRtev6OdbZjVbafGSkbPVev0Qiz3qkQ6f90Br6RXvuQsslYfuyNZLrCwt-6e7B7zAIJCPUDk-VZgmMRSf7iZZcEYAeE9ZCx9gNNNG9mlq7qpz9ztr4d0ltYmxgrLFAYUHCtZu12_XZme2f47iJ4KHU-_VRmwkT3zy2V1VK4OLlU_V9VRtYlQojfp9O2IWnYCZ13OL2hMsxzEXk31RoOEkMKPu57U-ob-pmARIHsC9Z7uOog3vGI3T86KWc3VYfYWM6pYoZ_pfpAc0kahqIocghyrDmGtQyhKo-Zz5RB0uLNbemlNmDjaQV7Y0dccQPRCwu_txCkjb9fQ
+  rerankerApiKey: eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODExNTM2OTgyLCJpYXQiOjE3ODAwMDA5ODIsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiMTFjZGNiZjUtZGQxNS00NGUyLWFhNWUtYTA4N2UzNzUxM2FkIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODAwMDA5ODIxMjIiLCJ1aWQiOiJlM2ZhZjI3Ny1jNWE0LTQ4ODgtODVlYi05NGZlMWVhM2QxNzAifX0sIm5iZiI6MTc4MDAwMDk4Miwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4MDAwMDk4MjEyMiJ9.AoWV-tYYP_z7PhXLqKI9XmYsG2BLYqzjCwDyF1PAKKbWH2Op3nZK29RkLeltc6Xtq3v-0372eD1mekX3iPapJNNP3wnmjmLmvvj59SD9_8PvvkDBgdfB_1h0Qnx-nsOxLvrsqr9WCMIJLKmWAjReFUWG8fcnwtKoFJPbONmOinUde7o3U-205eqI3OoQ-bxSamyFGJkk3IfSUr_KEI8HGWDWYlz6dKxHj3fKugddDNtVR8l1hSpJW8eka3sFKb8SquYUkhL0w4eU8Te_DU994kl7odPcp9xV7XI1t424rxN5XNrBQRwMvKxC7zu8NB-1nSVd9TgJGFcANWAzuX32iQ
+  vlmApiKey: eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODE4Mzc5NjcxLCJpYXQiOjE3ODY4NDM2NzEsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiZmZkMzM0MjktNmE3ZC00YmFjLTkxYjYtNDhjNWEzMjMwOWRkIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3ODY4NDM2NzE2ODAiLCJ1aWQiOiIwM2RjODJmYy1jNjUzLTQyMTgtODY5NS03ZjExZmIxNTMxYzcifX0sIm5iZiI6MTc4Njg0MzY3MSwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc4Njg0MzY3MTY4MCJ9.SoO5qFg2VnzXtOnprWJ_qnt_Hi9sle0WpreDMRvuP-rl2JcbJTI8drlzqYAc-Df_3V_S-j6PdauH9Oqs4M656tec5VJAt2-0x7AqW5aZ2RbagSHOYQUOqidKyPj8Y_xshfEBu9r85WWBekVyddPcxPHdBWux_gyJ26UM_Zhquk42zq33Ua8v7XPIXsN3v7aAXTWEdeV4ljaw2PC6YoD2NkKDi-7PXR-IaBPRK49CHNeyGdgLNiIeNxASryVVLq-IzGPz4X_m7ZSvahc_K7Qqrx6rfDp6zz-KYnxjjcwFtJgZb_UKkH0qHPkpykfBkfH7GP2wghADohRG8UDEdr4uYQ
+  asrApiKey: eyJhbGciOiJSUzI1NiIsImtpZCI6IkNUd1NsQkIxTkE0WV9zMDRxVE5NeDBjTFlpTFJEbVVxU0dldDdja3V4dmsifQ.eyJhdWQiOlsiYXBpIiwiaXN0aW8tY2EiXSwiZXhwIjoxODA5NTUwNzg5LCJpYXQiOjE3NzgwMTQ3ODksImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiNDI0NjI1MTMtY2ExNi00ZTgxLWIyZTItZDA1OTg2MzA4ODZlIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ1aSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJpc3ZjLWVwLTE3NzgwMTQ3ODk4OTAiLCJ1aWQiOiI4MTE2YmIwMS01OTljLTQ3MjMtOGZmNC0yNTkxYTU0NjhjMzUifX0sIm5iZiI6MTc3ODAxNDc4OSwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnVpOmlzdmMtZXAtMTc3ODAxNDc4OTg5MCJ9.iMeplOjNYeTjHy0hEQ6_AsRhVsovEVOQJkm2YQeAra7Tez8txFx_QBUvKECSztv4R2pMd4g1MpBWF4Nk69DaCvXXem8VL5NFh2K9IzW6uA8D_AJ_OPpcXlDOb6xWtzgm0C8r8FOo1SsgHfpPVqgn8WvhBSlPIYx4uyrSs5LCJaZ-4-q_kHaCRu4xlLZ2wbVnlnaGCBQjbGFl1IcDVLy8FqgswX6_mexHc1fQxeRQ86CmNFrXYoMnJMDEpqU5sMPzAyyk3otxj-G7N3Y2WK_FpcJLCGApcmF3KaKcIU7IdsLC_FVSC3VTBrOp5gDxSUqN61mEowVD8R4PceslwQiBdg
 
 # Per-process httpx connection pool limit for model endpoint clients.
-# Halved vs helm-scale (100/25) to match the smaller worker count.
+# Raised from the single-replica default of 30 so the embedder (on every
+# search's critical path) is not the bottleneck.
 modelPool:
-  maxConnections: 100
-  maxKeepaliveConnections: 25
+  maxConnections: 200
+  maxKeepaliveConnections: 50
 
 # -- S3 / MinIO configuration --------------------------------------------------
 # Endpoint URL is stored in the ConfigMap (not sensitive).
@@ -138,14 +129,12 @@ rag:
   deferCountSync: true
 
 # -- Qdrant configuration -----------------------------------------------------
-# 2-node Qdrant cluster with built-in sharding. Note: 2 is an even number so
-# Raft consensus has no failure tolerance - fine for testing. Use 3 (helm-scale)
-# for production.
+# Multi-replica Qdrant cluster with built-in sharding for read scaling.
 qdrant:
-  replicas: 2
+  replicas: 3
   image:
     repository: qdrant/qdrant
-    tag: "v1.19.0"
+    tag: v1.19.0
     pullPolicy: IfNotPresent
   grpcPort: 6334
   httpPort: 6333
@@ -197,12 +186,6 @@ service:
 
 
 # -- Resource limits ----------------------------------------------------------
-# Tuned so total requests are ~50% above the single-replica chart (helm/):
-#   app   : 2 pods x 2 containers x (2.5Gi/1.5cpu req, 8Gi/3cpu lim)
-#   qdrant: 2 pods x (10Gi/3cpu req, 20Gi/6cpu lim)
-#   redis : 1 pod x (256Mi/100m req, 512Mi/500m lim)
-#   total req  ~= 30Gi / 12 cpu   (helm/ = 20Gi / 8 cpu  -> +50%)
-#   total lim  ~= 72Gi / 24 cpu   (helm/ = 48Gi / 16 cpu -> +50%)
 resources:
   app:
     requests:
@@ -240,7 +223,7 @@ extraEnv: {}
 
 security:
   apiKey: ""
-  mediaTokenSecret: ""
+  mediaTokenSecret: "5787da7143fd0904dd927ce8d9524aba16b65aae05049146d84a7eaa280aa7dd"
   mediaTokenTtl: 3600
   ingestAllowHosts: ""
   blockPrivateHosts: true
@@ -266,6 +249,7 @@ ezua:
 
   # configure the authorization policy
   authorizationPolicy:
-    enabled: true
+    enabled: false
     namespace: "istio-system"
     providerName: "oauth2-proxy"
+

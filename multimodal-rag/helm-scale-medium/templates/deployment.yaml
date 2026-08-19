@@ -77,6 +77,10 @@ spec:
               {{- else }}
               value: ""
               {{- end }}
+            - name: QDRANT_PVC_SIZE
+              value: {{ .Values.persistence.qdrant.size | quote }}
+            - name: CONFIG_DIR
+              value: "/etc/rag/config:/etc/rag/secrets"
             {{- range $key, $val := .Values.extraEnv }}
             - name: {{ $key }}
               value: {{ $val | quote }}
@@ -87,6 +91,12 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: rag-config
+              mountPath: /etc/rag/config
+              readOnly: true
+            - name: rag-model-keys
+              mountPath: /etc/rag/secrets
+              readOnly: true
             {{- if .Values.persistence.qdrant.mountReadOnly }}
             - name: qdrant-data
               mountPath: /qdrant-storage
@@ -157,6 +167,8 @@ spec:
               {{- else }}
               value: ""
               {{- end }}
+            - name: CONFIG_DIR
+              value: "/etc/rag/config:/etc/rag/secrets"
             {{- range $key, $val := .Values.extraEnv }}
             - name: {{ $key }}
               value: {{ $val | quote }}
@@ -167,6 +179,12 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: rag-config
+              mountPath: /etc/rag/config
+              readOnly: true
+            - name: rag-model-keys
+              mountPath: /etc/rag/secrets
+              readOnly: true
             {{- if .Values.persistence.qdrant.mountReadOnly }}
             - name: qdrant-data
               mountPath: /qdrant-storage
@@ -189,7 +207,7 @@ spec:
             timeoutSeconds: 3
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: {{ .Values.mcp.port }}
             initialDelaySeconds: 10
             periodSeconds: 10
@@ -201,6 +219,12 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ .Values.deployment.name }}-data
+        - name: rag-config
+          configMap:
+            name: {{ .Values.deployment.name }}-config
+        - name: rag-model-keys
+          secret:
+            secretName: {{ .Values.deployment.name }}-model-keys
         {{- if .Values.persistence.qdrant.mountReadOnly }}
         - name: qdrant-data
           persistentVolumeClaim:

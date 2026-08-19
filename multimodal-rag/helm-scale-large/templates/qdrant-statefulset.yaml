@@ -8,6 +8,11 @@ metadata:
 spec:
   serviceName: {{ .Values.deployment.name }}-qdrant
   replicas: {{ .Values.qdrant.replicas }}
+  # Keep per-replica PVCs on scale-down / uninstall so data is never lost
+  # by accident; delete the PVCs explicitly to wipe.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
   selector:
     matchLabels:
       app: {{ .Values.deployment.name }}-qdrant
@@ -20,13 +25,33 @@ spec:
         - name: qdrant
           image: "{{ .Values.qdrant.image.repository }}:{{ .Values.qdrant.image.tag }}"
           imagePullPolicy: {{ .Values.qdrant.image.pullPolicy }}
+          # Each peer must advertise its own URI and bootstrap from qdrant-0
+          # so the raft cluster can form.  Without this, qdrant panics with
+          # "First peer should specify its uri".
+          command:
+            - /bin/sh
+            - -c
+            - |
+              ORDINAL="${POD_NAME##*-}"
+              SVC="{{ .Values.deployment.name }}-qdrant"
+              if [ "$ORDINAL" = "0" ]; then
+                echo "Starting first Qdrant peer (bootstraps new cluster)"
+                exec /qdrant/qdrant --uri "http://${POD_NAME}.${SVC}:6335/"
+              else
+                echo "Joining existing Qdrant cluster via ${SVC}-0"
+                exec /qdrant/qdrant --bootstrap "http://${SVC}-0.${SVC}:6335/" --uri "http://${POD_NAME}.${SVC}:6335/"
+              fi
           env:
-            # Tell Qdrant its advertised address so peers can bootstrap the
-            # cluster. Each pod registers as <sts-name>-<ordinal>.
             - name: QDRANT__CLUSTER__ENABLED
               value: "true"
-            - name: QDRANT__CLUSTER__P2P_PORT
+            - name: QDRANT__CLUSTER__P2P__PORT
               value: "6335"
+            - name: QDRANT__TELEMETRY__DETAIL_LEVEL
+              value: "full"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           ports:
             - containerPort: {{ .Values.qdrant.grpcPort }}
               name: grpc
@@ -38,11 +63,18 @@ spec:
             - name: data
               mountPath: /qdrant/storage
           resources: {{ toYaml .Values.resources.qdrant | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.qdrant.httpPort }}
+            failureThreshold: 30
+            periodSeconds: 5
+            timeoutSeconds: 3
           livenessProbe:
             httpGet:
               path: /healthz
               port: {{ .Values.qdrant.httpPort }}
-            initialDelaySeconds: 10
+            initialDelaySeconds: 0
             periodSeconds: 10
   volumeClaimTemplates:
     - metadata:

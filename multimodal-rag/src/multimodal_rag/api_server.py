@@ -13,15 +13,20 @@ Or via Python::
 import argparse
 import asyncio
 import datetime
+import io
 import json
 import mimetypes
 import os
 import random
+import re
 import resource
+import tarfile
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -37,9 +42,9 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
-from multimodal_rag.dataset_manager import DatasetManager, _cross_process_lock
+from multimodal_rag.dataset_manager import DatasetManager, EmbedderMismatchError, _cross_process_lock
 from multimodal_rag.utils.general_tools import sync_pool
 from multimodal_rag.utils.logging_utils import logging, setup_logger
 
@@ -211,6 +216,14 @@ QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
 # Path where the Qdrant PVC is mounted read-only (so we can report its disk
 # usage). Empty when the mount is not configured (e.g. sharded Qdrant cluster).
 QDRANT_STORAGE_PATH = os.environ.get("QDRANT_STORAGE_PATH", "")
+# Per-replica Qdrant PVC size (e.g. "100Gi" in the scale charts). Lets the
+# management page show capacity alongside per-replica shard placement even
+# when the per-replica PVCs are not mounted on the API pod. Empty when unset.
+QDRANT_PVC_SIZE = os.environ.get("QDRANT_PVC_SIZE", "")
+# Optional ``:``-separated directories of mounted ConfigMap/Secret files
+# (one file per env key).  When set, the watcher live-reloads the model
+# configuration when these files change — no pod rollout required.
+CONFIG_DIR = os.environ.get("CONFIG_DIR", "")
 RAG_REMOTE = os.environ.get("RAG_REMOTE", "true").lower() in ("true", "1", "yes")
 RAG_CAPTION_WITH_ASR = os.environ.get("RAG_CAPTION_WITH_ASR", "false").lower() in (
     "true",
@@ -569,6 +582,13 @@ app = FastAPI(
     version="1.0.0",
 )
 
+
+@app.exception_handler(EmbedderMismatchError)
+async def _embedder_mismatch_handler(request: Request, exc: EmbedderMismatchError):
+    """Return 409 when a dataset's vectors were built with a different
+    embedder than the one currently configured."""
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
 # Optional API-key authentication for the REST API.  Enabled by setting
 # RAG_API_KEY.  When set, every request must present either the
 # ``X-RAG-Api-Key`` header or ``Authorization: Bearer <key>``.  Liveness /
@@ -576,6 +596,23 @@ app = FastAPI(
 # password/token protected anyway) and staged-file serving are exempt.
 # With the key set, interactive docs (/docs) are effectively disabled.
 _RAG_API_KEY = os.environ.get("RAG_API_KEY", "")
+
+# Periodic embedder liveness monitor.  The embedder is the only required
+# model; it is probed once per minute in the background and the result is
+# surfaced in /api/admin/health. /healthz only flips to 503 after
+# _MODEL_HEALTH_FAIL_THRESHOLD consecutive failures so a transient blip does
+# not trigger a k8s restart loop.
+_MODEL_HEALTH_INTERVAL = float(os.environ.get("MODEL_HEALTH_INTERVAL", "60"))
+_MODEL_HEALTH_FAIL_THRESHOLD = int(os.environ.get("MODEL_HEALTH_FAIL_THRESHOLD", "3"))
+
+_model_health: dict[str, Any] = {
+    "embedder": {
+        "status": "unknown",
+        "last_check": None,
+        "error": None,
+        "consecutive_failures": 0,
+    }
+}
 
 _PUBLIC_PATHS = frozenset({"/healthz", "/readyz", "/favicon.png", "/", "/manage"})
 
@@ -627,6 +664,50 @@ async def _api_key_auth(request: Request, call_next):
     return JSONResponse({"detail": "Missing or invalid API key"}, status_code=401)
 
 
+def _reload_models() -> None:
+    """Rebuild the model objects from the (already re-applied) environment.
+
+    Used by the config watcher when the mounted ConfigMap/Secret files
+    change.  The new embedder endpoint is verified *before* swapping; if it
+    is unreachable the old configuration is kept so a bad edit cannot take
+    the deployment down.  On success the RAG cache and embedder fingerprints
+    are invalidated so the next request rebuilds with the new models.
+    """
+    from multimodal_rag.model_config import build_all
+
+    embedder, reranker, vlm, asr = build_all()
+    if embedder is None:
+        logger.warning("Config reload produced no embedder — keeping previous configuration")
+        return
+    dm = get_manager()
+    try:
+        dm._verify_endpoint(embedder, "embedder")
+    except Exception as exc:
+        logger.error("Config reload aborted — new embedder unreachable: %s", exc)
+        return
+    with dm._rag_cache_lock:
+        dm.embedder, dm.reranker, dm.vlm, dm.asr = embedder, reranker, vlm, asr
+        dm._rag_cache.clear()
+    dm._embedder_verified.clear()
+    dm._embedder_dim_cache.clear()
+    # Force the periodic liveness monitor to re-evaluate against the new endpoint.
+    _model_health["embedder"].update(
+        {
+            "status": "unknown",
+            "last_check": None,
+            "error": None,
+            "consecutive_failures": 0,
+        }
+    )
+    logger.info(
+        "Swapped embedder=%s reranker=%s vlm=%s asr=%s",
+        getattr(embedder, "model_name", "?"),
+        getattr(reranker, "model_name", "?") if reranker else "-",
+        getattr(vlm, "model_name", "?") if vlm else "-",
+        getattr(asr, "model_name", "?") if asr else "-",
+    )
+
+
 @app.on_event("startup")
 async def _eager_init() -> None:
     """Pre-initialise the DatasetManager before accepting traffic.
@@ -641,6 +722,14 @@ async def _eager_init() -> None:
     If a model endpoint is unreachable, the exception is logged but does
     not prevent startup — the first real request will retry.
     """
+    # Hot config: merge mounted ConfigMap/Secret files into env BEFORE the
+    # manager builds the models, then start the change watcher.
+    if CONFIG_DIR:
+        from multimodal_rag.model_config import apply_config_dirs, start_config_watcher
+
+        apply_config_dirs(CONFIG_DIR)
+        start_config_watcher(CONFIG_DIR, _reload_models)
+
     loop = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(sync_pool, get_manager)
@@ -659,6 +748,71 @@ async def _eager_init() -> None:
 
     asyncio.create_task(_prune_upload_jobs())
 
+    # Periodic embedder liveness probe (background, once per minute).
+    asyncio.create_task(_model_health_loop())
+
+
+async def _model_health_loop() -> None:
+    """Probe the required embedder endpoint every ``_MODEL_HEALTH_INTERVAL``.
+
+    Updates ``_model_health`` so ``/api/admin/health`` and ``/healthz`` can
+    reflect embedder reachability without re-checking synchronously.
+    """
+    while True:
+        await asyncio.sleep(_MODEL_HEALTH_INTERVAL)
+        try:
+            dm = await get_manager_async()
+        except Exception:
+            # Not initialised yet (e.g. embedder was down at startup) —
+            # /healthz already reports 503 until init succeeds.
+            continue
+        if _model_health["embedder"]["status"] == "unknown":
+            # Manager init already verified the embedder once, so seed the
+            # monitor as healthy until the first periodic probe disagrees.
+            _model_health["embedder"].update(
+                {
+                    "status": "healthy",
+                    "last_check": datetime.datetime.now(datetime.UTC).isoformat(),
+                    "error": None,
+                    "consecutive_failures": 0,
+                }
+            )
+        try:
+            loop = asyncio.get_running_loop()
+
+            def _probe_embedder() -> str | None:
+                try:
+                    dm._verify_endpoint(dm.embedder, "embedder")
+                    return None
+                except Exception as exc:
+                    return str(exc)
+
+            error = await loop.run_in_executor(sync_pool, _probe_embedder)
+        except Exception as exc:
+            logger.debug("Embedder health probe failed unexpectedly: %s", exc)
+            continue
+        embedder = _model_health["embedder"]
+        if error is None:
+            embedder.update(
+                {
+                    "status": "healthy",
+                    "last_check": datetime.datetime.now(datetime.UTC).isoformat(),
+                    "error": None,
+                    "consecutive_failures": 0,
+                }
+            )
+        else:
+            embedder["status"] = "unhealthy"
+            embedder["last_check"] = datetime.datetime.now(datetime.UTC).isoformat()
+            embedder["error"] = error
+            embedder["consecutive_failures"] += 1
+            logger.warning(
+                "Embedder endpoint unreachable (%d/%d checks) — %s",
+                embedder["consecutive_failures"],
+                _MODEL_HEALTH_FAIL_THRESHOLD,
+                error,
+            )
+
 
 # ---------------------------------------------------------------------------
 # API routes — REST
@@ -667,7 +821,14 @@ async def _eager_init() -> None:
 
 @app.get("/healthz")
 async def healthz():
-    """Liveness probe — returns 503 if the manager hasn't initialised yet."""
+    """Liveness probe — 503 only if the manager hasn't initialised yet.
+
+    Deliberately does NOT gate on model endpoints: the embedder is always a
+    remote vLLM/SGLang service, and restarting this pod cannot bring it back.
+    Embedder reachability gates the *readiness* probe (``/readyz``) instead,
+    so an unavailable embedder drops the pod out of rotation without a
+    restart loop.
+    """
     if _dm is None:
         raise HTTPException(503, "DatasetManager not yet initialised")
     return {"status": "ok"}
@@ -688,16 +849,37 @@ async def api_model_availability() -> dict[str, Any]:
     }
 
 
+@app.get("/api/admin/connections")
+async def api_connections() -> dict[str, Any]:
+    """Live-check all configured model endpoints via ``/v1/models``.
+
+    Returns one entry per role with a three-state status: ``healthy``
+    (reachable), ``not_provided`` (not configured), or ``unhealthy``
+    (configured but unreachable).  Used by the management page
+    "Test connections" button.
+    """
+    dm = await get_manager_async()
+    loop = asyncio.get_running_loop()
+    roles = await loop.run_in_executor(sync_pool, dm.check_model_connections)
+    return {"roles": roles}
+
+
 @app.get("/readyz")
 async def readyz():
-    """Readiness probe — checks that the manager is up and Qdrant is reachable.
+    """Readiness probe — manager up, Qdrant reachable, and the required
+    embedder endpoint healthy (checked periodically in the background).
 
     Uses a single lightweight GET to Qdrant's own ``/readyz`` endpoint
-    instead of calling ``list_datasets()`` (which iterates every
-    collection and can be slow under load).
+    instead of calling ``list_datasets()`` (which iterates every collection
+    and can be slow under load).  Failing readiness removes the pod from
+    Service endpoints without terminating it (a remote vLLM/SGLang embedder
+    outage is a transient condition that a pod restart cannot fix).
     """
     if _dm is None:
         raise HTTPException(503, "DatasetManager not yet initialised")
+    embedder = _model_health["embedder"]
+    if embedder["consecutive_failures"] >= _MODEL_HEALTH_FAIL_THRESHOLD:
+        raise HTTPException(503, f"Embedder endpoint unreachable: {embedder['error']}")
     try:
         url = f"http://{_dm.qdrant_host}:{_dm.qdrant_port}/readyz"
         async with httpx.AsyncClient(timeout=2.0) as client:
@@ -1301,6 +1483,132 @@ async def api_delete_document(
         raise HTTPException(500, str(e))
 
 
+class _TarStreamSink(io.RawIOBase):
+    """Non-seekable sink that accumulates tar stream chunks for HTTP streaming."""
+
+    def __init__(self) -> None:
+        self._buf = io.BytesIO()
+        self._chunks: list[bytes] = []
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, data: bytes) -> int:
+        self._buf.write(data)
+        if self._buf.tell() >= (1 << 20):  # flush ~1 MiB at a time
+            self._chunks.append(self._buf.getvalue())
+            self._buf = io.BytesIO()
+        return len(data)
+
+    def drain(self) -> list[bytes]:
+        if self._buf.tell():
+            self._chunks.append(self._buf.getvalue())
+            self._buf = io.BytesIO()
+        out, self._chunks = self._chunks, []
+        return out
+
+
+def _dataset_export_stream(dm: DatasetManager, name: str):
+    """Yield gzipped tar chunks for a full dataset backup.
+
+    Includes ``meta.json`` (password hash stripped), ``documents.jsonl``
+    (every Qdrant point as ``{"id", "payload"}`` NDJSON, streamed via
+    paginated scroll) and ``files/`` (all on-disk files referenced by the
+    dataset).  Streams to the response without buffering the whole archive
+    in memory.
+    """
+    sink = _TarStreamSink()
+    with tarfile.open(fileobj=sink, mode="w|gz") as tar:
+
+        def _add_bytes(arcname: str, data: bytes) -> None:
+            info = tarfile.TarInfo(arcname)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+            yield from sink.drain()  # noqa: B018
+
+        meta = dm._read_meta(name) or {}
+        meta.pop("password_hash", None)
+        yield from _add_bytes("meta.json", json.dumps(meta, default=str).encode("utf-8"))
+
+        # Documents: write to a temp file to avoid holding huge collections
+        # in memory, then add the file to the archive.
+        fd, tmp = tempfile.mkstemp(suffix=".jsonl")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+
+                def _emit(doc: dict[str, Any]) -> None:
+                    fh.write(json.dumps(doc, default=str))
+                    fh.write("\n")
+
+                dm.stream_all_documents(name, _emit)
+            with open(tmp, "rb") as fh:
+                info = tarfile.TarInfo("documents.jsonl")
+                info.size = os.fstat(fh.fileno()).st_size
+                tar.addfile(info, fh)
+            yield from sink.drain()
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+        files_dir = dm._dataset_dir(name) / "files"
+        if files_dir.is_dir():
+            for f in sorted(files_dir.rglob("*")):
+                if not f.is_file() or f.name.startswith(".") or f.name == ".hashes.json":
+                    continue
+                arcname = "files/" + f.relative_to(files_dir).as_posix()
+                tar.add(str(f), arcname=arcname)
+                yield from sink.drain()
+
+    yield from sink.drain()
+
+
+@app.get("/api/datasets/{name}/export")
+async def api_export_dataset(
+    name: str,
+    request: Request,
+    password: str = Query(""),
+    x_dataset_password: str | None = Header(None, alias="X-Dataset-Password"),
+):
+    """Download a complete dataset backup as a ``.tar.gz``.
+
+    Contains ``meta.json`` (password hash stripped), ``documents.jsonl``
+    (every Qdrant document as JSON Lines: ``{"id", "payload"}``) and
+    ``files/`` (all on-disk files).  Password-protected datasets require the
+    ``X-Dataset-Password`` header or ``?password=`` query param.  Restore by
+    re-adding the documents (``POST /documents``) and files
+    (``POST /batch-files``), or a fresh ingest from ``files/``.
+    """
+    dm = await get_manager_async()
+    try:
+        _require_dataset_password(dm, name, x_dataset_password or None or password or None, request)
+        dm.get_dataset(name, sync_count=False)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Dataset '{name}' not found")
+
+    # Generate the (blocking) tar stream in a worker thread so the event
+    # loop stays free, yielding chunks to the response as they are produced.
+    loop = asyncio.get_running_loop()
+    iterator = iter(_dataset_export_stream(dm, name))
+
+    async def _stream():
+        while True:
+            try:
+                chunk = await loop.run_in_executor(sync_pool, partial(next, iterator))
+            except StopIteration:
+                break
+            yield chunk
+
+    return StreamingResponse(
+        _stream(),
+        media_type="application/gzip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{name}.tar.gz"',
+        },
+    )
+
+
 # -- File serving -----------------------------------------------------------
 
 
@@ -1776,6 +2084,115 @@ async def api_health_stats() -> dict[str, Any]:
     return await loop.run_in_executor(sync_pool, _collect_health_stats)
 
 
+_SIZE_UNIT_MAP = {
+    "k": 1024,
+    "kb": 1024,
+    "ki": 1024,
+    "kib": 1024,
+    "m": 1024**2,
+    "mb": 1024**2,
+    "mi": 1024**2,
+    "mib": 1024**2,
+    "g": 1024**3,
+    "gb": 1024**3,
+    "gi": 1024**3,
+    "gib": 1024**3,
+    "t": 1024**4,
+    "tb": 1024**4,
+    "ti": 1024**4,
+    "tib": 1024**4,
+}
+
+
+def _parse_size_bytes(raw: str) -> int | None:
+    """Parse a Kubernetes-style size string ("100Gi", "25Mi") into bytes.
+
+    Returns None when the value is empty or unparseable.
+    """
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]*)\s*$", raw.strip().lower())
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = m.group(2)
+    mult = _SIZE_UNIT_MAP.get(unit) if unit else 1
+    if mult is None:
+        return None
+    return int(val * mult)
+
+
+def _peer_host_label(uri: str) -> str:
+    """Best-effort human label for a Qdrant peer URI (e.g. ``qdrant-0``)."""
+    try:
+        host = urllib.parse.urlparse(uri).hostname or ""
+    except Exception:
+        host = ""
+    if not host:
+        return uri
+    label = host.split(".", 1)[0]
+    return label or uri
+
+
+# Per-replica disk usage from Qdrant telemetry.  Fetched once per
+# ``_QDRANT_TELEMETRY_TTL`` seconds because /telemetry with full detail is a
+# relatively heavy call (per-segment stats for every collection) and the
+# health endpoint is polled every 10s.
+_QDRANT_TELEMETRY_CACHE: dict[str, Any] = {"ts": 0.0, "usage": {}}
+_QDRANT_TELEMETRY_TTL = 60.0
+
+
+def _qdrant_replica_usage(
+    replicas: list[dict[str, Any]],
+    qhost: str,
+    qport: str,
+) -> dict[str, int]:
+    """Best-effort used bytes per replica host from Qdrant telemetry.
+
+    Each node's telemetry lists only its own ``local`` shard segments; sum
+    ``indexed_vectors_size`` + ``payload_data_size`` per segment.  Returns
+    ``{host: used_bytes}`` for the replicas that answered; failures and nodes
+    without detail telemetry are simply omitted.
+    """
+    now = time.time()
+    if now - _QDRANT_TELEMETRY_CACHE["ts"] <= _QDRANT_TELEMETRY_TTL:
+        return dict(_QDRANT_TELEMETRY_CACHE["usage"])
+    try:
+        import httpx
+
+        usage: dict[str, int] = {}
+        for r in replicas:
+            host = r.get("host", "")
+            if not host:
+                continue
+            try:
+                with httpx.Client(timeout=10.0) as client:
+                    # details_level=6 (full) exposes per-shard local storage.
+                    resp = client.get(f"http://{host}.{qhost}:{qport}/telemetry?details_level=6")
+                    resp.raise_for_status()
+                    res = resp.json().get("result") or {}
+                    cols = res.get("collections") or {}
+                    inner = cols.get("collections") if isinstance(cols, dict) else None
+                    items = inner.values() if isinstance(inner, dict) else (inner if isinstance(inner, list) else [])
+                    total = 0
+                    for cinfo in items:
+                        if not isinstance(cinfo, dict):
+                            continue
+                        for sh in cinfo.get("shards") or []:
+                            if not isinstance(sh, dict):
+                                continue
+                            local = sh.get("local")
+                            if isinstance(local, dict):
+                                total += int(local.get("vectors_size_bytes") or 0)
+                                total += int(local.get("payloads_size_bytes") or 0)
+                    usage[host] = total
+            except Exception:
+                logger.debug("Suppressed exception", exc_info=True)
+        _QDRANT_TELEMETRY_CACHE.update({"ts": now, "usage": usage})
+        return dict(usage)
+    except Exception:
+        logger.debug("Suppressed exception", exc_info=True)
+        return dict(_QDRANT_TELEMETRY_CACHE.get("usage") or {})
+
+
 def _collect_health_stats() -> dict[str, Any]:
     """Synchronous helper that does the actual work for /api/admin/health."""
     global _last_cpu_time, _last_wall_time
@@ -1854,6 +2271,93 @@ def _collect_health_stats() -> dict[str, Any]:
         except Exception:
             logger.debug("Suppressed exception", exc_info=True)
 
+    # -- Qdrant cluster (per-replica shard placement + configured capacity) ----
+    # Qdrant does not expose on-disk usage per node, so for a sharded cluster
+    # (one RWO PVC per replica, none mounted on the API pod) we surface the
+    # per-replica shard placement from the cluster API plus the configured
+    # per-replica PVC size (QDRANT_PVC_SIZE) so operators can gauge storage
+    # spread without exec/kubectl.
+    cluster_info: dict[str, Any] | None = None
+    try:
+        import httpx
+
+        with httpx.Client(timeout=5.0) as client:
+            qhost = os.environ.get("QDRANT_HOST", "")
+            qport = os.environ.get("QDRANT_PORT", "6333")
+            if qhost:
+                resp = client.get(f"http://{qhost}:{qport}/cluster")
+                if resp.status_code == 200:
+                    result = resp.json().get("result") or {}
+                    if result.get("status") != "enabled":
+                        cluster_info = {
+                            "enabled": False,
+                            "replicas": [],
+                            "total_shards": 0,
+                            "per_replica_capacity_bytes": _parse_size_bytes(QDRANT_PVC_SIZE),
+                        }
+                    else:
+                        peers = result.get("peers") or {}
+                        # Shard placement comes from the per-collection
+                        # /collections/{name}/cluster endpoint — the /cluster
+                        # response's "collections" map is empty in practice.
+                        peer_shards: dict[str, int] = {}
+                        base = f"http://{qhost}:{qport}"
+                        try:
+                            coll_resp = client.get(f"{base}/collections")
+                            col_names = (coll_resp.json().get("result") or {}).get("collections") or []
+                            for col in col_names:
+                                name = col.get("name") if isinstance(col, dict) else None
+                                if not name:
+                                    continue
+                                cc = client.get(f"{base}/collections/{name}/cluster")
+                                c_res = cc.json().get("result") or {}
+                                for sh in c_res.get("local_shards") or []:
+                                    key = str(c_res.get("peer_id", ""))
+                                    peer_shards[key] = peer_shards.get(key, 0) + 1
+                                for sh in c_res.get("remote_shards") or []:
+                                    pid = sh.get("peer_id") if isinstance(sh, dict) else None
+                                    if pid is not None:
+                                        key = str(pid)
+                                        peer_shards[key] = peer_shards.get(key, 0) + 1
+                        except Exception:
+                            logger.debug("Suppressed exception", exc_info=True)
+                        replicas = []
+                        for pid in sorted(peers.keys(), key=lambda p: str(p)):
+                            ps = peer_shards.get(str(pid), 0)
+                            peer = peers[pid] or {}
+                            uri = peer.get("uri", "") if isinstance(peer, dict) else ""
+                            label = _peer_host_label(uri)
+                            if not label or label == uri:
+                                label = f"peer-{pid}"
+                            replicas.append({"host": label, "shards": ps})
+                        # Order by pod ordinal (qdrant-0, qdrant-1, qdrant-2) —
+                        # raft peer ids are assigned in join order and are
+                        # unrelated to the StatefulSet ordinals.
+                        replicas.sort(
+                            key=lambda r: int(m.group(1)) if (m := re.search(r"(\d+)$", r["host"])) else -1
+                        )
+                        for _i, _r in enumerate(replicas):
+                            _r["index"] = _i
+                        # Per-replica disk usage from Qdrant telemetry (needs
+                        # QDRANT__TELEMETRY_DETAIL_LEVEL=full).  Each node only
+                        # reports its OWN local shard segments, so fetch each
+                        # peer's telemetry directly.  Sum of segment vector +
+                        # payload sizes ≈ used bytes (excludes WAL/meta).
+                        if replicas:
+                            _usage = _qdrant_replica_usage(replicas, qhost, qport)
+                            for _r in replicas:
+                                _u = _usage.get(_r["host"])
+                                if _u is not None:
+                                    _r["used_bytes"] = _u
+                        cluster_info = {
+                            "enabled": True,
+                            "replicas": replicas,
+                            "total_shards": sum(peer_shards.values()),
+                            "per_replica_capacity_bytes": _parse_size_bytes(QDRANT_PVC_SIZE),
+                        }
+    except Exception:
+        logger.debug("Suppressed exception", exc_info=True)
+
     return {
         "cpu": {
             "percent": cpu_percent,
@@ -1876,6 +2380,14 @@ def _collect_health_stats() -> dict[str, Any]:
             "collections": qdrant_collections,
             "total_points": qdrant_total_points,
             "pvc": qdrant_pvc,
+            "cluster": cluster_info,
+        },
+        "models": {
+            "embedder": {
+                "status": _model_health["embedder"]["status"],
+                "last_check": _model_health["embedder"]["last_check"],
+                "error": _model_health["embedder"]["error"],
+            }
         },
     }
 
@@ -2091,6 +2603,44 @@ async def api_migrate_tier_schema(name: str) -> dict[str, Any]:
 
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(sync_pool, _do_migrate)
+
+
+@app.post("/api/admin/datasets/{name}/recreate")
+async def api_recreate_dataset(name: str) -> dict[str, Any]:
+    """Rebuild a dataset's Qdrant collection from its on-disk files.
+
+    Drops the existing collection (whose vectors were built with an older
+    embedder) and re-ingests the dataset's original files with the
+    currently configured embedder.  Returns a ``job_id`` immediately; poll
+    ``GET /api/datasets/{name}/upload-status/{job_id}`` for progress.
+    """
+    dm = await get_manager_async()
+    try:
+        dm.get_dataset(name, sync_count=False)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Dataset '{name}' not found")
+
+    loop = asyncio.get_running_loop()
+    file_entries = await loop.run_in_executor(sync_pool, dm._list_recreate_files, name)
+    if not file_entries:
+        raise HTTPException(409, f"Dataset '{name}' has no source files on disk to recreate from")
+
+    job_id = _upload_jobs.create(name, len(file_entries), source="recreate")
+
+    def _process() -> None:
+        try:
+
+            def cb(e):
+                _upload_jobs.add_event(job_id, e)
+
+            r = dm.recreate_dataset(name, file_entries, progress_callback=cb)
+            _upload_jobs.complete(job_id, r)
+        except Exception as exc:
+            _upload_jobs.fail(job_id, str(exc))
+
+    loop.run_in_executor(None, _process)
+
+    return {"job_id": job_id, "status": "recreating", "total_files": len(file_entries)}
 
 
 # ---------------------------------------------------------------------------

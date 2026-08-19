@@ -23,6 +23,7 @@
     --accent-hover: #02c99a;
     --green: #059669;
     --red: #dc2626;
+    --yellow: #d97706;
     --radius: 6px;
   }
   [data-theme="dark"] {
@@ -36,6 +37,7 @@
     --accent-hover: #02c99a;
     --green: #34d399;
     --red: #f87171;
+    --yellow: #fbbf24;
   }
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -331,8 +333,22 @@
       </div>
     </div>
 
+    <!-- Model connections (live embedder auto-check + manual test all) -->
+    <div id="manage-models" style="margin-top:20px;padding-top:20px;border-top:1px solid var(--border)">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;flex-wrap:wrap">
+        <div style="font-weight:500;font-size:.85rem">Model Connections</div>
+        <div id="embedder-live" style="font-size:.75rem;color:var(--text-muted)"></div>
+        <div style="flex:1"></div>
+        <button class="btn btn-outline btn-sm" onclick="testConnections()" id="test-connections-btn">Test connections</button>
+      </div>
+      <div style="font-size:.75rem;color:var(--text-muted);margin-bottom:8px">
+        Embedder is auto-checked every 60s; optional models (reranker, VLM, ASR) are checked on demand.
+      </div>
+      <div id="connections-results" style="font-size:.8rem"></div>
+    </div>
+
     <!-- Detailed storage stats (loaded once) -->
-    <div id="manage-stats" style="font-size:.85rem;color:var(--text-muted)">
+    <div id="manage-stats" style="font-size:.85rem;color:var(--text-muted);margin-top:20px">
       <div style="text-align:center;padding:20px"><span class="spinner"></span></div>
     </div>
   </div>
@@ -499,6 +515,8 @@
       <h2 id="selected-name"></h2>
       <div style="display:flex;gap:8px">
         <button class="btn btn-outline btn-sm" onclick="showDocs()">Documents</button>
+        <button class="btn btn-outline btn-sm" onclick="recreateDataset()" title="Drops the indexed vectors and re-embeds the original files from disk with the currently configured embedder">Recreate</button>
+        <button class="btn btn-outline btn-sm" onclick="downloadBackup()" title="Download the full dataset backup (.tar.gz: metadata + documents + files)">Backup</button>
         <button class="btn btn-danger btn-sm" onclick="deleteDataset()">Delete</button>
       </div>
     </div>
@@ -682,6 +700,13 @@ async function selectDataset(name) {
   }
 }
 
+function downloadBackup() {
+  if (!selectedDataset) return;
+  const pw = datasetPasswords[selectedDataset] || '';
+  const url = `/api/datasets/${selectedDataset}/export` + (pw ? `?password=${encodeURIComponent(pw)}` : '');
+  window.open(url, '_blank');
+}
+
 async function deleteDataset() {
   if (!selectedDataset) return;
   if (!confirm(`Delete dataset "${selectedDataset}"? This cannot be undone.`)) return;
@@ -694,6 +719,40 @@ async function deleteDataset() {
   } catch (e) {
     toast(e.message, 'error');
   }
+}
+
+async function recreateDataset() {
+  if (!selectedDataset) return;
+  if (!confirm(`Recreate "${selectedDataset}"?\n\nDrops the indexed vectors and re-embeds the original files from disk with the currently configured embedder.`)) return;
+  let jobId;
+  try {
+    const res = await api('POST', `/api/admin/datasets/${selectedDataset}/recreate`);
+    jobId = res.job_id;
+  } catch (e) {
+    toast(e.message, 'error');
+    return;
+  }
+  toast(`Recreating "${selectedDataset}"…`);
+  const poll = async () => {
+    try {
+      const job = await api('GET', `/api/datasets/${selectedDataset}/upload-status/${jobId}`, undefined, 15000);
+      if (job.status === 'complete') {
+        const n = job.result && job.result.file_count != null ? job.result.file_count : job.processed_files;
+        toast(`Recreated "${selectedDataset}" (${n} file${n === 1 ? '' : 's'})`);
+        await listDatasets();
+        await loadManageStats();
+        return;
+      }
+      if (job.status === 'error') {
+        toast(`Recreate failed: ${job.error || 'unknown error'}`, 'error');
+        return;
+      }
+      setTimeout(poll, 2000);
+    } catch (e) {
+      toast(e.message, 'error');
+    }
+  };
+  poll();
 }
 
 // -----------------------------------------------------------------------
@@ -1615,6 +1674,7 @@ async function pollHealth() {
     // Qdrant card
     const qdColor = qd.status === 'ok' ? 'var(--green)' : 'var(--red)';
     const qpvc = qd.pvc;
+    const qcluster = qd.cluster || null;
     const qdPvcRows = qpvc ? `
         <tr><td>Used</td><td style="text-align:right">${formatBytes(qpvc.used_bytes)}</td></tr>
         <tr><td>Limit</td><td style="text-align:right">${formatBytes(qpvc.total_bytes)}</td></tr>` : '';
@@ -1622,6 +1682,9 @@ async function pollHealth() {
       <div style="height:6px;background:var(--border);border-radius:3px;margin-bottom:8px;overflow:hidden">
         <div style="width:${Math.min(qpvc.used_percent,100)}%;height:100%;background:${qpvc.used_percent > 80 ? 'var(--red)' : (qpvc.used_percent > 50 ? 'var(--accent)' : 'var(--green)')};transition:width .5s"></div>
       </div>` : '';
+    const qclusterRows = (qcluster && qcluster.enabled && qcluster.replicas && qcluster.replicas.length) ? `
+        <tr><td>Replicas</td><td style="text-align:right">${qcluster.replicas.length}</td></tr>
+        <tr><td>Shards</td><td style="text-align:right">${qcluster.total_shards}</td></tr>` : '';
     document.getElementById('health-qdrant').innerHTML = `
       <div style="font-weight:500;margin-bottom:6px;font-size:.85rem">Qdrant — <span style="color:${qdColor}">${qd.status}</span></div>
       ${qdPvcBar}
@@ -1629,6 +1692,7 @@ async function pollHealth() {
         <tr><td>Collections</td><td style="text-align:right">${qd.collections}</td></tr>
         <tr><td>Total points</td><td style="text-align:right">${qd.total_points.toLocaleString()}</td></tr>
         ${qdPvcRows}
+        ${qclusterRows}
       </table>`;
 
     // Qdrant PVC panel in the storage section (same data, fuller layout)
@@ -1652,6 +1716,25 @@ async function pollHealth() {
                 <td style="text-align:right">${qpvc.used_percent}%</td></tr>
           </table>
           <div style="font-size:.75rem;color:var(--text-muted);margin-top:8px">Qdrant StatefulSet PVC — stores vector index & payloads</div>`;
+} else if (qcluster && qcluster.enabled && qcluster.replicas && qcluster.replicas.length) {
+        const cap = qcluster.per_replica_capacity_bytes ? ` · ${formatBytes(qcluster.per_replica_capacity_bytes)} each` : '';
+        const hasUsed = qcluster.replicas.some((r) => r.used_bytes != null);
+        const rows = qcluster.replicas.map((r) => `
+            <tr>
+              <td style="padding:4px 0;color:var(--text-muted)">${escHtml(r.host || ('replica ' + (r.index + 1)))}</td>
+              ${hasUsed ? `<td style="text-align:right">${r.used_bytes != null ? formatBytes(r.used_bytes) : '—'}</td>` : ''}
+            </tr>`).join('');
+        const totalUsed = hasUsed && qcluster.replicas.some((r) => r.used_bytes != null)
+          ? qcluster.replicas.reduce((s, r) => s + (r.used_bytes || 0), 0) : null;
+        qp.innerHTML = `
+          <div style="font-weight:500;margin-bottom:8px">Qdrant cluster — ${qcluster.replicas.length} replicas${cap}</div>
+          <table style="width:100%">
+            ${hasUsed ? '<tr><td style="padding:4px 0"></td><td style="text-align:right;font-size:.72rem;color:var(--text-muted)">used</td></tr>' : ''}
+            ${rows}
+            ${totalUsed !== null ? `<tr><td style="padding:4px 0;color:var(--text-muted);border-top:1px solid var(--border)">Total used</td>
+                <td style="text-align:right;border-top:1px solid var(--border)">${formatBytes(totalUsed)}</td></tr>` : ''}
+          </table>
+          <div style="font-size:.75rem;color:var(--text-muted);margin-top:8px">Telemetry disk usage per Qdrant replica — each replica has its own RWO PVC (not shared).</div>`;
       } else {
         qp.innerHTML = `
           <div style="font-weight:500;margin-bottom:8px">Qdrant DB PVC</div>
@@ -1661,6 +1744,72 @@ async function pollHealth() {
   } catch (e) {
     // Keep last values — don't flash red on a single failed poll
   }
+  renderEmbedderLive(h);
+}
+
+function renderEmbedderLive(h) {
+  const el = document.getElementById('embedder-live');
+  if (!el) return;
+  const emb = h && h.models && h.models.embedder;
+  if (!emb) return;
+  const color = emb.status === 'healthy' ? 'var(--green)'
+    : emb.status === 'unhealthy' ? 'var(--red)' : 'var(--yellow)';
+  const stateLabel = emb.status === 'unhealthy' ? 'unhealthy' : emb.status === 'healthy' ? 'healthy' : 'checking…';
+  let detail = '';
+  if (emb.last_check) {
+    try { detail = ` · checked ${new Date(emb.last_check).toLocaleTimeString()}`; } catch { /* ignore */ }
+  }
+  el.innerHTML = `
+    <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${color};margin-right:6px;vertical-align:middle"></span>
+    <span style="color:${color};font-weight:500">Embedder — ${stateLabel}</span>
+    <span>${detail}</span>`;
+}
+
+async function testConnections() {
+  const btn = document.getElementById('test-connections-btn');
+  const res = document.getElementById('connections-results');
+  if (btn) btn.disabled = true;
+  res.innerHTML = '<div style="text-align:center;padding:12px"><span class="spinner"></span> Checking model endpoints…</div>';
+  try {
+    const data = await api('GET', '/api/admin/connections', undefined, 45000);
+    res.innerHTML = (data.roles || []).map(connectionRow).join('');
+  } catch (e) {
+    res.innerHTML = `<div style="color:var(--red)">${escHtml(e.message)}</div>`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function connectionState(status) {
+  if (status === 'healthy') return { color: 'var(--green)', label: 'healthy' };
+  if (status === 'not_provided') return { color: 'var(--yellow)', label: 'not provided' };
+  return { color: 'var(--red)', label: 'unhealthy' };
+}
+
+function connectionRow(r) {
+  const labels = { embedder: 'Embedder', reranker: 'Reranker', vlm: 'VLM', asr: 'ASR' };
+  const name = labels[r.role] || r.role;
+  const st = connectionState(r.status);
+  let right = '';
+  if (r.status === 'healthy' && r.model_name) {
+    right = `<span style="color:var(--text-muted);font-size:.75rem">${escHtml(r.model_name)}</span>`;
+  } else if (r.status === 'unhealthy') {
+    right = `<span style="color:var(--text-muted);font-size:.75rem">${escHtml(r.url || '')}</span>`;
+  }
+  let err = '';
+  if (r.status === 'unhealthy' && r.error) {
+    err = `<div style="font-size:.72rem;color:var(--red);margin:2px 0 0 18px">${escHtml(r.error)}</div>`;
+  }
+  return `
+    <div style="padding:6px 0;border-bottom:1px solid var(--border)">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${st.color};flex-shrink:0"></span>
+        <span style="font-weight:500;width:90px">${name}</span>
+        <span>${st.label}</span>
+        <span style="margin-left:auto;text-align:right">${right}</span>
+      </div>
+      ${err}
+    </div>`;
 }
 
 async function loadManageStats() {

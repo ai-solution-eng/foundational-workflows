@@ -9,7 +9,7 @@
 replicaCount: 4
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v2.1.2
+  tag: v2.2.1
   pullPolicy: IfNotPresent
 
 deployment:
@@ -137,7 +137,7 @@ qdrant:
   replicas: 3
   image:
     repository: qdrant/qdrant
-    tag: "v1.18.2"
+    tag: "v1.19.0"
     pullPolicy: IfNotPresent
   grpcPort: 6334
   httpPort: 6333
