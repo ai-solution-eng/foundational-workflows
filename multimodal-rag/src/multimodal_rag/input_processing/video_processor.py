@@ -109,6 +109,11 @@ class VideoProcessor:
                 eff_fps = max(self.fps, self.target_frames / seg_duration)
             else:
                 eff_fps = self.fps
+            # Round the effective fps: some ffmpeg builds reject long
+            # non-terminating fractional fps values in the mp4 muxer
+            # ("Not yet implemented in FFmpeg, patches welcome",
+            # AVERROR_PATCHWELCOME), failing the whole segment transcode.
+            eff_fps = round(eff_fps, 4)
 
             # -- Compute effective per-frame pixel budget for this segment ------
             if self.total_pixels > 0 and eff_fps > 0:
@@ -227,6 +232,13 @@ class VideoProcessor:
             str(duration),
             "-i",
             input_path,
+            # Keep the audio track: caption_with_asr transcribes the video
+            # segment via the ASR model, and a silent (audio-less) segment
+            # fails ASR with "Invalid or unsupported audio file".  The
+            # fractional-fps muxer failure is handled by rounding *fps* in
+            # process_iter(); normalise negative timestamps defensively.
+            "-avoid_negative_ts",
+            "make_zero",
         ]
         if scale_filter:
             cmd += ["-vf", f"fps={fps},{scale_filter}"]

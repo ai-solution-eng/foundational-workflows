@@ -657,7 +657,7 @@ async function listDatasets() {
     <div class="dataset-item ${selectedDataset === d.name ? 'selected' : ''}"
          onclick="selectDataset('${d.name}')" style="cursor:pointer">
       <div class="dataset-info">
-        <div class="dataset-name">${d.has_password ? '🔒 ' : ''}${escHtml(d.name)}</div>
+        <div class="dataset-name">${d.has_password ? (datasetPasswords[d.name] ? '🔓 ' : '🔒 ') : ''}${escHtml(d.name)}</div>
         <div class="dataset-meta">${d.document_count || 0} docs · ${d.created ? new Date(d.created).toLocaleDateString() : ''}</div>
       </div>
     </div>
@@ -688,6 +688,7 @@ async function selectDataset(name) {
         await api('POST', `/api/datasets/${name}/verify-password`, { password: pw });
         datasetPasswords[name] = pw;
         delete mediaTokens[name];  // invalidate any token minted under the old password
+        await listDatasets();      // re-render so the lock icon becomes unlocked
       } catch (e) {
         toast('Incorrect password', 'error');
         datasetPasswords[name] = '';  // mark as attempted
@@ -1864,7 +1865,7 @@ async function loadManageStats() {
               return `<li style="margin:2px 0;color:var(--text-muted)">${k}: ${parts.join(', ')}</li>`;
             }).join('');
             return `<li style="margin:8px 0">
-              <strong>${d.has_password ? '🔒 ' : ''}${escHtml(d.name)}</strong>
+              <strong>${d.has_password ? (datasetPasswords[d.name] ? '🔓 ' : '🔒 ') : ''}${escHtml(d.name)}</strong>
               <span style="color:var(--text-muted);margin-left:8px">${d.documents} doc${d.documents !== 1 ? 's' : ''}, ${formatBytes(d.file_bytes)}</span>
               ${subs ? '<ol style="list-style:lower-alpha;margin:2px 0 0 20px;padding:0">' + subs + '</ol>' : ''}
             </li>`;

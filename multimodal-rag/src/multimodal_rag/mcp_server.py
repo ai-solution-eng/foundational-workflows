@@ -58,8 +58,9 @@ _MEDIA_TOKEN_TTL = max(60, int(os.environ.get("MEDIA_TOKEN_TTL", "3600")))
 
 # Periodic embedder liveness monitor (same env vars as the API server).
 # The embedder is the only required model; it is probed in the background
-# and /healthz flips to 503 only after _MODEL_HEALTH_FAIL_THRESHOLD
-# consecutive failures so a transient blip does not trigger a k8s restart.
+# and the result is surfaced via /api/admin/health.  Health/readiness
+# probes deliberately do NOT gate on it (a remote embedder outage cannot
+# be fixed by restarting this pod).
 _MODEL_HEALTH_INTERVAL = float(os.environ.get("MODEL_HEALTH_INTERVAL", "60"))
 _MODEL_HEALTH_FAIL_THRESHOLD = int(os.environ.get("MODEL_HEALTH_FAIL_THRESHOLD", "3"))
 
@@ -787,7 +788,7 @@ def _model_health_loop() -> None:
 
     Runs in a daemon thread (``_start_model_health_thread``) because the MCP
     server is launched via ``uvicorn.run``, which owns the event loop.
-    Updates ``_model_health`` so the MCP ``/readyz`` reflects embedder
+    Updates ``_model_health`` so ``/api/admin/health`` can surface embedder
     reachability without re-checking synchronously.  Only needed in the
     HTTP transports (the /healthz and /readyz routes only exist there).
     """
@@ -2497,12 +2498,10 @@ def _with_mcp_health(app: ASGIApp) -> ASGIApp:
     ``FastMCP`` returns the wrapped Starlette app, which supports adding
     routes directly.  ``/healthz`` is pure process liveness (no model
     checks — the embedder is always a remote vLLM/SGLang service, and
-    restarting this pod cannot bring it back).  ``/readyz`` returns 503
-    when the required embedder endpoint has been unreachable for the last
-    ``_MODEL_HEALTH_FAIL_THRESHOLD`` consecutive background checks, so an
-    embedder outage drops the sidecar out of rotation without a restart
-    loop.  The periodic probe runs in a daemon thread
-    (``_start_model_health_thread``), not uvicorn's event loop.
+    restarting this pod cannot bring it back).  ``/readyz`` is pure
+    readiness — it does not gate on the embedder either, for the same
+    reason (an embedder outage is a transient condition that a pod
+    restart cannot fix; it is surfaced via ``/api/admin/health``).
     """
     from starlette.responses import JSONResponse
 
@@ -2510,12 +2509,6 @@ def _with_mcp_health(app: ASGIApp) -> ASGIApp:
         return JSONResponse({"status": "ok"})
 
     async def _readyz(request: object) -> JSONResponse:
-        embedder = _model_health["embedder"]
-        if embedder["consecutive_failures"] >= _MODEL_HEALTH_FAIL_THRESHOLD:
-            return JSONResponse(
-                {"status": "unhealthy", "detail": f"Embedder endpoint unreachable: {embedder['error']}"},
-                status_code=503,
-            )
         return JSONResponse({"status": "ready"})
 
     app.add_route("/healthz", _healthz)  # type: ignore[attr-defined]

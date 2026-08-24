@@ -65,6 +65,12 @@ data:
   EMBEDDING_QUERY_BATCH_SIZE: {{ .Values.app.embeddingQueryBatchSize | quote }}
   EMBEDDING_QUERY_BATCH_WAIT_MS: {{ .Values.app.embeddingQueryBatchWaitMs | quote }}
   EMBEDDING_MAX_IMAGES_PER_PROMPT: {{ .Values.app.embeddingMaxImagesPerPrompt | quote }}
+  {{- if .Values.embedBatcher.enabled }}
+  # Shared (cross-process) embedding query batcher: all API/MCP pods route
+  # text-only queries here so the batch size no longer depends on the number
+  # of app processes.
+  RAG_EMBED_BATCH_URL: {{ printf "http://%s-embed-batcher.%s.svc.cluster.local:%d/embed" .Values.deployment.name .Release.Namespace (int .Values.embedBatcher.port) | quote }}
+  {{- end }}
   # Dynamic Qdrant query batcher (search path)
   QDRANT_QUERY_BATCH_SIZE: {{ .Values.app.qdrantQueryBatchSize | quote }}
   QDRANT_QUERY_BATCH_WAIT_MS: {{ .Values.app.qdrantQueryBatchWaitMs | quote }}

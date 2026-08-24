@@ -1020,6 +1020,39 @@ class MultimodalRAG:
     # -- vector store management ------------------------------------------------
 
     @staticmethod
+    def _normalize_doc(doc: Any) -> Any:
+        """Normalize common document schemas into the flat ``{text: ...}`` form.
+
+        API clients sometimes post the legacy nested shape::
+
+            {"id": "t1", "content": {"text": "...", "image": "..."}, "metadata": {...}}
+
+        The ``content`` mapping (or string) is lifted onto the top level and
+        any ``metadata`` dict is merged in, so downstream preprocessing and
+        embedding see the real ``text`` / ``image`` / ``video`` / ``audio``
+        keys instead of an empty document.  Docs already in the flat form are
+        returned unchanged.
+        """
+        if not isinstance(doc, dict):
+            return doc
+        content = doc.get("content")
+        if not isinstance(content, (dict, str)):
+            return doc
+        d = dict(doc)
+        d.pop("content", None)
+        if isinstance(content, dict):
+            for k, v in content.items():
+                d.setdefault(k, v)
+        else:
+            d.setdefault("text", content)
+        meta = d.get("metadata")
+        if isinstance(meta, dict):
+            d.pop("metadata", None)
+            for k, v in meta.items():
+                d.setdefault(k, v)
+        return d
+
+    @staticmethod
     def _to_documents(inputs: Sequence[str | dict[str, Any]]) -> list[Document]:
         docs = []
         for inp in inputs:
@@ -1060,6 +1093,7 @@ class MultimodalRAG:
         documents: Sequence[str | dict[str, Any]],
     ) -> list[str | dict[str, Any]]:
         """Run the preprocessor unless the embedder already supports all modalities."""
+        documents = [self._normalize_doc(d) for d in documents]
         if not self.preprocess:
             docs = list(documents)
             # Even without preprocessing, omit docs with unprocessable audio.
@@ -1249,6 +1283,12 @@ class MultimodalRAG:
                                 "error",
                                 "-i",
                                 path,
+                                # Video-only: muxing audio yields a negative first
+                                # packet (AAC priming) that some ffmpeg builds reject
+                                # in the mp4 muxer.  Only frames are needed here.
+                                "-an",
+                                "-avoid_negative_ts",
+                                "make_zero",
                                 "-vf",
                                 f"fps={fps},{scale}",
                                 "-f",

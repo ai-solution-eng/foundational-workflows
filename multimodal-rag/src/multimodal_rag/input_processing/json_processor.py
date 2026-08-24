@@ -73,9 +73,16 @@ def _json_path_for_keys(keys: list[str], parent_path: str = "$", separator: str 
 class JSONProcessor:
     """Flatten, stringify, and optionally chunk JSON data for RAG ingestion.
 
-    Each top-level object or array element becomes one or more document
-    dicts with a flattened key-value text representation and a
-    ``json_path`` metadata field pointing to its location in the source.
+    Each top-level object becomes one or more document dicts with a
+    flattened key-value text representation and a ``json_path`` metadata
+    field pointing to its location in the source.
+
+    When the root value is an array of records, consecutive records are
+    merged into context-aware chunks that fill up to ``merge_token_budget``
+    tokens (default 2048) instead of emitting one entry per record.  A
+    record that alone exceeds the budget is still split on its own.  Each
+    merged chunk carries a range ``json_path`` (e.g. ``$.0..5``) and a
+    ``json_element_count`` field so provenance stays traceable.
 
     Parameters
     ----------
@@ -90,6 +97,13 @@ class JSONProcessor:
         When ``False`` the JSON is simply pretty-printed.
     separator:
         Key path separator for flattened output (default ``"."``).
+    merge_records:
+        When the root is an array, merge consecutive records into chunks
+        that fill up to *merge_token_budget* (instead of one doc each).
+    merge_token_budget:
+        Target token budget for a merged array chunk (default 2048).
+        When *text_splitter* is ``None`` this is treated as a character
+        budget.
     """
 
     chunk_size: int = 8192
@@ -97,6 +111,8 @@ class JSONProcessor:
     flatten: bool = True
     separator: str = "."
     text_splitter: Any | None = None
+    merge_records: bool = True
+    merge_token_budget: int = 2048
 
     # ------------------------------------------------------------------
     # Public API
@@ -123,6 +139,8 @@ class JSONProcessor:
     def process_data(self, data: Any, source: str = "") -> list[dict[str, Any]]:
         """Process an already-parsed JSON value into document dicts."""
         if isinstance(data, list):
+            if self.merge_records:
+                return self._process_records(data, source)
             docs: list[dict[str, Any]] = []
             for i, item in enumerate(data):
                 item_docs = self._process_single(item, source)
@@ -133,6 +151,97 @@ class JSONProcessor:
             return docs
         else:
             return self._process_single(data, source)
+
+    # ------------------------------------------------------------------
+    # Record merging (array root)
+    # ------------------------------------------------------------------
+
+    def _process_records(self, records: list[Any], source: str) -> list[dict[str, Any]]:
+        """Merge consecutive array records into token-budgeted chunks.
+
+        Records are flattened to text and greedily packed into groups that
+        fit within *merge_token_budget*.  A record that alone exceeds the
+        budget is processed/split on its own via :meth:`_process_single`.
+        Each merged group becomes one document with a range ``json_path``
+        (e.g. ``$.0..5``) and a ``json_element_count`` field.
+        """
+        if not records:
+            return []
+
+        docs: list[dict[str, Any]] = []
+        group: list[tuple[int, Any, str]] = []  # (index, record, text)
+        group_tokens = 0
+
+        def _flush() -> None:
+            nonlocal group, group_tokens
+            if not group:
+                return
+            indexes = [idx for idx, _, _ in group]
+            texts = [t for _, _, t in group]
+            text = self._join_records(indexes, texts)
+            doc: dict[str, Any] = {
+                "text": text,
+                "source": source,
+                "json_path": self._path_for_indexes(indexes),
+                "json_element_count": len(indexes),
+            }
+            docs.append(doc)
+            group = []
+            group_tokens = 0
+
+        for idx, record in enumerate(records):
+            if self.flatten:
+                text = _flatten_to_text(record, self.separator)
+            else:
+                text = json.dumps(record, indent=2, ensure_ascii=False)
+
+            # A record that alone exceeds the chunk budget is split on its
+            # own (an oversized single object), never merged with siblings.
+            if self._exceeds_budget(text):
+                _flush()
+                item_docs = self._process_single(record, source)
+                for d in item_docs:
+                    existing = d.get("json_path", "$")
+                    d["json_path"] = f"$[{idx}]{existing[1:]}" if existing != "$" else f"$[{idx}]"
+                docs.extend(item_docs)
+                continue
+
+            tokens = self.count(text)
+            if group and group_tokens + tokens > self.merge_token_budget:
+                _flush()
+            group.append((idx, record, text))
+            group_tokens += tokens
+
+        _flush()
+        return docs
+
+    @staticmethod
+    def _join_records(indexes: list[int], texts: list[str]) -> str:
+        """Join flattened record texts with a readable record header."""
+        parts: list[str] = []
+        for idx, text in zip(indexes, texts):
+            parts.append(f"[record {idx}]")
+            parts.append(text)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _path_for_indexes(indexes: list[int]) -> str:
+        """Render a compact range json_path for a set of element indexes."""
+        if not indexes:
+            return "$"
+        if len(indexes) == 1:
+            return f"$[{indexes[0]}]"
+        # contiguous run -> range, else comma list
+        if indexes == list(range(indexes[0], indexes[0] + len(indexes))):
+            return f"$[{indexes[0]}..{indexes[-1]}]"
+        inner = ",".join(str(i) for i in indexes)
+        return f"$[{inner}]"
+
+    def count(self, text: str) -> int:
+        """Return token count when a tokenizer is available, else chars."""
+        if self.text_splitter is not None:
+            return self.text_splitter.count_tokens(text)
+        return len(text)
 
     # ------------------------------------------------------------------
     # Internal

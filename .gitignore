@@ -11,7 +11,7 @@ multimodal-rag/src/multimodal_rag/utils/pcai_models_full.py
 multimodal-rag/.backup_pre_token_chunking/
 
 # Packaged helm charts — rebuild locally from the chart directories.
-multimodal-rag/*.tar.gz
+# multimodal-rag/*.tar.gz
 
 # -- Python ------------------------------------------------------------------
 __pycache__/

@@ -6,10 +6,16 @@
 # Scale variant: multiple API replicas + gunicorn workers, multi-replica
 # Qdrant, optional Redis for cross-pod unlock cache. See helm/ for the
 # original single-replica chart.
-replicaCount: 4
+#
+# NOTE: replicas are kept at 2 because the embedder query batcher is per
+# process (one MCP process per pod).  Each process aggregates concurrent
+# searches into a single /v1/embeddings call; more processes than concurrent
+# users means tiny batches and the model serializes ~5/s.  2 replicas × the
+# MCP process per pod reproduces the medium chart's batching behaviour.
+replicaCount: 2
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v2.2.1
+  tag: v2.3.0
   pullPolicy: IfNotPresent
 
 deployment:
@@ -23,7 +29,15 @@ app:
   # `workers` event loops (one per process). Each worker gets its own
   # `sync_pool`, so effective concurrency ≈ replicaCount * workers *
   # syncPoolSize.
-  workers: 4
+  #
+  # NOTE: keep workers low. The embedding query batcher is per event loop,
+  # and the embedder model (qwen3-vl-embedding-8b) serializes concurrent
+  # /v1/embeddings HTTP requests (~5/s unbatched).  Spreading concurrent
+  # searches across many workers yields tiny batches (≈1) and throughput
+  # collapses to the model's unbatched rate.  The large chart previously
+  # used 4 (16 workers total with 4 replicas) and benchmarked ~8 req/s vs
+  # 49 req/s for the medium chart's 4 workers.
+  workers: 2
   # Per-worker thread pool for blocking RAG work (embedding, Qdrant, file
   # processing). Falls back to 12 if unset (matches the single-replica
   # chart).
@@ -178,6 +192,17 @@ mcp:
   enabled: true
   port: 9090
 
+# -- Shared embedding query batcher --------------------------------------------
+# A singleton aggregator: every API/MCP pod POSTs text-only embedding queries
+# here, and this single process collects them into one /v1/embeddings call.
+# This makes batch size independent of the number of app processes, so app
+# scaling no longer degrades embedder throughput (with per-process batchers,
+# 4+ batchers split the batch pool and throughput collapses to ~5-8 r/s).
+# Disable to fall back to the per-process _QueryBatcher.
+embedBatcher:
+  enabled: true
+  port: 8002
+
 # -- Service configuration ----------------------------------------------------
 service:
   api:
@@ -211,6 +236,13 @@ resources:
     limits:
       memory: "512Mi"
       cpu: "500m"
+  embedBatcher:
+    requests:
+      memory: "512Mi"
+      cpu: "500m"
+    limits:
+      memory: "1Gi"
+      cpu: "2"
 
 # -- Pod anti-affinity (spread replicas across nodes) -------------------------
 antiAffinity:

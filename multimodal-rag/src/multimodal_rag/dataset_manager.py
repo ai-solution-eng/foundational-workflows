@@ -17,9 +17,10 @@ import secrets
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import httpx
 
@@ -268,6 +269,19 @@ _NOTEBOOK_EXTS = frozenset({".ipynb"})
 _EBOOK_EXTS = frozenset({".epub"})
 _LOG_EXTS = frozenset({".log", ".txt.log"})
 _ARCHIVE_EXTS = frozenset({".zip", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".tbz2", ".txz", ".rar"})
+_INGESTED_HASHES_FILE = ".ingested_hashes.json"
+
+
+def _sha256_file(path: str | Path) -> str:
+    """Return the SHA-256 hex digest of a file's contents (streamed)."""
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(8192):
+            h.update(chunk)
+    return h.hexdigest()
+
 
 # ── Preprocessing limits for files stored on PVC ─────────────────────────
 _PVC_IMAGE_MAX_PIXELS: int = 1920 * 1080  # 2,073,600
@@ -1626,7 +1640,7 @@ class DatasetManager:
             # Consumer died before this batch was queued.
             err = consumer_error[0] or "consumer failed"
             logger.error("Dropping batch (%d files) — consumer thread dead: %s", len(batch_files_list_), err)
-            for fname, _, _ in batch_files_list_:
+            for fname, _, _, _ in batch_files_list_:
                 result_queue.put((fname, 0, err))
                 if progress_callback:
                     progress_callback({"file": fname, "status": "error", "error": err})
@@ -1645,7 +1659,7 @@ class DatasetManager:
                         # Mark all files in this batch as embedding (with chunk
                         # count).  Inside the try so a callback failure cannot
                         # kill the consumer thread.
-                        for fname, count, _ in batch_files_list:
+                        for fname, count, _, _ in batch_files_list:
                             if progress_callback:
                                 progress_callback({"file": fname, "status": "embedding", "chunks": count})
 
@@ -1654,7 +1668,7 @@ class DatasetManager:
                         # the batch.  Per-file retries, per-file outcomes.
                         per_file: list[tuple[str, int, str | None]] = []
                         offset = 0
-                        for fname, count, file_type_ in batch_files_list:
+                        for fname, count, file_type_, content_hash_ in batch_files_list:
                             file_docs = docs[offset : offset + count]
                             offset += count
                             try:
@@ -1667,6 +1681,8 @@ class DatasetManager:
                                 self._strip_media_payloads(rag, ids)
                                 self._increment_count(dataset_name, len(ids), file_type=file_type_)
                                 per_file.append((fname, len(ids), None))
+                                if content_hash_ and ids:
+                                    self._mark_ingested(dataset_name, content_hash_)
                             except Exception as exc:
                                 logger.warning("Embedding failed for '%s' after 3 attempts: %s", fname, exc)
                                 per_file.append((fname, 0, str(exc)))
@@ -1686,7 +1702,7 @@ class DatasetManager:
                                     )
                     except Exception as exc:
                         logger.error("Batch processing failed unexpectedly: %s", exc)
-                        for fname, _, _ in batch_files_list:
+                        for fname, _, _, _ in batch_files_list:
                             result_queue.put((fname, 0, str(exc)))
                             if progress_callback:
                                 progress_callback({"file": fname, "status": "error", "error": str(exc)})
@@ -1707,7 +1723,7 @@ class DatasetManager:
                         batch_queue.task_done()
                         break
                     _, pending_files = batch
-                    for fname, _, _ in pending_files:
+                    for fname, _, _, _ in pending_files:
                         result_queue.put((fname, 0, str(exc)))
                         if progress_callback:
                             progress_callback({"file": fname, "status": "error", "error": str(exc)})
@@ -1718,7 +1734,9 @@ class DatasetManager:
 
         # -- Producer: preprocess files, queue batches --------------------------
         batch_docs: list[str | dict[str, Any]] = []
-        batch_files_list: list[tuple[str, int, str]] = []
+        # (fname, chunk_count, file_type, content_hash) — the content hash lets
+        # the consumer mark successfully-embedded files for ingest dedup.
+        batch_files_list: list[tuple[str, int, str, str]] = []
         current_score = 0.0
 
         def _drain_results() -> None:
@@ -1745,6 +1763,12 @@ class DatasetManager:
                 dst = self._store_file(dataset_name, tmp_path, original_name=fname)
                 dst_str = str(dst)
                 file_type = _classify_file(dst_str)
+                content_hash = _sha256_file(dst)
+                if self._is_ingested(dataset_name, content_hash):
+                    file_results.append({"file": fname, "chunks": 0, "deduplicated": True})
+                    if progress_callback:
+                        progress_callback({"file": fname, "status": "skipped", "chunks": 0, "deduplicated": True})
+                    continue
                 file_bytes = dst.stat().st_size
                 file_total = 0  # estimated total chunks (0 if unknown)
 
@@ -1770,7 +1794,7 @@ class DatasetManager:
                             _fix_source(pdf_batch, fname, dst_str)
                             self._save_doc_media(dataset_name, pdf_batch, model_max_pixels=max_pixels)
                             batch_docs.extend(pdf_batch)
-                            batch_files_list.append((fname, len(pdf_batch), file_type))
+                            batch_files_list.append((fname, len(pdf_batch), file_type, content_hash))
                             pdf_batch = []
 
                             _queue_batch(batch_docs, batch_files_list)
@@ -1784,7 +1808,7 @@ class DatasetManager:
                         _fix_source(pdf_batch, fname, dst_str)
                         self._save_doc_media(dataset_name, pdf_batch, model_max_pixels=max_pixels)
                         batch_docs.extend(pdf_batch)
-                        batch_files_list.append((fname, len(pdf_batch), file_type))
+                        batch_files_list.append((fname, len(pdf_batch), file_type, content_hash))
                     current_score = 0.0
                     file_total = chunk_count
 
@@ -1800,7 +1824,7 @@ class DatasetManager:
                         doc["original_image"] = f"file://{original_dst}"
                     batch_docs.append(doc)
                     current_score += file_bytes / _MB
-                    batch_files_list.append((fname, 1, file_type))
+                    batch_files_list.append((fname, 1, file_type, content_hash))
                     file_total = 1
 
                     # Delete original if keep_originals=False
@@ -1834,7 +1858,7 @@ class DatasetManager:
                             _fix_source(vid_batch, fname, dst_str)
                             self._save_doc_media(dataset_name, vid_batch)
                             batch_docs.extend(vid_batch)
-                            batch_files_list.append((fname, len(vid_batch), file_type))
+                            batch_files_list.append((fname, len(vid_batch), file_type, content_hash))
                             vid_batch = []
 
                             _queue_batch(batch_docs, batch_files_list)
@@ -1847,7 +1871,7 @@ class DatasetManager:
                         _fix_source(vid_batch, fname, dst_str)
                         self._save_doc_media(dataset_name, vid_batch)
                         batch_docs.extend(vid_batch)
-                        batch_files_list.append((fname, len(vid_batch), file_type))
+                        batch_files_list.append((fname, len(vid_batch), file_type, content_hash))
                     current_score = 0.0
                     file_total = vid_chunk_count
 
@@ -1883,7 +1907,7 @@ class DatasetManager:
                     self._save_doc_media(dataset_name, audio_batch)
                     batch_docs.extend(audio_batch)
                     current_score += file_bytes / _MB
-                    batch_files_list.append((fname, len(segments), file_type))
+                    batch_files_list.append((fname, len(segments), file_type, content_hash))
                     file_total = len(segments)
 
                 else:
@@ -1928,21 +1952,21 @@ class DatasetManager:
                     n = min(len(batch_files_list), 10)
                     send_doc_count = 0
                     send_bytes = 0
-                    send_files: list[tuple[str, int, str]] = []
-                    for fname, cnt, file_type_ in batch_files_list[:n]:
+                    send_files: list[tuple[str, int, str, str]] = []
+                    for fname, cnt, file_type_, content_hash in batch_files_list[:n]:
                         file_payload = sum(
                             _doc_payload_bytes(d) for d in batch_docs[send_doc_count : send_doc_count + cnt]
                         )
                         if send_files and send_bytes + file_payload > _IDLE_SEND_BYTES:
                             break
-                        send_files.append((fname, cnt, file_type_))
+                        send_files.append((fname, cnt, file_type_, content_hash))
                         send_bytes += file_payload
                         send_doc_count += cnt
                     if not send_files:
                         # Even one file is over the cap — send it anyway so the
                         # pipeline cannot deadlock on a single huge file.
                         send_files = batch_files_list[:1]
-                        send_doc_count = sum(c for _, c, _ in send_files)
+                        send_doc_count = sum(c for _, c, _, _ in send_files)
                     keep_files = batch_files_list[len(send_files) :]
                     _queue_batch(batch_docs[:send_doc_count], send_files)
                     batch_docs = batch_docs[send_doc_count:]
@@ -2060,37 +2084,45 @@ class DatasetManager:
         original URL is used as the canonical ``source``.
         """
         fname = original_name or Path(file_path).name
-        # Archives: extract and process contained files
+        # Archives: extract and process each contained file through the same
+        # per-file handler used for standalone uploads (_add_file_processed), so
+        # images / videos / audio / PDFs inside an archive behave identically to
+        # the same file uploaded directly — same preprocessing, segmentation,
+        # model params, metadata and per-type chunk counts.  ArchiveProcessor now
+        # only handles extraction + bounds checks; per-member processing is
+        # delegated to the standalone handler.
         if Path(file_path).suffix.lower() in _ARCHIVE_EXTS:
             if source_url:
-                # URL archives extract directly from the temp file
-                archive_proc = ArchiveProcessor(
-                    chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap,
-                    text_splitter=text_splitter,
-                )
-                chunks = archive_proc.process(file_path)
-                _fix_source(chunks, fname, source_url)
-                self._save_doc_media(dataset_name, chunks)
-                ids = rag.add_to_vector_store(chunks) if chunks else []
-                self._strip_media_payloads(rag, ids)
-                self._increment_count(dataset_name, len(ids), file_type="archive")
+                # URL archives extract directly from the temp file; members are
+                # then stored and processed as ordinary local files.
+                archive_path = file_path
             else:
-                dst_path = self._store_file(dataset_name, file_path, original_name=fname)
-                archive_proc = ArchiveProcessor(
-                    chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap,
-                    text_splitter=text_splitter,
-                )
-                chunks = archive_proc.process(str(dst_path))
-                if chunks:
-                    _fix_source(chunks, fname, str(dst_path))
-                    self._save_doc_media(dataset_name, chunks)
-                    ids = rag.add_to_vector_store(chunks)
-                    self._strip_media_payloads(rag, ids)
-                    self._increment_count(dataset_name, len(ids), file_type="archive")
-                else:
-                    ids = []
+                archive_path = str(self._store_file(dataset_name, file_path, original_name=fname))
+
+            def _process_member(member_path: str, member_name: str) -> list[str]:
+                try:
+                    result = self._add_file_processed(
+                        dataset_name,
+                        member_path,
+                        rag,
+                        mpk,
+                        chunk_size,
+                        chunk_overlap,
+                        text_splitter=text_splitter,
+                        original_name=member_name,
+                    )
+                    return list(result.get("stored_ids") or [])
+                except ValueError as exc:
+                    # Unsupported member type — skip it, matching the old
+                    # behaviour of silently ignoring such files.
+                    logger.debug("Skipping unsupported archive member %s: %s", member_name, exc)
+                    return []
+                except Exception as exc:
+                    logger.warning("Failed to process archive member %s: %s", member_name, exc)
+                    return []
+
+            archive_proc = ArchiveProcessor(process_member=_process_member)
+            ids = archive_proc.process(archive_path)
             return {"type": "archive", "chunks": len(ids), "stored_ids": ids}
 
         file_type = _classify_file(file_path)
@@ -2117,6 +2149,15 @@ class DatasetManager:
             source_str = str(dst_path)
             store_url = f"file://{source_str}"
 
+        # Content-hash ingest dedup: identical bytes already successfully
+        # ingested into this dataset are skipped (no duplicate vectors).
+        content_hash: str | None = None
+        if not source_url:
+            content_hash = _sha256_file(dst_path)
+            if self._is_ingested(dataset_name, content_hash):
+                logger.info("Skipping %s: identical content already ingested in %s", fname, dataset_name)
+                return {"type": file_type, "chunks": 0, "stored_ids": [], "deduplicated": True}
+
         if file_type == "pdf":
             pdf_proc = PDFProcessor()
             chunks = pdf_proc.extract_chunks(
@@ -2130,7 +2171,9 @@ class DatasetManager:
             ids = rag.add_to_vector_store(chunks)
             self._strip_media_payloads(rag, ids)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
-            return {"type": "pdf", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "pdf", "chunks": len(ids), "stored_ids": ids}
+            )
 
         elif file_type == "image":
             original_path = str(dst_path)
@@ -2151,7 +2194,9 @@ class DatasetManager:
             if not source_url and source_str != original_path and not self._get_keep_originals(dataset_name):
                 self._delete_original_file(dataset_name, original_path, ids, "original_image")
 
-            return {"type": "image", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "image", "chunks": len(ids), "stored_ids": ids}
+            )
 
         elif file_type == "video":
             original_path = str(dst_path)
@@ -2182,7 +2227,9 @@ class DatasetManager:
             if original_url and not self._get_keep_originals(dataset_name):
                 self._delete_original_file(dataset_name, original_path, ids, "original_video")
 
-            return {"type": "video", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "video", "chunks": len(ids), "stored_ids": ids}
+            )
 
         elif file_type == "audio":
             import base64
@@ -2212,7 +2259,9 @@ class DatasetManager:
             ids = rag.add_to_vector_store(audio_docs)
             self._strip_media_payloads(rag, ids, store_url)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
-            return {"type": "audio", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "audio", "chunks": len(ids), "stored_ids": ids}
+            )
 
         elif file_type == "json":
             json_proc = JSONProcessor(
@@ -2224,7 +2273,9 @@ class DatasetManager:
             _fix_source(chunks, fname, source_str)
             ids = rag.add_to_vector_store(chunks) if chunks else []
             self._increment_count(dataset_name, len(ids), file_type=file_type)
-            return {"type": "json", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "json", "chunks": len(ids), "stored_ids": ids}
+            )
 
         elif file_type == "table":
             table_proc = TableProcessor(chunk_size=chunk_size, text_splitter=text_splitter)
@@ -2232,7 +2283,9 @@ class DatasetManager:
             _fix_source(chunks, fname, source_str)
             ids = rag.add_to_vector_store(chunks) if chunks else []
             self._increment_count(dataset_name, len(ids), file_type=file_type)
-            return {"type": "table", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "table", "chunks": len(ids), "stored_ids": ids}
+            )
 
         elif file_type == "code":
             code_proc = CodeProcessor(
@@ -2244,7 +2297,9 @@ class DatasetManager:
             _fix_source(chunks, fname, source_str)
             ids = rag.add_to_vector_store(chunks)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
-            return {"type": "code", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "code", "chunks": len(ids), "stored_ids": ids}
+            )
 
         elif file_type == "office":
             office_proc = OfficeProcessor(
@@ -2261,7 +2316,9 @@ class DatasetManager:
                 self._increment_count(dataset_name, len(ids), file_type=file_type)
             else:
                 ids = []
-            return {"type": "office", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "office", "chunks": len(ids), "stored_ids": ids}
+            )
 
         elif file_type == "html":
             html_proc = HTMLProcessor(
@@ -2273,7 +2330,9 @@ class DatasetManager:
             _fix_source(chunks, fname, source_str)
             ids = rag.add_to_vector_store(chunks)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
-            return {"type": "html", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "html", "chunks": len(ids), "stored_ids": ids}
+            )
 
         elif file_type == "xml":
             xml_proc = XMLProcessor(
@@ -2285,7 +2344,9 @@ class DatasetManager:
             _fix_source(chunks, fname, source_str)
             ids = rag.add_to_vector_store(chunks) if chunks else []
             self._increment_count(dataset_name, len(ids), file_type=file_type)
-            return {"type": "xml", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "xml", "chunks": len(ids), "stored_ids": ids}
+            )
 
         elif file_type == "yaml":
             yaml_proc = YAMLProcessor(
@@ -2297,7 +2358,9 @@ class DatasetManager:
             _fix_source(chunks, fname, source_str)
             ids = rag.add_to_vector_store(chunks) if chunks else []
             self._increment_count(dataset_name, len(ids), file_type=file_type)
-            return {"type": "yaml", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "yaml", "chunks": len(ids), "stored_ids": ids}
+            )
 
         elif file_type == "notebook":
             nb_proc = NotebookProcessor(
@@ -2314,7 +2377,9 @@ class DatasetManager:
                 self._increment_count(dataset_name, len(ids), file_type=file_type)
             else:
                 ids = []
-            return {"type": "notebook", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "notebook", "chunks": len(ids), "stored_ids": ids}
+            )
 
         elif file_type == "ebook":
             epub_proc = EbookProcessor(
@@ -2331,7 +2396,9 @@ class DatasetManager:
                 self._increment_count(dataset_name, len(ids), file_type=file_type)
             else:
                 ids = []
-            return {"type": "ebook", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "ebook", "chunks": len(ids), "stored_ids": ids}
+            )
 
         elif file_type == "log":
             log_proc = LogProcessor(chunk_size=chunk_size, text_splitter=text_splitter)
@@ -2339,7 +2406,9 @@ class DatasetManager:
             _fix_source(chunks, fname, source_str)
             ids = rag.add_to_vector_store(chunks)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
-            return {"type": "log", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "log", "chunks": len(ids), "stored_ids": ids}
+            )
 
         else:  # text
             text_proc = TextProcessor(
@@ -2351,7 +2420,9 @@ class DatasetManager:
             _fix_source(chunks, fname, source_str)
             ids = rag.add_to_vector_store(chunks)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
-            return {"type": "text", "chunks": len(ids), "stored_ids": ids}
+            return self._finish_ingest(
+                dataset_name, content_hash, {"type": "text", "chunks": len(ids), "stored_ids": ids}
+            )
 
     # ------------------------------------------------------------------
     # Media payload minimisation
@@ -3066,11 +3137,7 @@ class DatasetManager:
             self._write_embedder_fingerprint(dataset_name)
             return
 
-        if (
-            stored_dim
-            and cur_dim is not None
-            and int(stored_dim) != cur_dim
-        ):
+        if stored_dim and cur_dim is not None and int(stored_dim) != cur_dim:
             raise EmbedderMismatchError(
                 f"Dataset '{dataset_name}' was indexed with embedder "
                 f"{stored_name!r} (dim {stored_dim}); the currently configured "
@@ -3175,6 +3242,48 @@ class DatasetManager:
                     ft = meta.setdefault("file_type_counts", {})
                     ft[file_type] = max(0, ft.get(file_type, 0) - n)
                 self._write_meta(name, meta)
+
+    # ------------------------------------------------------------------
+    # Ingest dedup: per-dataset set of content hashes that were
+    # successfully embedded, so re-uploading byte-identical files (e.g. the
+    # same archive twice, or the same file again) does not create duplicate
+    # vectors.  Stored in a sidecar JSON next to the dataset files.
+    # ------------------------------------------------------------------
+
+    def _ingested_hashes_path(self, dataset_name: str) -> Path:
+        return self._dataset_dir(dataset_name) / "files" / _INGESTED_HASHES_FILE
+
+    def _is_ingested(self, dataset_name: str, file_hash: str) -> bool:
+        """True if *file_hash* was already successfully ingested here."""
+        p = self._ingested_hashes_path(dataset_name)
+        if not p.exists():
+            return False
+        try:
+            return file_hash in json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return False
+
+    def _mark_ingested(self, dataset_name: str, file_hash: str) -> None:
+        """Record *file_hash* as successfully ingested for *dataset_name*."""
+        p = self._ingested_hashes_path(dataset_name)
+        with _cross_process_lock(p.with_suffix(".lock")):
+            hashes: set[str] = set()
+            if p.exists():
+                try:
+                    hashes = set(json.loads(p.read_text(encoding="utf-8")))
+                except (json.JSONDecodeError, OSError):
+                    hashes = set()
+            hashes.add(file_hash)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(sorted(hashes)), encoding="utf-8")
+            os.replace(tmp, p)
+
+    def _finish_ingest(self, dataset_name: str, content_hash: str | None, result: dict[str, Any]) -> dict[str, Any]:
+        """Mark *content_hash* ingested when the result stored vectors, then return it."""
+        if content_hash and result.get("stored_ids"):
+            self._mark_ingested(dataset_name, content_hash)
+        return result
 
     def _store_file(self, dataset_name: str, source_path: str, original_name: str | None = None) -> Path:
         """Copy *source_path* into the dataset's files directory and return the new path.

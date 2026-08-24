@@ -1,15 +1,11 @@
 import os
+import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from multimodal_rag.input_processing.image_processor import ImageProcessor
-from multimodal_rag.input_processing.json_processor import JSONProcessor
-from multimodal_rag.input_processing.pdf_processor import PDFProcessor
-from multimodal_rag.input_processing.table_processor import TableProcessor
-from multimodal_rag.input_processing.text_processor import TextProcessor
-from multimodal_rag.input_processing.video_processor import VideoProcessor
 from multimodal_rag.utils.logging_utils import logging
 
 logger = logging.getLogger(__name__)
@@ -31,80 +27,6 @@ def _is_archive(path: str) -> bool:
     return Path(path).suffix.lower() in _SUPPORTED_ARCHIVE_EXTS
 
 
-_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"})
-_VIDEO_EXTS = frozenset({".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"})
-_AUDIO_EXTS = frozenset({".mp3", ".wav", ".flac", ".ogg", ".m4a", ".wma"})
-_TABLE_EXTS = frozenset({".csv", ".tsv", ".xlsx", ".xls", ".ods"})
-_TEXT_EXTS = frozenset({".txt", ".md"})
-_CODE_EXTS = frozenset(
-    {
-        ".py",
-        ".pyw",
-        ".js",
-        ".jsx",
-        ".mjs",
-        ".cjs",
-        ".ts",
-        ".tsx",
-        ".java",
-        ".cpp",
-        ".cxx",
-        ".cc",
-        ".c",
-        ".h",
-        ".hpp",
-        ".hxx",
-        ".cs",
-        ".rb",
-        ".go",
-        ".rs",
-        ".swift",
-        ".kt",
-        ".kts",
-        ".scala",
-        ".php",
-        ".r",
-        ".R",
-        ".sh",
-        ".bash",
-        ".zsh",
-    }
-)
-_OFFICE_EXTS = frozenset({".docx", ".pptx", ".odt", ".odp"})
-_HTML_EXTS = frozenset({".html", ".htm"})
-_XML_EXTS = frozenset({".xml"})
-_YAML_EXTS = frozenset({".yaml", ".yml"})
-
-
-def _classify_ext(path: str) -> str:
-    ext = Path(path).suffix.lower()
-    if ext == ".pdf":
-        return "pdf"
-    if ext in _IMAGE_EXTS:
-        return "image"
-    if ext in _VIDEO_EXTS:
-        return "video"
-    if ext in _AUDIO_EXTS:
-        return "audio"
-    if ext in _TEXT_EXTS:
-        return "text"
-    if ext == ".json":
-        return "json"
-    if ext in _TABLE_EXTS:
-        return "table"
-    if ext in _CODE_EXTS:
-        return "code"
-    if ext in _OFFICE_EXTS:
-        return "office"
-    if ext in _HTML_EXTS:
-        return "html"
-    if ext in _XML_EXTS:
-        return "xml"
-    if ext in _YAML_EXTS:
-        return "yaml"
-    return "unknown"
-
-
 def _tar_extract(path: str, mode: str, dest_dir: str) -> None:
     import tarfile
 
@@ -116,7 +38,7 @@ def _is_safe_member(dest_dir: str, member_path: str) -> bool:
     """Return True if *member_path* stays within *dest_dir* after extraction.
 
     Prevents Zip Slip / path traversal via crafted archive member names
-    (e.g. ``../../etc/cron.d/exfil``).  Mirrors the lexical check performed
+    (e.g. ``../../etc/passwd``).  Mirrors the lexical check performed
     by tarfile's ``filter="data"``.
     """
     dest = os.path.abspath(dest_dir)
@@ -130,64 +52,46 @@ def _is_safe_member(dest_dir: str, member_path: str) -> bool:
 
 @dataclass
 class ArchiveProcessor:
-    """Extract archives and recursively process contained files.
+    """Extract archives and hand every contained file to the caller's handler.
 
-    Supports ``.zip``, ``.tar``, ``.tar.gz`` / ``.tgz``, ``.tar.bz2`` /
-    ``.tbz2``, ``.tar.xz`` / ``.txz``, and ``.rar`` archives.
+    This class owns only *extraction*: archive-bomb bounds checks, safe
+    extraction (Zip Slip protection), and recursion through nested
+    directories and nested archives up to ``max_depth``.  Each extracted file
+    is passed to ``process_member(member_path, member_name)``, which is
+    responsible for processing it **exactly like a standalone upload** — the
+    caller supplies the same handler used for individually uploaded files, so
+    files inside an archive behave identically to the same file uploaded
+    directly (same preprocessing, segmentation, model params, metadata and
+    per-type chunk counts).
 
-    Each extracted file is dispatched to the appropriate processor
-    (PDF, image, video, audio, text, JSON, table, etc.).  Nested
-    archives are extracted recursively up to a configurable depth.
+    ``process_member`` returns the stored vector ids it produced for that
+    member; ``process`` aggregates them so the archive reports one total.
     """
 
-    chunk_size: int = 8192
-    chunk_overlap: int = 512
-    text_splitter: Any | None = None
     max_depth: int = _MAX_DEPTH
+    process_member: Callable[[str, str], list[str]] | None = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def process(self, archive_path: str, source: str = "") -> list[dict[str, Any]]:
-        """Extract *archive_path* and return all document chunks.
+    def process(self, archive_path: str) -> list[str]:
+        """Extract *archive_path* and process every member.
 
-        Returns
-        -------
-        list[dict]
-            Document dicts from all contained files, with ``source``
-            pointing to the original archive path.
+        Returns the aggregated list of stored vector ids for all members.
         """
         self._check_bounds(archive_path)
-        archive_source = source or str(archive_path)
         extract_dir = tempfile.mkdtemp(prefix="mmrag_archive_")
+        stored_ids: list[str] = []
         try:
             self._extract(archive_path, extract_dir)
-            docs = self._process_dir(extract_dir, archive_source, depth=0)
-            return docs
+            self._process_dir(extract_dir, depth=0, stored_ids=stored_ids)
+            return stored_ids
         except Exception as e:
             logger.error("Failed to process archive %s: %s", archive_path, e)
             return []
         finally:
-            import shutil
-
             shutil.rmtree(extract_dir, ignore_errors=True)
-
-    def _process_nested_archive(self, path: str, archive_source: str, depth: int) -> list[dict[str, Any]]:
-        # Bounds check applies to nested archives too — otherwise a crafted
-        # nested bomb could bypass the top-level guard.
-        self._check_bounds(path)
-        nested_dir = tempfile.mkdtemp(prefix="mmrag_nested_")
-        try:
-            self._extract(path, nested_dir)
-            return self._process_dir(nested_dir, archive_source, depth + 1)
-        except Exception as e:
-            logger.warning("Failed to extract nested archive %s: %s", path, e)
-            return []
-        finally:
-            import shutil
-
-            shutil.rmtree(nested_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # Bounds checking (archive-bomb guard)
@@ -228,8 +132,6 @@ class ArchiveProcessor:
                 for info in zf.infolist():
                     _account(info.file_size)
         elif ext == ".rar":
-            # Pre-scan only when the pure-python reader is available; the
-            # unrar-CLI fallback rejects ".." itself but has no size guard.
             try:
                 import rarfile
 
@@ -258,7 +160,7 @@ class ArchiveProcessor:
         ext = Path(path).suffix.lower()
         stem = Path(path).stem.lower()
 
-        if ext == ".zip" or Path(path).suffix == ".zip":
+        if ext == ".zip":
             import zipfile
 
             with zipfile.ZipFile(path, "r") as zf:
@@ -282,7 +184,6 @@ class ArchiveProcessor:
                 logger.warning("rarfile extraction failed for %s, trying unrar", path)
                 import subprocess as sp
 
-                # unrar ≥5.x refuses paths containing ".." on its own.
                 sp.run(
                     ["unrar", "x", "-y", path, dest_dir + "/"],
                     capture_output=True,
@@ -306,81 +207,31 @@ class ArchiveProcessor:
     # Recursive processing
     # ------------------------------------------------------------------
 
-    def _process_dir(self, directory: str, archive_source: str, depth: int) -> list[dict[str, Any]]:
+    def _process_dir(self, directory: str, depth: int, stored_ids: list[str]) -> None:
         if depth > self.max_depth:
             logger.warning("Max archive depth %s reached, skipping nested content", self.max_depth)
-            return []
-
-        docs: list[dict[str, Any]] = []
+            return
         for entry in sorted(os.listdir(directory)):
             full_path = os.path.join(directory, entry)
             if os.path.isdir(full_path):
-                docs.extend(self._process_dir(full_path, archive_source, depth))
+                self._process_dir(full_path, depth, stored_ids)
             elif os.path.isfile(full_path):
                 if _is_archive(full_path):
-                    nested = self._process_nested_archive(full_path, archive_source, depth)
-                    docs.extend(nested)
+                    self._process_nested_archive(full_path, depth, stored_ids)
                 else:
-                    file_docs = self._process_single_file(full_path, archive_source)
-                    docs.extend(file_docs)
-        return docs
+                    if self.process_member is None:
+                        raise RuntimeError("ArchiveProcessor.process_member must be provided by the caller")
+                    ids = self.process_member(full_path, entry) or []
+                    stored_ids.extend(ids)
 
-    def _process_single_file(self, path: str, archive_source: str) -> list[dict[str, Any]]:
-        file_type = _classify_ext(path)
+    def _process_nested_archive(self, path: str, depth: int, stored_ids: list[str]) -> None:
+        """Bounds-checked, safe extraction for an archive nested inside this one."""
+        self._check_bounds(path)
+        nested_dir = tempfile.mkdtemp(prefix="mmrag_nested_")
         try:
-            if file_type == "pdf":
-                pdf_proc = PDFProcessor()
-                chunks = pdf_proc.extract_chunks(path, chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
-                for c in chunks:
-                    c["source"] = c.get("source", archive_source)
-                return chunks
-            elif file_type == "image":
-                img_proc = ImageProcessor()
-                doc = img_proc.process(path)
-                doc["source"] = archive_source
-                return [doc]
-            elif file_type == "video":
-                vid_proc = VideoProcessor()
-                docs = vid_proc.process(path)
-                for d in docs:
-                    d["source"] = archive_source
-                return docs
-            elif file_type == "audio":
-                with open(path, "rb") as f:
-                    raw = f.read()
-                import base64
-                import mimetypes
-
-                mime = mimetypes.guess_type(path)[0] or "audio/mpeg"
-                b64 = base64.b64encode(raw).decode("utf-8")
-                return [
-                    {
-                        "text": f"[Audio: {Path(path).name}]",
-                        "audio": f"data:{mime};base64,{b64}",
-                        "source": archive_source,
-                    }
-                ]
-            elif file_type == "json":
-                json_proc = JSONProcessor(chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
-                chunks = json_proc.process(path)
-                for c in chunks:
-                    c["source"] = archive_source
-                return chunks
-            elif file_type == "table":
-                table_proc = TableProcessor(chunk_size=self.chunk_size, text_splitter=self.text_splitter)
-                chunks = table_proc.process(path)
-                for c in chunks:
-                    c["source"] = archive_source
-                return chunks
-            elif file_type == "text":
-                text_proc = TextProcessor(chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
-                chunks = text_proc.process(path)
-                for c in chunks:
-                    c["source"] = archive_source
-                return chunks
-            else:
-                logger.debug("Skipping unknown file type in archive: %s", path)
-                return []
+            self._extract(path, nested_dir)
+            self._process_dir(nested_dir, depth + 1, stored_ids)
         except Exception as e:
-            logger.warning("Failed to process %s in archive: %s", Path(path).name, e)
-            return []
+            logger.warning("Failed to extract nested archive %s: %s", path, e)
+        finally:
+            shutil.rmtree(nested_dir, ignore_errors=True)

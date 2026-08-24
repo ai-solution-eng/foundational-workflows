@@ -26,6 +26,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from collections.abc import Iterator
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -589,6 +590,7 @@ async def _embedder_mismatch_handler(request: Request, exc: EmbedderMismatchErro
     embedder than the one currently configured."""
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
+
 # Optional API-key authentication for the REST API.  Enabled by setting
 # RAG_API_KEY.  When set, every request must present either the
 # ``X-RAG-Api-Key`` header or ``Authorization: Bearer <key>``.  Liveness /
@@ -599,9 +601,9 @@ _RAG_API_KEY = os.environ.get("RAG_API_KEY", "")
 
 # Periodic embedder liveness monitor.  The embedder is the only required
 # model; it is probed once per minute in the background and the result is
-# surfaced in /api/admin/health. /healthz only flips to 503 after
-# _MODEL_HEALTH_FAIL_THRESHOLD consecutive failures so a transient blip does
-# not trigger a k8s restart loop.
+# surfaced in /api/admin/health.  Health/readiness probes deliberately do
+# NOT gate on it (a remote embedder outage cannot be fixed by restarting
+# this pod).
 _MODEL_HEALTH_INTERVAL = float(os.environ.get("MODEL_HEALTH_INTERVAL", "60"))
 _MODEL_HEALTH_FAIL_THRESHOLD = int(os.environ.get("MODEL_HEALTH_FAIL_THRESHOLD", "3"))
 
@@ -825,9 +827,7 @@ async def healthz():
 
     Deliberately does NOT gate on model endpoints: the embedder is always a
     remote vLLM/SGLang service, and restarting this pod cannot bring it back.
-    Embedder reachability gates the *readiness* probe (``/readyz``) instead,
-    so an unavailable embedder drops the pod out of rotation without a
-    restart loop.
+    Embedder reachability is surfaced in ``/api/admin/health`` instead.
     """
     if _dm is None:
         raise HTTPException(503, "DatasetManager not yet initialised")
@@ -866,20 +866,17 @@ async def api_connections() -> dict[str, Any]:
 
 @app.get("/readyz")
 async def readyz():
-    """Readiness probe — manager up, Qdrant reachable, and the required
-    embedder endpoint healthy (checked periodically in the background).
+    """Readiness probe — manager up and Qdrant reachable.
 
+    Deliberately does NOT gate on the embedder: it is always a remote
+    vLLM/SGLang service, and restarting this pod cannot bring it back.
+    Embedder reachability is surfaced in ``/api/admin/health`` instead.
     Uses a single lightweight GET to Qdrant's own ``/readyz`` endpoint
     instead of calling ``list_datasets()`` (which iterates every collection
-    and can be slow under load).  Failing readiness removes the pod from
-    Service endpoints without terminating it (a remote vLLM/SGLang embedder
-    outage is a transient condition that a pod restart cannot fix).
+    and can be slow under load).
     """
     if _dm is None:
         raise HTTPException(503, "DatasetManager not yet initialised")
-    embedder = _model_health["embedder"]
-    if embedder["consecutive_failures"] >= _MODEL_HEALTH_FAIL_THRESHOLD:
-        raise HTTPException(503, f"Embedder endpoint unreachable: {embedder['error']}")
     try:
         url = f"http://{_dm.qdrant_host}:{_dm.qdrant_port}/readyz"
         async with httpx.AsyncClient(timeout=2.0) as client:
@@ -1493,7 +1490,7 @@ class _TarStreamSink(io.RawIOBase):
     def writable(self) -> bool:
         return True
 
-    def write(self, data: bytes) -> int:
+    def write(self, data: Any) -> int:
         self._buf.write(data)
         if self._buf.tell() >= (1 << 20):  # flush ~1 MiB at a time
             self._chunks.append(self._buf.getvalue())
@@ -1520,11 +1517,11 @@ def _dataset_export_stream(dm: DatasetManager, name: str):
     sink = _TarStreamSink()
     with tarfile.open(fileobj=sink, mode="w|gz") as tar:
 
-        def _add_bytes(arcname: str, data: bytes) -> None:
+        def _add_bytes(arcname: str, data: bytes) -> Iterator[bytes]:
             info = tarfile.TarInfo(arcname)
             info.size = len(data)
             tar.addfile(info, io.BytesIO(data))
-            yield from sink.drain()  # noqa: B018
+            yield from sink.drain()
 
         meta = dm._read_meta(name) or {}
         meta.pop("password_hash", None)
@@ -1541,10 +1538,10 @@ def _dataset_export_stream(dm: DatasetManager, name: str):
                     fh.write("\n")
 
                 dm.stream_all_documents(name, _emit)
-            with open(tmp, "rb") as fh:
+            with open(tmp, "rb") as rf:
                 info = tarfile.TarInfo("documents.jsonl")
-                info.size = os.fstat(fh.fileno()).st_size
-                tar.addfile(info, fh)
+                info.size = os.fstat(rf.fileno()).st_size
+                tar.addfile(info, rf)
             yield from sink.drain()
         finally:
             try:
@@ -2321,7 +2318,7 @@ def _collect_health_stats() -> dict[str, Any]:
                                         peer_shards[key] = peer_shards.get(key, 0) + 1
                         except Exception:
                             logger.debug("Suppressed exception", exc_info=True)
-                        replicas = []
+                        replicas: list[dict[str, Any]] = []
                         for pid in sorted(peers.keys(), key=lambda p: str(p)):
                             ps = peer_shards.get(str(pid), 0)
                             peer = peers[pid] or {}
@@ -2333,9 +2330,7 @@ def _collect_health_stats() -> dict[str, Any]:
                         # Order by pod ordinal (qdrant-0, qdrant-1, qdrant-2) —
                         # raft peer ids are assigned in join order and are
                         # unrelated to the StatefulSet ordinals.
-                        replicas.sort(
-                            key=lambda r: int(m.group(1)) if (m := re.search(r"(\d+)$", r["host"])) else -1
-                        )
+                        replicas.sort(key=lambda r: int(m.group(1)) if (m := re.search(r"(\d+)$", r["host"])) else -1)
                         for _i, _r in enumerate(replicas):
                             _r["index"] = _i
                         # Per-replica disk usage from Qdrant telemetry (needs
