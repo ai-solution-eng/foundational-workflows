@@ -1456,6 +1456,25 @@ async def _arun_retrieval(
             # user-viewable version, not the tier-3 data URL stored
             # in Qdrant.
             entry.update(_prefer_preprocessed_media(doc))
+            # Never leak heavy tier-3 base64 data URLs into the result
+            # JSON that is handed back to the LLM.  The postprocessor
+            # (VLM/ASR) already consumed them internally to build the
+            # text in `context`; a data URL with no tier-2 ref to swap
+            # in is still megabytes of token garbage for a text-only LLM
+            # (tens of thousands of tokens).  When a tier-2 ref exists it
+            # was substituted above (and later converted to a signed HTTP
+            # URL); when it doesn't, drop the key instead of emitting
+            # base64.
+            for modality in ("image", "video", "audio"):
+                val = entry.get(modality)
+                if isinstance(val, str):
+                    heavy = val.startswith("data:")
+                elif isinstance(val, list):
+                    heavy = any(isinstance(v, str) and v.startswith("data:") for v in val)
+                else:
+                    heavy = False
+                if heavy:
+                    del entry[modality]
         raw_results.append(entry)
 
     # -- Optionally convert PVC paths to HTTP URLs --

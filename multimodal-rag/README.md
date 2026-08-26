@@ -77,24 +77,15 @@ immediately searchable via MCP tools and vice versa.
 
 ## Quick start
 
-```bash
-# Deploy to Kubernetes (see documentation/DEPLOYMENT.md for full guide)
-export DOMAIN_NAME="your-domain.com"
-envsubst < helm/values.yaml > values-resolved.yaml
-
-helm install multimodal-rag ./helm \
-  -f values-resolved.yaml \
-  --set models.embedder.url="https://..." \
-  --set models.reranker.url="https://..." \
-  --set models.vlm.url="https://..." \
-  --set models.asr.url="https://..." \
-  --set modelSecrets.embedderApiKey="eyJ..."
-
-# Verify
-kubectl get pods -l app=rag-mcp-server
-kubectl port-forward deployment/rag-mcp-server 8000:8000
-# → http://localhost:8000
-```
+To deploy this helm chart:
+1. Pickup the latest helm chart of your choice. 
+  a. There are 3 variants. 
+  b. Scale variants use multiple api and qdrant replicas to improve throughput. Requests are still routed jointly (for text) to a single request to improve performance.
+2. Add in model endpoints that you have deployed through MLIS.
+  a. The embedder is the only required endpoint.
+  b. A VLM/ASR model is often recommended to give images/videos or audios (including video embedded audio) respectively information to the base LLM.
+  c. A reranker can be helpful as well, but often times the LLM will just call top_k with sufficient performance. I have once seen it fail to retrieve with only top_k, increase the value to 100 with reranking, and succeed.
+3. Recommended: Generate a `security.mediaTokenSecret` value with `python -c "import secrets; print(secrets.token_hex(32))"`. There is a default one in the charts, but recommended to change for security. This governs token generation for password protected datasets.
 
 The image does not bundle any ML models — it connects to remote model
 endpoints (embedder, reranker, VLM, ASR) configured at runtime via

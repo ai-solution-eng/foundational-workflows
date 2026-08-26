@@ -9,7 +9,23 @@ from functools import cached_property
 from io import BytesIO
 from typing import Any
 
+import contextvars
 import numpy as np
+
+# Non-fatal captioning warnings for the CURRENT ingest request, surfaced to
+# the web UI.  The API layer sets a list per request; the ASR/VLM failure
+# paths append to it (no-op when unset, e.g. during retrieval).
+_ingest_warnings: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "ingest_warnings", default=None
+)
+
+
+def _record_ingest_warning(msg: str) -> None:
+    """Record a non-fatal captioning failure for the active ingest request."""
+    bucket = _ingest_warnings.get()
+    if bucket is not None:
+        bucket.append(msg)
+
 
 from multimodal_rag.utils.general_tools import (
     cosine_sim,
@@ -161,6 +177,44 @@ def _has_real_text(text: str) -> bool:
     remaining = _CAPTION_LINE_RE.sub("", text)
     remaining = _MEDIA_PLACEHOLDER_RE.sub("", remaining)
     return bool(remaining.strip())
+
+
+def _strip_captions(text: str) -> str:
+    """Remove auto-generated caption blocks (VLM/ASR) from *text*.
+
+    The caption lines added by the Preprocessor ([Image description]: ...,
+    [Video description]: ..., [Audio transcription]: ...) are metadata
+    for retrieval-time LLM consumption; they are not part of the media
+    content and should not steer the embedding. _CAPTION_LINE_RE also
+    matches the trailing newline, so concatenating remaining parts is clean.
+    """
+    return _CAPTION_LINE_RE.sub("", text)
+
+
+def _strip_embed_caption(doc: dict, supported: set[str]) -> dict:
+    """Return a copy of *doc* with auto-caption text stripped for embedding.
+
+    Caption stripping applies ONLY to pure media docs — those whose text
+    carries no real extracted content (just a "[Image: x.JPG]" placeholder
+    and/or a VLM/ASR caption).  For those, the raw image/video is what the
+    embedder should encode, not the caption wording, so the caption lines
+    are removed from the embedding input while the stored payload keeps
+    them for retrieval-time LLM consumption.
+
+    Docs that DO carry real text (e.g. a PDF page that also has an image)
+    are returned unchanged: the embedder should receive that extracted text
+    together with the VLM caption.  Docs whose media modality is not
+    supported by the embedder (e.g. audio today) are also unchanged — the
+    caption text is the only embeddable content.
+    """
+    supported_media = [m for m in ("image", "video", "audio") if doc.get(m)]
+    if not supported_media or not any(m in supported for m in supported_media):
+        return doc
+    if _has_real_text(doc.get("text") or ""):
+        return doc
+    out = dict(doc)
+    out["text"] = _strip_captions(doc.get("text") or "")
+    return out
 
 
 async def _afetch_media_bytes(url: str, async_client=None) -> bytes:
@@ -549,7 +603,13 @@ class Preprocessor:
                 else:
                     asr_tasks.extend([self._transcribe(url) for url in media["audio"]])
 
-            # -- video not supported → VLM description (+ optional ASR) -----
+            # -- video caption (VLM) / audio-track caption (ASR) ------------
+            # video_needs_vlm is only true when the embedder cannot ingest
+            # video; in that case the caption becomes the doc's text and the
+            # video payload is dropped.  When the embedder DOES support video
+            # natively, captioning is still done for the stored payload, but
+            # the caption lines are stripped from the embedding input below
+            # (see _strip_embed_caption) so the vector keys off the raw video.
             video_needs_vlm = "video" not in target_modalities and media["video"]
             video_captioned = False
             if video_needs_vlm:
@@ -562,19 +622,25 @@ class Preprocessor:
             elif "audio" not in target_modalities and self.caption:
                 asr_tasks.extend([self._transcribe(url) for url in media["video"]])
             # -- video supported, but VLM caption requested ------------------
+            # Caption is generated and stored, but is STRIPPED from the
+            # embedding input below (see _strip_embed_caption) so the
+            # vector keys off the raw video, not the caption wording.
             if not video_needs_vlm and media["video"] and self.caption_img and self.vlm is not None:
                 vlm_tasks.append(self._describe(d, query=query))
                 video_captioned = True
 
-            # -- image not supported → VLM description ----------------------
-            # When the embedder doesn't support images, describe and drop.
-            # When caption_with_vlm is on (and embedder DOES support images),
-            # describe but KEEP the image for the embedder.
+            # -- image caption (VLM) ------------------------------------------
+            # Same rule as video: when the embedder cannot ingest images the
+            # caption becomes the doc's text; when it can, captioning is kept
+            # for the stored payload but stripped from the embedding input
+            # below (see _strip_embed_caption).
             image_needs_vlm = "image" not in target_modalities and media["image"]
             image_captioned = False
             if image_needs_vlm and self.vlm is not None:
                 vlm_tasks.append(self._describe(d, query=query))
             elif self.caption_img and media["image"]:
+                # Caption generated for the stored payload; stripped from the
+                # embedding input below (see _strip_embed_caption).
                 vlm_tasks.append(self._describe(d, query=query))
                 image_captioned = True
 
@@ -582,19 +648,41 @@ class Preprocessor:
             vlm_results = list(await asyncio.gather(*vlm_tasks)) if vlm_tasks else []
 
             # -- audio ASR results ------------------------------------------
+            # ASR captioning runs only when the embedder cannot ingest audio
+            # ("audio" not in target_modalities) — same rule as image/video.
+            # If a future embedder supports audio natively, the ASR
+            # transcription is skipped automatically.
             if "audio" not in target_modalities and media["audio"] and self.asr is not None:
                 n = len(media["audio"])
-                for transcript in asr_results[:n]:
+                transcripts = [t for t in asr_results[:n] if t]
+                if len(transcripts) < n:
+                    # ASR unavailable for this track — behave like the
+                    # no-ASR-model case: drop the audio payload, omit the
+                    # doc entirely if nothing meaningful remains.
+                    d.pop("audio", None)
+                    has_other_media = bool(media["image"]) or bool(media["video"])
+                    text = (d.get("text") or "").strip()
+                    if not has_other_media and (not text or text.startswith("[Audio:")):
+                        wmsg = f"Omitting audio document: ASR unavailable ({d.get('source', '(unknown)')})"
+                        logger.warning(wmsg)
+                        _record_ingest_warning(wmsg)
+                        return None
+                    wmsg = f"Dropping audio from document: ASR unavailable ({d.get('source', '(unknown)')})"
+                    logger.warning(wmsg)
+                    _record_ingest_warning(wmsg)
+                for transcript in transcripts:
                     text_parts.append(f"[Audio transcription]: {transcript}")
                 asr_results = asr_results[n:]
 
             # -- VLM results (in order: video describe, image describe) -----
             vlm_idx = 0
             if (video_needs_vlm or video_captioned) and self.vlm is not None:
-                text_parts.append(f"[Video description]: {vlm_results[vlm_idx]}")
+                if vlm_results[vlm_idx]:
+                    text_parts.append(f"[Video description]: {vlm_results[vlm_idx]}")
                 vlm_idx += 1
             if (image_needs_vlm or image_captioned) and self.vlm is not None:
-                text_parts.append(f"[Image description]: {vlm_results[vlm_idx]}")
+                if vlm_results[vlm_idx]:
+                    text_parts.append(f"[Image description]: {vlm_results[vlm_idx]}")
                 vlm_idx += 1
 
             # -- remaining ASR results (video caption) ----------------------
@@ -602,7 +690,8 @@ class Preprocessor:
             # transcription]:") so ingest-time captions are reused and the
             # audio is not re-transcribed at retrieval.
             for transcript in asr_results:
-                text_parts.append(f"[Video audio transcription]: {transcript}")
+                if transcript:
+                    text_parts.append(f"[Video audio transcription]: {transcript}")
 
             d["text"] = "\n".join(p for p in text_parts if p)
             return d
@@ -616,15 +705,27 @@ class Preprocessor:
 
     # -- internal helpers ---------------------------------------------------
 
-    async def _transcribe(self, url: str) -> str:
+    async def _transcribe(self, url: str) -> str | None:
         assert self.asr is not None
-        return await _transcribe_media(url, self.asr)
+        try:
+            return await _transcribe_media(url, self.asr)
+        except Exception as exc:
+            msg = f"ASR unavailable — caption skipped ({url}): {exc}"
+            logger.warning(msg)
+            _record_ingest_warning(msg)
+            return None
 
     _DESCRIBE_SYSTEM_PROMPT = _DESCRIBE_SYSTEM_PROMPT_SIMPLE
 
-    async def _describe(self, doc_dict: dict[str, Any], query: str | dict[str, Any] | None = None) -> str:
+    async def _describe(self, doc_dict: dict[str, Any], query: str | dict[str, Any] | None = None) -> str | None:
         assert self.vlm is not None
-        return await _describe_doc(doc_dict, query, self.vlm, self._DESCRIBE_SYSTEM_PROMPT)
+        try:
+            return await _describe_doc(doc_dict, query, self.vlm, self._DESCRIBE_SYSTEM_PROMPT)
+        except Exception as exc:
+            msg = f"VLM unavailable — caption skipped ({doc_dict.get('source', '(unknown)')}): {exc}"
+            logger.warning(msg)
+            _record_ingest_warning(msg)
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -753,14 +854,17 @@ class Postprocessor:
                 and not has_video_audio_caption
             ):
                 for transcript in asr_results:
+                    if not transcript:
+                        continue
                     caption = f"[Video audio transcription]: {transcript}"
                     result["text"] = result["text"] + "\n" + caption if result.get("text") else caption
 
             # -- VLM description --------------------------------------------
             if needs_vlm and self.vlm is not None:
                 desc = vlm_results[0]
-                desc_text = f"[Media description]: {desc}"
-                result["text"] = result["text"] + "\n" + desc_text if result.get("text") else desc_text
+                if desc:
+                    desc_text = f"[Media description]: {desc}"
+                    result["text"] = result["text"] + "\n" + desc_text if result.get("text") else desc_text
 
             # -- Audio link (always — no ASR at retrieval) -----------------
             # Always emit a clickable link for audio results so the LLM
@@ -794,15 +898,27 @@ class Postprocessor:
 
     # -- internal helpers ---------------------------------------------------
 
-    async def _transcribe(self, url: str) -> str:
+    async def _transcribe(self, url: str) -> str | None:
         assert self.asr is not None
-        return await _transcribe_media(url, self.asr)
+        try:
+            return await _transcribe_media(url, self.asr)
+        except Exception as exc:
+            msg = f"ASR unavailable — caption skipped ({url}): {exc}"
+            logger.warning(msg)
+            _record_ingest_warning(msg)
+            return None
 
     _DESCRIBE_SYSTEM_PROMPT = _DESCRIBE_SYSTEM_PROMPT_WITH_SOURCE
 
-    async def _describe(self, doc_dict: dict[str, Any], query: str | dict[str, Any] | None = None) -> str:
+    async def _describe(self, doc_dict: dict[str, Any], query: str | dict[str, Any] | None = None) -> str | None:
         assert self.vlm is not None
-        return await _describe_doc(doc_dict, query, self.vlm, self._DESCRIBE_SYSTEM_PROMPT, log_timing=True)
+        try:
+            return await _describe_doc(doc_dict, query, self.vlm, self._DESCRIBE_SYSTEM_PROMPT, log_timing=True)
+        except Exception as exc:
+            msg = f"VLM unavailable — caption skipped ({doc_dict.get('source', '(unknown)')}): {exc}"
+            logger.warning(msg)
+            _record_ingest_warning(msg)
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -844,8 +960,12 @@ class MultimodalRAG:
                 if m is not None:
                     m.remote()
 
-        if self.caption_with_asr:
-            assert self.asr is not None, "To caption video, an `asr` model must be provided"
+        if self.caption_with_asr and self.asr is None:
+            logger.warning(
+                "caption_with_asr is enabled but no ASR model is configured; "
+                "video audio-track captioning will be skipped (auto-disabled). "
+                "Set MODEL_ASR_URL or pass an `asr` model to enable it."
+            )
 
         self._preprocessor = Preprocessor(
             vlm=self.vlm,
@@ -854,7 +974,15 @@ class MultimodalRAG:
             caption_with_vlm=self.caption_with_vlm,
             chunk_size=self.preprocess_chunk_size,
         )
-        self._postprocessor = Postprocessor(vlm=self.vlm, asr=self.asr, caption_with_asr=False)
+        # caption_with_asr is passed through so retrieval can still transcribe
+        # video audio tracks for docs ingested WITHOUT captioning (e.g. created
+        # before the flag was enabled).  The Postprocessor skips this when an
+        # ingest-time "[Video audio transcription]:" caption already exists.
+        self._postprocessor = Postprocessor(
+            vlm=self.vlm,
+            asr=self.asr,
+            caption_with_asr=self.caption_with_asr,
+        )
 
         vs = self.vector_store
         if isinstance(vs, dict):
@@ -1601,9 +1729,27 @@ class MultimodalRAG:
                 twin_parent_ids.append(idx)
 
             # ── 1. Embed this sub-batch (multimodal + text-only twins) ──────
+            # Ingest-time VLM/ASR captions are stored in the payload so the
+            # retrieval Postprocessor can reuse them for the LLM.  Only PURE
+            # media docs (no real extracted text) get their caption lines
+            # stripped from the embedding input — for those the raw image/
+            # video is what should drive the vector, not the caption wording.
+            # Docs that carry real text (e.g. a PDF page with an image) keep
+            # the extracted text AND the caption in the embedding.  Docs
+            # whose media modality is not supported by the embedder (e.g.
+            # audio today) also keep their caption text as the embeddable
+            # content — there is nothing else to embed.
             t1 = time.monotonic()
-            sub_embs = await self.embed.aembed_documents(sub)
+            embed_inputs = [
+                _strip_embed_caption(d, self._embed_modalities) if isinstance(d, dict) else d
+                for d in sub
+            ]
+            sub_embs = await self.embed.aembed_documents(embed_inputs)
             if twin_embed_docs:
+                # Twins embed text only (media keys removed). They are only
+                # created for docs that carry REAL text (see _has_real_text
+                # gating above), and real-text docs keep their VLM caption in
+                # the embedding — so no caption stripping here.
                 twin_embs = await self.embed.aembed_documents(twin_embed_docs)
                 sub_embs.extend(twin_embs)
             t_embed_total += time.monotonic() - t1
@@ -2108,8 +2254,12 @@ class MultiModalRAGSystem:
         self.llm = llm
         if remote:
             self.llm.remote()
-        if caption_with_asr:
-            assert asr is not None, "To caption video, an `asr` model must be provided"
+        if caption_with_asr and asr is None:
+            logger.warning(
+                "caption_with_asr is enabled but no ASR model is provided; "
+                "video audio-track captioning will be disabled (auto-disabled). "
+                "Pass an `asr` model to enable it."
+            )
         self._rag = MultimodalRAG(
             embedder=embedder,
             reranker=reranker,

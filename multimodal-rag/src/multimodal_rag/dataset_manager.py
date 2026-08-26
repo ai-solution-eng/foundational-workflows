@@ -8,6 +8,7 @@ uploaded files stored on a PVC at ``/data/datasets/<name>/files/``.
 
 import base64
 import contextlib
+import contextvars
 import hashlib
 import json
 import mimetypes
@@ -1009,8 +1010,9 @@ class DatasetManager:
     qdrant_port:
         Qdrant gRPC port.
     embedder, reranker, vlm, asr:
-        Model instances.  Uses defaults from :mod:`pcai_models` when
-        ``None``.
+        Model instances.  A missing optional model (``None``) disables its
+        feature (VLM captioning / ASR transcription / reranking) — no
+        hardcoded fallback is applied.
     caption_with_asr:
         Whether to transcribe audio tracks from videos via ASR.
     remote:
@@ -1038,38 +1040,15 @@ class DatasetManager:
         self.qdrant_host = qdrant_host
         self.qdrant_port = qdrant_port
 
-        if embedder is None:
-            try:
-                from multimodal_rag.utils.pcai_models import qwen3_vl_8B
-
-                embedder = qwen3_vl_8B
-            except ImportError:
-                pass
-        if reranker is None:
-            try:
-                from multimodal_rag.utils.pcai_models import qwen3_vl_reranker_8B
-
-                reranker = qwen3_vl_reranker_8B
-            except ImportError:
-                pass
-        if vlm is None:
-            try:
-                from multimodal_rag.utils.pcai_models import gemma4_31B
-
-                vlm = gemma4_31B
-            except ImportError:
-                pass
-        if asr is None:
-            try:
-                from multimodal_rag.utils.pcai_models import cohere_transcribe_3_2b
-
-                asr = cohere_transcribe_3_2b
-            except ImportError:
-                pass
+        # No hardcoded fallbacks: models come from the environment
+        # (model_config.build_all, env MODEL_*_URL).  A missing optional
+        # model stays None and simply disables its feature (VLM captioning /
+        # ASR transcription / reranking) rather than silently pointing at a
+        # baked-in endpoint.
         if embedder is None:
             raise RuntimeError(
                 "Embedder model is required — set MODEL_EMBEDDER_NAME and "
-                "MODEL_EMBEDDER_URL, or ensure the default can be imported."
+                "MODEL_EMBEDDER_URL."
             )
 
         self.embedder = embedder
@@ -1473,15 +1452,31 @@ class DatasetManager:
         return self._strip_password(meta)
 
     def update_dataset(self, name: str, updates: dict[str, Any]) -> None:
-        """Update metadata fields (e.g. description) for an existing dataset."""
+        """Update metadata fields for an existing dataset.
+
+        Captioning flags can be changed at any time — the cached RAG is
+        rebuilt so the new settings apply to subsequent ingests and
+        retrievals without a restart. Only affects future operations;
+        already-ingested content keeps its stored captions.
+        """
         with self._get_meta_lock(name):
             meta = self._read_meta(name)
             if not meta:
                 raise FileNotFoundError(f"Dataset '{name}' not found")
+            caption_changed = False
             for key in ("description", "caption_with_asr", "caption_with_vlm", "keep_originals"):
                 if key in updates:
-                    meta[key] = updates[key]
+                    if key in ("caption_with_asr", "caption_with_vlm"):
+                        meta[key] = bool(updates[key])
+                        caption_changed = True
+                    else:
+                        meta[key] = updates[key]
             self._write_meta(name, meta)
+        # Rebuild the cached RAG so the new caption flags take effect now.
+        if caption_changed:
+            with self._rag_cache_lock:
+                self._rag_cache.pop(name, None)
+            logger.info("Dataset '%s' caption settings updated; RAG cache invalidated", name)
 
     # ------------------------------------------------------------------
     # Adding content
@@ -1729,7 +1724,11 @@ class DatasetManager:
                             progress_callback({"file": fname, "status": "error", "error": str(exc)})
                     batch_queue.task_done()
 
-        consumer_thread = threading.Thread(target=consumer, daemon=True)
+        # Propagate the caller's context (incl. the ingest-warning collector
+        # from rag_system._ingest_warnings) into the consumer thread.
+        consumer_thread = threading.Thread(
+            target=lambda: contextvars.copy_context().run(consumer), daemon=True
+        )
         consumer_thread.start()
 
         # -- Producer: preprocess files, queue batches --------------------------

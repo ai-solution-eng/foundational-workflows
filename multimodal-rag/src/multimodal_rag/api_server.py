@@ -46,6 +46,7 @@ from fastapi import (
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from multimodal_rag.dataset_manager import DatasetManager, EmbedderMismatchError, _cross_process_lock
+from multimodal_rag.rag_system import _ingest_warnings
 from multimodal_rag.utils.general_tools import sync_pool
 from multimodal_rag.utils.logging_utils import logging, setup_logger
 
@@ -901,11 +902,14 @@ async def api_create_dataset(body: dict[str, Any] = Body(...)):
 
         {"name": "my-dataset", "description": "...", "caption_with_asr": false, "caption_with_vlm": false, "keep_originals": true, "password": "secret"}
 
-    ``caption_with_asr`` (default ``false``) controls whether audio tracks
-    from uploaded videos are transcribed during ingestion.
-    ``caption_with_vlm`` (default ``false``) controls whether images/videos
-    are described by the VLM during ingestion (enriching text for the
-    embedder and enabling VLM-skip at retrieval for generic queries).
+    ``caption_with_asr`` (defaults to the server config,
+    ``RAG_CAPTION_WITH_ASR``) controls whether audio tracks from uploaded
+    videos are transcribed during ingestion.
+    ``caption_with_vlm`` (defaults to ``RAG_CAPTION_WITH_VLM``) controls
+    whether images/videos are described by the VLM during ingestion
+    (enriching text for the embedder and enabling VLM-skip at retrieval
+    for generic queries).  When the corresponding model is unavailable,
+    the flag is auto-disabled with a warning.
     ``keep_originals`` (default ``true``) controls whether original
     full-quality files are kept on disk after preprocessing.
     ``password`` is optional — if set, all read operations on the dataset
@@ -915,12 +919,15 @@ async def api_create_dataset(body: dict[str, Any] = Body(...)):
     if not name:
         raise HTTPException(400, "Field 'name' is required")
     description = body.get("description", "")
-    caption_with_asr = body.get("caption_with_asr", False)
-    caption_with_vlm = body.get("caption_with_vlm", False)
+    dm = await get_manager_async()
+    # Defaults follow the server-wide config (env RAG_CAPTION_WITH_ASR /
+    # RAG_CAPTION_WITH_VLM, set from the Helm chart); per-request values
+    # in the body override them.
+    caption_with_asr = body.get("caption_with_asr", dm.caption_with_asr)
+    caption_with_vlm = body.get("caption_with_vlm", dm.caption_with_vlm)
     keep_originals = body.get("keep_originals", True)
     password = body.get("password") or None
     try:
-        dm = await get_manager_async()
         loop = asyncio.get_running_loop()
         meta = await loop.run_in_executor(
             sync_pool,
@@ -1128,8 +1135,16 @@ async def api_add_documents(
         dm = await get_manager_async()
         _require_dataset_password(dm, name, x_dataset_password, request)
         loop = asyncio.get_running_loop()
-        ids = await loop.run_in_executor(sync_pool, dm.add_documents, name, payload)
-        return {"status": "ok", "stored_ids": ids, "count": len(ids)}
+        warnings: list[str] = []
+        token = _ingest_warnings.set(warnings)
+        try:
+            ids = await loop.run_in_executor(sync_pool, dm.add_documents, name, payload)
+        finally:
+            _ingest_warnings.reset(token)
+        resp = {"status": "ok", "stored_ids": ids, "count": len(ids)}
+        if warnings:
+            resp["warnings"] = warnings
+        return resp
     except FileNotFoundError:
         raise HTTPException(404, f"Dataset '{name}' not found")
 
@@ -1169,13 +1184,21 @@ async def api_upload_file(
             tmp.close()
 
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(sync_pool, dm.add_file, name, tmp_path, file.filename)
+        warnings: list[str] = []
+        token = _ingest_warnings.set(warnings)
+        try:
+            result = await loop.run_in_executor(sync_pool, dm.add_file, name, tmp_path, file.filename)
+        finally:
+            _ingest_warnings.reset(token)
         _record_upload_history(
             name,
             [{"file": file.filename, "chunks": result.get("chunks", 0)}],
             "files",
         )
-        return {"status": "ok", "file": file.filename, **result}
+        resp = {"status": "ok", "file": file.filename, **result}
+        if warnings:
+            resp["warnings"] = warnings
+        return resp
     except ValueError as e:
         raise HTTPException(400, str(e))
     except FileNotFoundError as e:
@@ -1231,6 +1254,8 @@ async def api_upload_files_batch(
         raise
 
     job_id = _upload_jobs.create(name, len(file_entries), source="files")
+    warnings: list[str] = []
+    warnings_token = _ingest_warnings.set(warnings)
 
     def _process() -> None:
         try:
@@ -1239,6 +1264,8 @@ async def api_upload_files_batch(
                 _upload_jobs.add_event(job_id, e)
 
             r = dm.add_files_batch(name, file_entries, progress_callback=cb)
+            if warnings:
+                r["warnings"] = warnings
             _upload_jobs.complete(job_id, r)
             _record_upload_history(name, r.get("files") or [], "files")
         except Exception as exc:
@@ -1258,6 +1285,7 @@ async def api_upload_files_batch(
 
     loop = asyncio.get_running_loop()
     loop.run_in_executor(None, _process)
+    _ingest_warnings.reset(warnings_token)
 
     return {"job_id": job_id, "status": "uploading", "total_files": len(file_entries)}
 
@@ -1286,6 +1314,8 @@ async def api_upload_urls_batch(
         raise HTTPException(404, f"Dataset '{name}' not found")
 
     job_id = _upload_jobs.create(name, len(urls), source="urls")
+    warnings: list[str] = []
+    warnings_token = _ingest_warnings.set(warnings)
 
     def _process() -> None:
         try:
@@ -1294,6 +1324,8 @@ async def api_upload_urls_batch(
                 _upload_jobs.add_event(job_id, e)
 
             r = dm.add_urls_batch(name, urls, progress_callback=cb)
+            if warnings:
+                r["warnings"] = warnings
             _upload_jobs.complete(job_id, r)
             _record_upload_history(name, r.get("files") or [], "urls")
         except Exception as exc:
@@ -1306,6 +1338,7 @@ async def api_upload_urls_batch(
 
     loop = asyncio.get_running_loop()
     loop.run_in_executor(None, _process)
+    _ingest_warnings.reset(warnings_token)
 
     return {"job_id": job_id, "status": "uploading", "total_files": len(urls)}
 

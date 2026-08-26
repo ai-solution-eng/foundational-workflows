@@ -76,6 +76,15 @@ Committed as three waves over the `checkpoint-pre-audit-fixes` baseline.
   now reports the resolved `media_type`.
 - **Hash-index cache**: `.hashes.json` reads are mtime-cached per process so
   large file sets are not re-read/re-parsed on every upload.
+- **No base64 media in the LLM result JSON**: `search_dataset`/`search_memory`
+  result JSON no longer carries heavy tier-3 `image`/`video`/`audio` base64
+  data URLs. The Postprocessor still consumes them internally to generate
+  descriptions, but the JSON handed back to the LLM drops a media key when
+  no tier-2 `preprocessed_*` ref exists to attach a viewable URL — a
+  matched video segment previously dumped megabytes of
+  `data:video/mp4;base64,...` into a text-only LLM's context (tens of
+  thousands of wasted tokens). Tier-2 refs are still substituted and
+  converted to signed HTTP URLs as before.
 - **Model connectivity monitoring**: the embedder is probed in the background
   every `MODEL_HEALTH_INTERVAL` (default 60 s); `/api/admin/health` exposes
   `models.embedder` status. The embedder gate drives the **readiness** probes

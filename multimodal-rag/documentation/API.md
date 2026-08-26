@@ -83,6 +83,21 @@ resp.raise_for_status()
 print(resp.json())
 ```
 
+### Update a dataset (dynamic captioning config)
+
+Captioning settings are **not** frozen at create time — patch them whenever
+you like; they apply to subsequent ingests/retrievals (no restart, no
+recreate). Already-ingested content keeps its stored captions.
+
+```bash
+curl -X PATCH "$BASE/api/datasets/$DATASET" \
+  -H 'Content-Type: application/json' \
+  -d '{"caption_with_asr": true, "caption_with_vlm": true}'
+```
+
+Any subset of `description`, `caption_with_asr`, `caption_with_vlm`,
+`keep_originals` may be sent.
+
 ---
 
 ## 3. Add content

@@ -526,6 +526,11 @@
         style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem">
       <button class="btn btn-primary btn-sm" onclick="saveDescription()">Save</button>
     </div>
+    <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-weight:400;font-size:.85rem" title="Transcribe video audio tracks via ASR for NEW uploads to this dataset.">Caption with ASR <input type="checkbox" id="edit-caption-asr"></label>
+      <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-weight:400;font-size:.85rem;margin-left:8px" title="VLM-describe images/videos at ingest for NEW uploads. Enables VLM-skip at retrieval.">Caption with VLM <input type="checkbox" id="edit-caption-vlm"></label>
+      <button class="btn btn-primary btn-sm" onclick="saveDatasetSettings()" title="Apply captioning settings now — affects future ingests/retrievals">Save Captions</button>
+    </div>
     <div id="doc-list" style="margin-top:12px"></div>
   </div>
 
@@ -677,6 +682,10 @@ async function selectDataset(name) {
   document.getElementById('selected-meta').textContent =
     `${d.document_count || 0} documents · ${d.description || 'no description'} · created ${d.created ? new Date(d.created).toLocaleDateString() : 'unknown'}`;
   document.getElementById('desc-edit').value = d.description || '';
+  const cAsr = document.getElementById('edit-caption-asr');
+  const cVlm = document.getElementById('edit-caption-vlm');
+  if (cAsr) cAsr.checked = !!d.caption_with_asr;
+  if (cVlm) cVlm.checked = !!d.caption_with_vlm;
   document.getElementById('doc-list').innerHTML = '';
 
   // If dataset is password-protected and we don't have a password yet, prompt
@@ -967,6 +976,16 @@ async function pollJob(jobId, fileLabel, fileKey, updateLine, chunkTotals, chunk
         lastEventIdx = events.length;
 
         if (job.status === 'complete') {
+          const warns = (job.result && job.result.warnings) || [];
+          if (warns.length) {
+            const lineEl = document.querySelector('div[data-file-key="' + fileKey + '"]');
+            if (lineEl) {
+              const w = document.createElement('div');
+              w.style.marginTop = '2px'; w.style.fontSize = '.78rem'; w.style.color = '#b45309';
+              w.textContent = '⚠ ' + warns.length + ' caption(s) skipped — ' + warns[0] + (warns.length > 1 ? ' (+' + (warns.length - 1) + ' more)' : '');
+              lineEl.appendChild(w);
+            }
+          }
           if (onOk) onOk(fileLabel);
           resolve();
           return;
@@ -1018,7 +1037,13 @@ async function addText() {
   const body = Array.isArray(payload) ? payload : [payload];
   try {
     const res = await api('POST', `/api/datasets/${selectedDataset}/documents`, body, undefined, passwordHeader());
-    status.textContent = `✓ ${res.count} document(s) stored`;
+    status.innerHTML = `<span style="color:var(--green)">✓ ${res.count} document(s) stored</span>`;
+    if (res.warnings && res.warnings.length) {
+      const w = document.createElement('div');
+      w.style.marginTop = '4px'; w.style.fontSize = '.78rem'; w.style.color = '#b45309';
+      w.textContent = '⚠ ' + res.warnings.length + ' caption(s) skipped: ' + res.warnings.join('; ');
+      status.appendChild(w);
+    }
     input.value = '';
     await listDatasets();
   } catch (e) {
@@ -1522,6 +1547,26 @@ async function deleteDocument(docId) {
   }
 }
 
+async function saveDatasetSettings() {
+  if (!selectedDataset) return;
+  const cAsr = document.getElementById('edit-caption-asr');
+  const cVlm = document.getElementById('edit-caption-vlm');
+  if (!cAsr || !cVlm) return;
+  const body = {
+    caption_with_asr: cAsr.checked,
+    caption_with_vlm: cVlm.checked,
+  };
+  try {
+    await api('PATCH', '/api/datasets/' + selectedDataset, body);
+    toast('Caption settings applied (affects new content)');
+    listDatasets();
+    const d = datasets.find(x => x.name === selectedDataset);
+    if (d) { d.caption_with_asr = cAsr.checked; d.caption_with_vlm = cVlm.checked; }
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
 async function saveDescription() {
   if (!selectedDataset) return;
   const desc = document.getElementById('desc-edit').value.trim();
@@ -2001,6 +2046,20 @@ async function initCaptionCheckboxes() {
     vlmCheckbox.disabled = !hasVlm;
     vlmCheckbox.parentElement.style.opacity = hasVlm ? '1' : '0.5';
     vlmCheckbox.parentElement.style.cursor = hasVlm ? 'pointer' : 'not-allowed';
+    // Edit-dataset caption checkboxes: reflect model availability only
+    // (checked state comes from the dataset's stored flags via selectDataset).
+    const editAsr = document.getElementById('edit-caption-asr');
+    if (editAsr) {
+      editAsr.disabled = !hasAsr;
+      editAsr.parentElement.style.opacity = hasAsr ? '1' : '0.5';
+      editAsr.parentElement.style.cursor = hasAsr ? 'pointer' : 'not-allowed';
+    }
+    const editVlm = document.getElementById('edit-caption-vlm');
+    if (editVlm) {
+      editVlm.disabled = !hasVlm;
+      editVlm.parentElement.style.opacity = hasVlm ? '1' : '0.5';
+      editVlm.parentElement.style.cursor = hasVlm ? 'pointer' : 'not-allowed';
+    }
     // Reranker: hide checkbox + Rerank K input when no reranker model
     if (!hasReranker) {
       document.getElementById('search-reranker-wrap').style.display = 'none';

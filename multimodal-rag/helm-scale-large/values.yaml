@@ -15,7 +15,7 @@
 replicaCount: 2
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v2.3.0
+  tag: v2.4.0
   pullPolicy: IfNotPresent
 
 deployment:
@@ -136,8 +136,8 @@ s3:
 
 # -- RAG parameters -----------------------------------------------------------
 rag:
-  captionWithAsr: false  # Transcribe video audio tracks via ASR
-  captionWithVlm: false  # VLM-describe images/videos at ingest (enables VLM-skip at retrieval)
+  captionWithAsr: true  # Transcribe video audio tracks via ASR (auto-disables when no ASR model)
+  captionWithVlm: true  # VLM-describe images/videos at ingest (enables VLM-skip at retrieval; auto-disables if no VLM)
   remote: false         # Use remote model URLs (vs in-cluster .svc.cluster.local)
   dedupThreshold: 0.995  # Cosine similarity above which a doc is considered a duplicate (0.0–1.0)
   # When true, get_dataset() does NOT auto-sync document_count from Qdrant
@@ -258,7 +258,7 @@ extraEnv: {}
 
 security:
   apiKey: ""
-  mediaTokenSecret: ""
+  mediaTokenSecret: "48b00cdf6d0979891ada5b3e51a5dd883ee752a5a1256b578c8271c30569944d"
   mediaTokenTtl: 3600
   ingestAllowHosts: ""
   blockPrivateHosts: true

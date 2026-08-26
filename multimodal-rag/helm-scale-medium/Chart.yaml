@@ -2,7 +2,7 @@ apiVersion: v2
 name: rag-mcp-scale-medium
 description: Generation-2 scale variant - scale chart architecture (gunicorn workers, multi-replica Qdrant, Redis unlock cache) with a reduced resource footprint for drop-in testing on the current cluster
 type: application
-version: 2.3.0
-appVersion: "2.3.0"
+version: 2.4.0
+appVersion: "2.4.0"
 sources:
   - https://github.com/ai-solution-eng/internal-projects/tree/main/multimodal-rag-project
