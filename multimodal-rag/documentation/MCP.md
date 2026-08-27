@@ -30,7 +30,7 @@ layout.
 > it. Converted media URLs always carry a short-lived HMAC `?token=` (never
 > the dataset password), which the API server verifies when serving files.
 
-> **Multi-replica deployments (helm-scale / helm-scale-g2):** the MCP
+> **Multi-replica deployments (helm-scale-medium / helm-scale-large):** the MCP
 > server runs `stateless_http=True` + `json_response=True` so any pod
 > can handle any request — no in-memory session state. Dataset unlock
 > state is shared across pods via Redis (`redis.enabled=true`). This is

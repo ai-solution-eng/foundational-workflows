@@ -8,14 +8,17 @@ deployment see [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md).
 
 ## 1. HTML Frontend (Dataset Manager UI)
 
-Start it:
+Start it (from the repo root, with the package on `PYTHONPATH`):
 
 ```bash
-cd /workspace/src/multimodal_rag
-python -m uvicorn html_frontend.main:app --host 0.0.0.0 --port 8000 --reload
+cd /home/andrew/Code/HPE/MultimodalRAG
+PYTHONPATH=src python -m multimodal_rag.api_server --host 0.0.0.0 --port 8000
 ```
 
-Open `http://localhost:8000`.
+`MEDIA_TOKEN_SECRET` must be set (the server refuses to start without it):
+`MEDIA_TOKEN_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")`.
+Open `http://localhost:8000` (the HTML frontend lives at `/`, served from
+`src/multimodal_rag/templates/index.html`).
 
 | Action | How |
 |---|---|
@@ -85,7 +88,7 @@ inputs = [
 
 ## 3. REST API
 
-The API server exposes 17+ REST endpoints. Key ones:
+The API server exposes 35 REST endpoints. Key ones:
 
 | Method | Path | Purpose |
 |--------|------|---------|

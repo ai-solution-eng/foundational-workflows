@@ -15,6 +15,7 @@ exposed via a REST API, an HTML frontend, and an MCP server.
 ## Features
 
 - **Joint multimodal embedding** (text, image, video) via Qwen3-VL-Embedding-8B — search with any combination of modalities
+- **Dual-embedding "twins"** — PDFs get a text-only twin so text queries match; images/videos/audio get a caption twin (media + caption) so caption wording is searchable alongside the raw-media embedding; unsupported media degrades to caption-only or is skipped
 - **Audio support** via ASR transcription (Cohere Transcribe) — audio is converted to text before embedding
 - **17+ file formats** with format-specific chunking: PDF (page-by-page + image extraction), images, video (overlapping segments), audio, text/markdown, JSON, XML, YAML, CSV/Excel, code (16 languages), HTML, Office docs, Jupyter notebooks, EPUB, log files, archives
 - **Cross-encoder reranking** via Qwen3-VL-Reranker-8B for improved precision at the cost of latency
@@ -114,8 +115,8 @@ opt-in protection (per-process env vars, or first-class [Helm
 | `CONFIG_DIR` | `:`-separated dirs of mounted ConfigMap/Secret files (one file per env key). When set, model config is **live-reloaded** on file change — no rollout needed (charts mount `-config` and `-model-keys` at `/etc/rag/config:/etc/rag/secrets`). The new embedder is verified before swap; an unreachable one is rejected and the old config is kept. | unset (env-only, rollout required) |
 | `QUERY_EMB_CACHE_MAX`, `FILE_HASH_CACHE_MAX`, `ASR_TRANSCRIPT_CACHE_MAX`, `UNLOCK_CACHE_MAX` | Bounded sizes for the in-process caches. | 4096 / 4096 / 512 / 4096 |
 
-All defaults preserve the pre-1.9 behaviour. `helm/`, `helm-scale/` and
-`helm-scale-g2/` ship a `security:` values block wired to these flags, e.g.:
+All defaults preserve the pre-1.9 behaviour. `helm/`, `helm-scale-large/` and
+`helm-scale-medium/` ship a `security:` values block wired to these flags, e.g.:
 
 ```bash
 helm upgrade multimodal-rag ./helm \

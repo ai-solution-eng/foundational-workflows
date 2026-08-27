@@ -71,5 +71,4 @@ data:
   {{- if .Values.redis.enabled }}
   # Redis-backed cross-pod unlock cache
   REDIS_URL: {{ printf "redis://%s-redis.%s.svc.cluster.local:%d" .Values.deployment.name .Release.Namespace (int .Values.redis.port) | quote }}
-  REDIS_UNLOCK_TTL: {{ .Values.redis.unlockTtl | quote }}
   {{- end }}

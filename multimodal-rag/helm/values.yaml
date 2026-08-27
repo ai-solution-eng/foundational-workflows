@@ -8,7 +8,7 @@
 replicaCount: 1
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v2.4.0
+  tag: v2.5.0
   pullPolicy: IfNotPresent
 
 deployment:
@@ -113,7 +113,6 @@ service:
   api:
     type: ClusterIP
     port: 80
-    targetPort: 8000
   mcp:
     type: ClusterIP
 
@@ -163,7 +162,6 @@ security:
 # -- PCAI ---------------------------------------------------------------------
 ezua:
   enabled: true
-  domainName: "${DOMAIN_NAME}"
   # configure the application endpoint
 
   virtualService:

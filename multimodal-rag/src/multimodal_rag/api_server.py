@@ -12,6 +12,7 @@ Or via Python::
 
 import argparse
 import asyncio
+import contextvars
 import datetime
 import io
 import json
@@ -27,6 +28,7 @@ import time
 import urllib.parse
 import uuid
 from collections.abc import Iterator
+from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -52,6 +54,25 @@ from multimodal_rag.utils.logging_utils import logging, setup_logger
 
 logger = logging.getLogger(__name__)
 
+
+def _submit_with_context(executor, fn, *args, **kwargs):
+    """Submit *fn(*args, **kwargs)* to *executor* keeping this thread's
+    contextvars active in the worker thread.
+
+    ``run_in_executor`` hands *fn* to a thread-pool worker whose contextvars
+    are the empty default, so the ingest-warning collector (``_ingest_warnings``
+    in :mod:`rag_system`) set in this request handler would be invisible there
+    and every skip/caption warning would silently vanish before the UI can
+    return it.  ``contextvars.copy_context()`` is evaluated HERE (the handler
+    thread, with the collector set) and ``Context.run`` executes *fn* under it
+    in the worker — and transitively under the background event loop and the
+    consumer threads that ``sync_wrapper_safe``/``add_files_batch`` spawn, so
+    warnings accumulate into the same list the handler returns.
+    """
+    ctx = contextvars.copy_context()
+    return asyncio.get_running_loop().run_in_executor(executor, ctx.run, lambda: fn(*args, **kwargs))
+
+
 # ---------------------------------------------------------------------------
 # Upload job tracker (thread-safe, poll-based progress)
 # ---------------------------------------------------------------------------
@@ -63,29 +84,80 @@ class _UploadJobTracker:
     Replaces the previous SSE stream approach which tied upload lifecycle
     to a persistent HTTP connection.  With polling, a browser tab can be
     closed and reopened without losing progress tracking.
+
+    Job state lives in-process **and** is mirrored to Redis (when
+    ``REDIS_URL`` is configured and reachable), so in multi-worker /
+    multi-replica deployments any API process can answer a progress poll for
+    a job that another process created — the in-memory-only tracker returned
+    "Job not found" whenever the load balancer landed the poll on a different
+    gunicorn worker or pod (e.g. recreate under the 4-replica × 4-worker
+    scale chart).  Without Redis it degrades to in-memory-only (single
+    process) behaviour.
     """
+
+    _REDIS_PREFIX = "upload_job:"
+    # Long enough for big batch/recreate ingests; cleanup is via Redis TTL.
+    _REDIS_TTL_SECONDS = 6 * 3600
 
     def __init__(self) -> None:
         self._jobs: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
+    def _redis(self):
+        """Best-effort shared Redis client (reuses dataset_manager's)."""
+        try:
+            return _get_redis()
+        except Exception:
+            return None
+
+    def _redis_key(self, job_id: str) -> str:
+        return f"{self._REDIS_PREFIX}{job_id}"
+
+    def _redis_set(self, job: dict[str, Any]) -> None:
+        r = self._redis()
+        if r is None:
+            return
+        try:
+            r.set(self._redis_key(job["job_id"]), json.dumps(job, default=str), ex=self._REDIS_TTL_SECONDS)
+        except Exception:
+            # Best-effort mirror; the in-process copy remains authoritative
+            # for the owning worker.
+            pass
+
+    def _redis_get(self, job_id: str) -> dict[str, Any] | None:
+        r = self._redis()
+        if r is None:
+            return None
+        try:
+            raw = r.get(self._redis_key(job_id))
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+
     def create(self, dataset_name: str, total_files: int, source: str = "files") -> str:
         job_id = uuid.uuid4().hex[:12]
+        job = {
+            "job_id": job_id,
+            "dataset": dataset_name,
+            "source": source,
+            "status": "uploading",
+            "total_files": total_files,
+            "processed_files": 0,
+            "total_chunks": 0,
+            "events": [],
+            "result": None,
+            "error": None,
+            "created_at": time.time(),
+            "completed_at": None,
+        }
         with self._lock:
-            self._jobs[job_id] = {
-                "job_id": job_id,
-                "dataset": dataset_name,
-                "source": source,
-                "status": "uploading",
-                "total_files": total_files,
-                "processed_files": 0,
-                "total_chunks": 0,
-                "events": [],
-                "result": None,
-                "error": None,
-                "created_at": time.time(),
-                "completed_at": None,
-            }
+            self._jobs[job_id] = job
+        self._redis_set(job)
         return job_id
 
     def add_event(self, job_id: str, event: dict[str, Any]) -> None:
@@ -104,6 +176,7 @@ class _UploadJobTracker:
                 job["total_chunks"] += event.get("chunks", 0)
             elif status == "error":
                 job["processed_files"] += 1
+        self._redis_set(job)
 
     def complete(self, job_id: str, result: dict[str, Any] | None = None) -> None:
         with self._lock:
@@ -113,6 +186,7 @@ class _UploadJobTracker:
             job["status"] = "complete"
             job["result"] = result
             job["completed_at"] = time.time()
+        self._redis_set(job)
 
     def fail(self, job_id: str, error: str) -> None:
         with self._lock:
@@ -122,16 +196,21 @@ class _UploadJobTracker:
             job["status"] = "error"
             job["error"] = error
             job["completed_at"] = time.time()
+        self._redis_set(job)
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is None:
-                return None
+        if job is not None:
             return dict(job)
+        return self._redis_get(job_id)
 
     def cleanup_old(self, max_age_seconds: int = 3600) -> None:
-        """Remove completed jobs older than *max_age_seconds*."""
+        """Remove completed jobs older than *max_age_seconds*.
+
+        Only the in-process copy is pruned here; Redis keys expire via their
+        own TTL so another worker can still answer a poll for them.
+        """
         now = time.time()
         with self._lock:
             stale = [
@@ -579,9 +658,23 @@ def _require_dataset_password(
 # FastAPI app
 # ---------------------------------------------------------------------------
 
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Run startup initialisation, then serve.
+
+    Replaces the deprecated ``@app.on_event("startup")`` hook (removed in
+    FastAPI 0.99+).  ``_eager_init`` is defined later in this module; the
+    reference resolves lazily when the lifespan actually runs at startup.
+    """
+    await _eager_init()
+    yield
+
+
 app = FastAPI(
     title="Multimodal RAG Dataset Manager",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 
@@ -711,7 +804,6 @@ def _reload_models() -> None:
     )
 
 
-@app.on_event("startup")
 async def _eager_init() -> None:
     """Pre-initialise the DatasetManager before accepting traffic.
 
@@ -1134,11 +1226,10 @@ async def api_add_documents(
     try:
         dm = await get_manager_async()
         _require_dataset_password(dm, name, x_dataset_password, request)
-        loop = asyncio.get_running_loop()
         warnings: list[str] = []
         token = _ingest_warnings.set(warnings)
         try:
-            ids = await loop.run_in_executor(sync_pool, dm.add_documents, name, payload)
+            ids = await _submit_with_context(sync_pool, dm.add_documents, name, payload)
         finally:
             _ingest_warnings.reset(token)
         resp = {"status": "ok", "stored_ids": ids, "count": len(ids)}
@@ -1183,11 +1274,10 @@ async def api_upload_file(
         finally:
             tmp.close()
 
-        loop = asyncio.get_running_loop()
         warnings: list[str] = []
         token = _ingest_warnings.set(warnings)
         try:
-            result = await loop.run_in_executor(sync_pool, dm.add_file, name, tmp_path, file.filename)
+            result = await _submit_with_context(sync_pool, dm.add_file, name, tmp_path, file.filename)
         finally:
             _ingest_warnings.reset(token)
         _record_upload_history(
@@ -1283,8 +1373,7 @@ async def api_upload_files_batch(
                 except Exception:
                     logger.debug("Suppressed exception", exc_info=True)
 
-    loop = asyncio.get_running_loop()
-    loop.run_in_executor(None, _process)
+    _submit_with_context(None, _process)
     _ingest_warnings.reset(warnings_token)
 
     return {"job_id": job_id, "status": "uploading", "total_files": len(file_entries)}
@@ -1336,8 +1425,7 @@ async def api_upload_urls_batch(
             ]
             _record_upload_history(name, failed_files, "urls")
 
-    loop = asyncio.get_running_loop()
-    loop.run_in_executor(None, _process)
+    _submit_with_context(None, _process)
     _ingest_warnings.reset(warnings_token)
 
     return {"job_id": job_id, "status": "uploading", "total_files": len(urls)}

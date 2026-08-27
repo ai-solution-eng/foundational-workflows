@@ -100,7 +100,6 @@ security.blockPrivateHosts=true    # default on — blocks SSRF targets
 
 # PCAI / EZUA (Istio-based ingress)
 ezua.enabled=true
-ezua.domainName="your-domain.com"             # Must match cluster domain
 ezua.virtualService.endpoint="rag-mcp-server.your-domain.com"
 ezua.virtualService.istioGateway="istio-system/ezaf-gateway"
 ezua.virtualService.timeout=660s

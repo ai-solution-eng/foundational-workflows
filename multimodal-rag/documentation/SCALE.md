@@ -84,8 +84,9 @@ password whenever routed to a different pod/worker. The scale chart adds:
   `redis-server` in-memory (no persistence — unlock state is ephemeral).
 - `REDIS_URL` is injected into the ConfigMap, and the backend
   (`api_server.py`) lazily builds a Redis client. `_unlock_cache_get` /
-  `_unlock_cache_set` use Redis with a TTL (`REDIS_UNLOCK_TTL: 1800s`)
-  so a single unlock works across all pods.
+  `_unlock_cache_set` use Redis with a TTL (in-app `UNLOCK_TTL` default
+  1800 s — not chart-configurable) so a single unlock works across all
+  pods.
 - Falls back to in-memory dict if Redis is unavailable.
 
 Unlock identity is also derived from the authenticated user

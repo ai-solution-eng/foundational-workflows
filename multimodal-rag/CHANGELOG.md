@@ -3,9 +3,11 @@
 All notable changes to this project are tracked here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased] — audit-hardening series (targets v1.9.0)
+## [2.5.0] — 2026-08-27
 
-Committed as three waves over the `checkpoint-pre-audit-fixes` baseline.
+Audit-hardening release: caption twins for media, unified "skip entirely"
+drop + on-disk cleanup, ingest-warning surfacing to the UI, and Low-severity
+audit clean-ups. Committed over the `checkpoint-pre-audit-fixes` baseline.
 
 ### Wave 1 — MCP/REST hardening (no behavior change by default)
 
@@ -96,6 +98,93 @@ Committed as three waves over the `checkpoint-pre-audit-fixes` baseline.
   live-checks every configured model (`healthy` / `not_provided` /
   `unhealthy`), and the management page gained a "Test connections" button
   plus a live embedder status indicator.
+
+### Caption twins for media (dual-embedding ingest)
+
+- **Caption twins for image/video/audio**: pure-media docs (whose text is a
+  media placeholder + an ingest-time VLM/ASR caption) now get a *second*
+  embedding — the same media embedded **with** the caption text — in addition
+  to the base media-only embedding (which strips captions via
+  `_strip_embed_caption`). Caption wording is therefore searchable by text
+  queries that the raw-media embedding would miss. Gated by
+  `_media_caption_twin_needed()`: created only when the embedder supports the
+  doc's media modality AND a caption is present. If the embedder can't embed
+  the media but a VLM/ASR module can, the Preprocessor collapses the media to
+  caption text and embeds that (existing behaviour, unchanged); if neither
+  supports it, the media is skipped entirely. Twins share the parent's
+  `(source, page, chunk_index)` identity and are tagged `_twin=True`, so
+  retrieval `_dedup_twins()` still prefers the parent when both match.
+- New offline tests: `tests/full_pipeline/test_twins.py` (helper gating +
+  end-to-end ingest through the in-memory store with a stub embedder).
+
+### Ingest-warning surfacing fix
+
+- **Skip/caption warnings now reach the UI**: ingest warnings (media dropped
+  because neither the embedder nor a VLM/ASR supports it, ASR/VLM unavailable,
+  caption skipped) are collected per request and returned to the frontend as
+  `warnings` — single-file uploads and `POST /documents` return them in the
+  response body; batch-files/batch-urls attach them to the job result the UI
+  polls. Previously the collector (a `contextvars.ContextVar`) was invisible
+  to the thread-pool/background-loop workers that actually run ingestion, so
+  the `warnings` list always came back empty in every path. The four ingest
+  call sites in `api_server.py` now submit through
+  `_submit_with_context`, which copies the request context into the worker
+  threads. Regression test: `tests/full_pipeline/test_ingest_warnings.py`.
+
+### Audit clean-up (Low-severity)
+
+- **PIL file handle released** (`dataset_manager.py`): `Image.open(...)` in
+  `_preprocess_image_file` now runs under a `with` block, so the decoded
+  image's file handle is closed right after the size check instead of being
+  left to GC.
+- **Media-payload strip no longer silent** (`dataset_manager.py`):
+  `_strip_media_payloads` logs a warning when the Qdrant retrieve fails or a
+  `set_payload` group fails, instead of bare `return`/`continue` swallowing
+  the error.
+- **Deprecated FastAPI startup hooks removed**: `api_server.py` and
+  `embed_batcher.py` replaced `@app.on_event("startup")` with a
+  `lifespan=` context manager (the `on_event` API is removed in FastAPI
+  0.99+). Both apps still run the same eager init / config-watcher / health
+  loop / upload-prune work at startup; verified via `app.router.lifespan_context`.
+
+### Unified "skip entirely" drop + on-disk cleanup
+
+- **Uniform drop rule for all media types** (`rag_system.py`): audio, image
+  and video now behave identically when the embedder can't ingest the media
+  and no VLM/ASR can convert it to caption text — the media is removed and,
+  if nothing embeddable remains (no supported media, no caption text, no
+  real text — a bare `[Video: x.mp4] [0s–32s]` placeholder doesn't count),
+  the whole document is **omitted** and logged + surfaced as an ingest
+  warning. Previously image (kept but never embedded) and video (left a
+  placeholder-only doc) diverged from audio's drop.
+- **On-disk cleanup of dropped files** (`dataset_manager.py`): when every
+  document a file produced is dropped, the stored copy in `files/` (and its
+  `*_preprocessed` tier-2 sibling) is deleted and its content-hash entry
+  forgotten — a file that can never be used no longer occupies PVC space.
+  Deleting is guarded by a vector-store reference check (`_file_referenced`),
+  so a file still referenced by any Qdrant point is never orphaned; remote
+  (URL) ingests are never deleted. Wired into both the batch consumer and the
+  single-file/URL ingest path. New offline tests:
+  `tests/full_pipeline/test_ingest_drop_cleanup.py`.
+
+### Deployment fixes (found in mm-rag production)
+
+- **Recreate now actually re-embeds** (`dataset_manager.py`):
+  `recreate_dataset` clears the per-dataset ingest-dedup index
+  (`.ingested_hashes.json`) before re-processing, so it no longer skips every
+  previously-ingested file as "already ingested" and leaves the freshly-dropped
+  collection empty. Previously, "Recreate" dropped the Qdrant collection and
+  then stored **0** documents (files are skipped by content-hash dedup on the
+  second pass).
+- **Job progress is now shared across workers/pods** (`api_server.py`):
+  `_UploadJobTracker` mirrors each job to Redis (when `REDIS_URL` is set) with
+  a 6h TTL, so the poll-based `upload-status` endpoint answers from any API
+  process. The in-memory-only tracker returned `404 Job … not found` under the
+  scale chart (4 replicas × 4 gunicorn workers) whenever the load balancer
+  routed the progress poll to a different process than the one that created
+  the job — breaking progress for batch uploads and recreate. Falls back to
+  in-memory-only when Redis is unavailable.
+- New offline tests: `tests/full_pipeline/test_job_tracker_recreate.py`.
 
 ### Known limitations / future work
 

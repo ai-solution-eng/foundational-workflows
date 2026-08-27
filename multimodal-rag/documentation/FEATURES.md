@@ -384,6 +384,47 @@ When a HuggingFace tokenizer is bundled (`tokenizer_type="HuggingFace"`), all te
 - **File-level**: SHA-256 hash of input files; duplicates are skipped before copying to PVC. Tracked in `.hashes.json` per dataset.
 - **Vector-level**: cosine similarity > 0.995 against existing vectors — skipped before insertion. Uses a **single batched `query_batch_points` call** per sub-batch (1 HTTP request instead of 64 individual queries). The `score_threshold` is enforced server-side by Qdrant, so only matches above the threshold are returned. The InMemoryVectorStore path uses vectorised numpy cosine similarity (N×M matrix in one shot). The threshold is tunable via the `RAG_DEDUP_THRESHOLD` env var.
 
+**Dual-embedding ("twin") ingest:**
+A multimodal doc gets a *second* embedding ("twin") at ingest time so both
+visual and text queries can retrieve it. Every twin is tagged `_twin=True`
+and shares its parent's `(source, page, chunk_index, time-window)` identity
+so the retrieval dedup can collapse it when the parent also appears in the
+results (the parent always carries the media); a twin that matches alone is
+kept. The time-window component (`timestamp_start`/`timestamp_end`) keeps
+different segments of the same video from collapsing with each other.
+
+| Doc kind | Base embedding (primary) | Twin embedding |
+|----------|--------------------------|----------------|
+| Real extracted text + media (e.g. a PDF page) | text + media + caption | **Text-only twin** — same text, media stripped from the embedding input (media kept in the stored payload) |
+| Pure media + caption (image/video/audio) | **Media only** — caption lines stripped from the embedding input so the vector keys off the raw media | **Caption twin** — the same media embedded together with the VLM/ASR caption text, so caption wording is searchable |
+| Pure media, no caption | Media only | none — nothing for a twin to add |
+| Media the embedder doesn't support (e.g. audio) but a VLM/ASR exists | Caption text only — the Preprocessor converts the media to caption text (the media stays in the stored payload as a viewable `file://` ref) | none (the caption text embedding is the caption-only path) |
+| Media **neither** the embedder nor VLM/ASR can handle | **Dropped** — the media key is removed and the whole sample is **omitted** (logged + surfaced as an ingest warning) | — |
+
+**Unified "skip entirely" rule** (applies uniformly to audio, image and video):
+any media the embedder can't ingest and that no VLM/ASR can convert to text is
+removed; if nothing embeddable remains (no supported media, no caption text,
+no real extracted text) the document is omitted entirely — a bare
+`[Video: x.mp4] [0s–32s]` placeholder does not count as content. A doc that
+also carries embeddable content keeps it (e.g. real text with an
+unconvertible image → the image is dropped, the text is embedded).
+
+**On-disk cleanup:** when every document a file produced is dropped, the
+stored copy in `files/` (and its `*_preprocessed` tier-2 sibling) is deleted
+and its content-hash entry forgotten, so a file that can never be used does
+not sit on the PVC forever. Deleting is guarded: it only happens when no
+Qdrant point references the file's `source`, so nothing already retrievable
+is orphaned. The warning "Removed unreferenced file (…)" is surfaced to the
+UI alongside the drop warnings.
+
+Caption twins are created only when the embedder supports the doc's media
+modality **and** a caption line is present (`[Image description]`,
+`[Video description]`, `[Audio transcription]`, `[Video audio
+transcription]`). Gating lives in `_media_caption_twin_needed()` and the
+embedding-input splitting in `_strip_embed_caption()` (both in
+`rag_system.py`); see `tests/full_pipeline/test_twins.py` for the offline
+ingest tests that assert base vs twin embedding inputs.
+
 **Media payload stripping:** After embedding and storage, base64 data URLs in Qdrant payloads are replaced with lightweight `file://` PVC paths to reduce storage size. Existing valid `file://` refs are left alone; remote URLs (`http://`/`https://`/`s3://`) are kept as-is.
 
 **Batch ingestion**:
@@ -392,6 +433,7 @@ When a HuggingFace tokenizer is bundled (`tokenizer_type="HuggingFace"`), all te
 - `batch_score=128.0` (2.56 MB ≈ 1.0 score) bounds embedding API payload size.
 - **Generalized retry** (`retry_call` / `retry_async_call` in `general_tools.py`): 3 attempts with linear backoff; longer delays for connection errors. Used by S3 downloads, S3 prefix listing, and the embedding consumer.
 - Progress callback events: `preprocessing`, `preprocessed` (includes `total` estimated chunk count), `embedding` (includes `chunks` sub-batch size), `complete`, `error` — streamed to clients via SSE.
+- **Ingest warnings surface to the UI**: whenever media is dropped (neither the embedder nor a VLM/ASR supports it), ASR/VLM is unavailable, or a caption is skipped, a per-request warning is collected and returned as `warnings` — in the single-file / `POST /documents` response bodies and in the batch job result the frontend polls (rendered as "⚠ N caption(s) skipped: …"). The collector (`_ingest_warnings`) is a contextvar that `api_server._submit_with_context` propagates into the worker threads and background loop (plain `run_in_executor` would drop it).
 
 **Sub-batched embed → dedup → upsert**:
 - Documents are processed in sub-batches of ~64 (the embedder's `chunk_size`).
@@ -467,7 +509,7 @@ A routing step can optionally skip RAG entirely if the LLM determines it can ans
 
 ## API Server
 
-**30 REST endpoints** (`api_server.py`):
+**35 REST endpoints** (`api_server.py`):
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -499,6 +541,8 @@ A routing step can optionally skip RAG entirely if the LLM determines it can ans
 | GET | `/api/datasets/{name}/files/{filepath:path}` | Serve stored file (password via header or query) |
 | POST | `/api/staging` | Stage an upload for the MCP tools (returns `file://`/`http://` URLs) |
 | GET | `/api/staging/{staging_id}` | Download a staged file by id |
+| GET | `/api/admin/upload-history` | List recent upload/batch jobs (status, counts, errors) |
+| DELETE | `/api/admin/upload-history` | Prune completed/failed upload jobs |
 | POST | `/api/admin/datasets/{name}/migrate-tier-schema` | Migrate a dataset to the three-tier storage schema |
 | GET | `/api/admin/storage` | PVC disk usage + per-dataset stats |
 | GET | `/` | HTML frontend |
