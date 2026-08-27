@@ -1,5 +1,12 @@
 # Deployment Guide
 
+> **PCAI is a Kubernetes wrapper — you never run `helm` or `kubectl`.** You
+> import the packaged chart (`rag-mcp-server` `.tar.gz`) into PCAI once, then
+> drive the deployment by setting the chart's **`values.yaml`** in the PCAI
+> *Helm Values* editor (or via the PCAI API). Every `--set` in this guide maps
+> 1:1 to a key in `values.yaml`. There is no `envsubst` step — set the actual
+> domain value directly in `values.yaml`.
+
 ---
 
 > **⚠ Required config: `MEDIA_TOKEN_SECRET`**
@@ -9,192 +16,191 @@
 > tokens (the legacy `?password=` URLs were removed), and this shared secret
 > is what signs/verifies them. Deploying without it crashes both pods.
 >
-> Generate one and set it in the chart before deploying:
+> Generate one and set it in `values.yaml` before deploying:
 >
 > ```bash
 > python -c "import secrets; print(secrets.token_hex(32))"
-> # helm values: security.mediaTokenSecret="<output>"
-> # or --set security.mediaTokenSecret="<output>"
-> ```
->
-> Sanity-check a rendered chart locally (no cluster needed):
-> ```bash
-> helm template mm . -f helm/.values.yaml | grep MEDIA_TOKEN_SECRET
+> # -> values.yaml:  security.mediaTokenSecret: "<output>"
 > ```
 
 ---
 
 ## Prerequisites
 
-- Docker (or Podman) for building the image
-- A container registry you can push to (Docker Hub, GHCR, internal registry, etc.)
-- A Kubernetes cluster with Helm 3 installed
-- `kubectl` configured to access your cluster
+- A PCAI environment where you can import the packaged chart and edit its values.
+- The image is public in `ghcr.io/ai-solution-eng/...` — you only need
+  registry push access if you build a custom image.
+- Model endpoints (embedder, reranker, VLM, ASR) deployed through MLIS, with
+  their API tokens.
 
 ---
 
-## 1. Build and push the Docker image
+## 1. Import the chart in PCAI and set the image
 
-```bash
-# From the repo root
-docker build -f docker/Dockerfile -t your-registry/rag-api-server:latest .
+The packaged charts ship with
+`ghcr.io/ai-solution-eng/multimodal-rag-mcp:v2.5.0` as the default
+`image.repository`/`image.tag` — no image build is required. If you need a
+custom build, the Dockerfile lives at `docker/Dockerfile` and expects the repo
+root as the build context; push the result to your registry and override the
+values:
 
-# Push to your registry
-docker push your-registry/rag-api-server:latest
+```yaml
+# values.yaml
+image:
+  repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
+  tag: v2.5.0
 ```
 
-> **Note on models**: The image does not bundle any ML models. It connects to remote model endpoints configured at runtime via environment variables. The defaults in `values.yaml` point to models hosted on the PCAI internal cluster.
->
-> **Default image**: the charts ship with `ghcr.io/ai-solution-eng/multimodal-rag-mcp:v1.9.5` as the default `image.repository`/`image.tag` — override both for your own registry. If you need to build a custom image, the Dockerfile lives at `docker/Dockerfile` and expects the repo root as the build context.
+> **Note on models**: The image does not bundle any ML models. It connects to
+> remote model endpoints configured via values; the defaults point to models
+> hosted on the PCAI internal cluster.
 
 ---
 
 ## 2. Configure deployment values
 
-All configuration lives in `helm/values.yaml`. Key settings:
+All configuration lives in the chart's `values.yaml`. Key settings you edit
+in the PCAI *Helm Values* editor:
 
-```bash
-# Set your image (required)
-image.repository=your-registry/rag-api-server
-image.tag=latest
-
+```yaml
 # PVC sizes — adjust for your dataset scale
-persistence.data.size=200Gi        # Uploaded files + dataset metadata
-persistence.qdrant.size=150Gi      # Qdrant vectors + index
+persistence:
+  data:
+    size: 200Gi        # Uploaded files + dataset metadata
+  qdrant:
+    size: 150Gi        # Qdrant vectors + index
 
 # Model configuration — each model has name, url, className, and
-# optional extra kwargs.  Set url to "" to disable a component.
-models.embedder.name="Qwen/Qwen3-VL-Embedding-8B"
-models.embedder.url="https://..."          # required
-models.embedder.className="MultiModalEmbeddings"
-models.reranker.name="Qwen/Qwen3-VL-Reranker-8B"
-models.reranker.url="https://..."          # required
-models.reranker.className="MultiModalReranker"
-models.vlm.name="RedHatAI/gemma-4-31B-it-FP8-block"
-models.vlm.url="https://..."               # required
-models.asr.name="CohereLabs/cohere-transcribe-03-2026"
-models.asr.url="https://..."               # required
+# optional extra kwargs. Set url to "" to disable a component.
+models:
+  embedder:
+    name: "Qwen/Qwen3-VL-Embedding-8B"
+    url: "https://..."              # required
+    className: "MultiModalEmbeddings"
+  reranker:
+    name: "Qwen/Qwen3-VL-Reranker-8B"
+    url: "https://..."              # required
+    className: "MultiModalReranker"
+  vlm:
+    name: "RedHatAI/gemma-4-31B-it-FP8-block"
+    url: "https://..."              # required
+  asr:
+    name: "CohereLabs/cohere-transcribe-03-2026"
+    url: "https://..."              # required
 
 # Model API keys (stored in a Kubernetes Secret, never in the image)
-modelSecrets.embedderApiKey="eyJ..."
-modelSecrets.rerankerApiKey="eyJ..."
-modelSecrets.vlmApiKey="eyJ..."
-modelSecrets.asrApiKey="eyJ..."
+modelSecrets:
+  embedderApiKey: "eyJ..."
+  rerankerApiKey: "eyJ..."
+  vlmApiKey: "eyJ..."
+  asrApiKey: "eyJ..."
 
 # RAG pipeline defaults
-rag.captionWithAsr=false   # Transcribe video audio tracks via ASR during ingestion
-rag.captionWithVlm=false   # VLM-describe images/videos at ingest (enables VLM-skip at retrieval)
-rag.remote=false           # Use remote model URLs vs in-cluster .svc.cluster.local
+rag:
+  captionWithAsr: false   # Transcribe video audio tracks via ASR during ingestion
+  captionWithVlm: false   # VLM-describe images/videos at ingest (enables VLM-skip at retrieval)
+  remote: false           # Use remote model URLs vs in-cluster .svc.cluster.local
 
 # MCP server (sidecar)
-mcp.enabled=true
-mcp.port=9090
+mcp:
+  enabled: true
+  port: 9090
 
 # Security — REQUIRED: a shared secret for short-lived media HMAC tokens.
 # Both the API and MCP servers refuse to start without it (the legacy
 # ?password= media URLs were removed). Also raises the SSRF guard defaults.
-security.mediaTokenSecret="<random-string-shared-by-both-containers>"
-security.mediaTokenTtl=3600
-security.ingestAllowHosts=""       # e.g. ".minio.svc.cluster.local" (bypasses private-block)
-security.blockPrivateHosts=true    # default on — blocks SSRF targets
+security:
+  mediaTokenSecret: "<random-string-shared-by-both-containers>"
+  mediaTokenTtl: 3600
+  ingestAllowHosts: ""        # e.g. ".minio.svc.cluster.local" (bypasses private-block)
+  blockPrivateHosts: true     # default on — blocks SSRF targets
 
 # PCAI / EZUA (Istio-based ingress)
-ezua.enabled=true
-ezua.virtualService.endpoint="rag-mcp-server.your-domain.com"
-ezua.virtualService.istioGateway="istio-system/ezaf-gateway"
-ezua.virtualService.timeout=660s
-ezua.authorizationPolicy.namespace="istio-system"
-ezua.authorizationPolicy.providerName="oauth2-proxy"
-
-# Note: ${DOMAIN_NAME} in values.yaml is substituted at deploy time.
-#   export DOMAIN_NAME="your-domain.com"
-#   envsubst < values.yaml > values-resolved.yaml
-#   helm install ... -f values-resolved.yaml
+ezua:
+  enabled: true
+  virtualService:
+    endpoint: "rag-mcp-server.<your-domain>"
+    istioGateway: "istio-system/ezaf-gateway"
+    timeout: 660s
+  authorizationPolicy:
+    namespace: "istio-system"
+    providerName: "oauth2-proxy"
 
 # Resources — scale based on expected Qdrant load
-resources.app.limits.memory=4Gi
-resources.qdrant.limits.memory=48Gi   # ~40 GiB needed for 1M × 4096-dim vectors
+resources:
+  app:
+    limits:
+      memory: 4Gi
+  qdrant:
+    limits:
+      memory: 48Gi   # ~40 GiB needed for 1M × 4096-dim vectors
 ```
 
-You can set these via `--set` flags or edit `values.yaml` directly.
+> Set the actual PCAI domain in `ezua.virtualService.endpoint` (e.g.
+> `rag-mcp-server.<your-domain>`) directly — there is no `${DOMAIN_NAME}`
+> envsubst step in a PCAI deployment.
 
 ---
 
-## 3. Install the Helm chart
+## 3. Install / update in PCAI
 
-```bash
-cd helm/
+Import the packaged `rag-mcp-server` chart into PCAI, then set the values
+above (image, models + `modelSecrets`, `security.mediaTokenSecret`,
+persistence sizes, `ezua.*`) in the *Helm Values* editor and apply. Model
+URLs and API keys are required.
 
-# 1. Resolve ${DOMAIN_NAME} in values.yaml
-export DOMAIN_NAME="your-domain.com"
-envsubst < values.yaml > values-resolved.yaml
+To change a setting later, edit the values in PCAI and apply again — that is
+the only "upgrade" path you need.
 
-# 2. Dry-run first to validate
-helm install multimodal-rag . \
-  --dry-run --debug -f values-resolved.yaml \
-  --set image.repository=your-registry/rag-api-server
-
-# 3. Actual install (model URLs and API keys required)
-helm install multimodal-rag . \
-  -f values-resolved.yaml \
-  --set image.repository=your-registry/rag-api-server \
-  --set image.tag=latest \
-  --set models.embedder.url="https://..." \
-  --set models.reranker.url="https://..." \
-  --set models.vlm.url="https://..." \
-  --set models.asr.url="https://..." \
-  --set modelSecrets.embedderApiKey="eyJ..." \
-  --set modelSecrets.rerankerApiKey="eyJ..." \
-  --set modelSecrets.vlmApiKey="eyJ..." \
-  --set modelSecrets.asrApiKey="eyJ..."
+```yaml
+# values.yaml — the keys PCAI renders from (also shown above)
+image:
+  repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
+  tag: v2.5.0
+models:
+  embedder:
+    name: "Qwen/Qwen3-VL-Embedding-8B"
+    url: "https://..."
+    className: "MultiModalEmbeddings"
+  reranker:
+    name: "Qwen/Qwen3-VL-Reranker-8B"
+    url: "https://..."
+    className: "MultiModalReranker"
+  vlm:
+    name: "RedHatAI/gemma-4-31B-it-FP8-block"
+    url: "https://..."
+  asr:
+    name: "CohereLabs/cohere-transcribe-03-2026"
+    url: "https://..."
+modelSecrets:
+  embedderApiKey: "eyJ..."
+  rerankerApiKey: "eyJ..."
+  vlmApiKey: "eyJ..."
+  asrApiKey: "eyJ..."
+persistence:
+  data:
+    size: 500Gi
+  qdrant:
+    size: 200Gi
+security:
+  mediaTokenSecret: "<generated>"
+ezua:
+  virtualService:
+    endpoint: "rag-mcp-server.<your-domain>"
 ```
 
-Or with many overrides:
-
-```bash
-export DOMAIN_NAME="your-domain.com"
-envsubst < values.yaml > values-resolved.yaml
-
-helm install multimodal-rag . \
-  -f values-resolved.yaml \
-  --set image.repository=your-registry/rag-api-server \
-  --set image.tag=v1.9.5 \
-  --set models.embedder.url="https://..." \
-  --set models.reranker.url="https://..." \
-  --set models.vlm.url="https://..." \
-  --set models.asr.url="https://..." \
-  --set modelSecrets.embedderApiKey="eyJ..." \
-  --set modelSecrets.rerankerApiKey="eyJ..." \
-  --set modelSecrets.vlmApiKey="eyJ..." \
-  --set modelSecrets.asrApiKey="eyJ..." \
-  --set persistence.data.size=500Gi \
-  --set persistence.qdrant.size=200Gi \
-  --set resources.qdrant.limits.memory=64Gi
-```
-
-> **Tip**: Put model URLs and API keys in a separate `secrets.yaml` values file and
-> pass it with `-f` to keep them out of your shell history:
-> ```bash
-> helm install multimodal-rag . -f values.yaml -f secrets.yaml
-> ```
+> **Tip**: keep the model URLs and API keys in a private values fragment (or
+> the PCAI Secret) so they stay out of commit history; the chart reads them
+> from values at apply time.
 
 ---
 
 ## 4. Verify the deployment
 
+In the PCAI UI the deployment should reach **Ready**. To check locally
+(optional, developer convenience):
+
 ```bash
-# Check pods are running
-kubectl get pods -l app=rag-mcp-server
-
-# Check the API server logs (models initializing)
-kubectl logs -l app=rag-mcp-server -c rag-api-server
-
-# Check the MCP server logs (if enabled)
-kubectl logs -l app=rag-mcp-server -c rag-mcp-server
-
-# Check Qdrant is ready
-kubectl get pods -l app=rag-mcp-server-qdrant
-
 # Port-forward to test locally
 kubectl port-forward deployment/rag-mcp-server 8000:8000
 
@@ -207,15 +213,20 @@ curl http://localhost:8000/api/datasets
 # → {"datasets": []}
 ```
 
+Pods and logs are visible from the PCAI workload view
+(\cmd{kubectl get pods -l app=rag-mcp-server} and
+\cmd{kubectl logs -l app=rag-mcp-server -c rag-api-server} work the same as
+ever for operators who have cluster access).
+
 ---
 
 ## 5. Access the web UI
 
 If EZUA (Istio) is enabled, the service is available at the VirtualService
-endpoint (e.g. `https://rag-mcp-server.your-domain.com`).  Authentication is
+endpoint (e.g. `https://rag-mcp-server.<your-domain>`). Authentication is
 handled by the `oauth2-proxy` AuthorizationPolicy.
 
-Otherwise port-forward:
+For a local developer preview only, port-forward:
 
 ```bash
 kubectl port-forward deployment/rag-mcp-server 8000:8000
@@ -299,19 +310,18 @@ When `ezua.enabled=true` (default), the chart also creates:
 
 ## 8. Upgrading
 
-```bash
-helm upgrade multimodal-rag . \
-  --set image.tag=v1.9.5 \
-  --reuse-values  # keep existing non-default values
+In PCAI, upgrading is just editing the values and applying again. To bump the
+image, change `image.tag` in the *Helm Values* editor:
+
+```yaml
+# values.yaml
+image:
+  tag: v2.5.0
 ```
 
-To change specific values while upgrading:
-
-```bash
-helm upgrade multimodal-rag . \
-  --set image.tag=v1.9.5 \
-  --set persistence.data.size=500Gi
-```
+To change specific settings (e.g. storage or model endpoints), edit the
+corresponding keys in `values.yaml` and re-apply; the rest of the values are
+kept.
 
 ---
 
@@ -319,11 +329,11 @@ helm upgrade multimodal-rag . \
 
 | Symptom | Likely cause | Check |
 |---------|-------------|-------|
-| Pods stuck in `Pending` | PVC not binding | `kubectl describe pvc` |
-| API server crash-looping | Model connection failure | `kubectl logs -c rag-api-server` |
+| Pods stuck in `Pending` | PVC not binding | Check the PVC status in PCAI |
+| API server crash-looping | Model connection failure | Read the API pod logs in PCAI |
 | MCP tools return "dataset not found" | Dataset created on different Qdrant | Verify `QDRANT_HOST` matches |
 | Search returns 0 results | Empty dataset or wrong collection | Check via web UI document list |
 | Qdrant OOMKilled | Vector count exceeds memory | Increase `resources.qdrant.limits.memory` |
-| 404 at VirtualService endpoint | Kyverno labels not applied | `kubectl describe deployment -n <ns> \| grep hpe-ezua` |
+| 404 at VirtualService endpoint | Kyverno labels not applied | Confirm the workload is labelled `hpe-ezua` (PCAI discovery) |
 | 401 at VirtualService endpoint | OAuth2 token missing/expired | Check `oauth2-proxy` logs in `istio-system` |
-| `${DOMAIN_NAME}` literal in VS endpoint | `envsubst` step skipped | `kubectl describe vs -n <ns>` shows unresolved variable |
+| Endpoint shows `rag-mcp-server.<domain>` unresolved | Domain value not set | Set `ezua.virtualService.endpoint` in values.yaml |

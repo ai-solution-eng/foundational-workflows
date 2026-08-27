@@ -1659,7 +1659,7 @@ class DatasetManager:
                         # Mark all files in this batch as embedding (with chunk
                         # count).  Inside the try so a callback failure cannot
                         # kill the consumer thread.
-                        for fname, count, _, _ in batch_files_list:
+                        for fname, count, _, _, _ in batch_files_list:
                             if progress_callback:
                                 progress_callback({"file": fname, "status": "embedding", "chunks": count})
 

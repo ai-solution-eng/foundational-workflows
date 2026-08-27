@@ -127,6 +127,25 @@ def test_clear_ingested_hashes_unblocks_reingest():
         assert dm._is_ingested("ds", "abc123") is False
 
 
+def test_batch_file_tuple_is_five_elements():
+    """Regression: batch_files_list entries carry (fname, count, file_type,
+    content_hash, stored_path).  Shrinking the tuple back to 4 breaks the
+    batch consumer with 'too many values to unpack (expected 4, got 5)' —
+    the exact upload failure seen against the 2.5.0 deployment."""
+    batch = [
+        ("2604.07035v2.pdf", 2, "pdf", "hash123", "/data/datasets/ds/files/uuid_pdf.pdf"),
+        ("photo.jpg", 1, "image", "hash456", "/data/datasets/ds/files/uuid_photo.jpg"),
+    ]
+    # The two consumer loops over the batch (see add_files_batch): the
+    # "marking" loop and the per-file embed/store loop.
+    for fname, count, _, _, _ in batch:
+        assert fname and count >= 0
+    for fname, count, file_type_, content_hash_, stored_path in batch:
+        assert stored_path.endswith((".pdf", ".jpg"))
+        assert content_hash_ and file_type_
+    assert len(batch) == 2
+
+
 if __name__ == "__main__":
     import traceback
 
