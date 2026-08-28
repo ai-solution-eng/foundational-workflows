@@ -335,6 +335,64 @@ class Filter:
             description="Skip distillation for assistant replies shorter than "
             "this (trivial exchanges aren't worth storing). 0 = distil all.",
         )
+        # -- SQL lessons (self-improving SQL agent loop) ---------------------
+        SQL_LESSONS_ENABLED: bool = Field(
+            default=False,
+            description="Enable the SQL-lesson loop: at inlet, recall the top-k "
+            "curated lessons from the SQL_LESSONS_DATASET dataset and inject "
+            "them as 'follow if applicable' context before the agent writes "
+            "SQL. This is the recall half of resolve -> distill -> store -> "
+            "promote -> recall.",
+        )
+        SQL_LESSONS_DATASET: str = Field(
+            default="sql-lessons",
+            description="Curated SQL-lesson dataset the agent recalls from. "
+            "Written ONLY by the promotion gate (candidate -> curated). The "
+            "separate 'sql-lessons-candidates' dataset holds unvalidated "
+            "distilled lessons and is never read directly.",
+        )
+        SQL_LESSONS_PASSWORD: str = Field(
+            default="",
+            description="Password for the SQL-lesson datasets (shared, not "
+            "per-user). Sent as X-Dataset-Password to the RAG API; never "
+            "injected into the LLM context.",
+        )
+        SQL_LESSONS_RECALL_TOP_K: int = Field(
+            default=3,
+            ge=1,
+            le=10,
+            description="Number of curated SQL lessons to recall and inject "
+            "at inlet.",
+        )
+        SQL_LESSONS_INJECT_AS_SYSTEM: bool = Field(
+            default=True,
+            description="Inject recalled SQL lessons as a system message "
+            "(True) or prepend to the user message (False).",
+        )
+        SQL_LESSONS_DISTILL_ENABLED: bool = Field(
+            default=False,
+            description="Enable the write half of the SQL-lesson loop: after "
+            "each turn, ask the distillation LLM to extract 0-3 candidate "
+            "lessons from the exchange and store them in "
+            "SQL_LESSONS_CANDIDATES_DATASET (NEVER the curated set). The "
+            "prompt only derives lessons from positive evidence (SQL ran and "
+            "the result was accepted/plausible, or a concrete fix for a "
+            "concrete error). Requires DISTILL_LLM_URL/MODEL. Promotion "
+            "candidate -> curated is a separate manual/gated step.",
+        )
+        SQL_LESSONS_CANDIDATES_DATASET: str = Field(
+            default="sql-lessons-candidates",
+            description="Write-only staging dataset for distilled SQL lesson "
+            "candidates. The agent NEVER reads this directly — the promotion "
+            "gate reviews candidates here before promoting to the curated "
+            "sql-lessons dataset.",
+        )
+        SQL_LESSONS_DISTILL_MIN_REPLY_CHARS: int = Field(
+            default=200,
+            ge=0,
+            description="Skip SQL-lesson distillation for assistant replies "
+            "shorter than this (trivial exchanges aren't worth lessons).",
+        )
         # -- Media URL repair -----------------------------------------------
         REPAIR_MEDIA_URLS: bool = Field(
             default=True,
@@ -684,6 +742,188 @@ class Filter:
             elif isinstance(content, list):
                 content.insert(0, {"type": "text", "text": full})
 
+    # ── SQL lessons (self-improving SQL agent loop: recall half) ──────────
+    # Recall the top-k curated lessons from the sql-lessons dataset at inlet
+    # so the agent follows them before writing SQL. Storage/distillation is
+    # handled separately (outlet + promotion gate), keeping this half read-only.
+
+    async def _recall_sql_lessons(self, dataset_name: str, query: str) -> str:
+        """Search the curated SQL-lesson dataset; return formatted context (or '')."""
+        if not self.valves.SQL_LESSONS_ENABLED or not query.strip():
+            return ""
+        api = self.valves.RAG_API_URL.rstrip("/")
+        url = f"{api}/api/datasets/{dataset_name}/search"
+        params = {"q": query[:500], "top_k": self.valves.SQL_LESSONS_RECALL_TOP_K}
+        headers = {"Content-Type": "application/json"}
+        if self.valves.SQL_LESSONS_PASSWORD:
+            headers["X-Dataset-Password"] = self.valves.SQL_LESSONS_PASSWORD
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(url, params=params, headers=headers)
+                resp.raise_for_status()
+                results = resp.json().get("results", [])
+        except Exception:
+            logger.warning("SQL-lesson recall failed for '%s'", dataset_name, exc_info=True)
+            return ""
+        if not results:
+            return ""
+        lines: list[str] = []
+        for i, r in enumerate(results):
+            content = r.get("text") or r.get("content") or ""
+            if isinstance(content, dict):
+                content = content.get("text", "")
+            score = r.get("score", 0)
+            # kind/tags may be top-level OR nested inside `content` (the
+            # server returns {content: {text, kind, ...}, score}).
+            kind = r.get("kind") or (r.get("content").get("kind", "") if isinstance(r.get("content"), dict) else "")
+            if content:
+                head = f"[SQL LESSON {i + 1}] (score: {score:.4f})"
+                if kind:
+                    head += f" — {kind}"
+                lines.append(f"{head}\n{content}")
+        if not lines:
+            return ""
+        context = "\n\n".join(lines)
+        logger.info("SQL-lesson recall: %d hit(s) for '%.40s…'", len(lines), query)
+        return context
+
+    def _inject_sql_lessons(self, messages: list[dict], context: str) -> None:
+        """Inject recalled SQL lessons as 'follow if applicable' context."""
+        full = (
+            "The following are SQL lessons from past, validated resolutions. "
+            "Follow any that apply to the current question — they encode "
+            "intent-to-schema mappings and performance guards. Do not mention "
+            "'lessons' or 'recall' to the user unless they ask.\n\n" + context
+        )
+        if self.valves.SQL_LESSONS_INJECT_AS_SYSTEM:
+            messages.insert(0, {"role": "system", "content": full})
+        else:
+            last = messages[-1]
+            content = last.get("content", "")
+            if isinstance(content, str):
+                last["content"] = f"{full}\n\n{content}"
+            elif isinstance(content, list):
+                content.insert(0, {"type": "text", "text": full})
+
+    # ── SQL lessons (self-improving SQL agent loop: write half) ───────────
+    # Distill 0-3 candidate lessons from a resolved exchange and store them
+    # in the CANDIDATES dataset (never the curated one). The distillation
+    # prompt only emits lessons on positive evidence; the promotion gate
+    # later moves candidates -> curated.
+
+    _SQL_DISTILL_SYSTEM_PROMPT = (
+        "You are an SQL lesson curator for an LLM SQL agent. Given a "
+        "user-question/assistant-resolution exchange, decide whether a "
+        "durable, reusable lesson was established that would help FUTURE "
+        "agents answer similar questions — an intent-to-schema mapping "
+        "(what the user means maps to which table/column/pattern), a "
+        "performance guard (bounded IN-list, trailing-12-month window, "
+        "LIMIT, never ILIKE raw serials), or a fix for a repeated failure "
+        "(e.g. serial lives in the mapping table, not the raw columns).\n\n"
+        "Only derive lessons from POSITIVE evidence: the SQL executed and the "
+        "result was accepted/plausible, OR a concrete fix for a concrete "
+        "error. If nothing durable (trivial Q&A, no SQL run, transient), "
+        "respond with exactly: NOTHING\n\n"
+        "Otherwise respond with 1-3 concise, standalone lessons, each:\n"
+        "- kind: schema-map | perf-guard | resolution-pattern | fail-fix\n"
+        "- content: the imperative instruction (1-3 sentences), standalone — "
+        "a future session with zero other context must understand it\n"
+        "- trigger: the class of question this applies to\n"
+        "- tables: comma-separated table/dataset names\n"
+        "- tags: comma-separated keywords\n"
+        'Format as JSON: {"lessons": [{kind, content, trigger, tables, tags}, ...]}'
+    )
+
+    async def _distill_and_store_sql_lessons(
+        self,
+        user_text: str,
+        assistant_text: str,
+    ) -> Optional[str]:
+        """Ask the distillation LLM for SQL lessons and store them as candidates.
+
+        Returns the number of candidates stored (as a string) or None if the
+        exchange was not worth storing (or distillation is disabled/failed).
+        """
+        if not self.valves.SQL_LESSONS_DISTILL_ENABLED:
+            return None
+        if not self.valves.DISTILL_LLM_URL or not self.valves.DISTILL_LLM_MODEL:
+            return None
+        if len(assistant_text) < self.valves.SQL_LESSONS_DISTILL_MIN_REPLY_CHARS:
+            return None
+
+        url = self.valves.DISTILL_LLM_URL.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.valves.DISTILL_LLM_API_KEY:
+            headers["Authorization"] = f"Bearer {self.valves.DISTILL_LLM_API_KEY}"
+        payload = {
+            "model": self.valves.DISTILL_LLM_MODEL,
+            "messages": [
+                {"role": "system", "content": self._SQL_DISTILL_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"User: {user_text[:2000]}\n\nAssistant: {assistant_text[:4000]}",
+                },
+            ],
+            "max_tokens": 512,
+            "temperature": 0.1,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+                raw = resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception:
+            logger.warning("SQL-lesson distillation LLM call failed", exc_info=True)
+            return None
+
+        if not raw or raw.upper().strip() == "NOTHING":
+            return None
+        import json
+
+        try:
+            data = json.loads(raw)
+            lessons = data.get("lessons", []) if isinstance(data, dict) else data
+            lessons = [les for les in lessons if isinstance(les, dict) and les.get("content")]
+        except Exception:
+            logger.warning("SQL-lesson distillation: unparseable JSON: %.120s…", raw)
+            return None
+
+        if not lessons:
+            return None
+
+        # Store each lesson as a candidate in the WRITE-ONLY candidates dataset.
+        dataset_name = (self.valves.SQL_LESSONS_CANDIDATES_DATASET or "sql-lessons-candidates").strip()
+        api = self.valves.RAG_API_URL.rstrip("/")
+        store_url = f"{api}/api/datasets/{dataset_name}/documents"
+        headers = {"Content-Type": "application/json"}
+        if self.valves.SQL_LESSONS_PASSWORD:
+            headers["X-Dataset-Password"] = self.valves.SQL_LESSONS_PASSWORD
+
+        stored = 0
+        for lesson in lessons:
+            doc = {
+                "text": lesson.get("content", ""),
+                "kind": lesson.get("kind", "resolution-pattern"),
+                "trigger": lesson.get("trigger", ""),
+                "tables": lesson.get("tables", []),
+                "tags": lesson.get("tags", []),
+                "status": "candidate",
+                "source": "openwebui:sql-lesson",
+            }
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(store_url, json=[doc], headers=headers)
+                    resp.raise_for_status()
+                stored += 1
+            except Exception:
+                logger.warning("SQL-lesson candidate store failed", exc_info=True)
+                break
+
+        if stored:
+            logger.info("Stored %d SQL-lesson candidate(s) in '%s'", stored, dataset_name)
+            return str(stored)
+        return None
+
     _DISTILL_SYSTEM_PROMPT = (
         "You are a memory curator for an LLM chat application. Given a "
         "user-assistant exchange, decide whether anything durable was "
@@ -1026,6 +1266,18 @@ class Filter:
                     if memory_ctx:
                         self._inject_memory_context(messages, memory_ctx)
 
+        # ── 0b. SQL-lesson recall (self-improving SQL agent loop) ──────────
+        # If enabled, recall the top-k CURATED sql-lessons for the user's
+        # question and inject them as 'follow if applicable' context before
+        # the agent writes SQL. Recall is read-only; distillation/storage is
+        # handled separately (outlet + promotion gate).
+        if self.valves.SQL_LESSONS_ENABLED and user_text:
+            sql_ds = (self.valves.SQL_LESSONS_DATASET or "").strip()
+            if sql_ds:
+                lesson_ctx = await self._recall_sql_lessons(sql_ds, user_text)
+                if lesson_ctx:
+                    self._inject_sql_lessons(messages, lesson_ctx)
+
         # Determine early whether media should be stripped for this model.
         # This must be known before the early return below so that
         # historical user messages — whose re-injected media would crash
@@ -1311,17 +1563,9 @@ class Filter:
         if messages and self.valves.REPAIR_MEDIA_URLS:
             self._repair_last_assistant_media_urls(messages)
 
-        if not self._memory_enabled():
-            return body
-        if not self.valves.DISTILL_LLM_URL or not self.valves.DISTILL_LLM_MODEL:
-            return body  # recall works, but writes are disabled
-
-        # Resolve the per-user memory dataset from the OWUI user identity.
-        memory_ds = self._memory_dataset_for_user(__user__)
-        if not memory_ds:
-            return body  # no usable user identity → cannot isolate memory
-
-        messages: list[dict] = body.get("messages", [])
+        # Extract the exchange once; both per-user memory and SQL lessons
+        # distillation consume the same user/assistant text.
+        messages = body.get("messages", [])
         if not messages:
             return body
         user_text = ""
@@ -1338,5 +1582,18 @@ class Filter:
         if not user_text or not assistant_text:
             return body
 
-        await self._distill_and_store_memory(memory_ds, __user__, user_text, assistant_text)
+        # ── Long-term memory (per-user, optional) ─────────────────────────
+        if self._memory_enabled() and self.valves.DISTILL_LLM_URL and self.valves.DISTILL_LLM_MODEL:
+            memory_ds = self._memory_dataset_for_user(__user__)
+            if memory_ds:
+                await self._distill_and_store_memory(memory_ds, __user__, user_text, assistant_text)
+
+        # ── SQL lessons (self-improving SQL agent loop: write half) ───────
+        # Ask the distillation LLM to extract 0-3 candidate lessons and store
+        # them in sql-lessons-candidates. Independent of per-user memory; the
+        # store is shared and password-protected, and the distill prompt only
+        # emits on positive evidence.
+        if self.valves.SQL_LESSONS_DISTILL_ENABLED:
+            await self._distill_and_store_sql_lessons(user_text, assistant_text)
+
         return body

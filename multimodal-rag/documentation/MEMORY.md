@@ -114,10 +114,12 @@ OWUI uses a filter (`openwebui_extension/filter.py`) with an **inlet**
 write after each reply). Memory goes through the RAG REST API directly
 — no MCP needed. Full valve reference: [`openwebui_extension/README.md`](../openwebui_extension/README.md).
 
-> The extension dir also ships two memory-free variants: `filter_no_memory.py`
-> (identical media→MCP routing, no recall/store) and `filter_media_strip.py`
-> (strips image/video/audio parts for text-only LLMs, no RAG at all). Use
-> those when you want media routing without a memory store.
+> The extension dir also ships a memory-free variant, `filter_media_strip.py`
+> (strips image/video/audio parts for text-only LLMs, no RAG at all). Use it
+> when you want media handling without a memory store. The former
+> `filter_no_memory.py` fork was removed — the full `filter.py` covers that
+> case by disabling its memory/SQL-lesson valves (`MEMORY_ENABLED`,
+> `SQL_LESSONS_ENABLED`).
 
 ### Per-user isolation (SSO)
 

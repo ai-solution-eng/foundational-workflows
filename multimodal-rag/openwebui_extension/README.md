@@ -6,17 +6,21 @@ tool **without** injecting raw media into the LLM context window.
 
 ## Variants
 
-This directory ships **three** filters — pick the one that matches your
-setup:
+This directory ships **two** filters — pick the one that matches your setup:
 
 | File | Media routing | Long-term memory | Use when |
 |------|---------------|------------------|----------|
-| [`filter.py`](filter.py) | Full (stage → MCP hint, `STRIP_MODELS` per-model) | Yes (recall + distillation) | You want both RAG-backed media routing **and** per-user memory |
-| [`filter_no_memory.py`](filter_no_memory.py) | Identical to `filter.py` | **No** (memory valves removed) | You only need the media→MCP routing; no recall/store |
+| [`filter.py`](filter.py) | Full (stage → MCP hint, `STRIP_MODELS` per-model) | Yes (recall + distillation + SQL lessons) | You want RAG-backed media routing **and** long-term memory / SQL lessons (valve-gated) |
 | [`filter_media_strip.py`](filter_media_strip.py) | **Strip-only** — removes image/video (and optionally audio) parts for text-only LLMs | No | Your text-only LLM errors on media; you don't want RAG staging at all |
 
-All three declare `file_handler = True` so they take control of file
-processing. The rest of this document describes the full `filter.py`.
+> Memory and SQL-lesson features are **valve-gated** in `filter.py`, so a
+> dedicated "no memory" fork is no longer shipped — disable
+> `MEMORY_ENABLED` / `SQL_LESSONS_ENABLED` / `SQL_LESSONS_DISTILL_ENABLED`
+> for a pure media-routing filter. (Formerly `filter_no_memory.py`.)
+
+Both remaining filters declare `file_handler = True` so they take control
+of file processing. The rest of this document describes the full
+`filter.py`.
 
 ## Problem
 
@@ -155,6 +159,14 @@ After installing, click the ⚙️ icon next to the filter to configure:
 | `DISTILL_LLM_MODEL` | _(empty)_ | Model name for distillation (e.g. `deepseek-v4-flash`) |
 | `DISTILL_LLM_API_KEY` | _(empty)_ | API key for the distillation LLM |
 | `DISTILL_MIN_REPLY_CHARS` | `200` | Skip distillation for shorter assistant replies |
+| `SQL_LESSONS_ENABLED` | `false` | Enable the self-improving SQL lesson loop (recall half): at inlet, recall the top-k curated lessons from `SQL_LESSONS_DATASET` and inject them as "follow if applicable" context before the agent writes SQL |
+| `SQL_LESSONS_DATASET` | `sql-lessons` | Curated SQL-lesson dataset the agent recalls from. Written ONLY by the promotion gate (candidate → curated); never by the filter. |
+| `SQL_LESSONS_PASSWORD` | _(empty)_ | Password for the SQL-lesson datasets (shared, not per-user). Sent as `X-Dataset-Password` to the RAG API; never injected into LLM context. |
+| `SQL_LESSONS_RECALL_TOP_K` | `3` | Number of curated SQL lessons to recall at inlet |
+| `SQL_LESSONS_INJECT_AS_SYSTEM` | `true` | Inject recalled SQL lessons as a system message (vs. prepend to user) |
+| `SQL_LESSONS_DISTILL_ENABLED` | `false` | Enable the write half: after each turn, ask the distillation LLM to extract 0-3 candidate lessons and store them in `SQL_LESSONS_CANDIDATES_DATASET` (NEVER the curated set). |
+| `SQL_LESSONS_CANDIDATES_DATASET` | `sql-lessons-candidates` | Write-only staging dataset for distilled SQL lesson candidates. Never read directly by the agent. |
+| `SQL_LESSONS_DISTILL_MIN_REPLY_CHARS` | `200` | Skip SQL-lesson distillation for shorter assistant replies |
 
 ## Long-term Memory
 
@@ -248,6 +260,68 @@ Memory recall runs **before** media processing in the inlet — the two
 are independent. A single user message can trigger both a memory recall
 (context injection) and media staging (MCP `search_dataset` hint). The
 outlet runs after the reply and is completely separate from the inlet.
+
+## Self-Improving SQL Lessons
+
+In addition to media routing and per-user memory, the filter ships the
+**SQL-lesson loop**: an agent that answers questions with SQL improves over
+time from how its queries resolve — the same loop that was closed *by hand*
+when writing a governed SQL system prompt, but automatic.
+
+```
+OWUI turn ─► inlet ─► recall top-k from  sql-lessons (curated) ─► inject into prompt
+                 │
+                 ▼
+           agent resolves via SQL MCP (e.g. SQLhandler / sql-toromont)
+                 │
+                 ▼
+OWUI turn ─► outlet ─► distill → sql-lessons-candidates      (automatic)
+                 │
+                 ▼
+       you run promote.py  → candidate → sql-lessons (curated)  (gated)
+```
+
+### Two datasets (the poison guardrail)
+
+| Dataset | Writes | Reads |
+|---|---|---|
+| `sql-lessons` (**curated**) | promotion gate only (`promote.py`) | the agent (recall) |
+| `sql-lessons-candidates` (**staging**) | the filter (distill) | the promotion gate only |
+
+The agent **only ever reads curated**; the loop **only ever writes
+candidates**. This is what stops self-improvement from poisoning the prompt
+with unvalidated lessons.
+
+### Enabling
+
+1. **Seed the datasets** (one-time, from the repo — creates both datasets and
+   uploads the lessons; `--adapter <name>` layers a domain's lessons):
+   ```bash
+   RAG_API_URL=... python3 seed_sql_lessons.py --adapter toromont
+   ```
+2. **Filter valves:** `SQL_LESSONS_ENABLED = true` (recall at inlet) and
+   `SQL_LESSONS_DISTILL_ENABLED = true` (distill at outlet). Set
+   `SQL_LESSONS_PASSWORD` if the datasets are protected.
+3. **Promotion** (non-automatic, gated): when candidates accumulate, run
+   `promote.py` (see [`sql_lessons/TOROMONT_DEPLOY.md`](sql_lessons/TOROMONT_DEPLOY.md)
+   for the full walk-through).
+
+### What the loop does not do
+
+- It does **not** change your system prompt — recalled lessons are injected
+  as an extra system message at runtime.
+- It does **not** write to the curated set from the filter — only the
+  promotion gate does.
+- It does **not** modify the SQL server or any container image.
+
+### Full docs
+
+The mechanism, lesson schema, promotion gate, eval harness, staleness, the
+end-to-end deployment runbook, and the K8s CronJob deploy artifacts all live
+**in this repo** under [`sql_lessons/`](sql_lessons/) (`sql_lessons/README.md`,
+`sql_lessons/TOROMONT_DEPLOY.md`, `sql_lessons/deploy/`). The design rationale
+is in `design/self-improving-sql-agent.md` in the workspace (not part of this
+repo).
 
 ## Model Setup in Open WebUI
 
