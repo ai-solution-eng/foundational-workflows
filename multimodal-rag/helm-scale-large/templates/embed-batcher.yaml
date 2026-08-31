@@ -42,6 +42,10 @@ spec:
             # Never route to ourselves (would recurse).
             - name: RAG_EMBED_BATCH_URL
               value: ""
+            {{- range $key, $val := .Values.extraEnv }}
+            - name: {{ $key }}
+              value: {{ $val | quote }}
+            {{- end }}
           ports:
             - containerPort: {{ .Values.embedBatcher.port }}
               name: http

@@ -12,7 +12,7 @@
 replicaCount: 2
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v3.1.4
+  tag: v3.2.0
   pullPolicy: IfNotPresent
 
 deployment:
@@ -42,11 +42,11 @@ app:
   # of added latency per query.
   embeddingQueryBatchSize: 128
   embeddingQueryBatchWaitMs: 200
-  # Idle early-flush: flush a partial batch once no new query arrives for
-  # this many ms, instead of always waiting the full window — keeps burst
-  # batching intact while single-user/interactive searches skip the wait.
-  # 0 restores the old always-wait-full-window behavior.
-  embeddingQueryIdleWaitMs: 10
+  # Idle early-flush (v2, batch-guarded): flush a stalled queue of <=2 items
+  # after this many ms instead of waiting the full window — interactive
+  # searches skip most of the wait; bursts still batch at full size.  0
+  # disables.  Benchmarked on v3.1.8 (see helm-scale-large for numbers).
+  embeddingQueryIdleWaitMs: 50
   # Max images per embedding prompt (vLLM model limit, set in deployment args).
   embeddingMaxImagesPerPrompt: 4
   # Dynamic Qdrant query batcher for concurrent similarity searches.
@@ -55,6 +55,12 @@ app:
   # embedding batcher already synchronises the burst.
   qdrantQueryBatchSize: 128
   qdrantQueryBatchWaitMs: 5
+  # Per-process thread pool for Qdrant I/O (searches, upserts, scrolls).
+  # Must comfortably exceed the concurrent searches a single process serves:
+  # at 250-concurrency / 4 replicas each process serves ~62 searches through
+  # this pool. The old code default (4) oversubscribed ~15x and was the
+  # bottleneck in sustained-saturation benchmarks.
+  qdrantPoolSize: 16
 
 
 # -- Persistence ---------------------------------------------------------------

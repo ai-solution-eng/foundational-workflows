@@ -47,6 +47,7 @@ from fastapi import (
 )
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+from multimodal_rag import __version__
 from multimodal_rag.dataset_manager import (
     DatasetManager,
     EmbedderMismatchError,
@@ -695,7 +696,7 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Multimodal RAG Dataset Manager",
-    version="1.0.0",
+    version=__version__,
     lifespan=_lifespan,
 )
 

@@ -1164,6 +1164,8 @@ class DatasetManager:
         self._verify_endpoints()
 
         # Cache: dataset_name → MultimodalRAG instance
+        self._has_password_cache: dict[str, tuple[float, bool]] = {}
+        self._has_password_lock = threading.Lock()
         self._rag_cache: OrderedDict[str, MultimodalRAG] = OrderedDict()
         self._rag_cache_lock = threading.Lock()
         # LRU cap: each cached MultimodalRAG holds its own QdrantClient
@@ -1356,8 +1358,27 @@ class DatasetManager:
         return self._strip_password(meta)
 
     def has_password(self, name: str) -> bool:
+        # TTL-cached: every search/unlock called this, i.e. an NFS stat+read
+        # + JSON parse of meta.json PER REQUEST for a value that changes only
+        # when a password is set/removed.  Once the read was parallelised
+        # (async offload), 4 replicas' worth of concurrent metadata reads
+        # degraded the NFS server and search throughput declined within a
+        # single benchmark run.  30s TTL; invalidated on password change and
+        # dataset delete.
+        now = time.monotonic()
+        with self._has_password_lock:
+            entry = self._has_password_cache.get(name)
+            if entry is not None and now - entry[0] < 30.0:
+                return entry[1]
         meta = self._read_meta(name)
-        return bool(meta and meta.get("password_hash"))
+        result = bool(meta and meta.get("password_hash"))
+        with self._has_password_lock:
+            self._has_password_cache[name] = (now, result)
+        return result
+
+    def _invalidate_has_password(self, name: str) -> None:
+        with self._has_password_lock:
+            self._has_password_cache.pop(name, None)
 
     def verify_password(self, name: str, password: str) -> bool:
         meta = self._read_meta(name)
@@ -1369,6 +1390,7 @@ class DatasetManager:
         return _check_password(password, stored)
 
     def set_password(self, name: str, password: str | None) -> None:
+        self._invalidate_has_password(name)
         meta = self._read_meta(name)
         if not meta:
             raise FileNotFoundError(f"Dataset '{name}' not found")
@@ -1390,6 +1412,7 @@ class DatasetManager:
     def delete_dataset(self, name: str) -> None:
         """Delete a dataset and its Qdrant collection."""
         self._validate_name(name)
+        self._invalidate_has_password(name)
         rag = self._get_rag(name, check_embedder=False)
         try:
             vs = rag.vector_store

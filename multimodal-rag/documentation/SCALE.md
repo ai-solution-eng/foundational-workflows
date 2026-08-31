@@ -13,9 +13,9 @@ tested as a drop-in replacement on a cluster sized for the base chart. The
 
 ## 1. Multiple API replicas + load balancing
 
-`values.yaml` — `replicaCount: 2`
+`values.yaml` — `replicaCount: 4`
 
-The Deployment runs 2 pods (vs 1 in the base chart). Traffic is
+The Deployment runs 4 pods (vs 1 in the base chart). Traffic is
 distributed across them by:
 
 - A **ClusterIP Service** (`templates/service.yaml`) with
@@ -34,12 +34,14 @@ distributed across them by:
 `templates/deployment.yaml` — gunicorn command
 
 Instead of a single `uvicorn` process, the scale chart runs **gunicorn
-with `UvicornWorker`** and `workers: 2` (`values.yaml` → `app.workers`).
-Replicas are kept at 2 because the embedder query batcher is per process —
-the large chart previously ran 4 replicas × 4 workers and benchmarked
-~8 req/s vs 49 req/s for the medium chart's 2×2 (batching fragments as
-worker count grows). Effective concurrency =
-`replicas × workers × syncPoolSize` = 2 × 2 × 64 = **256 concurrent
+with `UvicornWorker`** (`values.yaml` → `app.workers`). The large chart
+defaults to **4 replicas × 4 workers** (16 event loops): the shared
+embed-batcher singleton aggregates text queries cross-process
+(`RAG_EMBED_BATCH_URL`), so per-worker batch fragmentation no longer
+applies.  (The old "4 workers → ~8 req/s" result predates the singleton
+and does not reproduce: the same 4×4 shape measured 49.3 req/s @ N=100
+and 72.8 req/s @ N=250 on v3.1.8, 100% success.)  Effective concurrency =
+`replicas × workers × syncPoolSize` = 4 × 4 × 64 = **1024 concurrent
 blocking operations** cluster-wide. Each worker process gets its own
 `sync_pool`, `httpx` connection pools, and Qdrant clients.
 

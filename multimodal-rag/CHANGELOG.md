@@ -3,7 +3,7 @@
 All notable changes to this project are tracked here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [3.2.0] — 2026-08-31
 
 ### Added
 - **Documents download**: `GET /api/datasets/{name}/documents/download?format=md|jsonl` —
@@ -35,6 +35,30 @@ All notable changes to this project are tracked here. Format loosely follows
 - `_rag_cache` is now LRU-capped (`RAG_CACHE_MAX`, default 64) and closes
   evicted Qdrant clients.
 - File copies during ingest no longer hold the cross-process hash lock.
+- **Idle early-flush for the embedding query batchers (v2, batch-guarded)**:
+  when the query queue stops growing and holds at most 2 items, it flushes
+  after `EMBEDDING_QUERY_IDLE_WAIT_MS` (chart default 50ms) instead of
+  waiting the full 200ms window; bursts never split, because the idle check
+  only fires on a stalled small queue.  (The unguarded v1 — 10ms, no guard —
+  was benchmark-convicted: mid-burst splitting collapsed N=100 from 53 to
+  15 r/s — and reverted.)  v3.1.8 A/B: single-query mean 238ms (was
+  ~370-550 with the full window), N=100 49.3 r/s and N=250 72.8 r/s
+  (p99 5.2s vs v1's 51s), 100% success at every load.
+
+### Changed
+- **Chart defaults**: the idle early-flush is promoted into the
+  `helm-scale-large` / `helm-scale-medium` values
+  (`app.embeddingQueryIdleWaitMs: 50`) and scale-large is restored to
+  **4 replicas × 4 workers** — the old "4 workers → ~8 req/s" result
+  predates the shared embed-batcher singleton and does not reproduce (the
+  same 4×4 shape measured 49.3 / 72.8 r/s on v3.1.8).  The single-replica
+  `helm/` chart has no batcher tuning surface and keeps the disabled (0)
+  default.
+- **Release tooling**: `automation.sh` bumps versions BEFORE the docker
+  build (previously the image baked the previous release's version), and
+  the package carries `__version__` (surfaced in FastAPI `/docs`;
+  in-cluster self-identification: `python3 -c "import multimodal_rag;
+  print(multimodal_rag.__version__)"`).
 
 ## [3.0.0] — 2026-08-31
 
