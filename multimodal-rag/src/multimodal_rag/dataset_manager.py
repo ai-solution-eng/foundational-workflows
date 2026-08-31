@@ -18,6 +18,7 @@ import secrets
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -220,6 +221,61 @@ def _write_hash_index(hashes_path: Path, index: dict[str, str]) -> None:
     os.replace(tmp, hashes_path)
     with _hash_index_cache_lock:
         _hash_index_cache[hashes_path] = (hashes_path.stat().st_mtime_ns, dict(index))
+
+
+# Deferred hash-index writes: batch ingests used to rewrite the ENTIRE
+# .hashes.json once per file (O(n²) serialization + NFS writes across a
+# batch).  _store_file(..., defer_write=True) instead records its new
+# entries here; _flush_hash_index_writes() merges them into the on-disk
+# index under the cross-process lock once per batch.  If the process dies
+# before the flush the files are still on disk — only the dedup entries are
+# missing, so a retry re-copies them (benign duplicates, never corruption).
+_hash_index_dirty: dict[Path, dict[str, str]] = {}
+_hash_index_dirty_lock = threading.Lock()
+
+
+def _flush_hash_index_writes() -> None:
+    """Persist all deferred hash-index entries (merge, not clobber).
+
+    Re-reads the on-disk index under the dataset's cross-process lock so
+    entries written by another pod during our batch survive.
+    """
+    with _hash_index_dirty_lock:
+        dirty = dict(_hash_index_dirty)
+        _hash_index_dirty.clear()
+    for hashes_path, updates in dirty.items():
+        if not updates:
+            continue
+        with _cross_process_lock(hashes_path.parent / ".hashes.lock"):
+            fresh = _load_hash_index(hashes_path)
+            fresh.update(updates)
+            _write_hash_index(hashes_path, fresh)
+
+
+# Ingest-dedup (.ingested_hashes.json) read cache — the batch loop used to
+# re-read and re-parse the whole file for every file (same O(n²) pattern).
+_ingested_hashes_cache: dict[Path, tuple[int, set[str]]] = {}
+_ingested_hashes_cache_lock = threading.Lock()
+
+
+def _load_ingested_hashes(p: Path) -> set[str]:
+    """Return the parsed ingest-dedup hash set for *p* (mtime-cached)."""
+    mtime = p.stat().st_mtime_ns if p.exists() else 0
+    with _ingested_hashes_cache_lock:
+        cached = _ingested_hashes_cache.get(p)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+    hashes: set[str] = set()
+    if mtime:
+        try:
+            hashes = set(json.loads(p.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError):
+            hashes = set()
+    with _ingested_hashes_cache_lock:
+        _ingested_hashes_cache[p] = (mtime, hashes)
+        if len(_ingested_hashes_cache) > 100:  # bound across many datasets
+            _ingested_hashes_cache.pop(next(iter(_ingested_hashes_cache)), None)
+    return hashes
 
 
 # Supported file extensions mapped to a media type label
@@ -549,19 +605,27 @@ def _host_matches_allowlist(host: str) -> bool:
     return False
 
 
-def _host_is_private(host: str) -> bool:
-    """Return True if *host* is or resolves to a private/loopback/link-local address."""
+def _host_is_private(host: str, allow_loopback: bool = False) -> bool:
+    """Return True if *host* is or resolves to a private/loopback/link-local address.
+
+    With ``allow_loopback=True`` (the query-time media policy) loopback
+    addresses and the literal name ``localhost`` are *not* considered
+    private: clients legitimately hand the server's own media URLs
+    (``http://localhost:8000/api/datasets/...``) back to the query tools.
+    """
     import ipaddress
     import socket
 
     hostname = host.rsplit(":", 1)[0].strip("[]")
     if hostname == "localhost":
-        return True
+        return not allow_loopback
     try:
         ip = ipaddress.ip_address(hostname)
     except ValueError:
         ip = None
     if ip is not None:
+        if ip.is_loopback and allow_loopback:
+            return False
         return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved
     try:
         addrinfos = socket.getaddrinfo(hostname, None)
@@ -571,6 +635,8 @@ def _host_is_private(host: str) -> bool:
         try:
             ip = ipaddress.ip_address(info[4][0])
         except ValueError:
+            continue
+        if ip.is_loopback and allow_loopback:
             continue
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
             return True
@@ -596,6 +662,41 @@ def _check_url_policy(url: str) -> None:
         return
     if _INGEST_BLOCK_PRIVATE and _host_is_private(host):
         raise ValueError(f"URL host '{host}' resolves to a private/internal address (INGEST_BLOCK_PRIVATE_HOSTS=true)")
+
+
+def _check_media_url_policy(url: str) -> None:
+    """Policy for *user-supplied query-time* media URLs (search with
+    image/video/audio, ``describe_media``, ``transcribe_audio``).
+
+    Ingest-time downloads guard the server against malicious URLs; this
+    guards the same surface for query-time fetches, which previously had no
+    check at all (an internal-SSRF / exfiltration channel: a caller could
+    point the embedder/VLM/ASR at cloud metadata or in-cluster services and
+    read the response back as a description/transcript/embedding match).
+
+    Same rules as :func:`_check_url_policy` with one difference: loopback is
+    allowed by default, because clients legitimately pass the server's own
+    media URLs (``http://localhost:8000/api/datasets/...?token=...``) back
+    to these tools.  ``INGEST_ALLOW_HOSTS`` remains authoritative when set;
+    set ``INGEST_BLOCK_PRIVATE_HOSTS=false`` to disable (not recommended).
+    """
+    if not url.startswith(("http://", "https://")):
+        return
+    from urllib.parse import urlparse
+
+    host = urlparse(url).hostname or ""
+    if _INGEST_ALLOW_HOSTS:
+        if not _host_matches_allowlist(host):
+            raise ValueError(
+                f"URL host '{host}' is not allowed by INGEST_ALLOW_HOSTS"
+                + (f"={','.join(_INGEST_ALLOW_HOSTS)}" if _INGEST_ALLOW_HOSTS else "")
+            )
+        return
+    if _INGEST_BLOCK_PRIVATE and _host_is_private(host, allow_loopback=True):
+        raise ValueError(
+            f"URL host '{host}' resolves to a private/internal address "
+            f"(INGEST_BLOCK_PRIVATE_HOSTS=true; add it to INGEST_ALLOW_HOSTS to permit)"
+        )
 
 
 def _download_url(url: str, timeout: int = 120) -> str:
@@ -1063,8 +1164,13 @@ class DatasetManager:
         self._verify_endpoints()
 
         # Cache: dataset_name → MultimodalRAG instance
-        self._rag_cache: dict[str, MultimodalRAG] = {}
+        self._rag_cache: OrderedDict[str, MultimodalRAG] = OrderedDict()
         self._rag_cache_lock = threading.Lock()
+        # LRU cap: each cached MultimodalRAG holds its own QdrantClient
+        # (connection pool + sockets).  Unbounded growth — one client per
+        # dataset ever touched, for the process lifetime — matters on
+        # servers serving many datasets.  Eviction closes the client.
+        self._rag_cache_max = max(1, int(os.environ.get("RAG_CACHE_MAX", "64")))
 
         # Embedder fingerprint support: current embedder's vector dimension
         # (probed once per embedder object) and the set of datasets whose
@@ -1767,7 +1873,7 @@ class DatasetManager:
                 progress_callback({"file": fname, "status": "preprocessing"})
 
             try:
-                dst = self._store_file(dataset_name, tmp_path, original_name=fname)
+                dst = self._store_file(dataset_name, tmp_path, original_name=fname, defer_write=True)
                 dst_str = str(dst)
                 stored_path = str(dst)  # tier-0 stored path (before preprocessing)
                 file_type = _classify_file(dst_str)
@@ -1995,6 +2101,11 @@ class DatasetManager:
             _queue_batch(batch_docs, batch_files_list)
         batch_queue.put(None)  # sentinel
         consumer_thread.join()
+
+        # Persist the batch's deferred .hashes.json entries — one merged
+        # write under the cross-process lock instead of a full index rewrite
+        # per stored file (O(n²) NFS I/O on large batches).
+        _flush_hash_index_writes()
 
         # If the consumer thread crashed, propagate the error
         if consumer_error[0] is not None:
@@ -3251,6 +3362,23 @@ class DatasetManager:
                         },
                     )
                     self._rag_cache[dataset_name] = rag
+                    # LRU eviction: drop the least-recently-used RAG (and
+                    # close its Qdrant client) past the cap.
+                    while len(self._rag_cache) > self._rag_cache_max:
+                        _, evicted = self._rag_cache.popitem(last=False)
+                        try:
+                            vs = getattr(evicted, "vector_store", None)
+                            client = getattr(vs, "_client", None)
+                            if client is not None:
+                                client.close()
+                        except Exception:
+                            logger.debug("Evicted RAG client close failed", exc_info=True)
+                else:
+                    self._rag_cache.move_to_end(dataset_name)
+        else:
+            with self._rag_cache_lock:
+                if dataset_name in self._rag_cache:
+                    self._rag_cache.move_to_end(dataset_name)
         if check_embedder and dataset_name not in self._embedder_verified:
             self._assert_embedder_compatible(dataset_name)
             self._embedder_verified.add(dataset_name)
@@ -3416,29 +3544,22 @@ class DatasetManager:
 
     def _is_ingested(self, dataset_name: str, file_hash: str) -> bool:
         """True if *file_hash* was already successfully ingested here."""
-        p = self._ingested_hashes_path(dataset_name)
-        if not p.exists():
-            return False
-        try:
-            return file_hash in json.loads(p.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return False
+        return file_hash in _load_ingested_hashes(self._ingested_hashes_path(dataset_name))
 
     def _mark_ingested(self, dataset_name: str, file_hash: str) -> None:
         """Record *file_hash* as successfully ingested for *dataset_name*."""
         p = self._ingested_hashes_path(dataset_name)
         with _cross_process_lock(p.with_suffix(".lock")):
-            hashes: set[str] = set()
-            if p.exists():
-                try:
-                    hashes = set(json.loads(p.read_text(encoding="utf-8")))
-                except (json.JSONDecodeError, OSError):
-                    hashes = set()
+            hashes = _load_ingested_hashes(p)
+            if file_hash in hashes and p.exists():
+                return
             hashes.add(file_hash)
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(sorted(hashes)), encoding="utf-8")
             os.replace(tmp, p)
+            with _ingested_hashes_cache_lock:
+                _ingested_hashes_cache[p] = (p.stat().st_mtime_ns, hashes)
 
     def _clear_ingested_hashes(self, dataset_name: str) -> None:
         """Forget every ingest-dedup hash for *dataset_name*.
@@ -3454,6 +3575,8 @@ class DatasetManager:
                     p.unlink()
             except OSError:
                 logger.warning("Could not clear ingest-dedup index %s", p)
+            with _ingested_hashes_cache_lock:
+                _ingested_hashes_cache.pop(p, None)
 
     def _finish_ingest(self, dataset_name: str, content_hash: str | None, result: dict[str, Any]) -> dict[str, Any]:
         """Mark *content_hash* ingested when the result stored vectors, then return it."""
@@ -3461,12 +3584,27 @@ class DatasetManager:
             self._mark_ingested(dataset_name, content_hash)
         return result
 
-    def _store_file(self, dataset_name: str, source_path: str, original_name: str | None = None) -> Path:
+    def _store_file(
+        self,
+        dataset_name: str,
+        source_path: str,
+        original_name: str | None = None,
+        defer_write: bool = False,
+    ) -> Path:
         """Copy *source_path* into the dataset's files directory and return the new path.
 
         Files are deduplicated by SHA-256 hash: if a file with the same
         content was already stored, the existing path is returned without
         copying.
+
+        With ``defer_write=True`` (batch ingests) the new hash entry is not
+        written to ``.hashes.json`` immediately: it is recorded in a dirty
+        set merged into the on-disk index by
+        :func:`_flush_hash_index_writes` at the end of the batch.  Writing
+        the whole index once per file made N-file ingests O(n²) in disk I/O.
+        Callers that defer MUST flush (batch paths do so in ``finally``);
+        crash before flush only loses dedup entries — files remain on disk
+        and a retry re-copies them.
         """
         self._validate_name(dataset_name)
         files_dir = self._dataset_dir(dataset_name) / "files"
@@ -3478,6 +3616,22 @@ class DatasetManager:
             while chunk := f.read(8192):
                 h.update(chunk)
         file_hash = h.hexdigest()
+
+        # Copy FIRST — outside the lock.  The destination name is a fresh
+        # UUID, so concurrent writers never collide on the file itself; the
+        # cross-process lock only guards the .hashes.json read-modify-write.
+        # (It used to be held across the whole copy, serializing concurrent
+        # uploads to a dataset behind each full file copy on the NFS PVC.)
+        if original_name:
+            stem = Path(original_name).stem
+            suffix = Path(original_name).suffix
+        else:
+            stem = Path(source_path).stem
+            suffix = Path(source_path).suffix
+        dest = files_dir / f"{uuid.uuid4().hex}_{stem}{suffix}"
+        import shutil
+
+        shutil.copy2(source_path, dest)
 
         # Load or create hash index.  The read→modify→write of .hashes.json
         # is guarded by a cross-process file lock so concurrent uploads
@@ -3491,21 +3645,17 @@ class DatasetManager:
             if file_hash in hash_index:
                 existing = Path(hash_index[file_hash])
                 if existing.exists():
+                    # Another writer stored this file while we were copying
+                    # — drop our duplicate and reuse the indexed copy.
+                    dest.unlink(missing_ok=True)
                     return existing
-                # Stale entry — remove and re-store
+                # Stale entry — replace it with our fresh copy
                 del hash_index[file_hash]
 
-            # Copy file — use original_name for a readable stem if available
-            if original_name:
-                stem = Path(original_name).stem
-                suffix = Path(original_name).suffix
-            else:
-                stem = Path(source_path).stem
-                suffix = Path(source_path).suffix
-            dest = files_dir / f"{uuid.uuid4().hex}_{stem}{suffix}"
-            import shutil
-
-            shutil.copy2(source_path, dest)
             hash_index[file_hash] = str(dest)
-            _write_hash_index(hash_index_path, hash_index)
+            if defer_write:
+                with _hash_index_dirty_lock:
+                    _hash_index_dirty.setdefault(hash_index_path, {})[file_hash] = str(dest)
+            else:
+                _write_hash_index(hash_index_path, hash_index)
             return dest

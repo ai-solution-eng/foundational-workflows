@@ -47,3 +47,4 @@ data:
   MEDIA_TOKEN_TTL: {{ int (.Values.security.mediaTokenTtl | default 3600) | quote }}
   PW_MAX_FAILURES: {{ int (.Values.security.pwMaxFailures | default 10) | quote }}
   PW_FAIL_WINDOW: {{ int (.Values.security.pwFailWindow | default 300) | quote }}
+  RAG_TRUST_PROXY_IDENTITY: {{ .Values.security.trustProxyIdentity | default false | quote }}

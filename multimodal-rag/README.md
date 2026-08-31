@@ -119,19 +119,25 @@ opt-in protection (per-process env vars, or first-class [Helm
 
 | Env var | Purpose | Default |
 |---|---|---|
-| `RAG_API_KEY` | Require `Authorization: Bearer <key>` (or `X-RAG-Api-Key`) on all `/api/*` routes (health/probes, frontend pages, and media serving stay open; `/docs` is effectively disabled). | unset (no auth) |
-| `MEDIA_TOKEN_SECRET` | Secret shared by API + MCP so returned media URLs carry short-lived HMAC `?token=` (expiry `MEDIA_TOKEN_TTL`) instead of the dataset `?password=` in the clear. | unset (legacy `?password=`) |
+| `RAG_API_KEY` | Require `Authorization: Bearer <key>` (or `X-RAG-Api-Key`) on all `/api/*` routes. Exempt: health/probes, the HTML pages (the served page embeds the key so the browser UI keeps working), dataset media serving, and staged media. MCP clients are unaffected (the MCP server has no key middleware). The charts ship a default key — change it for real deployments; direct/scripted callers must send the header, and the Open WebUI filter takes it via its `RAG_API_KEY` valve. | charts: shipped default (auth on); unset = no auth |
+| `MEDIA_TOKEN_SECRET` | **Required.** Secret shared by API + MCP; returned media URLs carry short-lived HMAC `?token=` (expiry `MEDIA_TOKEN_TTL`) — the legacy clear `?password=` suffix was removed. Both servers refuse to start without it. | unset → startup refused |
 | `INGEST_ALLOW_HOSTS` | Comma-separated host allowlist for `/batch-urls` http(s) ingestion (`.example.com` matches subdomains). | unset (all hosts) |
-| `INGEST_BLOCK_PRIVATE_HOSTS` | Reject http(s) URLs (ingest) that resolve to private/loopback/link-local ranges. | `false` |
+| `INGEST_BLOCK_PRIVATE_HOSTS` | Reject http(s) URLs (ingest **and query-time media**) that resolve to private/link-local ranges (query-time still allows loopback — clients pass the server's own media URLs back). | `true` |
 | `MAX_REMOTE_DOWNLOAD_BYTES` | Cap per remote/S3 download (streamed, aborted past this). | 536870912 |
 | `ARCHIVE_MAX_TOTAL_BYTES` / `ARCHIVE_MAX_MEMBER_BYTES` / `ARCHIVE_MAX_ENTRIES` | Zip/tar/rar unpacked-size caps (incl. nested archives). | 2 GiB / 1 GiB / 10000 |
-| `MEDIA_ALLOW_PATH_PREFIXES` | Allowlist of `file://` prefixes the MCP `describe_media`/`transcribe_audio`/audio-query tools may read (`:`-separated). | unset (unrestricted) |
+| `MEDIA_ALLOW_PATH_PREFIXES` | Allowlist of `file://` prefixes the MCP `describe_media`/`transcribe_audio`/audio-query tools may read (`:`-separated). | `DATA_PATH/datasets:DATA_PATH/staging` (fail-closed when unset) |
 | `PW_MAX_FAILURES` / `PW_FAIL_WINDOW` | Password-failure throttle (returns 429 per identity). | 10 / 300 s |
-| `MODEL_HEALTH_INTERVAL` / `MODEL_HEALTH_FAIL_THRESHOLD` | Background embedder liveness probe: interval in seconds, and consecutive failures before `/healthz` returns 503. | 60 / 3 |
+| `MODEL_HEALTH_INTERVAL` / `MODEL_HEALTH_FAIL_THRESHOLD` | Background embedder probe: interval in seconds, and consecutive failures before a warning is logged. The result surfaces in `/api/admin/health` and the manage page — `/healthz` and `/readyz` deliberately do **not** gate on the embedder (a remote-model outage is not fixed by restarting this pod). | 60 / 3 |
 | `CONFIG_DIR` | `:`-separated dirs of mounted ConfigMap/Secret files (one file per env key). When set, model config is **live-reloaded** on file change — no rollout needed (charts mount `-config` and `-model-keys` at `/etc/rag/config:/etc/rag/secrets`). The new embedder is verified before swap; an unreachable one is rejected and the old config is kept. | unset (env-only, rollout required) |
-| `QUERY_EMB_CACHE_MAX`, `FILE_HASH_CACHE_MAX`, `ASR_TRANSCRIPT_CACHE_MAX`, `UNLOCK_CACHE_MAX` | Bounded sizes for the in-process caches. | 4096 / 4096 / 512 / 4096 |
+| `QUERY_EMB_CACHE_MAX`, `FILE_HASH_CACHE_MAX`, `ASR_TRANSCRIPT_CACHE_MAX`, `UNLOCK_CACHE_MAX` | Bounded sizes for the in-process caches (query vectors are stored packed — `array('f')`). | 4096 / 4096 / 512 / 4096 |
+| `RAG_TRUST_PROXY_IDENTITY` | Trust `X-Auth-Request-*`/`X-Email`/`X-User` headers for unlock-cache scoping and password throttling. Keep **off** unless an enforcing auth proxy overwrites these headers on every request — otherwise clients can spoof them to hijack unlocks or rotate identities past the throttle. | `false` (socket peer) |
+| `QDRANT_CLIENT_TIMEOUT` | Hard timeout (s) for sync Qdrant calls, so a hung Qdrant cannot pin `sync_pool`/`qdrant-io` threads forever. | unset (no timeout; charts set 30) |
+| `QDRANT_POOL_SIZE` / `MEDIA_POOL_SIZE` | Dedicated thread-pool sizes for Qdrant I/O (batched searches, upserts) and ffmpeg/media work — kept off the event loop and out of the default executor. | 4 / 2 |
+| `EMBEDDING_QUERY_IDLE_WAIT_MS` | Idle early-flush for the embedding query batchers: a batch flushes early when no new query arrives for this long, so an isolated interactive search doesn't wait out the full `EMBEDDING_QUERY_BATCH_WAIT_MS` window (bursts still coalesce). `0` restores the old full-window behavior. | 10 |
+| `RAG_EMBED_BATCH_URL` | Optional URL of a shared (cross-process) embedding query batcher: text-only queries are POSTed there instead of the per-process local batcher, so batch size is independent of worker/pod count. Falls back to local batching when unreachable. | unset (local batching) |
+| `MODEL_EMBED_MAX_CONCURRENCY` | Per-event-loop bound on concurrent multimodal embedding POSTs (one request per converted doc; concurrent ingests multiply this). `0` disables the bound. | 32 |
 
-All defaults preserve the pre-1.9 behaviour. `helm/`, `helm-scale-large/` and
+Some defaults have deliberately shifted from permissive to strict since v1.9 (`MEDIA_TOKEN_SECRET` now required, private-host ingest blocking on, media path allowlist fail-closed). `helm/`, `helm-scale-large/` and
 `helm-scale-medium/` ship a `security:` values block wired to these flags. In
 PCAI you set them in `values.yaml` (the *Helm Values* editor):
 

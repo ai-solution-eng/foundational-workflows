@@ -259,8 +259,15 @@ API and updating `RAG_MEMORY_PASSWORD` in users' env.
   `document_count` to confirm writes are landing.
 - **Multi-replica:** in stateless mode (v1.3.0+), each request logs as a
   fresh transport (no "Created new transport with session ID" line).
-  Unlock state is shared via Redis, not in-memory — verify with
+  The REST unlock cache is shared via Redis (not in-memory) — verify with
   `kubectl exec deploy/rag-mcp-server-redis -- redis-cli KEYS '*unlock*'`.
+  The MCP unlock cache is per-process; on multi-replica deployments pass
+  `password=` on each MCP tool call instead of relying on `unlock_dataset`.
+- **API-key auth (`RAG_API_KEY`) does not affect the memory plugins:** both
+  the DSH and opencode session-memory plugins talk MCP (`/mcp`,
+  `tools/call`) — the MCP server has no API-key middleware. Only direct
+  REST callers need the `X-RAG-Api-Key` header.
+
 
 ### Troubleshooting
 

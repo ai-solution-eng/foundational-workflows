@@ -32,12 +32,24 @@ layout.
 
 > **Multi-replica deployments (helm-scale-medium / helm-scale-large):** the MCP
 > server runs `stateless_http=True` + `json_response=True` so any pod
-> can handle any request — no in-memory session state. Dataset unlock
-> state is shared across pods via Redis (`redis.enabled=true`). This is
+> can handle any request — no in-memory session state. Note that the MCP
+> unlock cache is **per-process** (an in-process dict, unlike the REST
+> unlock cache which is Redis-backed when `redis.enabled=true`): with
+> `stateless_http=True` any pod can handle any request, but an MCP
+> `unlock_dataset` on pod A is not visible to pod B — callers should pass
+> `password=` per tool call on multi-replica deployments. This is
 > required for horizontal scaling; the default stateful mode would
 > return `404 Session not found` when the K8s Service load-balances a
 > request to a different pod than the one that initialized the session.
 > See [SCALE.md](SCALE.md) for the full scale-chart architecture.
+
+> **API-key auth does not apply to the MCP server.** `RAG_API_KEY`
+> (`security.apiKey`) is enforced only by the REST API server's middleware.
+> The MCP transport has no API-key middleware — MCP clients (opencode, DSH
+> session-memory plugins, other MCP hosts) need nothing beyond whatever the
+> gateway requires; dataset protection comes from the per-tool
+> `password=` / unlock flow. The REST-side auth semantics are documented in
+> `API.md`.
 
 If the cluster ingress uses `oauth2-proxy` (EZUA), include a bearer
 token in the `Authorization` header:
@@ -53,7 +65,7 @@ token in the `Authorization` header:
 | Tool | Purpose | Needs `dataset_name`? | Needs `password`? |
 |------|---------|----------------------|-------------------|
 | `list_datasets()` | List all datasets with metadata | — | — |
-| `unlock_dataset(dataset_name, password, ttl)` | Verify a dataset password; cached across pods via Redis (default 30 min) | yes | yes |
+| `unlock_dataset(dataset_name, password, ttl)` | Verify a dataset password; cached per-process (default 30 min) — pass `password=` per call on multi-replica deployments | yes | yes |
 | `search_dataset(dataset_name, query, image?, video?, audio?, top_k?, use_reranker?, reranker_top_k?, base_llm_modalities?, password?, media_base_url?)` | Full multimodal retrieval with post-processing | yes | if protected |
 | `get_dataset_files(dataset_name, file_path?, limit?, offset?, password?)` | List or retrieve files in a dataset | yes | if protected |
 | `get_dataset_info(dataset_name, password?)` | Dataset metadata | yes | if protected |

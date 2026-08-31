@@ -108,7 +108,7 @@ User uploads files / pastes image  ──→  Open WebUI Filter (inlet)
 ## Prerequisites
 
 - Open WebUI **v0.3.0+** (for Functions/Filter support)
-- A running [Multimodal RAG API server](src/multimodal_rag/api_server.py)
+- A running [Multimodal RAG API server](../src/multimodal_rag/api_server.py)
   (for the staging endpoint) — ships with the standard helm chart
 - The **Multimodal RAG MCP server** enabled and connected to the Open
   WebUI model, so the LLM can call `search_dataset`.
@@ -135,6 +135,7 @@ After installing, click the ⚙️ icon next to the filter to configure:
 | Valve | Default | Description |
 |-------|---------|-------------|
 | `RAG_API_URL` | `http://rag-mcp-server-api.mm-rag-mcp.svc.cluster.local` | Base URL of the Multimodal RAG API (for the staging endpoint + dataset list) |
+| `RAG_API_KEY` | `""` | API key sent as `X-RAG-Api-Key` on every RAG-API request; required when the server has `security.apiKey` set (the charts ship a default one) |
 | `DATASET_NAME` | `default` | Fallback injected into the hint only if the filter can't fetch the live dataset list |
 | `ROUTE_IMAGES` | `true` | Hand images off to the MCP tool (false = leave for a vision LLM) |
 | `ROUTE_VIDEO` | `true` | Hand video off to the MCP tool |
@@ -145,6 +146,7 @@ After installing, click the ⚙️ icon next to the filter to configure:
 | `MCP_TOOL_HINT` | _(default text)_ | Header prepended to the staged-media hint |
 | `INJECT_AS_SYSTEM` | `true` | Inject as system message (vs. append to user) |
 | `MAX_CONTEXT_CHARS` | `4000` | Max characters of injected context (hint + text files) |
+| `REPAIR_MEDIA_URLS` | `true` | Repair garbled media URLs in the model's reply: match every `/api/datasets/{name}/files/{file}` URL, re-resolve the real staged/dataset path, and substitute the correct host + short-lived `?token=` so media renders |
 | `CONTEXT_HEADER` | _(default text)_ | Header before injected context |
 | `PRIORITY` | `0` | Filter priority (lower = runs first) |
 | `MEMORY_ENABLED` | `true` | Enable long-term memory (recall + write) |
@@ -407,7 +409,7 @@ do **not** want to route those through RAG at all, set the matching
 | "media skipped — DEFER_TO_MCP off" warning | `DEFER_TO_MCP=false` and no native support | Enable MCP + set `DEFER_TO_MCP=true`, or set `ROUTE_*=false` for a vision LLM |
 | Staging upload fails | RAG API unreachable | Check `RAG_API_URL` and `STAGING_PATH` |
 | MCP tool can't read `file://` URL | PVC not shared between API & MCP | Ensure both containers mount `DATA_PATH` at the same path (default helm chart does) |
-| Staged files accumulate | Sweep runs probabilistically (~1 in 10 uploads) in the background | Increase `STAGING_SWEEP_RATE` (or set `STAGING_TTL` lower); files live under `DATA_PATH/staging/` |
+| Staged files accumulate | Sweep runs probabilistically (~1 in 10 uploads) in the background | On the **RAG API server** set `STAGING_SWEEP_RATE` higher (or `STAGING_TTL` lower) — these are server env vars, not filter valves; files live under `DATA_PATH/staging/` |
 | Hint shows only `DATASET_NAME` instead of full list | Filter couldn't reach `GET /api/datasets` | Check `RAG_API_URL` reachability and RAG API health |
 | Upload shows error in UI | `file_handler` conflict with other filters | Check for conflicting filters |
 

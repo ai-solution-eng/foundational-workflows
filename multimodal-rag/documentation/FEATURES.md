@@ -2,6 +2,11 @@
 
 ## Overview
 
+<div align="center"><img src="./rag_system_flow-1.png" width="700" alt="Data pipeline: dataset building (left) feeding a shared vector store, queried at query time (right)"></div>
+
+<div align="center"><img src="./deployment_flow-1.png" width="900" alt="Deployment architecture: clients, edge, release pods, data, and MLIS model endpoints"></div>
+
+
 This system ingests documents in **17+ file formats**, processes each with a format-specific chunking strategy, embeds them into a joint multimodal vector space (text, image, video, audio) via **Qwen3-VL-Embedding-8B**, and retrieves them at query time with optional cross-encoder reranking via **Qwen3-VL-Reranker-8B**.
 
 Modalities the embedder doesn't support natively (audio) are converted to text via ASR **before** embedding (Preprocessor). Modalities the downstream LLM doesn't support are converted **after** retrieval (Postprocessor).
@@ -518,14 +523,14 @@ A routing step can optionally skip RAG entirely if the LLM determines it can ans
 | GET | `/api/admin/health` | Full health (model endpoints, Qdrant status + per-replica shard placement, PVC) |
 | GET | `/api/admin/models` | Discovered model list (model_name per role) |
 | GET | `/api/admin/connections` | Live-check every configured model endpoint (`/v1/models`) → per-role `healthy` / `not_provided` / `unhealthy` |
-| POST | `/api/datasets` | Create (name, description, caption_video, password) |
+| POST | `/api/datasets` | Create (name, description, caption_with_asr, caption_with_vlm, keep_originals, password) |
 | POST | `/api/datasets/{name}/verify-password` | Verify password → 200/401/403 |
 | POST | `/api/datasets/{name}/unlock` | Unlock (cached, Redis across pods) |
 | POST | `/api/datasets/{name}/lock` | Revoke unlock |
 | POST | `/api/datasets/{name}/media-token` | Mint a short-lived dataset-scoped HMAC token for media URLs |
 | GET | `/api/datasets` | List all |
 | GET | `/api/datasets/{name}` | Get one (uses `X-Dataset-Password` header) |
-| PATCH | `/api/datasets/{name}` | Update metadata (description, caption_video) |
+| PATCH | `/api/datasets/{name}` | Update metadata (description, caption_with_asr, caption_with_vlm) |
 | DELETE | `/api/datasets/{name}` | Delete dataset + Qdrant collection |
 | POST | `/api/admin/datasets/{name}/recreate` | Rebuild a dataset from its on-disk files with the current embedder (drops the old collection, re-embeds) |
 | POST | `/api/datasets/{name}/documents` | Add raw text/dict docs |
@@ -559,8 +564,8 @@ Exposes **9 MCP tools** (`mcp_server.py`):
 
 | Tool | Purpose |
 |------|---------|
-| `list_datasets()` | Returns formatted text of all datasets (with `[caption_video]` / `[password]` markers) |
-| `unlock_dataset()` | Verify a dataset password and cache the unlock across pods via Redis (default TTL 30 min) |
+| `list_datasets()` | Returns formatted text of all datasets (with `[asr]` / `[vlm]` / `[password]` / `[unlocked]` markers) |
+| `unlock_dataset()` | Verify a dataset password and cache the unlock per-process (default TTL 30 min; the MCP cache is not Redis-backed — pass `password=` per call on multi-replica deployments) |
 | `search_dataset()` | Multimodal search (`dataset_name`, `query`, `image`/`video`/`audio`, `top_k`, `use_reranker`, `reranker_top_k`, `password`, `media_base_url`). Instantiates a `Postprocessor` for modality conversion based on `base_llm_modalities`. |
 | `get_dataset_files()` | List or retrieve files from a dataset (text inline; binary returns metadata + `download_url`) |
 | `get_dataset_info()` | Returns dataset metadata |
@@ -613,11 +618,12 @@ the `X-Dataset-Password` request header, never in a URL.
 so it is probed automatically every `MODEL_HEALTH_INTERVAL` seconds (default
 60) in the background. The result (`healthy` / `unhealthy`, last check time,
 error) is exposed via `/api/admin/health` under `models.embedder` and shown on
-the management page. The embedder gate drives the **readiness** probes, not
-liveness: `/readyz` (API) and the MCP sidecar's `/readyz` return 503 after
-`MODEL_HEALTH_FAIL_THRESHOLD` (default 3) consecutive failures, dropping the
-pod out of Service rotation without a restart loop — the embedder is always a
-remote vLLM/SGLang endpoint, and a pod restart cannot bring it back. The
+the management page. After `MODEL_HEALTH_FAIL_THRESHOLD` (default 3)
+consecutive failures a warning is logged — **no probe gates on the embedder**:
+`/healthz` and `/readyz` (API and MCP sidecar) deliberately do not check model
+endpoints, because the embedder is always a remote vLLM/SGLang endpoint and a
+pod restart cannot bring it back (dropping the pod out of Service rotation
+would only reduce remaining capacity). The
 management page's "Test connections" button additionally runs an on-demand
 live check of **every** configured model (`GET /api/admin/connections`) with
 three states: healthy (green), not provided (yellow), unhealthy (red).
@@ -688,7 +694,7 @@ When `S3_ENDPOINT_URL` is unset, the default boto3 credential chain (IAM roles, 
 
 ## Storage & Metadata
 
-**Per-dataset metadata** (`meta.json`): `name`, `description`, `caption_video`, `created`, `document_count`, `password_hash`, `file_type_counts` (dict of per-type doc counts).
+**Per-dataset metadata** (`meta.json`): `name`, `description`, `caption_with_asr`, `caption_with_vlm`, `created`, `document_count`, `password_hash`, `file_type_counts` (dict of per-type doc counts).
 
 **Dataset management:**
 - Each dataset = one Qdrant collection named after the dataset.
@@ -697,7 +703,7 @@ When `S3_ENDPOINT_URL` is unset, the default boto3 credential chain (IAM roles, 
 - `original_source` field preserves the original basename alongside the stored `source` PVC path.
 - Document deletion by Qdrant point ID (`PointIdsList` selector with `wait=True`).
 
-**Endpoint verification** (at startup): all 4 model endpoints (embedder, reranker, vlm, asr) are pinged via OpenAI-compatible `GET /v1/models`. Raises `RuntimeError` if unreachable.
+**Endpoint verification** (at startup): the embedder is pinged via OpenAI-compatible `GET /v1/models` and raises `RuntimeError` if unreachable (it is the one required model); reranker/vlm/asr are optional — if unreachable, a warning is logged and startup proceeds without them.
 
 **Admin storage stats:** `/api/admin/storage` returns PVC disk usage (total/used/free/utilization) and per-dataset breakdowns with file-type sub-items (docs + bytes per type). Runs in a thread pool (via `run_in_executor`) so health/readiness probes stay responsive during large collection scans. File-type backfill uses paginated Qdrant scroll (256 points at a time, capped at 50k) with `PayloadSelectorInclude` to fetch only `metadata.source` instead of full payloads — preventing memory spikes and event-loop blocking that previously caused pod crashes on the management page.
 

@@ -5,6 +5,7 @@ import os
 import re
 import time
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cached_property
 from io import BytesIO
@@ -30,6 +31,7 @@ from multimodal_rag.utils.pcai_model_classes import (
     VoiceModel,
 )
 from multimodal_rag.vector_store import (
+    _QDRANT_IO_POOL,
     Document,
     InMemoryVectorStore,
     QdrantVectorStore,
@@ -37,6 +39,15 @@ from multimodal_rag.vector_store import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Dedicated pool for media-side subprocess/CPU work (ffmpeg resize/transcode,
+# ffmpeg probe) inside async ingest.  Previously this shared the *default*
+# executor with the Qdrant search batcher, so concurrent uploads could stall
+# every search on the pod; it now has its own bounded lane (MEDIA_POOL_SIZE).
+_MEDIA_POOL = ThreadPoolExecutor(
+    max_workers=max(1, int(os.environ.get("MEDIA_POOL_SIZE", "2"))),
+    thread_name_prefix="media-io",
+)
 
 __all__ = ["MultiModalRAGSystem", "MultimodalRAG", "Postprocessor", "Preprocessor"]
 
@@ -283,7 +294,9 @@ async def _afetch_media_bytes(url: str, async_client=None) -> bytes:
             return resp.content
         import httpx
 
-        async with httpx.AsyncClient() as c:
+        # Bounded timeout: this per-call client previously had none, so a
+        # hung media server would hang the enclosing asyncio.gather forever.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=15.0)) as c:
             resp = await c.get(url, follow_redirects=True)
             resp.raise_for_status()
             return resp.content
@@ -569,6 +582,51 @@ def _query_needs_vlm(query: str | dict[str, Any] | None) -> bool:
     q_lower = q_text.lower()
     for _label, pattern in _VLM_SPECIFIC_PATTERNS:
         if re.search(pattern, q_lower):
+            return True
+    return False
+
+
+def _media_payloads_needed(
+    docs: list[Any],
+    *,
+    use_vlm: bool,
+    vlm: Any,
+    llm_modalities: set[str],
+    query: str | dict[str, Any] | None,
+) -> bool:
+    """Conservatively predict whether tier-3 base64 media payloads are needed.
+
+    Mirrors the Postprocessor's VLM-skip logic (caption reuse for generic
+    queries) so retrieval can run a lightweight phase-1 search (tier-3 base64
+    excluded) and only re-fetch payloads when a consumer will actually use
+    them:
+
+    * a vision-capable base LLM consumes ``image``/``video`` keys directly;
+    * a VLM conversion will run — i.e. some retrieved doc has media and is
+      NOT covered by a reusable ingest-time caption (caption present AND the
+      query is generic).
+
+    Media presence is detected from tier-2 ``preprocessed_*`` refs, which —
+    unlike the tier-3 base64 keys — survive the lightweight payload selector.
+    Audio never triggers a payload fetch: tier-3 audio is stored as a file
+    ref, so the Postprocessor's ASR path reads it from disk regardless.
+    """
+    if bool(llm_modalities & {"image", "video"}):
+        return any(isinstance(d, dict) and any(k in d for k in ("image", "video", "preprocessed_image", "preprocessed_video")) for d in docs)
+    if not use_vlm or vlm is None:
+        return False
+    query_is_specific = _query_needs_vlm(query)
+    for d in docs:
+        if not isinstance(d, dict):
+            continue
+        text = d.get("text") or ""
+        if ("image" in d or "preprocessed_image" in d) and not (
+            "[Image description]:" in text and not query_is_specific
+        ):
+            return True
+        if ("video" in d or "preprocessed_video" in d) and not (
+            "[Video description]:" in text and not query_is_specific
+        ):
             return True
     return False
 
@@ -1360,7 +1418,12 @@ class MultimodalRAG:
         try:
             client = vs._client  # type: ignore[attr-defined]
             coll = vs.collection_name  # type: ignore[attr-defined]
-            records, _ = client.scroll(coll, limit=limit, with_payload=True, with_vectors=False)
+            # Offloaded: the sync scroll is a network round-trip that would
+            # otherwise block the caller's event loop.
+            records, _ = await asyncio.get_running_loop().run_in_executor(
+                _QDRANT_IO_POOL,
+                lambda: client.scroll(coll, limit=limit, with_payload=True, with_vectors=False),
+            )
             out = []
             for rec in records:
                 payload = rec.payload or {}
@@ -1756,10 +1819,12 @@ class MultimodalRAG:
 
         for sub in list_chunker(processed, embed_batch_size):
             # ── 0b. Resize media before storage ─────────────────────────────
-            # Run in a thread pool — ffmpeg/probe subprocess calls would
-            # otherwise block the event loop for up to 300s per video.
+            # Run in the dedicated media pool — ffmpeg/probe subprocess calls
+            # would otherwise block the event loop for up to 300s per video
+            # (and would previously compete with Qdrant search flushes on the
+            # default executor).
             loop = asyncio.get_running_loop()
-            sub = await loop.run_in_executor(None, self._resize_media_in_docs, sub)
+            sub = await loop.run_in_executor(_MEDIA_POOL, self._resize_media_in_docs, sub)
 
             # ── 0c. Split long audio transcriptions into chunks ─────────────
             sub = self._split_audio_chunks(sub)
@@ -1888,7 +1953,7 @@ class MultimodalRAG:
             # ── 2b. Deduplicate ─────────────────────────────────────────────
             if deduplicate and sub_embs:
                 results = await loop.run_in_executor(
-                    None,
+                    _QDRANT_IO_POOL,
                     self._batch_find_duplicates,
                     vs,
                     sub_embs,
@@ -1937,7 +2002,14 @@ class MultimodalRAG:
                             },
                         )
                     )
-                client.upsert(collection_name=coll, points=points, **kwargs)
+                # Offloaded: a media-heavy sub-batch can carry tens to
+                # hundreds of MB of tier-3 base64 payloads — the sync upsert
+                # (network + JSON serialization) must not block the event
+                # loop while it POSTs.
+                await loop.run_in_executor(
+                    _QDRANT_IO_POOL,
+                    lambda: client.upsert(collection_name=coll, points=points, **kwargs),
+                )
 
             t_store_total += time.monotonic() - t2
             # sub_embs / sub_docs fall out of scope here — released before the
@@ -2647,23 +2719,41 @@ class MultiModalRAGSystem:
             logger.verbose("%.2fs route(llm)  → RAG needed", time.monotonic() - t_r)  # type: ignore[attr-defined]
 
         t_r = time.monotonic()
-        # Base64 media payloads are needed when the reranker, VLM, or a
-        # vision-capable base LLM will consume them.
-        llm_mods = self._llm_modalities
-        need_media = (
-            (use_reranker and self._rag.reranker is not None)
-            or (use_vlm and self._rag.vlm is not None)
-            or bool(llm_mods & {"image", "video"})
-        )
+        # Two-phase media fetch: phase 1 searches WITHOUT the heavy tier-3
+        # base64 payloads whenever the reranker doesn't need them upfront;
+        # _media_payloads_needed() then predicts — from the light docs
+        # (captions + tier-2 refs) and the query — whether a consumer will
+        # actually use the payloads, and only then does phase 2 re-search
+        # with them included.  With a VLM configured but a generic query over
+        # pre-captioned docs this skips a multi-MB Qdrant transfer entirely.
+        # (The second search re-embeds the query — cheap relative to the
+        # payload transfer it avoids; the embed batcher absorbs it.)
+        reranker_needs_media = use_reranker and self._rag.reranker is not None
         retrieved = await self._rag.aretrieve(
             query,
             documents,
             top_k,
             use_reranker=use_reranker,
             reranker_top_k=reranker_top_k,
-            need_media=need_media,
+            need_media=reranker_needs_media,
         )
         retrieved_docs = [d for d, _ in retrieved]
+        if not reranker_needs_media and _media_payloads_needed(
+            retrieved_docs,
+            use_vlm=use_vlm,
+            vlm=self._rag.vlm,
+            llm_modalities=self._llm_modalities,
+            query=query,
+        ):
+            retrieved = await self._rag.aretrieve(
+                query,
+                documents,
+                top_k,
+                use_reranker=False,
+                reranker_top_k=reranker_top_k,
+                need_media=True,
+            )
+            retrieved_docs = [d for d, _ in retrieved]
         logger.verbose(  # type: ignore[attr-defined]
             "%.2fs retrieve  — %d docs (top_k=%s, reranker=%s%s)",
             time.monotonic() - t_r,

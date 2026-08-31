@@ -13,9 +13,9 @@ tested as a drop-in replacement on a cluster sized for the base chart. The
 
 ## 1. Multiple API replicas + load balancing
 
-`values.yaml` — `replicaCount: 4`
+`values.yaml` — `replicaCount: 2`
 
-The Deployment runs 4 pods (vs 1 in the base chart). Traffic is
+The Deployment runs 2 pods (vs 1 in the base chart). Traffic is
 distributed across them by:
 
 - A **ClusterIP Service** (`templates/service.yaml`) with
@@ -34,9 +34,12 @@ distributed across them by:
 `templates/deployment.yaml` — gunicorn command
 
 Instead of a single `uvicorn` process, the scale chart runs **gunicorn
-with `UvicornWorker`** and `workers: 4` (`values.yaml` → `app.workers`).
-This gives 4 independent event loops per pod, so effective concurrency =
-`replicas × workers × syncPoolSize` = 4 × 4 × 64 = **1024 concurrent
+with `UvicornWorker`** and `workers: 2` (`values.yaml` → `app.workers`).
+Replicas are kept at 2 because the embedder query batcher is per process —
+the large chart previously ran 4 replicas × 4 workers and benchmarked
+~8 req/s vs 49 req/s for the medium chart's 2×2 (batching fragments as
+worker count grows). Effective concurrency =
+`replicas × workers × syncPoolSize` = 2 × 2 × 64 = **256 concurrent
 blocking operations** cluster-wide. Each worker process gets its own
 `sync_pool`, `httpx` connection pools, and Qdrant clients.
 
@@ -177,10 +180,10 @@ is also annotated with `helm.sh/resource-policy: keep` so it survives
 
 | Dimension | Base chart (`helm/`) | Medium chart (`helm-scale-medium/`) | Large chart (`helm-scale-large/`) |
 |---|---|---|---|
-| API replicas | 1 | 2 | 4 |
-| Server | `uvicorn` (1 event loop) | `gunicorn` + 2 `UvicornWorker`s | `gunicorn` + 4 `UvicornWorker`s |
+| API replicas | 1 | 2 | 2 |
+| Server | `uvicorn` (1 event loop) | `gunicorn` + 2 `UvicornWorker`s | `gunicorn` + 2 `UvicornWorker`s |
 | Qdrant | 1 instance (HTTP) | 2-node cluster (gRPC, sharded) | 3-node cluster (gRPC, sharded) |
-| Qdrant client timeout | none | 30s | 30s |
+| Qdrant client timeout | 30s | 30s | 30s |
 | Unlock cache | in-process dict | Redis (cross-pod) | Redis (cross-pod) |
 | Unlock identity | client IP | authenticated user (oauth2-proxy) | authenticated user (oauth2-proxy) |
 | Count sync on read | every call | deferred (admin-only) | deferred (admin-only) |
@@ -208,7 +211,7 @@ Each API pod runs **two** containers (`rag-api-server` +
 |---|---|---|---|---|---|
 | **App** (2 ctr/pod) | `helm/` | 1 | 4 Gi / 4 cpu | 16 Gi / 8 cpu | — |
 | | `helm-scale-medium/` | 2 | 5 Gi / 3 cpu | 16 Gi / 6 cpu | — |
-| | `helm-scale-large/` | 4 | 8 Gi / 4 cpu | 16 Gi / 8 cpu | — |
+| | `helm-scale-large/` | 2 | 8 Gi / 4 cpu | 16 Gi / 8 cpu | — |
 | **Qdrant** | `helm/` | 1 | 16 Gi / 4 cpu | 32 Gi / 8 cpu | 50 Gi |
 | | `helm-scale-medium/` | 2 | 10 Gi / 3 cpu | 20 Gi / 6 cpu | 25 Gi × 2 |
 | | `helm-scale-large/` | 3 | 16 Gi / 4 cpu | 32 Gi / 8 cpu | 100 Gi × 3 |
@@ -220,10 +223,10 @@ Each API pod runs **two** containers (`rag-api-server` +
 
 | | `helm/` (base) | `helm-scale-medium/` | `helm-scale-large/` |
 |---|---|---|---|
-| **Req memory** | 20 Gi | 30.25 Gi (+51 %) | 80.25 Gi (+301 %) |
-| **Req CPU** | 8.0 | 12.1 (+51 %) | 28.1 (+251 %) |
-| **Lim memory** | 48 Gi | 72.5 Gi (+51 %) | 160.5 Gi (+234 %) |
-| **Lim CPU** | 16.0 | 24.5 (+53 %) | 56.5 (+253 %) |
+| **Req memory** | 20 Gi | 30.25 Gi (+51 %) | 64.25 Gi (+221 %) |
+| **Req CPU** | 8.0 | 12.1 (+51 %) | 20.1 (+151 %) |
+| **Lim memory** | 48 Gi | 72.5 Gi (+51 %) | 128.5 Gi (+168 %) |
+| **Lim CPU** | 16.0 | 24.5 (+53 %) | 40.5 (+153 %) |
 | **PVC total** | 100 Gi | 100 Gi (+0 %) | 400 Gi (+300 %) |
 
 Percentages are relative to the base chart. The medium variant is tuned so

@@ -28,10 +28,16 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+      automountServiceAccountToken: false
       containers:
         - name: rag-api-server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           command:
             - python
             - -m
@@ -63,6 +69,10 @@ spec:
               {{- end }}
             - name: QDRANT_PVC_SIZE
               value: {{ .Values.persistence.qdrant.size | quote }}
+            # Bound sync Qdrant calls so a hung Qdrant cannot pin a
+            # sync_pool/qdrant-io thread (and the requests behind it) forever.
+            - name: QDRANT_CLIENT_TIMEOUT
+              value: "30"
             - name: CONFIG_DIR
               value: "/etc/rag/config:/etc/rag/secrets"
             {{- range $key, $val := .Values.extraEnv }}
@@ -81,6 +91,10 @@ spec:
             - name: rag-model-keys
               mountPath: /etc/rag/secrets
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: gunicorn-ctl
+              mountPath: /home/app/.gunicorn
             {{- /* Qdrant's PVC, mounted read-only so the API server can report */}}
             {{- /* its disk usage on the management page. Disabled in the scale */}}
             {{- /* chart where Qdrant runs as a sharded cluster (no single PVC). */}}
@@ -117,6 +131,11 @@ spec:
         - name: rag-mcp-server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           command:
             - python
             - -m
@@ -207,3 +226,7 @@ spec:
           persistentVolumeClaim:
             claimName: data-{{ .Values.deployment.name }}-qdrant-0
         {{- end }}
+        - name: tmp
+          emptyDir: {}
+        - name: gunicorn-ctl
+          emptyDir: {}

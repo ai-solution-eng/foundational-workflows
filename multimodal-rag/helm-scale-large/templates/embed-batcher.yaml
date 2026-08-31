@@ -17,10 +17,16 @@ spec:
       labels:
         app: {{ .Values.deployment.name }}-embed-batcher
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: embed-batcher
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           command: ["python", "-m", "multimodal_rag.embed_batcher"]
           args: ["--host", "0.0.0.0", "--port", {{ .Values.embedBatcher.port | quote }}]
           envFrom:
@@ -46,6 +52,8 @@ spec:
             - name: rag-model-keys
               mountPath: /etc/rag/secrets
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
           resources: {{ toYaml .Values.resources.embedBatcher | nindent 12 }}
           startupProbe:
             httpGet:
@@ -75,6 +83,8 @@ spec:
         - name: rag-model-keys
           secret:
             secretName: {{ .Values.deployment.name }}-model-keys
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

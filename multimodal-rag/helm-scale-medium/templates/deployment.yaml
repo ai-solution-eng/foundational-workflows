@@ -42,10 +42,16 @@ spec:
                         - {{ .Values.deployment.appName }}
                 topologyKey: kubernetes.io/hostname
       {{- end }}
+      automountServiceAccountToken: false
       containers:
         - name: rag-api-server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           command:
             - gunicorn
             - -k
@@ -97,6 +103,10 @@ spec:
             - name: rag-model-keys
               mountPath: /etc/rag/secrets
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: gunicorn-ctl
+              mountPath: /home/app/.gunicorn
             {{- if .Values.persistence.qdrant.mountReadOnly }}
             - name: qdrant-data
               mountPath: /qdrant-storage
@@ -130,6 +140,11 @@ spec:
         - name: rag-mcp-server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           command:
             - python
             - -m
@@ -230,3 +245,7 @@ spec:
           persistentVolumeClaim:
             claimName: data-{{ .Values.deployment.name }}-qdrant-0
         {{- end }}
+        - name: tmp
+          emptyDir: {}
+        - name: gunicorn-ctl
+          emptyDir: {}

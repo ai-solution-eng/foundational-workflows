@@ -36,8 +36,13 @@ Uploaded files land in `/data/datasets/<name>/files/`. Every dataset gets its ow
 
 ```python
 from multimodal_rag import DatasetManager
+from multimodal_rag.model_config import build_all
 
-dm = DatasetManager(base_path="/data")
+# An embedder is required — DatasetManager refuses to start without one
+# (set MODEL_EMBEDDER_NAME / MODEL_EMBEDDER_URL first; reranker/vlm/asr
+# are optional and built as None when their _URL env vars are unset).
+embedder, reranker, vlm, asr = build_all()
+dm = DatasetManager(base_path="/data", embedder=embedder, reranker=reranker, vlm=vlm, asr=asr)
 
 # Create
 dm.create_dataset("dataset_1", "My research papers")
@@ -93,7 +98,7 @@ The API server exposes 35 REST endpoints. Key ones:
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/healthz` | Liveness/readiness |
-| `POST` | `/api/datasets` | Create (name, description, caption_video, password) |
+| `POST` | `/api/datasets` | Create (name, description, caption_with_asr, caption_with_vlm, keep_originals, password) |
 | `GET` | `/api/datasets` | List all |
 | `GET` | `/api/datasets/{name}` | Get one (uses `X-Dataset-Password` header) |
 | `DELETE` | `/api/datasets/{name}` | Delete dataset + Qdrant collection |

@@ -27,7 +27,10 @@ service (see [DEPLOYMENT.md](DEPLOYMENT.md)).
   omit it. Unprotected datasets need none of this.
 - **Optional API key** — if `RAG_API_KEY` is set on the server, every
   `/api/*` request must carry `Authorization: Bearer <key>` or
-  `X-RAG-Api-Key: <key>`. Health/probe and frontend routes stay open.
+  `X-RAG-Api-Key: <key>`. Health/probe routes, the HTML pages (the
+  served page embeds the key for its JS), dataset media serving, and
+  staged media stay open. The MCP server is not covered by this
+  middleware.
 
 Throughout this document `BASE=http://localhost:8000` and
 `DATASET=my_dataset`.
@@ -57,8 +60,8 @@ Fields (all optional except `name`):
 |---|---|---|
 | `name` | — | Must match `[A-Za-z0-9._-]` and start alphanumeric |
 | `description` | `""` | Free-text description |
-| `caption_with_asr` | `false` | Transcribe audio tracks from uploaded videos during ingestion |
-| `caption_with_vlm` | `false` | Describe images/videos with the VLM during ingestion |
+| `caption_with_asr` | server config (`RAG_CAPTION_WITH_ASR`, chart default `true`) | Transcribe audio tracks from uploaded videos during ingestion (auto-disables when no ASR model is configured) |
+| `caption_with_vlm` | server config (`RAG_CAPTION_WITH_VLM`, chart default `true`) | Describe images/videos with the VLM during ingestion (auto-disables when no VLM is configured) |
 | `keep_originals` | `true` | Keep full-quality originals on disk after preprocessing |
 | `password` | unset | Protect the dataset; all reads/ingests then require it |
 
@@ -301,10 +304,14 @@ optional `password` field.
 | `GET` | `/api/datasets/{name}` | Get one dataset's metadata |
 | `PATCH` | `/api/datasets/{name}` | Update metadata (`description`, caption flags) |
 | `POST` | `/api/datasets/{name}/verify-password` | Verify a password → 200 / 401 / 403 |
-| `POST` | `/api/datasets/{name}/unlock` | Unlock for ~30 min (cached, Redis across pods) |
+| `POST` | `/api/datasets/{name}/unlock` | Unlock for ~30 min (REST cache is Redis-backed when Redis is enabled) |
+| `POST` | `/api/datasets/{name}/lock` | Immediately revoke a cached unlock |
+| `POST` | `/api/datasets/{name}/media-token` | Mint a short-lived dataset-scoped HMAC media token (`?token=`) so the password never travels in a URL |
 | `GET` | `/api/datasets/{name}/files/{path}` | Serve a stored file (header, `?password=`, or `?token=`) |
 | `GET` | `/api/datasets/{name}/export` | Download full dataset backup (`.tar.gz`: `meta.json` + `documents.jsonl` + `files/`) |
-| `POST` | `/api/admin/datasets/{name}/recreate` | Rebuild a dataset from its on-disk files with the current embedder (drops old collection, re-embeds; poll `upload-status/{job_id}`) |
+| `GET` | `/api/datasets/{name}/documents/download?format=md\|jsonl` | Download every document as one file — readable Markdown (default) or `{"id","text","metadata"}` JSONL; no binary files, heavy base64 media stripped |
+| `POST` | `/api/admin/datasets/{name}/recreate` | Rebuild a dataset from its on-disk files with the current embedder (drops old collection, re-embeds; poll `upload-status/{job_id}`; password-protected datasets require the `X-Dataset-Password` header) |
+| `POST` | `/api/admin/datasets/{name}/migrate-tier-schema` | One-time migration of a dataset's points to the three-tier media schema (idempotent; password-gated) |
 | `GET` | `/api/admin/health` | Health: model endpoints, Qdrant status + per-replica shard placement, PVC |
 | `GET` | `/api/admin/models` | Discovered model names per role |
 

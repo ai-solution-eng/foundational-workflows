@@ -21,10 +21,15 @@ spec:
       labels:
         app: {{ .Values.deployment.name }}-qdrant
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: qdrant
           image: "{{ .Values.qdrant.image.repository }}:{{ .Values.qdrant.image.tag }}"
           imagePullPolicy: {{ .Values.qdrant.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           # Each peer must advertise its own URI and bootstrap from qdrant-0
           # so the raft cluster can form.  Without this, qdrant panics with
           # "First peer should specify its uri".

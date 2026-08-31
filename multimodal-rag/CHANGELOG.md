@@ -3,6 +3,128 @@
 All notable changes to this project are tracked here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- **Documents download**: `GET /api/datasets/{name}/documents/download?format=md|jsonl` —
+  every document as one streamed file (readable Markdown by default, JSONL
+  for scripts), no binary files, heavy tier-3 base64 stripped, tier-2 refs
+  kept; UI "Download Docs" button on the manage page (named to avoid the
+  existing "Documents" viewer button).
+- **Opt-in backup CronJob** (`backups.enabled`): exports non-protected
+  datasets to an S3/MinIO bucket on a schedule.
+
+### Fixed
+- **API-key middleware exemptions never matched**: `scope["route"]` is not
+  set inside an http middleware (routing happens later), so once
+  `security.apiKey` shipped a default (v3.1.0), every exempt route —
+  dataset media serving, staged media, the HTML pages' JS fetches —
+  returned 401 `Missing or invalid API key`. The middleware now resolves
+  the matched endpoint explicitly.
+- **Default API key + auto-wiring** (`security.apiKey`): charts ship a
+  default key; the served UI embeds it for the browser, and the Open WebUI
+  filter gained an `RAG_API_KEY` valve — direct/scripted callers send
+  `X-RAG-Api-Key`. Same chart-known-default tradeoff as the token secret.
+- **Optional Redis auth** (`redis.password`) and container hardening
+  (read-only rootfs, no privilege escalation, dropped capabilities,
+  no SA token automount) across all charts.
+
+### Performance
+- Two-phase media fetch: searches skip the tier-3 base64 transfer when the
+  VLM conversion would be caption-skipped anyway (`_media_payloads_needed`).
+- `_rag_cache` is now LRU-capped (`RAG_CACHE_MAX`, default 64) and closes
+  evicted Qdrant clients.
+- File copies during ingest no longer hold the cross-process hash lock.
+
+## [3.0.0] — 2026-08-31
+
+*(Shipped as 3.0.0: mandatory `MEDIA_TOKEN_SECRET` and password-gated destructive routes are breaking changes.)*
+
+Second audit round (documentation / performance / security). Supersedes two
+descriptions in the 2.5.0 notes below: **signed media tokens are mandatory,
+not opt-in** (both servers refuse to start without `MEDIA_TOKEN_SECRET`, and
+the legacy `?password=` suffix was fully removed — commit `c27ddab`), and
+**per-client unlock scoping no longer keys on `X-Forwarded-For`** (dropped as
+spoofable; identity now comes from auth-proxy headers when
+`RAG_TRUST_PROXY_IDENTITY` is set, else the socket peer).
+
+### Security
+
+- **Destructive routes are now password-gated**: `DELETE`/`PATCH
+  /api/datasets/{name}`, `/api/admin/datasets/{name}/recreate` and
+  `/migrate-tier-schema` require the dataset password (`X-Dataset-Password`
+  header or a cached unlock) — previously a password-protected dataset could
+  be deleted or rewritten by a caller who never knew the password. The
+  frontend passes `passwordHeader()` on delete/recreate/poll/patch.
+- **Query-time SSRF guard**: media URLs supplied at query time (REST search
+  `image`/`video`/`audio`, MCP `search_dataset`, `describe_media`,
+  `transcribe_audio`, and `add_memory` at write time) are now checked with
+  the same host policy as ingest (`_check_media_url_policy`) — private and
+  link-local ranges (incl. cloud metadata) are blocked by default; loopback
+  is allowed so clients can pass the server's own media URLs back;
+  `INGEST_ALLOW_HOSTS` remains authoritative. `_afetch_media_bytes` also
+  gained a bounded timeout (previously none).
+- **Proxy identity headers are opt-in** (`RAG_TRUST_PROXY_IDENTITY`, helm
+  `security.trustProxyIdentity`): `X-Auth-Request-*`/`X-Email`/`X-User` are
+  client-spoofable, so they are only trusted when the operator confirms an
+  enforcing auth proxy overwrites them; the default is the socket peer.
+  Charts set it `true` (oauth2-proxy deployments).
+- **RAR fallback hardening**: the `unrar` CLI fallback now pre-lists members
+  (entry cap + traversal check), rejects symlink members and enforces the
+  size caps on the extracted bytes (`_sweep_extracted_tree`), fails closed
+  when no RAR tooling exists, and checks the CLI exit code. Bare
+  `.gz`/`.bz2`/`.xz` (non-tar) files now decompress correctly with a
+  streamed byte cap instead of always failing in tarfile.
+- Startup warning when `RAG_API_KEY` is unset (admin surface unauthenticated).
+- Frontend `escHtml` escapes quotes — dataset-controlled values interpolated
+  into attributes (`href=`/`src=`/`onclick=`) can no longer break out
+  (stored XSS).
+
+### Performance
+
+- Dedicated thread pools: `_QDRANT_IO_POOL` (`QDRANT_POOL_SIZE`, 4) for
+  Qdrant upserts/scrolls/dedup/batched searches and `_MEDIA_POOL`
+  (`MEDIA_POOL_SIZE`, 2) for ffmpeg work — previously sync Qdrant upserts
+  ran on the event loop (a media-heavy sub-batch froze every concurrent
+  request) and long ingest jobs shared the default executor with the search
+  batcher.
+- `_require_dataset_password` is async: PBKDF2-600k verification (~0.2–0.5 s
+  CPU) and NFS `has_password`/`get_dataset` meta reads run in `sync_pool`
+  instead of on the event loop (`get_dataset`'s cross-pod retry loop could
+  block the loop up to 2 s).
+- MCP query-embedding cache stores packed `array('f')` vectors — ~65 MB at
+  cap instead of ~530 MB for 4096-dim Python lists.
+- Batch ingest coalesces `.hashes.json` writes into one merged write per
+  batch (`_flush_hash_index_writes`) and caches `.ingested_hashes.json`
+  reads — both were full-file rewrites/re-parses per stored file (O(n²) NFS
+  I/O).
+- Charts set `QDRANT_CLIENT_TIMEOUT=30` (code default remains no-timeout).
+
+### Documentation
+
+- README security table corrected: `MEDIA_TOKEN_SECRET` required (not
+  optional-with-fallback), `INGEST_BLOCK_PRIVATE_HOSTS` defaults `true`,
+  `MEDIA_ALLOW_PATH_PREFIXES` defaults fail-closed, embedder health does not
+  gate `/healthz`/`/readyz`; new env vars documented
+  (`RAG_TRUST_PROXY_IDENTITY`, `QDRANT_CLIENT_TIMEOUT`, `QDRANT_POOL_SIZE`,
+  `MEDIA_POOL_SIZE`).
+- DEPLOYMENT.md: image tag `v2.5.1` (was `v2.5.0`), only the embedder is
+  required (reranker/vlm/asr optional), VLM example updated to the shipped
+  default, `captionWith*` chart defaults (`true`), VirtualService timeout
+  tiers (300s/3600s, was 660s).
+- SCALE.md: `helm-scale-large` is 2 replicas × 2 workers (was documented as
+  4×4/1024-concurrency; actual 2×2 = 256, matching the shipped values and
+  their benchmarking note); summary/resource totals recomputed.
+- MCP.md / FEATURES.md / MEMORY.md: the MCP unlock cache is per-process, not
+  Redis-backed (Redis backs the REST unlock cache only).
+- USAGE.md: programmatic quickstart now passes the required embedder;
+  create-dataset fields corrected (`caption_with_asr`/`caption_with_vlm`/
+  `keep_originals`).
+- API.md: `POST /lock` and `POST /media-token` added to the endpoint table;
+  create-dataset defaults follow server config.
+- Open WebUI README: `REPAIR_MEDIA_URLS` valve documented; relative link and
+  troubleshooting row fixed.
+
 ## [2.5.0] — 2026-08-27
 
 Audit-hardening release: caption twins for media, unified "skip entirely"

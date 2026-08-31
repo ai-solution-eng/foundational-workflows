@@ -24,7 +24,26 @@ spec:
         - name: redis
           image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
           imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
-          command: ["redis-server", "--save", "", "--appendonly", "no"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          command:
+            - sh
+            - -c
+            - |
+              {{- if .Values.redis.password }}
+              exec redis-server --save "" --appendonly no --requirepass "$REDIS_PASSWORD"
+              {{- else }}
+              exec redis-server --save "" --appendonly no
+              {{- end }}
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.deployment.name }}-model-keys
+                  key: REDIS_PASSWORD
           ports:
             - containerPort: {{ .Values.redis.port }}
               name: redis
@@ -36,7 +55,7 @@ spec:
             periodSeconds: 10
           readinessProbe:
             exec:
-              command: ["redis-cli", "ping"]
+              command: ["sh", "-c", "redis-cli --no-auth-warning ${REDIS_PASSWORD:+-a \"$REDIS_PASSWORD\"} ping"]
             initialDelaySeconds: 3
             periodSeconds: 5
 ---

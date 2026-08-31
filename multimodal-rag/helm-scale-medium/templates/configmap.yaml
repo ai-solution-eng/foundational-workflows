@@ -48,6 +48,7 @@ data:
   MEDIA_TOKEN_TTL: {{ int (.Values.security.mediaTokenTtl | default 3600) | quote }}
   PW_MAX_FAILURES: {{ int (.Values.security.pwMaxFailures | default 10) | quote }}
   PW_FAIL_WINDOW: {{ int (.Values.security.pwFailWindow | default 300) | quote }}
+  RAG_TRUST_PROXY_IDENTITY: {{ .Values.security.trustProxyIdentity | default false | quote }}
   # -- Scale tuning ----------------------------------------------------------
   # Per-worker thread pool for blocking RAG work
   SYNC_POOL_SIZE: {{ .Values.app.syncPoolSize | quote }}
@@ -64,6 +65,7 @@ data:
   # Dynamic embedding query batcher (search path)
   EMBEDDING_QUERY_BATCH_SIZE: {{ .Values.app.embeddingQueryBatchSize | quote }}
   EMBEDDING_QUERY_BATCH_WAIT_MS: {{ .Values.app.embeddingQueryBatchWaitMs | quote }}
+  EMBEDDING_QUERY_IDLE_WAIT_MS: {{ int (.Values.app.embeddingQueryIdleWaitMs | default 10) | quote }}
   EMBEDDING_MAX_IMAGES_PER_PROMPT: {{ .Values.app.embeddingMaxImagesPerPrompt | quote }}
   # Dynamic Qdrant query batcher (search path)
   QDRANT_QUERY_BATCH_SIZE: {{ .Values.app.qdrantQueryBatchSize | quote }}

@@ -16,10 +16,15 @@ spec:
       labels:
         app: {{ .Values.deployment.name }}-qdrant
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: qdrant
           image: "{{ .Values.qdrant.image.repository }}:{{ .Values.qdrant.image.tag }}"
           imagePullPolicy: {{ .Values.qdrant.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           ports:
             - containerPort: {{ .Values.qdrant.grpcPort }}
               name: grpc

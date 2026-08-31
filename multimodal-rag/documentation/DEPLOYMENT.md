@@ -7,6 +7,9 @@
 > 1:1 to a key in `values.yaml`. There is no `envsubst` step — set the actual
 > domain value directly in `values.yaml`.
 
+
+<div align="center"><img src="./deployment_flow-1.png" width="900" alt="Deployment architecture: clients -> Istio gateway/oauth2-proxy -> API server + MCP sidecar + embed-batcher + Redis -> Qdrant cluster + PVC -> MLIS model endpoints, with security layers annotated"></div>
+
 ---
 
 > **⚠ Required config: `MEDIA_TOKEN_SECRET`**
@@ -38,7 +41,7 @@
 ## 1. Import the chart in PCAI and set the image
 
 The packaged charts ship with
-`ghcr.io/ai-solution-eng/multimodal-rag-mcp:v2.5.0` as the default
+`ghcr.io/ai-solution-eng/multimodal-rag-mcp:v3.0.0` as the default
 `image.repository`/`image.tag` — no image build is required. If you need a
 custom build, the Dockerfile lives at `docker/Dockerfile` and expects the repo
 root as the build context; push the result to your registry and override the
@@ -48,7 +51,7 @@ values:
 # values.yaml
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v2.5.0
+  tag: v3.0.0
 ```
 
 > **Note on models**: The image does not bundle any ML models. It connects to
@@ -79,14 +82,18 @@ models:
     className: "MultiModalEmbeddings"
   reranker:
     name: "Qwen/Qwen3-VL-Reranker-8B"
-    url: "https://..."              # required
+    url: "https://..."              # optional — empty string disables
     className: "MultiModalReranker"
   vlm:
-    name: "RedHatAI/gemma-4-31B-it-FP8-block"
-    url: "https://..."              # required
+    name: "Qwen/Qwen3.8-27B-FP8"    # any OpenAI-compatible VLM
+    url: "https://..."              # optional — empty string disables
   asr:
     name: "CohereLabs/cohere-transcribe-03-2026"
-    url: "https://..."              # required
+    url: "https://..."              # optional — empty string disables
+
+Only the **embedder** is required: an unreachable embedder aborts startup.
+Reranker/VLM/ASR are optional — if unreachable, startup logs a warning and
+continues without them (reranking/captioning/transcription degrade).
 
 # Model API keys (stored in a Kubernetes Secret, never in the image)
 modelSecrets:
@@ -97,8 +104,8 @@ modelSecrets:
 
 # RAG pipeline defaults
 rag:
-  captionWithAsr: false   # Transcribe video audio tracks via ASR during ingestion
-  captionWithVlm: false   # VLM-describe images/videos at ingest (enables VLM-skip at retrieval)
+  captionWithAsr: true    # Transcribe video audio tracks via ASR during ingestion (auto-disables if no ASR model)
+  captionWithVlm: true    # VLM-describe images/videos at ingest (auto-disables if no VLM; enables VLM-skip at retrieval)
   remote: false           # Use remote model URLs vs in-cluster .svc.cluster.local
 
 # MCP server (sidecar)
@@ -121,7 +128,7 @@ ezua:
   virtualService:
     endpoint: "rag-mcp-server.<your-domain>"
     istioGateway: "istio-system/ezaf-gateway"
-    timeout: 660s
+    timeout: 300s          # default tier; longTimeout: 3600s covers batch uploads / SSE / MCP
   authorizationPolicy:
     namespace: "istio-system"
     providerName: "oauth2-proxy"
@@ -136,9 +143,12 @@ resources:
       memory: 48Gi   # ~40 GiB needed for 1M × 4096-dim vectors
 ```
 
-> Set the actual PCAI domain in `ezua.virtualService.endpoint` (e.g.
-> `rag-mcp-server.<your-domain>`) directly — there is no `${DOMAIN_NAME}`
-> envsubst step in a PCAI deployment.
+> The `${DOMAIN_NAME}` placeholder is resolved by PCAI's deployment pipeline
+> before helm runs — submitted values are envsubst-ed (verified: the deployed
+> release stores the fully-resolved endpoint). Keep the placeholder in
+> `ezua.virtualService.endpoint` as-is. Note that `ezua.domainName` itself is
+> a platform-convention key no chart template reads; the VirtualService is
+> built from `ezua.virtualService.endpoint`.
 
 ---
 
@@ -156,7 +166,7 @@ the only "upgrade" path you need.
 # values.yaml — the keys PCAI renders from (also shown above)
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v2.5.0
+  tag: v3.0.0
 models:
   embedder:
     name: "Qwen/Qwen3-VL-Embedding-8B"
@@ -167,7 +177,7 @@ models:
     url: "https://..."
     className: "MultiModalReranker"
   vlm:
-    name: "RedHatAI/gemma-4-31B-it-FP8-block"
+    name: "Qwen/Qwen3.8-27B-FP8"
     url: "https://..."
   asr:
     name: "CohereLabs/cohere-transcribe-03-2026"
@@ -316,7 +326,7 @@ image, change `image.tag` in the *Helm Values* editor:
 ```yaml
 # values.yaml
 image:
-  tag: v2.5.0
+  tag: v3.0.0
 ```
 
 To change specific settings (e.g. storage or model endpoints), edit the
