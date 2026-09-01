@@ -1,39 +1,25 @@
 # REST API Reference
 
-How to drive the Multimodal RAG API server directly from `curl`, Python,
-or any HTTP client — no HTML frontend required. You can create datasets,
-upload files, ingest URLs, add raw documents, delete content, and search.
+How to drive the Multimodal RAG API server directly from `curl`, Python, or any HTTP client — no HTML frontend required. You can create datasets, upload files, ingest URLs, add raw documents, delete
+content, and search.
 
-The API server also ships an interactive **Swagger UI** at `/docs` on the
-running server (e.g. `http://localhost:8000/docs`) with every endpoint,
-request schema, and a "Try it out" button.
+The API server also ships an interactive **Swagger UI** at `/docs` on the running server (e.g. `http://localhost:8000/docs`) with every endpoint, request schema, and a "Try it out" button.
 
 ---
 
 ## 1. Basics
 
-**Base URL:** the API server listens on port `8000`. Locally (after
-`kubectl port-forward deployment/rag-mcp-server 8000:8000`) it is
-`http://localhost:8000`. In-cluster it is the `rag-mcp-server-api`
+**Base URL:** the API server listens on port `8000`. Locally (after `kubectl port-forward deployment/rag-mcp-server 8000:8000`) it is `http://localhost:8000`. In-cluster it is the `rag-mcp-server-api`
 service (see [DEPLOYMENT.md](DEPLOYMENT.md)).
 
 **Authentication:**
 
-- **Dataset password** — for password-protected datasets send the
-  password in the `X-Dataset-Password` request header on every call
-  (JSON endpoints), or as a `password` form field on multipart uploads.
-  `POST /api/datasets/{name}/unlock` verifies the password once and
-  caches it for ~30 min (Redis across pods), so subsequent calls can
-  omit it. Unprotected datasets need none of this.
-- **Optional API key** — if `RAG_API_KEY` is set on the server, every
-  `/api/*` request must carry `Authorization: Bearer <key>` or
-  `X-RAG-Api-Key: <key>`. Health/probe routes, the HTML pages (the
-  served page embeds the key for its JS), dataset media serving, and
-  staged media stay open. The MCP server is not covered by this
-  middleware.
+- **Dataset password** — for password-protected datasets send the password in the `X-Dataset-Password` request header on every call (JSON endpoints), or as a `password` form field on multipart
+  uploads. `POST /api/datasets/{name}/unlock` verifies the password once and caches it for ~30 min (Redis across pods), so subsequent calls can omit it. Unprotected datasets need none of this.
+- **Optional API key** — if `RAG_API_KEY` is set on the server, every `/api/*` request must carry `Authorization: Bearer <key>` or `X-RAG-Api-Key: <key>`. Health/probe routes, the HTML pages (the
+  served page embeds the key for its JS), dataset media serving, and staged media stay open. The MCP server is not covered by this middleware.
 
-Throughout this document `BASE=http://localhost:8000` and
-`DATASET=my_dataset`.
+Throughout this document `BASE=http://localhost:8000` and `DATASET=my_dataset`.
 
 ---
 
@@ -65,8 +51,7 @@ Fields (all optional except `name`):
 | `keep_originals` | `true` | Keep full-quality originals on disk after preprocessing |
 | `password` | unset | Protect the dataset; all reads/ingests then require it |
 
-> Naming note: dataset names are validated against
-> `^[A-Za-z0-9][A-Za-z0-9._-]*$` (prevents path traversal).
+> Naming note: dataset names are validated against `^[A-Za-z0-9][A-Za-z0-9._-]*$` (prevents path traversal).
 
 **Python:**
 
@@ -88,9 +73,8 @@ print(resp.json())
 
 ### Update a dataset (dynamic captioning config)
 
-Captioning settings are **not** frozen at create time — patch them whenever
-you like; they apply to subsequent ingests/retrievals (no restart, no
-recreate). Already-ingested content keeps its stored captions.
+Captioning settings are **not** frozen at create time — patch them whenever you like; they apply to subsequent ingests/retrievals (no restart, no recreate). Already-ingested content keeps its stored
+captions.
 
 ```bash
 curl -X PATCH "$BASE/api/datasets/$DATASET" \
@@ -98,8 +82,7 @@ curl -X PATCH "$BASE/api/datasets/$DATASET" \
   -d '{"caption_with_asr": true, "caption_with_vlm": true}'
 ```
 
-Any subset of `description`, `caption_with_asr`, `caption_with_vlm`,
-`keep_originals` may be sent.
+Any subset of `description`, `caption_with_asr`, `caption_with_vlm`, `keep_originals` may be sent.
 
 ---
 
@@ -107,9 +90,7 @@ Any subset of `description`, `caption_with_asr`, `caption_with_vlm`,
 
 ### 3.1 Single file upload (multipart)
 
-Supported types: PDF, image (jpg/png/gif/bmp/webp), video
-(mp4/mkv/avi/mov), audio (mp3/wav/flac/ogg), and text files. Files are
-processed (chunked / transcribed / described) and embedded into the
+Supported types: PDF, image (jpg/png/gif/bmp/webp), video (mp4/mkv/avi/mov), audio (mp3/wav/flac/ogg), and text files. Files are processed (chunked / transcribed / described) and embedded into the
 dataset's Qdrant collection.
 
 ```bash
@@ -136,8 +117,7 @@ with open("paper.pdf", "rb") as f:
 
 ### 3.2 Batch upload (recommended for many files)
 
-Returns a `job_id` immediately; poll the status endpoint until
-`status` is `complete` or `error`.
+Returns a `job_id` immediately; poll the status endpoint until `status` is `complete` or `error`.
 
 ```bash
 curl -X POST "$BASE/api/datasets/$DATASET/batch-files" \
@@ -153,8 +133,7 @@ curl -H 'X-Dataset-Password: secret' \
   "$BASE/api/datasets/$DATASET/upload-status/<job_id>"
 ```
 
-The response contains `status`, per-file events, and aggregate counters;
-stop polling once `status` is `complete` or `error`.
+The response contains `status`, per-file events, and aggregate counters; stop polling once `status` is `complete` or `error`.
 
 ### 3.3 Ingest from URLs (S3 / HTTP)
 
@@ -166,10 +145,8 @@ curl -X POST "$BASE/api/datasets/$DATASET/batch-urls" \
 # → {"job_id":"...","status":"uploading","total_files":2}
 ```
 
-Poll `GET /api/datasets/$DATASET/upload-status/<job_id>` as above. Note
-the server-side `INGEST_ALLOW_HOSTS` / `INGEST_BLOCK_PRIVATE_HOSTS`
-settings (see [README](../README.md) security table) can restrict which
-hosts are ingestible.
+Poll `GET /api/datasets/$DATASET/upload-status/<job_id>` as above. Note the server-side `INGEST_ALLOW_HOSTS` / `INGEST_BLOCK_PRIVATE_HOSTS` settings (see [README](../README.md) security table) can
+restrict which hosts are ingestible.
 
 ### 3.4 Add raw text / structured documents
 
@@ -184,9 +161,7 @@ curl -X POST "$BASE/api/datasets/$DATASET/documents" \
   ]'
 ```
 
-Accepts a JSON array, or a single string/dict. Document dicts may mix
-`text`, `image`, `video`, `audio` keys; each media key takes a URL,
-data-URL, or list. Response:
+Accepts a JSON array, or a single string/dict. Document dicts may mix `text`, `image`, `video`, `audio` keys; each media key takes a URL, data-URL, or list. Response:
 
 ```json
 {"status": "ok", "stored_ids": ["...", "..."], "count": 2}
@@ -214,12 +189,8 @@ curl -X DELETE -H 'X-Dataset-Password: secret' \
 # → {"status": "ok", "deleted": "<doc_id>"}
 ```
 
-> **About "deleting files":** deletion is at the **document (Qdrant
-> point) level** — the ID you delete is the vector/point ID returned by
-> list-documents, not a filename. This removes the entry from search.
-> The on-disk original under `/data/datasets/<name>/files/` is kept
-> (it is reused for retrieval/media display), so there is no
-> per-file-path delete endpoint.
+> **About "deleting files":** deletion is at the **document (Qdrant point) level** — the ID you delete is the vector/point ID returned by list-documents, not a filename. This removes the entry from
+> search. The on-disk original under `/data/datasets/<name>/files/` is kept (it is reused for retrieval/media display), so there is no per-file-path delete endpoint.
 
 ### 4.3 Delete the whole dataset (collection + files)
 
@@ -235,24 +206,17 @@ curl -H 'X-Dataset-Password: secret' \
   "$BASE/api/datasets/$DATASET/export" -o my_dataset-backup.tar.gz
 ```
 
-Streams a `.tar.gz` containing `meta.json` (password hash stripped),
-`documents.jsonl` (every Qdrant point as `{"id","payload"}` JSON Lines), and
-`files/` (all on-disk files referenced by the dataset). Restore by re-adding
-the documents (`POST /documents`) and files (`POST /batch-files`), or use the
-management page "Backup" button.
+Streams a `.tar.gz` containing `meta.json` (password hash stripped), `documents.jsonl` (every Qdrant point as `{"id","payload"}` JSON Lines), and `files/` (all on-disk files referenced by the
+dataset). Restore by re-adding the documents (`POST /documents`) and files (`POST /batch-files`), or use the management page "Backup" button.
 
 ---
 
 ## 5. Embedding-model changes and dataset recreate
 
-Vectors are embedded at ingestion time; nothing re-embeds them later, and
-there is **no automatic rebuild** when you swap the embedding model. Each
-dataset records the embedder model + dimension in its `meta.json`; if you
-change the embedder the server **fails loudly** (HTTP 409) on search/ingest
-for existing datasets instead of silently mixing incompatible vectors.
+Vectors are embedded at ingestion time; nothing re-embeds them later, and there is **no automatic rebuild** when you swap the embedding model. Each dataset records the embedder model + dimension in
+its `meta.json`; if you change the embedder the server **fails loudly** (HTTP 409) on search/ingest for existing datasets instead of silently mixing incompatible vectors.
 
-To rebuild a dataset with the new embedder, drop the old collection and
-re-ingest its on-disk originals (this also re-records the fingerprint):
+To rebuild a dataset with the new embedder, drop the old collection and re-ingest its on-disk originals (this also re-records the fingerprint):
 
 ```bash
 curl -X POST "$BASE/api/admin/datasets/$DATASET/recreate"
@@ -265,9 +229,8 @@ Poll until `status` is `complete` or `error` (same endpoint as uploads):
 curl "$BASE/api/datasets/$DATASET/upload-status/<job_id>"
 ```
 
-New datasets created after the swap are unaffected (fresh collection at the
-new model's dimension). Delete-and-re-upload works too, but `recreate`
-skips the upload since the originals are already on disk.
+New datasets created after the swap are unaffected (fresh collection at the new model's dimension). Delete-and-re-upload works too, but `recreate` skips the upload since the originals are already on
+disk.
 
 ---
 
@@ -289,9 +252,7 @@ curl -X POST "$BASE/api/datasets/$DATASET/search" \
   }'
 ```
 
-`GET` params: `q` (required), `top_k` (1–100, default 10),
-`use_reranker` (default false), `reranker_top_k` (1–50, default 3).
-`POST` accepts the same params in the body plus the `query` dict and an
+`GET` params: `q` (required), `top_k` (1–100, default 10), `use_reranker` (default false), `reranker_top_k` (1–50, default 3). `POST` accepts the same params in the body plus the `query` dict and an
 optional `password` field.
 
 ---

@@ -30,3 +30,11 @@ helm-scale-large/.values.yaml
 # Editor
 .vscode/
 .idea/
+
+# Local cluster credentials (never commit)
+.g2_cluster.yaml
+
+# Packaged charts / sync-conflict duplicates
+rag-mcp-*.tar.gz
+*.sync-conflict-*
+sync-to-demos.sh

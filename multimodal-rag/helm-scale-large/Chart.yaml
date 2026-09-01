@@ -2,7 +2,7 @@ apiVersion: v2
 name: rag-mcp-scale-large
 description: Scale-friendly multi-replica Multi-modal RAG (gunicorn workers, multi-replica Qdrant, Redis-backed unlock cache)
 type: application
-version: 3.2.0
-appVersion: "3.2.0"
+version: 3.4.0
+appVersion: "3.4.0"
 sources:
   - https://github.com/ai-solution-eng/internal-projects/tree/main/multimodal-rag-project

@@ -1,8 +1,7 @@
 # Usage Guide
 
-How to use the HTML frontend and the Python programmatic API. For MCP
-tool access see [documentation/MCP.md](documentation/MCP.md); for
-deployment see [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md).
+How to use the HTML frontend and the Python programmatic API. For MCP tool access see [documentation/MCP.md](documentation/MCP.md); for deployment see
+[documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md).
 
 ---
 
@@ -15,10 +14,8 @@ cd /home/andrew/Code/HPE/MultimodalRAG
 PYTHONPATH=src python -m multimodal_rag.api_server --host 0.0.0.0 --port 8000
 ```
 
-`MEDIA_TOKEN_SECRET` must be set (the server refuses to start without it):
-`MEDIA_TOKEN_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")`.
-Open `http://localhost:8000` (the HTML frontend lives at `/`, served from
-`src/multimodal_rag/templates/index.html`).
+`MEDIA_TOKEN_SECRET` must be set (the server refuses to start without it): `MEDIA_TOKEN_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")`. Open `http://localhost:8000` (the HTML
+frontend lives at `/`, served from `src/multimodal_rag/templates/index.html`).
 
 | Action | How |
 |---|---|
@@ -72,9 +69,7 @@ dm.list_datasets()
 dm.delete_dataset("dataset_1")
 ```
 
-Input format follows the HuggingFace API convention: strings are
-auto-detected (plain text stays text, URLs/data URIs/local paths to
-media files are recognised). For dicts, the `image`, `video` and
+Input format follows the HuggingFace API convention: strings are auto-detected (plain text stays text, URLs/data URIs/local paths to media files are recognised). For dicts, the `image`, `video` and
 `audio` keys accept either a single URL or a list for multiple items:
 
 ```python
@@ -112,5 +107,4 @@ The API server exposes 35 REST endpoints. Key ones:
 | `DELETE` | `/api/datasets/{name}/documents/{doc_id}` | Delete single doc |
 | `GET` | `/api/datasets/{name}/files/{filepath}` | Serve stored file |
 
-See [documentation/FEATURES.md](documentation/FEATURES.md) for full
-endpoint details and search parameters.
+See [documentation/FEATURES.md](documentation/FEATURES.md) for full endpoint details and search parameters.

@@ -1,11 +1,8 @@
 # Deployment Guide
 
-> **PCAI is a Kubernetes wrapper — you never run `helm` or `kubectl`.** You
-> import the packaged chart (`rag-mcp-server` `.tar.gz`) into PCAI once, then
-> drive the deployment by setting the chart's **`values.yaml`** in the PCAI
-> *Helm Values* editor (or via the PCAI API). Every `--set` in this guide maps
-> 1:1 to a key in `values.yaml`. There is no `envsubst` step — set the actual
-> domain value directly in `values.yaml`.
+> **PCAI is a Kubernetes wrapper — you never run `helm` or `kubectl`.** You import the packaged chart (`rag-mcp-server` `.tar.gz`) into PCAI once, then drive the deployment by setting the chart's
+> **`values.yaml`** in the PCAI *Helm Values* editor (or via the PCAI API). Every `--set` in this guide maps 1:1 to a key in `values.yaml`. There is no `envsubst` step — set the actual domain value
+> directly in `values.yaml`.
 
 
 <div align="center"><img src="./deployment_flow-1.png" width="900" alt="Deployment architecture: clients -> Istio gateway/oauth2-proxy -> API server + MCP sidecar + embed-batcher + Redis -> Qdrant cluster + PVC -> MLIS model endpoints, with security layers annotated"></div>
@@ -14,38 +11,27 @@
 
 > **⚠ Required config: `MEDIA_TOKEN_SECRET`**
 >
-> Since v1.9.5, both the API and MCP containers **refuse to start** without
-> `MEDIA_TOKEN_SECRET` set. Media URLs are served via short-lived HMAC
-> tokens (the legacy `?password=` URLs were removed), and this shared secret
-> is what signs/verifies them. Deploying without it crashes both pods.
+> Since v1.9.5, both the API and MCP containers **refuse to start** without `MEDIA_TOKEN_SECRET` set. Media URLs are served via short-lived HMAC tokens (the legacy `?password=` URLs were removed), and
+> this shared secret is what signs/verifies them. Deploying without it crashes both pods.
 >
 > Generate one and set it in `values.yaml` before deploying:
 >
-> ```bash
-> python -c "import secrets; print(secrets.token_hex(32))"
-> # -> values.yaml:  security.mediaTokenSecret: "<output>"
-> ```
+> ```bash python -c "import secrets; print(secrets.token_hex(32))" # -> values.yaml:  security.mediaTokenSecret: "<output>" ```
 
 ---
 
 ## Prerequisites
 
 - A PCAI environment where you can import the packaged chart and edit its values.
-- The image is public in `ghcr.io/ai-solution-eng/...` — you only need
-  registry push access if you build a custom image.
-- Model endpoints (embedder, reranker, VLM, ASR) deployed through MLIS, with
-  their API tokens.
+- The image is public in `ghcr.io/ai-solution-eng/...` — you only need registry push access if you build a custom image.
+- Model endpoints (embedder, reranker, VLM, ASR) deployed through MLIS, with their API tokens.
 
 ---
 
 ## 1. Import the chart in PCAI and set the image
 
-The packaged charts ship with
-`ghcr.io/ai-solution-eng/multimodal-rag-mcp:v3.0.0` as the default
-`image.repository`/`image.tag` — no image build is required. If you need a
-custom build, the Dockerfile lives at `docker/Dockerfile` and expects the repo
-root as the build context; push the result to your registry and override the
-values:
+The packaged charts ship with `ghcr.io/ai-solution-eng/multimodal-rag-mcp:v3.0.0` as the default `image.repository`/`image.tag` — no image build is required. If you need a custom build, the Dockerfile
+lives at `docker/Dockerfile` and expects the repo root as the build context; push the result to your registry and override the values:
 
 ```yaml
 # values.yaml
@@ -54,16 +40,13 @@ image:
   tag: v3.0.0
 ```
 
-> **Note on models**: The image does not bundle any ML models. It connects to
-> remote model endpoints configured via values; the defaults point to models
-> hosted on the PCAI internal cluster.
+> **Note on models**: The image does not bundle any ML models. It connects to remote model endpoints configured via values; the defaults point to models hosted on the PCAI internal cluster.
 
 ---
 
 ## 2. Configure deployment values
 
-All configuration lives in the chart's `values.yaml`. Key settings you edit
-in the PCAI *Helm Values* editor:
+All configuration lives in the chart's `values.yaml`. Key settings you edit in the PCAI *Helm Values* editor:
 
 ```yaml
 # PVC sizes — adjust for your dataset scale
@@ -143,24 +126,18 @@ resources:
       memory: 48Gi   # ~40 GiB needed for 1M × 4096-dim vectors
 ```
 
-> The `${DOMAIN_NAME}` placeholder is resolved by PCAI's deployment pipeline
-> before helm runs — submitted values are envsubst-ed (verified: the deployed
-> release stores the fully-resolved endpoint). Keep the placeholder in
-> `ezua.virtualService.endpoint` as-is. Note that `ezua.domainName` itself is
-> a platform-convention key no chart template reads; the VirtualService is
-> built from `ezua.virtualService.endpoint`.
+> The `${DOMAIN_NAME}` placeholder is resolved by PCAI's deployment pipeline before helm runs — submitted values are envsubst-ed (verified: the deployed release stores the fully-resolved endpoint). Keep
+> the placeholder in `ezua.virtualService.endpoint` as-is. Note that `ezua.domainName` itself is a platform-convention key no chart template reads; the VirtualService is built from
+> `ezua.virtualService.endpoint`.
 
 ---
 
 ## 3. Install / update in PCAI
 
-Import the packaged `rag-mcp-server` chart into PCAI, then set the values
-above (image, models + `modelSecrets`, `security.mediaTokenSecret`,
-persistence sizes, `ezua.*`) in the *Helm Values* editor and apply. Model
-URLs and API keys are required.
+Import the packaged `rag-mcp-server` chart into PCAI, then set the values above (image, models + `modelSecrets`, `security.mediaTokenSecret`, persistence sizes, `ezua.*`) in the *Helm Values* editor
+and apply. Model URLs and API keys are required.
 
-To change a setting later, edit the values in PCAI and apply again — that is
-the only "upgrade" path you need.
+To change a setting later, edit the values in PCAI and apply again — that is the only "upgrade" path you need.
 
 ```yaml
 # values.yaml — the keys PCAI renders from (also shown above)
@@ -199,16 +176,13 @@ ezua:
     endpoint: "rag-mcp-server.<your-domain>"
 ```
 
-> **Tip**: keep the model URLs and API keys in a private values fragment (or
-> the PCAI Secret) so they stay out of commit history; the chart reads them
-> from values at apply time.
+> **Tip**: keep the model URLs and API keys in a private values fragment (or the PCAI Secret) so they stay out of commit history; the chart reads them from values at apply time.
 
 ---
 
 ## 4. Verify the deployment
 
-In the PCAI UI the deployment should reach **Ready**. To check locally
-(optional, developer convenience):
+In the PCAI UI the deployment should reach **Ready**. To check locally (optional, developer convenience):
 
 ```bash
 # Port-forward to test locally
@@ -223,18 +197,14 @@ curl http://localhost:8000/api/datasets
 # → {"datasets": []}
 ```
 
-Pods and logs are visible from the PCAI workload view
-(\cmd{kubectl get pods -l app=rag-mcp-server} and
-\cmd{kubectl logs -l app=rag-mcp-server -c rag-api-server} work the same as
-ever for operators who have cluster access).
+Pods and logs are visible from the PCAI workload view (\cmd{kubectl get pods -l app=rag-mcp-server} and \cmd{kubectl logs -l app=rag-mcp-server -c rag-api-server} work the same as ever for operators
+who have cluster access).
 
 ---
 
 ## 5. Access the web UI
 
-If EZUA (Istio) is enabled, the service is available at the VirtualService
-endpoint (e.g. `https://rag-mcp-server.<your-domain>`). Authentication is
-handled by the `oauth2-proxy` AuthorizationPolicy.
+If EZUA (Istio) is enabled, the service is available at the VirtualService endpoint (e.g. `https://rag-mcp-server.<your-domain>`). Authentication is handled by the `oauth2-proxy` AuthorizationPolicy.
 
 For a local developer preview only, port-forward:
 
@@ -254,11 +224,9 @@ The UI lets you:
 
 ## 6. Connect an MCP client
 
-When `mcp.enabled=true` (default), the MCP server runs as a sidecar
-container exposing `streamable-http` transport on port 9090 at `/mcp`.
+When `mcp.enabled=true` (default), the MCP server runs as a sidecar container exposing `streamable-http` transport on port 9090 at `/mcp`.
 
-For the full tool list, connection configs (opencode, Claude Desktop,
-Open WebUI, stdio), and the long-term memory setup, see:
+For the full tool list, connection configs (opencode, Claude Desktop, Open WebUI, stdio), and the long-term memory setup, see:
 
 - **[MCP.md](MCP.md)** — all 9 MCP tools + connection configs for any client
 - **[MEMORY.md](MEMORY.md)** — per-user long-term memory setup (opencode + Open WebUI)
@@ -314,14 +282,14 @@ When `ezua.enabled=true` (default), the chart also creates:
 
 - **VirtualService** — routes `rag-mcp-server.<domain>` through `istio-system/ezaf-gateway`
 - **AuthorizationPolicy** — enforces OAuth2 authentication at the Istio ingress gateway
-- **Kyverno ClusterPolicy** — auto-labels Pods/Deployments/Services in the release namespace with `hpe-ezua/type: vendor-service` and `hpe-ezua/app: rag-mcp-server` (required for the EZUA ingress to discover the service)
+- **Kyverno ClusterPolicy** — auto-labels Pods/Deployments/Services in the release namespace with `hpe-ezua/type: vendor-service` and `hpe-ezua/app: rag-mcp-server` (required for the EZUA ingress to
+  discover the service)
 
 ---
 
 ## 8. Upgrading
 
-In PCAI, upgrading is just editing the values and applying again. To bump the
-image, change `image.tag` in the *Helm Values* editor:
+In PCAI, upgrading is just editing the values and applying again. To bump the image, change `image.tag` in the *Helm Values* editor:
 
 ```yaml
 # values.yaml
@@ -329,9 +297,7 @@ image:
   tag: v3.0.0
 ```
 
-To change specific settings (e.g. storage or model endpoints), edit the
-corresponding keys in `values.yaml` and re-apply; the rest of the values are
-kept.
+To change specific settings (e.g. storage or model endpoints), edit the corresponding keys in `values.yaml` and re-apply; the rest of the values are kept.
 
 ---
 

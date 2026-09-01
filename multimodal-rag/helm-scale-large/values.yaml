@@ -14,7 +14,7 @@
 replicaCount: 4
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v3.2.0
+  tag: v3.4.0
   pullPolicy: IfNotPresent
 
 deployment:
@@ -146,6 +146,7 @@ s3:
 
 # -- RAG parameters -----------------------------------------------------------
 rag:
+  ocr: false           # OCR fallback for scanned PDF pages via tesseract (per-dataset API flag still overrides; costs nothing on text pages)
   captionWithAsr: true  # Transcribe video audio tracks via ASR (auto-disables when no ASR model)
   captionWithVlm: true  # VLM-describe images/videos at ingest (enables VLM-skip at retrieval; auto-disables if no VLM)
   remote: false         # true = model URLs used as-is. false = URLs containing
@@ -341,6 +342,16 @@ ezua:
     namespace: "istio-system"
     providerName: "oauth2-proxy"
 
+# -- Metrics (optional) ---------------------------------------------------------
+# Prometheus exposition lives on the API container at /metrics (unauthenticated
+# like the health endpoints — intended for in-cluster scrapers; bound the
+# exposure with a NetworkPolicy / AuthorizationPolicy if the pod is broadly
+# reachable).  Enable the ServiceMonitor when the cluster runs the Prometheus
+# Operator.
+metrics:
+  serviceMonitor: false
+  interval: "30s"
+
 # -- Backups (optional) ---------------------------------------------------------
 # Opt-in CronJob: exports every non-password-protected dataset via the
 # /export endpoint and uploads the .tar.gz to the S3/MinIO bucket below
@@ -351,3 +362,4 @@ backups:
   enabled: false
   schedule: "0 3 * * *"
   bucket: ""          # required when enabled, e.g. "mm-rag-backups"
+  retentionDays: 0    # prune exports older than N days (0 = keep forever)

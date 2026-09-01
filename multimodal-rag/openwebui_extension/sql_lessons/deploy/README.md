@@ -42,8 +42,8 @@ kubectl apply -f openwebui_extension/sql_lessons/deploy/cronjob.yaml -n <namespa
 | Item | Default in manifest | Notes |
 |---|---|---|
 | `RAG_API_URL` | `https://rag-mcp-server.tr7-0211-...` | in-cluster or via ingress; the job needs network to it |
-| `--curated-dataset` | `sql-learnings` | matches your dataset name |
-| `--candidates-dataset` | `sql-learnings-staging` | matches your staging name |
+| `--curated-dataset` | `sql-lessons` | matches your dataset name |
+| `--candidates-dataset` | `sql-lessons-candidates` | matches your staging name |
 | `--auto` | on | evidence + near-dup gate; no review LLM needed |
 | `RAG_LESSONS_PASSWORD` | none | only if the datasets are password-protected — mount from a Secret, never inline |
 

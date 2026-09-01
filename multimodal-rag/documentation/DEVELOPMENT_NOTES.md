@@ -1,8 +1,6 @@
 # Development Notes
 
-Engineering journal: embedding/reranker validation, benchmark output from
-the full RAG pipeline, and debugging notes from model setup. Preserved
-for reference; not required for deployment or usage.
+Engineering journal: embedding/reranker validation, benchmark output from the full RAG pipeline, and debugging notes from model setup. Preserved for reference; not required for deployment or usage.
 
 ---
 
@@ -112,15 +110,16 @@ array([[0.662, 0.96 , 0.007, 0.006, 0.008, 0.007, 0.015, 0.007, 0.041, 0.033, 0.
 
 ## Full RAG pipeline benchmarks
 
-The full E2E module is [hosted here](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/rag_system.py#L1043) with a test_script [here](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/tests/full_pipeline/run_pipeline.py).
+The full E2E module is [hosted here](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/rag_system.py#L1043) with a test_script
+[here](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/tests/full_pipeline/run_pipeline.py).
 
-Tested with local LLM pdfs, images, and a video of 2 people playing an
-old video game. Overall, the results were excellent. It could retrieve
-images when needed, including from within pdfs, as well as videos.
+Tested with local LLM pdfs, images, and a video of 2 people playing an old video game. Overall, the results were excellent. It could retrieve images when needed, including from within pdfs, as well as
+videos.
 
 The flow at query time:
 1. LLM determines if it needs a RAG call.
-2. Data is passed through an optional preprocessor component. This handles any missing modality, (in the current model case, specifically audio for transcribing videos and audio), and converts it to text.
+2. Data is passed through an optional preprocessor component. This handles any missing modality, (in the current model case, specifically audio for transcribing videos and audio), and converts it to
+   text.
 3. The query is embedded, and retrival occurs.
 4. An optional reranking occurs to improve performance and limit results.
 5. A post-processor is applied, for e.g. a VLM to convert images back to text for a text only LLM (such as deepseek v4).
@@ -153,21 +152,14 @@ run_call('Can you show me videos of an old video game?', route=True, use_reranke
 <pre><code style="white-space: pre-wrap;">
 Can you find data of or about a kid getting his hair cut?
 
- ######################################## 
+########################################
 
-Logging Info:
-2026-06-11 09:10:56,454 - VERBOSE - 1.74s route(llm)  → RAG needed
-2026-06-11 09:10:57,019 - VERBOSE - 0.57s retrieve  — 10 docs (top_k=10, reranker=no)
-2026-06-11 09:11:00,437 - VERBOSE -   3.41s vlm describe  — 1 media items
-2026-06-11 09:11:00,988 - VERBOSE -   3.97s vlm describe  — 1 media items
-2026-06-11 09:11:01,062 - VERBOSE -   4.04s vlm describe  — 1 media items
-2026-06-11 09:11:01,180 - VERBOSE -   4.16s vlm describe  — 1 media items
-2026-06-11 09:11:01,676 - VERBOSE -   4.65s vlm describe  — 1 media items
-2026-06-11 09:11:02,415 - VERBOSE -   5.39s vlm describe  — 1 media items
-2026-06-11 09:11:02,415 - VERBOSE - 5.40s postproc  — VLM/ASR conversion (6 docs with media)
-2026-06-11 09:11:07,645 - VERBOSE - 5.23s llm       — generation (192 tokens?)  [total 12.93s]
+Logging Info: 2026-06-11 09:10:56,454 - VERBOSE - 1.74s route(llm)  → RAG needed 2026-06-11 09:10:57,019 - VERBOSE - 0.57s retrieve  — 10 docs (top_k=10, reranker=no) 2026-06-11 09:11:00,437 - VERBOSE -
+3.41s vlm describe  — 1 media items 2026-06-11 09:11:00,988 - VERBOSE -   3.97s vlm describe  — 1 media items 2026-06-11 09:11:01,062 - VERBOSE -   4.04s vlm describe  — 1 media items 2026-06-11
+09:11:01,180 - VERBOSE -   4.16s vlm describe  — 1 media items 2026-06-11 09:11:01,676 - VERBOSE -   4.65s vlm describe  — 1 media items 2026-06-11 09:11:02,415 - VERBOSE -   5.39s vlm describe  — 1
+media items 2026-06-11 09:11:02,415 - VERBOSE - 5.40s postproc  — VLM/ASR conversion (6 docs with media) 2026-06-11 09:11:07,645 - VERBOSE - 5.23s llm       — generation (192 tokens?)  [total 12.93s]
 
- ######################################## 
+########################################
 
 Based on the provided context, there are multiple images showing a child getting a haircut. For example:
 
@@ -178,50 +170,47 @@ Based on the provided context, there are multiple images showing a child getting
 - **DSC01366.JPG**: An adult in a blue shirt steadies a toddler's forehead while clipping the top of their hair.
 - **DSC01364.JPG**: An adult in a blue hoodie trims a child's blonde hair with gray clippers; the child sits in a high chair.
 
-These descriptions collectively document a toddler's first haircut, showing the setting, clothing, tools (electric clippers), and interactions. The sources are the image filenames (e.g., DSC01367.JPG) but no specific page numbers are provided.
+These descriptions collectively document a toddler's first haircut, showing the setting, clothing, tools (electric clippers), and interactions. The sources are the image filenames (e.g., DSC01367.JPG)
+but no specific page numbers are provided.
 
- ######################################################################################################################## 
+########################################################################################################################
 
 Can you find and describe images of a child climbing through a snow tunnel?
 
- ######################################## 
+########################################
 
-Logging Info:
-2026-06-11 09:11:08,810 - VERBOSE - 1.16s route(llm)  → RAG needed
-2026-06-11 09:11:10,504 - VERBOSE - 1.69s retrieve  — 3 docs (top_k=10, reranker=yes)
-2026-06-11 09:11:13,645 - VERBOSE -   3.14s vlm describe  — 1 media items
-2026-06-11 09:11:13,706 - VERBOSE -   3.20s vlm describe  — 1 media items
-2026-06-11 09:11:13,929 - VERBOSE -   3.43s vlm describe  — 1 media items
-2026-06-11 09:11:13,929 - VERBOSE - 3.43s postproc  — VLM/ASR conversion (3 docs with media)
-2026-06-11 09:11:18,318 - VERBOSE - 4.39s llm       — generation (224 tokens)  [total 10.67s]
+Logging Info: 2026-06-11 09:11:08,810 - VERBOSE - 1.16s route(llm)  → RAG needed 2026-06-11 09:11:10,504 - VERBOSE - 1.69s retrieve  — 3 docs (top_k=10, reranker=yes) 2026-06-11 09:11:13,645 - VERBOSE -
+3.14s vlm describe  — 1 media items 2026-06-11 09:11:13,706 - VERBOSE -   3.20s vlm describe  — 1 media items 2026-06-11 09:11:13,929 - VERBOSE -   3.43s vlm describe  — 1 media items 2026-06-11
+09:11:13,929 - VERBOSE - 3.43s postproc  — VLM/ASR conversion (3 docs with media) 2026-06-11 09:11:18,318 - VERBOSE - 4.39s llm       — generation (224 tokens)  [total 10.67s]
 
- ######################################## 
+########################################
 
 Based on the provided context, there are three images showing a child in a snow tunnel. Below are descriptions of each:
 
-1. **[DSC01379.JPG]** – A high-angle, close-up shot of a young child crawling through a snow tunnel. The child wears a dark navy blue winter jacket with red accents and "CYBER" text on the sleeve, plus a grey knit beanie covered in snow.
+1. **[DSC01379.JPG]** – A high-angle, close-up shot of a young child crawling through a snow tunnel. The child wears a dark navy blue winter jacket with red accents and "CYBER" text on the sleeve,
+   plus a grey knit beanie covered in snow.
 
-2. **[DSC01378.JPG]** – A medium shot taken from inside the snow tunnel, looking outward. A child is peering in from the opening, wearing a black winter coat and black knit hat with small pom-poms. They are smiling and looking directly at the camera.
+2. **[DSC01378.JPG]** – A medium shot taken from inside the snow tunnel, looking outward. A child is peering in from the opening, wearing a black winter coat and black knit hat with small pom-poms.
+   They are smiling and looking directly at the camera.
 
-3. **[DSC01380.JPG]** – A close-up, eye-level shot of a young child smiling and looking down while crawling through the snow tunnel. The child has a dark blue coat with red accents, a grey beanie covered in snow, and black/grey gloves.
+3. **[DSC01380.JPG]** – A close-up, eye-level shot of a young child smiling and looking down while crawling through the snow tunnel. The child has a dark blue coat with red accents, a grey beanie
+   covered in snow, and black/grey gloves.
 
- ######################################################################################################################## 
+########################################################################################################################
 
 Can you describe to me what the most important new approaches were in the Deepseek V4 Flash family of models
 
- ######################################## 
+########################################
 
-Logging Info:
-2026-06-11 09:11:19,885 - VERBOSE - 1.57s route(llm)  → RAG needed
-2026-06-11 09:11:21,636 - VERBOSE - 1.75s retrieve  — 5 docs (top_k=20, reranker=yes)
-2026-06-11 09:11:21,636 - VERBOSE - 0.00s postproc  — text-only (skipped VLM/ASR)
-2026-06-11 09:11:35,634 - VERBOSE - 14.00s llm       — generation (386 tokens)  [total 17.32s]
+Logging Info: 2026-06-11 09:11:19,885 - VERBOSE - 1.57s route(llm)  → RAG needed 2026-06-11 09:11:21,636 - VERBOSE - 1.75s retrieve  — 5 docs (top_k=20, reranker=yes) 2026-06-11 09:11:21,636 - VERBOSE -
+0.00s postproc  — text-only (skipped VLM/ASR) 2026-06-11 09:11:35,634 - VERBOSE - 14.00s llm       — generation (386 tokens)  [total 17.32s]
 
- ######################################## 
+########################################
 
 Based on the provided context, the DeepSeek-V4 Flash family introduced several key architectural and methodological innovations:
 
-1. **Hybrid Attention with CSA and HCA** — Compressed Sparse Attention (CSA) + Heavily Compressed Attention (HCA). For a 1M-token context, achieves only 10% of the single-token FLOPs and 7% of the KV cache size compared to DeepSeek-V3.2.
+1. **Hybrid Attention with CSA and HCA** — Compressed Sparse Attention (CSA) + Heavily Compressed Attention (HCA). For a 1M-token context, achieves only 10% of the single-token FLOPs and 7% of the KV
+   cache size compared to DeepSeek-V3.2.
 
 2. **Precision Optimizations** — Routed expert parameters in FP4, other operations in FP8.
 
@@ -231,28 +220,23 @@ Based on the provided context, the DeepSeek-V4 Flash family introduced several k
 
 5. **Post-Training via On-Policy Distillation (OPD)** — Two-stage: specialist training (SFT + RL/GRPO), then unified consolidation via OPD (reverse KL divergence).
 
- ######################################################################################################################## 
+########################################################################################################################
 
 Can you show me videos of an old video game?
 
- ######################################## 
+########################################
 
-Logging Info:
-2026-06-11 09:11:36,751 - VERBOSE - 1.12s route(llm)  → RAG needed
-2026-06-11 09:11:42,538 - VERBOSE - 5.79s retrieve  — 5 docs (top_k=10, reranker=yes)
-2026-06-11 09:11:49,057 - VERBOSE -   6.51s vlm describe  — 1 media items
-2026-06-11 09:11:51,360 - VERBOSE -   8.81s vlm describe  — 1 media items
-2026-06-11 09:11:51,757 - VERBOSE -   9.21s vlm describe  — 1 media items
-2026-06-11 09:11:52,902 - VERBOSE -   10.36s vlm describe  — 1 media items
-2026-06-11 09:11:52,956 - VERBOSE -   10.41s vlm describe  — 1 media items
-2026-06-11 09:11:52,956 - VERBOSE - 10.42s postproc  — VLM/ASR conversion (5 docs with media)
-2026-06-11 09:11:57,974 - VERBOSE - 5.02s llm       — generation (249 tokens)  [total 22.34s]
+Logging Info: 2026-06-11 09:11:36,751 - VERBOSE - 1.12s route(llm)  → RAG needed 2026-06-11 09:11:42,538 - VERBOSE - 5.79s retrieve  — 5 docs (top_k=10, reranker=yes) 2026-06-11 09:11:49,057 - VERBOSE -
+6.51s vlm describe  — 1 media items 2026-06-11 09:11:51,360 - VERBOSE -   8.81s vlm describe  — 1 media items 2026-06-11 09:11:51,757 - VERBOSE -   9.21s vlm describe  — 1 media items 2026-06-11
+09:11:52,902 - VERBOSE -   10.36s vlm describe  — 1 media items 2026-06-11 09:11:52,956 - VERBOSE -   10.41s vlm describe  — 1 media items 2026-06-11 09:11:52,956 - VERBOSE - 10.42s postproc  — VLM/ASR
+conversion (5 docs with media) 2026-06-11 09:11:57,974 - VERBOSE - 5.02s llm       — generation (249 tokens)  [total 22.34s]
 
- ######################################## 
+########################################
 
-Certainly! The retrieved context contains several clips from **Super Smash Bros.** for the **Nintendo 64** (released in 1999). The footage shows matches between **Yoshi** and **Captain Falcon** on the **Hyrule Castle** stage.
+Certainly! The retrieved context contains several clips from **Super Smash Bros.** for the **Nintendo 64** (released in 1999). The footage shows matches between **Yoshi** and **Captain Falcon** on the
+**Hyrule Castle** stage.
 
- ######################################################################################################################## 
+########################################################################################################################
 </code></pre>
 
 </details>
@@ -265,9 +249,14 @@ Challenges encountered while setting up the base models for testing.
 
 ### Embeddings
 
-* For the [embedding client](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/utils/langchain_embed_override.py#L420), close matches between the VLLM implementation highlighted on [huggingface](https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B#vllm-basic-usage-example). Cosine distance ~`1e-4`. This differs slightly from the output of the [sentence-transformers demonstration](https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B#sentence-transformers) of the same page, but is reasonable.
-* The OpenAI Client with `client.embeddings.create` does not support calling with dictionaries, eliminating the possibility of image calls and also joint text-image calls. See [here](https://github.com/openai/openai-python/blob/main/src/openai/resources/embeddings.py#L178).
-* The Langchain Embeddings class does not produce equivalent representations for Qwen3-VL-Embedding-8B as the local variants, even for simple text. There is a strange design decision to differ from the OpenAI client defaults [that was fixed here](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/utils/pcai_models.py#L85) to match offline text embedding results.
+* For the [embedding client](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/utils/langchain_embed_override.py#L420), close matches between the
+  VLLM implementation highlighted on [huggingface](https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B#vllm-basic-usage-example). Cosine distance ~`1e-4`. This differs slightly from the output of the
+  [sentence-transformers demonstration](https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B#sentence-transformers) of the same page, but is reasonable.
+* The OpenAI Client with `client.embeddings.create` does not support calling with dictionaries, eliminating the possibility of image calls and also joint text-image calls. See
+  [here](https://github.com/openai/openai-python/blob/main/src/openai/resources/embeddings.py#L178).
+* The Langchain Embeddings class does not produce equivalent representations for Qwen3-VL-Embedding-8B as the local variants, even for simple text. There is a strange design decision to differ from
+  the OpenAI client defaults [that was fixed here](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/utils/pcai_models.py#L85) to match offline
+  text embedding results.
 
 ### Comparisons of embeddings
 
@@ -277,7 +266,8 @@ Full tests show equivalence on local tests of base64 to http links, giving confi
 
 #### Embedding Model
 
-Near perfect reproduction of the offline and online versions of vllm. The full results [are here](https://github.com/ai-solution-eng/internal-projects/tree/main/multimodal-rag-project/tests/embeddings/comparison.txt).
+Near perfect reproduction of the offline and online versions of vllm. The full results [are
+here](https://github.com/ai-solution-eng/internal-projects/tree/main/multimodal-rag-project/tests/embeddings/comparison.txt).
 
 Highlights (showing ~5e-4 deltas between the online and offline reference implementations):
 ```
@@ -335,13 +325,19 @@ sentence_transformers Similarities:
 
 ### Reranker
 
-* [This tool](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/utils/langchain_embed_override.py#L509) was developed to serve as a reranker wrapper for remote models.
-* The reference CrossEncoder implementation [highlighted here](https://huggingface.co/Qwen/Qwen3-VL-Reranker-8B#using-sentence-transformers) fails to load with the error `TypeError: LogitScore.__init__() missing 1 required positional argument: 'true_token_id'`. You need to place a file @ `~/.cache/huggingface/hub/models--Qwen--Qwen3-VL-Reranker-8B/snapshots/b212dc8c91a8164aef1ea2de9c1a867611e75c04/1_CausalScoreHead/config.json` with contents `{"true_token_id": 9693, "false_token_id": 2152}` to solve it. Then you get sensible results. Results agree with or without base64 encoding.
+* [This tool](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/utils/langchain_embed_override.py#L509) was developed to serve as a reranker
+  wrapper for remote models.
+* The reference CrossEncoder implementation [highlighted here](https://huggingface.co/Qwen/Qwen3-VL-Reranker-8B#using-sentence-transformers) fails to load with the error `TypeError:
+  LogitScore.__init__() missing 1 required positional argument: 'true_token_id'`. You need to place a file @
+  `~/.cache/huggingface/hub/models--Qwen--Qwen3-VL-Reranker-8B/snapshots/b212dc8c91a8164aef1ea2de9c1a867611e75c04/1_CausalScoreHead/config.json` with contents `{"true_token_id": 9693,
+  "false_token_id": 2152}` to solve it. Then you get sensible results. Results agree with or without base64 encoding.
 * [The VLLM local implementation](https://huggingface.co/Qwen/Qwen3-VL-Reranker-8B#using-vllm) is thus used for testing, which deploys successfully. Results look very reasonable for reranking.
 
-The reranker puts cross-comparisons on a `[0,1]` scale of similarity. Test data: 18 samples (text, image, joint text-image of 6 reference internet samples). The full results [are here](https://github.com/ai-solution-eng/internal-projects/tree/main/multimodal-rag-project/tests/reranker/comparison.txt).
+The reranker puts cross-comparisons on a `[0,1]` scale of similarity. Test data: 18 samples (text, image, joint text-image of 6 reference internet samples). The full results [are
+here](https://github.com/ai-solution-eng/internal-projects/tree/main/multimodal-rag-project/tests/reranker/comparison.txt).
 
-Comparing the PCAI VLLM implementation used, reasonable ranking parity between all samples used. The values are sorted, so all indices on right side being True means the top results match across modalities.
+Comparing the PCAI VLLM implementation used, reasonable ranking parity between all samples used. The values are sorted, so all indices on right side being True means the top results match across
+modalities.
 
 ```
    text_image_scores

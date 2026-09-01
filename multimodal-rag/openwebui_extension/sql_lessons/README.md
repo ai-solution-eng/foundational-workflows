@@ -127,4 +127,4 @@ counters are present.
 
 ## Reference
 
-Design doc: `../self-improving-sql-agent.md`.
+Design doc: [DESIGN.md](DESIGN.md).

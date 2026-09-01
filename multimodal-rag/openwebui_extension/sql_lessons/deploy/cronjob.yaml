@@ -38,9 +38,9 @@ spec:
               args:
                 - --auto
                 - --curated-dataset
-                - sql-learnings
+                - sql-lessons
                 - --candidates-dataset
-                - sql-learnings-staging
+                - sql-lessons-staging
                 # Remove --auto and add these to use LLM review instead:
                 # - --llm-url
                 # - <distill-llm-url>
@@ -48,7 +48,7 @@ spec:
                 # - <distill-llm-model>
               env:
                 - name: RAG_API_URL
-                  value: "https://rag-mcp-server.tr7-0211-ai-application.pcai0211.tr7.hpecolo.net"
+                  value: "https://rag.example.com"   # <-- set to your RAG API URL
                 # Only set if the datasets are password-protected; mount from a Secret.
                 # - name: RAG_LESSONS_PASSWORD
                 #   valueFrom:

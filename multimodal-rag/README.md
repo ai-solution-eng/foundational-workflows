@@ -1,12 +1,10 @@
 # Multimodal RAG
 
-End-to-end multimodal retrieval-augmented generation: ingest documents
-in 17+ formats (text, PDF, images, video, audio, code, tables, office
-docs, and more), embed them into a joint multimodal vector space, and
-retrieve at query time with optional cross-encoder reranking — all
-exposed via a REST API, an HTML frontend, and an MCP server.
+End-to-end multimodal retrieval-augmented generation: ingest documents in 17+ formats (text, PDF, images, video, audio, code, tables, office docs, and more), embed them into a joint multimodal vector
+space, and retrieve at query time with optional cross-encoder reranking — all exposed via a REST API, an HTML frontend, and an MCP server.
 
-[Video Demonstration](https://storage.googleapis.com/ai-solution-engineering-videos/public/MultimodalRag.mkv) with chapters and subtitles. Highlights models, dataset ingestion, open webui integration, and the opencode longterm memory implementation.
+[Video Demonstration](https://storage.googleapis.com/ai-solution-engineering-videos/public/MultimodalRag.mkv) with chapters and subtitles. Highlights models, dataset ingestion, open webui integration,
+and the opencode longterm memory implementation.
 
 <div align="center"><img src="./documentation/rag_system_flow-1.png" width="700" alt="RAG system flow: dataset building (left) feeding a shared vector store, queried by query-time retrieval (right), with dynamic batching annotations throughout"></div>
 
@@ -15,13 +13,15 @@ exposed via a REST API, an HTML frontend, and an MCP server.
 ## Features
 
 - **Joint multimodal embedding** (text, image, video) via Qwen3-VL-Embedding-8B — search with any combination of modalities
-- **Dual-embedding "twins"** — PDFs get a text-only twin so text queries match; images/videos/audio get a caption twin (media + caption) so caption wording is searchable alongside the raw-media embedding; unsupported media degrades to caption-only or is skipped
+- **Dual-embedding "twins"** — PDFs get a text-only twin so text queries match; images/videos/audio get a caption twin (media + caption) so caption wording is searchable alongside the raw-media
+  embedding; unsupported media degrades to caption-only or is skipped
 - **Audio support** via ASR transcription (Cohere Transcribe) — audio is converted to text before embedding
-- **17+ file formats** with format-specific chunking: PDF (page-by-page + image extraction), images, video (overlapping segments), audio, text/markdown, JSON, XML, YAML, CSV/Excel, code (16 languages), HTML, Office docs, Jupyter notebooks, EPUB, log files, archives
+- **17+ file formats** with format-specific chunking: PDF (page-by-page + image extraction), images, video (overlapping segments), audio, text/markdown, JSON, XML, YAML, CSV/Excel, code (16
+  languages), HTML, Office docs, Jupyter notebooks, EPUB, log files, archives
 - **Cross-encoder reranking** via Qwen3-VL-Reranker-8B for improved precision at the cost of latency
 - **Modality conversion** — retrieved media the LLM doesn't support is auto-converted (images/video → VLM description, audio → ASR transcript)
 - **Dataset management** — password-protected datasets, per-dataset Qdrant collections, dedup (cosine ≥ 0.995), S3/HTTP URL ingestion
-- **MCP server** — 9 tools (search, list, recall, store memory, describe media, transcribe audio) over streamable-http / stdio / sse
+- **MCP server** — 13 tools (search, federated search, list, recall + memory management, describe media, transcribe audio) over streamable-http / stdio / sse
 - **Long-term memory** — per-user LLM-curated memory store for opencode and Open WebUI, with SSO-backed isolation
 - **Open WebUI extension** — filter that routes unsupported modalities to the RAG MCP tool, plus inlet/outlet memory hooks
 - **Helm chart** — 2-container pod (API + MCP sidecar), Qdrant StatefulSet, Istio/EZUA ingress with oauth2-proxy
@@ -53,9 +53,7 @@ exposed via a REST API, an HTML frontend, and an MCP server.
               └──────────────────┘
 ```
 
-Both the API server and MCP server connect to the same Qdrant instance
-and share the same PVC, so datasets created through the web UI are
-immediately searchable via MCP tools and vice versa.
+Both the API server and MCP server connect to the same Qdrant instance and share the same PVC, so datasets created through the web UI are immediately searchable via MCP tools and vice versa.
 
 ---
 
@@ -66,7 +64,7 @@ immediately searchable via MCP tools and vice versa.
 | **[USAGE.md](USAGE.md)** | HTML frontend usage + programmatic Python API |
 | **[documentation/API.md](documentation/API.md)** | REST API reference with `curl`/Python examples — create datasets, add/delete files |
 | **[documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md)** | Build the image, install the helm chart, verify, troubleshoot |
-| **[documentation/MCP.md](documentation/MCP.md)** | All 9 MCP tools + connection configs for opencode, Claude Desktop, OWUI, stdio |
+| **[documentation/MCP.md](documentation/MCP.md)** | All 13 MCP tools + connection configs for opencode, Claude Desktop, OWUI, stdio |
 | **[documentation/MEMORY.md](documentation/MEMORY.md)** | Long-term memory setup per client (opencode + Open WebUI), multi-user isolation, operations |
 | **[documentation/FEATURES.md](documentation/FEATURES.md)** | Deep technical reference: every format, chunking strategy, embedding, reranking, storage |
 | **[documentation/AGENTS.md](documentation/AGENTS.md)** | opencode agent policy: when to recall / write memories |
@@ -78,44 +76,34 @@ immediately searchable via MCP tools and vice versa.
 
 ## Quick start
 
-> **PCAI is a Helm wrapper — you never run `helm` or `kubectl`.** Import the
-> packaged chart into PCAI once, then drive the deployment by setting the
-> chart's **`values.yaml`** in the PCAI *Helm Values* editor (or via the PCAI
-> API). Every `--set` in the upstream docs maps 1:1 to a key in `values.yaml`.
+> **PCAI is a Helm wrapper — you never run `helm` or `kubectl`.** Import the packaged chart into PCAI once, then drive the deployment by setting the chart's **`values.yaml`** in the PCAI *Helm Values*
+> editor (or via the PCAI API). Every `--set` in the upstream docs maps 1:1 to a key in `values.yaml`.
 
 To deploy on PCAI:
-1. Pick the chart variant you need and import it into PCAI.
-   a. There are 3 variants: `helm/` (single replica), `helm-scale-medium/`,
+1. Pick the chart variant you need and import it into PCAI. a. There are 3 variants: `helm/` (single replica), `helm-scale-medium/`,
       `helm-scale-large/`.
-   b. Scale variants use multiple API and Qdrant replicas to improve
+b. Scale variants use multiple API and Qdrant replicas to improve
       throughput. Requests are still routed jointly (for text) to a single
       request to improve performance.
-2. Set the model endpoints (deployed through MLIS) as `models.*` values:
-   a. The embedder (`models.embedder.url`) is the only required endpoint.
-   b. A VLM/ASR model is often recommended to give images/videos or audios
+2. Set the model endpoints (deployed through MLIS) as `models.*` values: a. The embedder (`models.embedder.url`) is the only required endpoint. b. A VLM/ASR model is often recommended to give
+   images/videos or audios
       (including video-embedded audio) respectively to the base LLM.
-   c. A reranker can be helpful as well, but often the LLM will just call
+c. A reranker can be helpful as well, but often the LLM will just call
       `top_k` with sufficient performance. I have once seen it fail to
       retrieve with only `top_k`; increase the value to 100 with reranking
       and it succeeds.
-3. Recommended: generate a `security.mediaTokenSecret` value with
-   `python -c "import secrets; print(secrets.token_hex(32))"` and set it in
-   `values.yaml`. There is a default one in the charts, but it is recommended
-   to change it for security; it governs token generation for password
-   protected datasets.
+3. Recommended: generate a `security.mediaTokenSecret` value with `python -c "import secrets; print(secrets.token_hex(32))"` and set it in `values.yaml`. There is a default one in the charts, but it
+   is recommended to change it for security; it governs token generation for password protected datasets.
 
-The image does not bundle any ML models — it connects to remote model
-endpoints (embedder, reranker, VLM, ASR) configured at runtime via the chart's
-values. See `documentation/DEPLOYMENT.md` for details.
+The image does not bundle any ML models — it connects to remote model endpoints (embedder, reranker, VLM, ASR) configured at runtime via the chart's values. See `documentation/DEPLOYMENT.md` for
+details.
 
 ---
 
 ## Security hardening (opt-in)
 
-The core server is **unauthenticated by default** and is designed to sit
-behind an ingress auth proxy (Istio + oauth2-proxy). For additional,
-opt-in protection (per-process env vars, or first-class [Helm
-`security` values]), set any of the following:
+The core server is **unauthenticated by default** and is designed to sit behind an ingress auth proxy (Istio + oauth2-proxy). For additional, opt-in protection (per-process env vars, or first-class
+[Helm `security` values]), set any of the following:
 
 | Env var | Purpose | Default |
 |---|---|---|
@@ -137,9 +125,8 @@ opt-in protection (per-process env vars, or first-class [Helm
 | `RAG_EMBED_BATCH_URL` | Optional URL of a shared (cross-process) embedding query batcher: text-only queries are POSTed there instead of the per-process local batcher, so batch size is independent of worker/pod count. Falls back to local batching when unreachable. | unset (local batching) |
 | `MODEL_EMBED_MAX_CONCURRENCY` | Per-event-loop bound on concurrent multimodal embedding POSTs (one request per converted doc; concurrent ingests multiply this). `0` disables the bound. | 32 |
 
-Some defaults have deliberately shifted from permissive to strict since v1.9 (`MEDIA_TOKEN_SECRET` now required, private-host ingest blocking on, media path allowlist fail-closed). `helm/`, `helm-scale-large/` and
-`helm-scale-medium/` ship a `security:` values block wired to these flags. In
-PCAI you set them in `values.yaml` (the *Helm Values* editor):
+Some defaults have deliberately shifted from permissive to strict since v1.9 (`MEDIA_TOKEN_SECRET` now required, private-host ingest blocking on, media path allowlist fail-closed). `helm/`,
+`helm-scale-large/` and `helm-scale-medium/` ship a `security:` values block wired to these flags. In PCAI you set them in `values.yaml` (the *Helm Values* editor):
 
 ```yaml
 # values.yaml
@@ -149,6 +136,4 @@ security:
   blockPrivateHosts: true
 ```
 
-> Keep deployment secret material (e.g. `helm/.values.yaml`, which contains
-> Kubernetes service-account tokens) out of version control — it is not
-> covered by `.gitignore`.
+> Keep deployment secret material (e.g. `helm/.values.yaml`, which contains Kubernetes service-account tokens) out of version control — it is not covered by `.gitignore`.

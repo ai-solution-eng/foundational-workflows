@@ -1,6 +1,6 @@
 """Shared helpers for the self-improving SQL lesson loop (OWUI filter side).
 
-The loop (from ``design/self-improving-sql-agent.md``):
+The loop (from ``DESIGN.md`` in this directory):
 
     resolve -> distill -> store(candidate) -> promote -> recall(next question)
 

@@ -7,11 +7,14 @@
 <div align="center"><img src="./deployment_flow-1.png" width="900" alt="Deployment architecture: clients, edge, release pods, data, and MLIS model endpoints"></div>
 
 
-This system ingests documents in **17+ file formats**, processes each with a format-specific chunking strategy, embeds them into a joint multimodal vector space (text, image, video, audio) via **Qwen3-VL-Embedding-8B**, and retrieves them at query time with optional cross-encoder reranking via **Qwen3-VL-Reranker-8B**.
+This system ingests documents in **17+ file formats**, processes each with a format-specific chunking strategy, embeds them into a joint multimodal vector space (text, image, video, audio) via
+**Qwen3-VL-Embedding-8B**, and retrieves them at query time with optional cross-encoder reranking via **Qwen3-VL-Reranker-8B**.
 
-Modalities the embedder doesn't support natively (audio) are converted to text via ASR **before** embedding (Preprocessor). Modalities the downstream LLM doesn't support are converted **after** retrieval (Postprocessor).
+Modalities the embedder doesn't support natively (audio) are converted to text via ASR **before** embedding (Preprocessor). Modalities the downstream LLM doesn't support are converted **after**
+retrieval (Postprocessor).
 
-Chunk sizes are **dynamic** — sourced from the embedder model config, with a dual-budget system: general text uses `chunk_size=2048` / `chunk_overlap=256`, while structured types (code/json/xml/yaml) use `code_chunk_size=8192` / `code_chunk_overlap=512`. When a HuggingFace tokenizer is available, chunking is **token-aware** rather than character-based.
+Chunk sizes are **dynamic** — sourced from the embedder model config, with a dual-budget system: general text uses `chunk_size=2048` / `chunk_overlap=256`, while structured types (code/json/xml/yaml)
+use `code_chunk_size=8192` / `code_chunk_overlap=512`. When a HuggingFace tokenizer is available, chunking is **token-aware** rather than character-based.
 
 ---
 
@@ -43,13 +46,17 @@ Media files are stored at three quality tiers to balance fidelity, storage, and 
 | 2 — Preprocessed | `preprocessed_image` / `preprocessed_video` | `1920×1080` px | `1280×720` @ 24 fps | `file://` PVC path | Base LLM (display links), frontend |
 | 3 — Model-ready | `image` / `video` | `720×720` px | `720×720` segments @ 1 fps, ≤5×720² total px | Base64 data URL in Qdrant | Reranker, VLM, embedder |
 
-**Tier 1** is the original file copied to PVC by `_store_file()`. It is referenced by `original_*` keys only when it differs from tier 2 (i.e. the file was large enough to require preprocessing). Previously this file was orphaned; it is now linked so users can request full quality on demand.
+**Tier 1** is the original file copied to PVC by `_store_file()`. It is referenced by `original_*` keys only when it differs from tier 2 (i.e. the file was large enough to require preprocessing).
+Previously this file was orphaned; it is now linked so users can request full quality on demand.
 
-**Tier 2** is produced by `_preprocess_image_file()` / `_preprocess_video_file()` which create a `*_preprocessed` sibling on PVC. Images are downscaled (LANCZOS, aspect-preserving) via PIL; videos are transcoded via ffmpeg (libx264 CRF 28, AAC 128k, `+faststart`). Files within the limits are returned unchanged (tier 1 = tier 2).
+**Tier 2** is produced by `_preprocess_image_file()` / `_preprocess_video_file()` which create a `*_preprocessed` sibling on PVC. Images are downscaled (LANCZOS, aspect-preserving) via PIL; videos are
+transcoded via ffmpeg (libx264 CRF 28, AAC 128k, `+faststart`). Files within the limits are returned unchanged (tier 1 = tier 2).
 
-**Tier 3** is produced by `ImageProcessor` / `VideoProcessor` at ingest time and stored directly as a base64 data URL in the Qdrant payload. The reranker and VLM consume these data URLs directly — no file I/O, no client-side re-resizing. The embedding endpoint's server-side `mm_processor_kwargs` (max_pixels=720×720) is a no-op on data that is already at tier 3.
+**Tier 3** is produced by `ImageProcessor` / `VideoProcessor` at ingest time and stored directly as a base64 data URL in the Qdrant payload. The reranker and VLM consume these data URLs directly — no
+file I/O, no client-side re-resizing. The embedding endpoint's server-side `mm_processor_kwargs` (max_pixels=720×720) is a no-op on data that is already at tier 3.
 
-`_strip_media_payloads()` intentionally **does not** strip tier-3 `image`/`video` keys — the data URLs stay in Qdrant. Only `audio` and tier-1/2 `preprocessed_*`/`original_*` keys are stripped (as a safety net, since they should already be `file://` refs).
+`_strip_media_payloads()` intentionally **does not** strip tier-3 `image`/`video` keys — the data URLs stay in Qdrant. Only `audio` and tier-1/2 `preprocessed_*`/`original_*` keys are stripped (as a
+safety net, since they should already be `file://` refs).
 
 ### Migration
 
@@ -91,8 +98,11 @@ The migration is idempotent and:
 6. Images are deduplicated across chunks on the same page.
 7. **Noise filtering**: reference lists, author lists, and tables of contents are auto-detected via heuristics and skipped.
 8. Output: `{"text": "...", "image": ["data:image/...;base64,..."], "source": "...", "page": N}`
+9. **OCR fallback (scanned pages)**: pages carrying images but an empty text layer are rasterized at `OCR_DPI` (default 150) and OCR'd through the **tesseract CLI** (no python binding — same subprocess pattern as ffmpeg/unrar); the recognised text becomes the page's text blocks tagged `[OCR page N]`, so scanned archives become text-searchable and feed the BM25 lane. Opt-in per dataset (`ocr: true` on create/PATCH, default off — OCR on a big scan is expensive); when the binary is absent the fallback silently skips (VLM caption twins remain the no-tesseract path). Env: `OCR_LANG` (eng), `OCR_DPI`, `OCR_TIMEOUT_S`. New datasets default to the server-wide `RAG_OCR_DEFAULT` (chart values `rag.ocr`, default false); an explicit `ocr` in the create/PATCH body always wins.
 
-**Incremental extraction**: `extract_chunks_iter()` is a generator that opens the PDF once and yields chunks page-by-page. Overlap state carries between pages so cross-page chunking is identical to the list version. The batch ingestion pipeline uses this generator to hand off sub-batches to the embedding consumer **while later pages are still being extracted**, enabling concurrent extraction + embedding for large PDFs (e.g. 8k+ pages).
+**Incremental extraction**: `extract_chunks_iter()` is a generator that opens the PDF once and yields chunks page-by-page. Overlap state carries between pages so cross-page chunking is identical to
+the list version. The batch ingestion pipeline uses this generator to hand off sub-batches to the embedding consumer **while later pages are still being extracted**, enabling concurrent extraction +
+embedding for large PDFs (e.g. 8k+ pages).
 
 ---
 
@@ -107,7 +117,8 @@ The migration is idempotent and:
 4. Text default: `[Image: {filename}]`.
 5. HTTP(S) URLs are downloaded to temp files and processed through full resizing (remote URLs are not passed through untouched).
 6. Output: `{"text": "[Image: photo.jpg]", "image": "data:image/jpeg;base64,...", "source": "/path/to/photo.jpg"}`
-7. **Media persistence**: tier-3 data URLs are kept in Qdrant (consumed directly by reranker/VLM). Tier-2 `preprocessed_image` `file://` refs are produced for PDF-extracted images via `_save_doc_media()`. Tier-1 `original_image` refs are set when the file was preprocessed.
+7. **Media persistence**: tier-3 data URLs are kept in Qdrant (consumed directly by reranker/VLM). Tier-2 `preprocessed_image` `file://` refs are produced for PDF-extracted images via
+   `_save_doc_media()`. Tier-1 `original_image` refs are set when the file was preprocessed.
 
 ---
 
@@ -142,7 +153,8 @@ No dedicated processor file; handled inline in `dataset_manager.py`.
 1. Read raw file bytes.
 2. Guess MIME type via `mimetypes`.
 3. Base64 encode to `data:{mime};base64,{b64}`.
-4. **Segmentation**: files larger than 5 MiB are split via ffmpeg's segment muxer into byte-budgeted segments; each segment becomes a separate document with `segment_index` and a label like `"foo.mp3 — segment 1/3"`.
+4. **Segmentation**: files larger than 5 MiB are split via ffmpeg's segment muxer into byte-budgeted segments; each segment becomes a separate document with `segment_index` and a label like `"foo.mp3
+   — segment 1/3"`.
 5. Text: `[Audio: {filename}]`
 6. Output: `{"text": "[Audio: recording.mp3]", "audio": "data:audio/mpeg;base64,...", "source": "/path/to/audio.mp3"}`
 
@@ -198,7 +210,8 @@ No dedicated processor file; handled inline in `dataset_manager.py`.
 
 ### Code — Syntax-Aware Chunking, Function Boundaries
 
-**Supported languages (16):** Python, JavaScript, TypeScript, Java, C++, C, C#, Go, Rust, Ruby, Swift, PHP, Kotlin, Scala, Shell, R (plus fallback patterns for unlisted extensions like `.pyw`, `.jsx`, `.mjs`, `.cjs`, `.tsx`, `.h`, `.hpp`).
+**Supported languages (16):** Python, JavaScript, TypeScript, Java, C++, C, C#, Go, Rust, Ruby, Swift, PHP, Kotlin, Scala, Shell, R (plus fallback patterns for unlisted extensions like `.pyw`, `.jsx`,
+`.mjs`, `.cjs`, `.tsx`, `.h`, `.hpp`).
 
 **Parameters:** `code_chunk_size` (dynamic, default 8192), `code_chunk_overlap` (default 512), `add_language_annotation=True`
 
@@ -336,7 +349,8 @@ No dedicated processor file; handled inline in `dataset_manager.py`.
 4. **Entry grouping**: new entry detection by timestamp/severity pattern matching; continuation lines merged.
 5. **Chunking**: entries grouped by character budget or `max_entries_per_chunk`; overlapping supported.
 6. Metadata: `timestamp_start`, `timestamp_end`, `severities` (set of observed severity levels).
-7. Output: `{"text": "2024-01-01 12:00:00 ERROR Server crash\n...", "source": "...", "timestamp_start": "2024-01-01 12:00:00", "timestamp_end": "2024-01-01 12:00:05", "severities": ["ERROR"], "chunk_index": N}`
+7. Output: `{"text": "2024-01-01 12:00:00 ERROR Server crash\n...", "source": "...", "timestamp_start": "2024-01-01 12:00:00", "timestamp_end": "2024-01-01 12:00:05", "severities": ["ERROR"],
+   "chunk_index": N}`
 
 ---
 
@@ -346,9 +360,11 @@ When a HuggingFace tokenizer is bundled (`tokenizer_type="HuggingFace"`), all te
 
 **`TokenTextSplitter`** (`utils/token_text_splitter.py`):
 - Uses standalone HuggingFace `tokenizers` library (Rust, CPU-only — no PyTorch needed).
-- `from_bundled()`: locates `tokenizer.json` via the `RAG_TOKENIZER_PATH` env var (override) or an upward search from `utils/` through the package, `src/` root, and application root (covers the Docker layout where the file lives at `/app/tokenizer.json`); returns `None` and logs a warning if missing (callers fall back to character-based chunking).
+- `from_bundled()`: locates `tokenizer.json` via the `RAG_TOKENIZER_PATH` env var (override) or an upward search from `utils/` through the package, `src/` root, and application root (covers the Docker
+  layout where the file lives at `/app/tokenizer.json`); returns `None` and logs a warning if missing (callers fall back to character-based chunking).
 - `count_tokens()`: `len(tokenizer.encode(text).ids)`.
-- `split_text()`: token-boundary splitting with a 10% net-new tail merge (tiny final chunks fold into the previous) and a `chunk_size // 4` minimum-tail backfill (512 tokens for text, 2048 for code) so no standalone final chunk is smaller than the floor.
+- `split_text()`: token-boundary splitting with a 10% net-new tail merge (tiny final chunks fold into the previous) and a `chunk_size // 4` minimum-tail backfill (512 tokens for text, 2048 for code)
+  so no standalone final chunk is smaller than the floor.
 - `merge_until_budget()`: merges fragments into groups fitting `chunk_size` tokens; carries overlap from the last fragment of the previous group.
 - `overlap_text()`: returns last `chunk_overlap` tokens decoded back.
 
@@ -357,7 +373,8 @@ When a HuggingFace tokenizer is bundled (`tokenizer_type="HuggingFace"`), all te
 - `EmbeddingModel.code_text_splitter` — uses `code_chunk_size`/`code_chunk_overlap` (defaults 8192/512).
 - Structured types (code, json, xml, yaml) use the `code_*` splitter; everything else uses the general splitter.
 
-**Bundled tokenizer**: The Dockerfile pre-downloads `tokenizer.json` from `huggingface.co/Qwen/Qwen3-VL-Embedding-8B` into `/app/tokenizer.json` at build time, enabling token-count chunking without runtime download.
+**Bundled tokenizer**: The Dockerfile pre-downloads `tokenizer.json` from `huggingface.co/Qwen/Qwen3-VL-Embedding-8B` into `/app/tokenizer.json` at build time, enabling token-count chunking without
+runtime download.
 
 ---
 
@@ -369,7 +386,8 @@ When a HuggingFace tokenizer is bundled (`tokenizer_type="HuggingFace"`), all te
 
 **Audio handling:** Audio is not natively supported by the embedder. The **Preprocessor** converts audio → text via ASR (Cohere Transcribe 03-2026) before embedding.
 
-**Image/video handling:** Images and videos in retrieved documents can be passed through to the LLM natively (if the LLM supports them) or converted to text descriptions via a VLM (Gemma 4 31B) by the **Postprocessor**.
+**Image/video handling:** Images and videos in retrieved documents can be passed through to the LLM natively (if the LLM supports them) or converted to text descriptions via a VLM (Gemma 4 31B) by the
+**Postprocessor**.
 
 **Input conversion** (`InputConversion` in `model_adapters.py`):
 - Accepts plain strings, bare media URLs (auto-detected), data URIs, local file paths, and dicts with `text`/`image`/`video`/`audio` keys.
@@ -379,24 +397,25 @@ When a HuggingFace tokenizer is bundled (`tokenizer_type="HuggingFace"`), all te
 - Images resized via PIL LANCZOS to `width × height ≤ max_pixels`.
 - Conversational wrapper added (system/user/assistant) with instruction `"Represent the user's input."`.
 
-**Text-only batch embedding**: Text-only documents (no media keys or unsupported modalities) are batched into a single `POST /v1/embeddings` request using the `input: [str1, str2, ...]` format. Each text is pre-formatted with the Qwen3-VL chat template on the client side (`_fmt_chat_template`), producing the same token sequence the server would generate from the `messages` format. This reduces N HTTP requests to 1 for text-only docs (typically ~60 of 64 docs per sub-batch). Multimodal docs still use individual `messages` requests, concurrent via `asyncio.gather`. Both paths run concurrently. Embeddings are >0.996 cosine similar to the per-doc `messages` format — within embedding noise.
+**Text-only batch embedding**: Text-only documents (no media keys or unsupported modalities) are batched into a single `POST /v1/embeddings` request using the `input: [str1, str2, ...]` format. Each
+text is pre-formatted with the Qwen3-VL chat template on the client side (`_fmt_chat_template`), producing the same token sequence the server would generate from the `messages` format. This reduces N
+HTTP requests to 1 for text-only docs (typically ~60 of 64 docs per sub-batch). Multimodal docs still use individual `messages` requests, concurrent via `asyncio.gather`. Both paths run concurrently.
+Embeddings are >0.996 cosine similar to the per-doc `messages` format — within embedding noise.
 
-**Embedding count guard**: After `aembed_documents`, the returned embedding count is checked against the document count. If they differ (e.g. API returned fewer vectors), a warning is logged and both lists are truncated to the shorter length to prevent silent data loss from `zip()`.
+**Embedding count guard**: After `aembed_documents`, the returned embedding count is checked against the document count. If they differ (e.g. API returned fewer vectors), a warning is logged and both
+lists are truncated to the shorter length to prevent silent data loss from `zip()`.
 
 **Media processor kwargs** (shared with reranker): `fps=1.0, max_frames=64, min_pixels=4096, max_pixels=720×720, total_pixels=5×720×720`.
 
 **Deduplication:**
 - **File-level**: SHA-256 hash of input files; duplicates are skipped before copying to PVC. Tracked in `.hashes.json` per dataset.
-- **Vector-level**: cosine similarity > 0.995 against existing vectors — skipped before insertion. Uses a **single batched `query_batch_points` call** per sub-batch (1 HTTP request instead of 64 individual queries). The `score_threshold` is enforced server-side by Qdrant, so only matches above the threshold are returned. The InMemoryVectorStore path uses vectorised numpy cosine similarity (N×M matrix in one shot). The threshold is tunable via the `RAG_DEDUP_THRESHOLD` env var.
+- **Vector-level**: cosine similarity > 0.995 against existing vectors — skipped before insertion. Uses a **single batched `query_batch_points` call** per sub-batch (1 HTTP request instead of 64
+  individual queries). The `score_threshold` is enforced server-side by Qdrant, so only matches above the threshold are returned. The InMemoryVectorStore path uses vectorised numpy cosine similarity
+  (N×M matrix in one shot). The threshold is tunable via the `RAG_DEDUP_THRESHOLD` env var.
 
-**Dual-embedding ("twin") ingest:**
-A multimodal doc gets a *second* embedding ("twin") at ingest time so both
-visual and text queries can retrieve it. Every twin is tagged `_twin=True`
-and shares its parent's `(source, page, chunk_index, time-window)` identity
-so the retrieval dedup can collapse it when the parent also appears in the
-results (the parent always carries the media); a twin that matches alone is
-kept. The time-window component (`timestamp_start`/`timestamp_end`) keeps
-different segments of the same video from collapsing with each other.
+**Dual-embedding ("twin") ingest:** A multimodal doc gets a *second* embedding ("twin") at ingest time so both visual and text queries can retrieve it. Every twin is tagged `_twin=True` and shares its
+parent's `(source, page, chunk_index, time-window)` identity so the retrieval dedup can collapse it when the parent also appears in the results (the parent always carries the media); a twin that
+matches alone is kept. The time-window component (`timestamp_start`/`timestamp_end`) keeps different segments of the same video from collapsing with each other.
 
 | Doc kind | Base embedding (primary) | Twin embedding |
 |----------|--------------------------|----------------|
@@ -406,39 +425,32 @@ different segments of the same video from collapsing with each other.
 | Media the embedder doesn't support (e.g. audio) but a VLM/ASR exists | Caption text only — the Preprocessor converts the media to caption text (the media stays in the stored payload as a viewable `file://` ref) | none (the caption text embedding is the caption-only path) |
 | Media **neither** the embedder nor VLM/ASR can handle | **Dropped** — the media key is removed and the whole sample is **omitted** (logged + surfaced as an ingest warning) | — |
 
-**Unified "skip entirely" rule** (applies uniformly to audio, image and video):
-any media the embedder can't ingest and that no VLM/ASR can convert to text is
-removed; if nothing embeddable remains (no supported media, no caption text,
-no real extracted text) the document is omitted entirely — a bare
-`[Video: x.mp4] [0s–32s]` placeholder does not count as content. A doc that
-also carries embeddable content keeps it (e.g. real text with an
-unconvertible image → the image is dropped, the text is embedded).
+**Unified "skip entirely" rule** (applies uniformly to audio, image and video): any media the embedder can't ingest and that no VLM/ASR can convert to text is removed; if nothing embeddable remains
+(no supported media, no caption text, no real extracted text) the document is omitted entirely — a bare `[Video: x.mp4] [0s–32s]` placeholder does not count as content. A doc that also carries
+embeddable content keeps it (e.g. real text with an unconvertible image → the image is dropped, the text is embedded).
 
-**On-disk cleanup:** when every document a file produced is dropped, the
-stored copy in `files/` (and its `*_preprocessed` tier-2 sibling) is deleted
-and its content-hash entry forgotten, so a file that can never be used does
-not sit on the PVC forever. Deleting is guarded: it only happens when no
-Qdrant point references the file's `source`, so nothing already retrievable
-is orphaned. The warning "Removed unreferenced file (…)" is surfaced to the
-UI alongside the drop warnings.
+**On-disk cleanup:** when every document a file produced is dropped, the stored copy in `files/` (and its `*_preprocessed` tier-2 sibling) is deleted and its content-hash entry forgotten, so a file
+that can never be used does not sit on the PVC forever. Deleting is guarded: it only happens when no Qdrant point references the file's `source`, so nothing already retrievable is orphaned. The
+warning "Removed unreferenced file (…)" is surfaced to the UI alongside the drop warnings.
 
-Caption twins are created only when the embedder supports the doc's media
-modality **and** a caption line is present (`[Image description]`,
-`[Video description]`, `[Audio transcription]`, `[Video audio
-transcription]`). Gating lives in `_media_caption_twin_needed()` and the
-embedding-input splitting in `_strip_embed_caption()` (both in
-`rag_system.py`); see `tests/full_pipeline/test_twins.py` for the offline
-ingest tests that assert base vs twin embedding inputs.
+Caption twins are created only when the embedder supports the doc's media modality **and** a caption line is present (`[Image description]`, `[Video description]`, `[Audio transcription]`, `[Video
+audio transcription]`). Gating lives in `_media_caption_twin_needed()` and the embedding-input splitting in `_strip_embed_caption()` (both in `rag_system.py`); see `tests/full_pipeline/test_twins.py`
+for the offline ingest tests that assert base vs twin embedding inputs.
 
-**Media payload stripping:** After embedding and storage, base64 data URLs in Qdrant payloads are replaced with lightweight `file://` PVC paths to reduce storage size. Existing valid `file://` refs are left alone; remote URLs (`http://`/`https://`/`s3://`) are kept as-is.
+**Media payload stripping:** After embedding and storage, base64 data URLs in Qdrant payloads are replaced with lightweight `file://` PVC paths to reduce storage size. Existing valid `file://` refs
+are left alone; remote URLs (`http://`/`https://`/`s3://`) are kept as-is.
 
 **Batch ingestion**:
 - Producer-consumer pipeline with background daemon thread.
-- **Consumer crash resilience**: the consumer thread is wrapped in a top-level try/except. If it crashes unexpectedly, the error is propagated back to the caller as `{"status": "error", "error": ...}` instead of silently returning success with incomplete results.
+- **Consumer crash resilience**: the consumer thread is wrapped in a top-level try/except. If it crashes unexpectedly, the error is propagated back to the caller as `{"status": "error", "error": ...}`
+  instead of silently returning success with incomplete results.
 - `batch_score=128.0` (2.56 MB ≈ 1.0 score) bounds embedding API payload size.
-- **Generalized retry** (`retry_call` / `retry_async_call` in `general_tools.py`): 3 attempts with linear backoff; longer delays for connection errors. Used by S3 downloads, S3 prefix listing, and the embedding consumer.
+- **Generalized retry** (`retry_call` / `retry_async_call` in `general_tools.py`): 3 attempts with linear backoff; longer delays for connection errors. Used by S3 downloads, S3 prefix listing, and the
+  embedding consumer.
 - Progress callback events: `preprocessing`, `preprocessed` (includes `total` estimated chunk count), `embedding` (includes `chunks` sub-batch size), `complete`, `error` — streamed to clients via SSE.
-- **Ingest warnings surface to the UI**: whenever media is dropped (neither the embedder nor a VLM/ASR supports it), ASR/VLM is unavailable, or a caption is skipped, a per-request warning is collected and returned as `warnings` — in the single-file / `POST /documents` response bodies and in the batch job result the frontend polls (rendered as "⚠ N caption(s) skipped: …"). The collector (`_ingest_warnings`) is a contextvar that `api_server._submit_with_context` propagates into the worker threads and background loop (plain `run_in_executor` would drop it).
+- **Ingest warnings surface to the UI**: whenever media is dropped (neither the embedder nor a VLM/ASR supports it), ASR/VLM is unavailable, or a caption is skipped, a per-request warning is collected
+  and returned as `warnings` — in the single-file / `POST /documents` response bodies and in the batch job result the frontend polls (rendered as "⚠ N caption(s) skipped: …"). The collector
+  (`_ingest_warnings`) is a contextvar that `api_server._submit_with_context` propagates into the worker threads and background loop (plain `run_in_executor` would drop it).
 
 **Sub-batched embed → dedup → upsert**:
 - Documents are processed in sub-batches of ~64 (the embedder's `chunk_size`).
@@ -456,15 +468,38 @@ ingest tests that assert base vs twin embedding inputs.
 ## Retrieval
 
 1. Query is embedded using the same Qwen3-VL-Embedding-8B model.
-2. Cosine similarity search in Qdrant returns `top_k` (default 10) results.
+2. Similarity search in Qdrant returns `top_k` (default 10) results — **hybrid dense + BM25 with server-side RRF fusion** on hybrid-capable collections (see below), flat dense cosine on legacy ones.
 3. Optional **Qwen3-VL-Reranker-8B** cross-encoder reranks the results; final count truncated to `reranker_top_k`.
 4. **Score breakdown**: each result exposes `embedding_score` and `reranker_score` separately, in addition to the combined rounded `score`.
+
+### Metadata-filtered search
+
+Search results can be narrowed server-side (AND-combined `Filter` applied in Qdrant *before* ranking) via an optional filter dict on every search surface — REST `GET/POST /api/datasets/{name}/search`, MCP `search_dataset`, and federated `search_datasets` / `POST /api/search`:
+
+| Key | Matches | Payload field |
+|-----|---------|---------------|
+| `file_types` | one of the `_classify_file` labels (`pdf`, `image`, `video`, `audio`, `text`, `json`, `table`, `code`, `office`, `html`, `xml`, `yaml`, `notebook`, `ebook`, `log`, `unknown`) | `metadata.file_type` (stamped from the document source at ingest; backfilled onto older datasets by the admin endpoint below) |
+| `severities` | any observed severity (`ERROR`, `WARN`, ...) | `metadata.severities` |
+| `source_prefix` | stored source path startswith (Qdrant `MatchPrefix`) | `metadata.source` |
+| `date_from` / `date_to` | `timestamp_start` within an ISO-8601 datetime range (log entries and timestamped documents; media segments carry float seconds and never match) | `metadata.timestamp_start` |
+
+Payload indexes (`file_type`/`severities`/`source` keyword, `timestamp_start` datetime) are created for new collections automatically; existing collections get them (plus the `file_type` backfill) via the idempotent `POST /api/admin/datasets/{name}/backfill-search-metadata` endpoint. The builder (`build_payload_filter` / `filters_to_predicate` in `vector_store.py`) validates dates (→ 400/ToolError) and ignores unknown keys.
+
+### Hybrid dense + BM25 (RRF fusion)
+
+Dense cosine retrieval is weakest exactly where this corpus is strongest — code identifiers, log error codes, JSON/YAML keys. New collections therefore carry a **second, sparse `bm25` vector** alongside the named `dense` vector (schema `schema_version: 2` in `meta.json`):
+
+- **Ingest**: every document with real text — or caption text for media docs; bare `[Image: x]` placeholders are skipped — gets a BM25-weighted sparse vector (`SparseVector`) stored next to the dense one. Document frequencies live in a per-dataset `files/.bm25_stats.json` sidecar (same cross-process-lock pattern as `.hashes.json`), persisted once per ingest; delete paths (`delete_document(s)`, session-history replacement, S3 pruning) decrement it best-effort so session churn cannot inflate df forever. Tokenization uses the bundled Qwen `tokenizer.json` (`utils/bm25.py`; stdlib-regex fallback in dev checkouts).
+- **Query**: text queries run `prefetch=[dense, sparse]` + `FusionQuery(RRF)` in Qdrant — one round-trip, batcher semantics unchanged (per-request fusion). Multimodal queries stay dense-only (no lexical lane for pixels). The filter dict is pushed into both prefetches.
+- **Knobs/behaviour**: `RAG_HYBRID_SEARCH` (default on) gates the lane's *behaviour*, not the schema; `RAG_BM25_K1` (1.5), `RAG_BM25_B` (0.75). Local/embedded Qdrant supports RRF (verified); if a server rejects fusion, the store degrades to dense-only once with a warning (strict exception classifier — unrelated errors propagate). `SEARCH_HYBRID` in `/metrics` counts what actually ran.
+- **Legacy collections** (unnamed default vector) keep flat dense search; their first touch logs a one-time "recreate to enable hybrid" nudge — rebuild via the Recreate button / `POST /api/admin/datasets/{name}/recreate`.
 
 ---
 
 ## Reranker (Separate Model Class)
 
-The reranker is now a **first-class model role** (`RerankerModel`) cleanly separated from `EmbeddingModel`. It no longer carries embedding-specific fields (`embedding_dim`, `chunk_size`, `tokenizer_name`).
+The reranker is now a **first-class model role** (`RerankerModel`) cleanly separated from `EmbeddingModel`. It no longer carries embedding-specific fields (`embedding_dim`, `chunk_size`,
+`tokenizer_name`).
 
 **Model:** Qwen3-VL-Reranker-8B — class `RerankerModel` → `MultiModalReranker`
 
@@ -485,7 +520,8 @@ The reranker is now a **first-class model role** (`RerankerModel`) cleanly separ
 
 Two modes:
 
-- **Text-only LLM (DeepSeek-V4-Flash):** All retrieved modalities are converted to text by the Postprocessor (image/video → VLM description, audio → ASR transcription) before being passed to the model.
+- **Text-only LLM (DeepSeek-V4-Flash):** All retrieved modalities are converted to text by the Postprocessor (image/video → VLM description, audio → ASR transcription) before being passed to the
+  model.
 - **Multimodal LLM (Gemma 4 31B):** Image and video are passed through natively. Only audio is converted to text.
 
 A routing step can optionally skip RAG entirely if the LLM determines it can answer from its training data.
@@ -494,21 +530,32 @@ A routing step can optionally skip RAG entirely if the LLM determines it can ans
 1. **Routing** (optional): asks the LLM "YES or NO" — if NO, answers directly without retrieval.
 2. **Retrieval**: embeds query, similarity search, optional rerank.
 3. **Postprocessing decision**: if `use_vlm=True` and retrieved docs contain media unsupported by the LLM → run `Postprocessor`.
-4. **Multimodal content building**: assembles OpenAI-compatible content parts (text/image_url/video_url/audio_url); collapses to plain string when all text-only. `file://` paths are converted to inline `data:` URLs for LLM consumption.
+4. **Multimodal content building**: assembles OpenAI-compatible content parts (text/image_url/video_url/audio_url); collapses to plain string when all text-only. `file://` paths are converted to
+   inline `data:` URLs for LLM consumption.
 5. **Generation**: builds messages (system prompt + user content), calls the LLM.
 
-**Postprocessor fallback links**: When the LLM doesn't support a modality and the conversion model (ASR/VLM) is unavailable, the Postprocessor includes clickable HTTP links in the text so the LLM can share references with the user:
+**Postprocessor fallback links**: When the LLM doesn't support a modality and the conversion model (ASR/VLM) is unavailable, the Postprocessor includes clickable HTTP links in the text so the LLM can
+share references with the user:
 - `[Audio file]: {url}` when ASR is None
 - `[Image file]: {url}` when VLM is None
 - `[Video file]: {url}` when VLM is None
 
-**Clickable source references**: All source references in context text and multimodal content use `_pvc_to_http_url()` to convert `file://` PVC paths to HTTP URLs via `MEDIA_BASE_URL`, so the LLM always sees clickable links rather than internal storage paths.
+**Clickable source references**: All source references in context text and multimodal content use `_pvc_to_http_url()` to convert `file://` PVC paths to HTTP URLs via `MEDIA_BASE_URL`, so the LLM
+always sees clickable links rather than internal storage paths.
 
-**Local vs remote models:** `model_usage` flag (`.remote()` / `.local()`) switches between in-cluster service DNS (`.svc.cluster.local`) and external URLs. Remote mode disables SSL verification and uses connection-pooled HTTP clients.
+**Local vs remote models:** `model_usage` flag (`.remote()` / `.local()`) switches between in-cluster service DNS (`.svc.cluster.local`) and external URLs. Remote mode disables SSL verification and
+uses connection-pooled HTTP clients.
 
-**MCP agent support:** Any `ChatModel` can build an openai-agents SDK agent via `agent()` / `aagent()`. `tool_json` is a `{name: {url, headers, transport?, timeout?}}` dict — each entry is connected as an `MCPServerStreamableHttp`, with an optional per-server `timeout` (seconds, default 30) applied to both the SDK session read timeout and the underlying httpx request so slow tool calls (SQL queries, k8s ops) aren't cancelled at the SDK's 5s default. The underlying OpenAI client defaults to the **Chat Completions API** (`/chat/completions`) because PCAI's SGLang/vLLM endpoints can't round-trip tool results over the Responses API (`/v1/responses` returns a 400 on tool-result follow-ups); set `transport: "responses"` on the source to use `OpenAIResponsesModel` (e.g. against real OpenAI). A model can also be exposed as a single `respond` tool via `to_mcp_tools()`, which uses Chat Completions and strips agent-token artifacts (`<|tool_call|>` wrappers, internal `input_file_*.png` refs) from the output with `strip_tool_markers()`.
+**MCP agent support:** Any `ChatModel` can build an openai-agents SDK agent via `agent()` / `aagent()`. `tool_json` is a `{name: {url, headers, transport?, timeout?}}` dict — each entry is connected
+as an `MCPServerStreamableHttp`, with an optional per-server `timeout` (seconds, default 30) applied to both the SDK session read timeout and the underlying httpx request so slow tool calls (SQL
+queries, k8s ops) aren't cancelled at the SDK's 5s default. The underlying OpenAI client defaults to the **Chat Completions API** (`/chat/completions`) because PCAI's SGLang/vLLM endpoints can't
+round-trip tool results over the Responses API (`/v1/responses` returns a 400 on tool-result follow-ups); set `transport: "responses"` on the source to use `OpenAIResponsesModel` (e.g. against real
+OpenAI). A model can also be exposed as a single `respond` tool via `to_mcp_tools()`, which uses Chat Completions and strips agent-token artifacts (`<|tool_call|>` wrappers, internal
+`input_file_*.png` refs) from the output with `strip_tool_markers()`.
 
-**Speech flow:** `SpeechFlowModel` (`pcai_model_classes.py`) composes an ASR `VoiceModel`, a `ChatModel`, and a TTS `VoiceModel` (by source slug) into one `audio_chat` tool that runs the whole ASR → LLM → TTS pipeline in a single MCP call. By default the synthesized reply is written to the artifact store and returned as an `artifact://` URI + transcript/reply; pass `return_audio_base64=true` to get the audio inline as base64 instead. Step failures return structured `{"error": ...}` results rather than raising.
+**Speech flow:** `SpeechFlowModel` (`pcai_model_classes.py`) composes an ASR `VoiceModel`, a `ChatModel`, and a TTS `VoiceModel` (by source slug) into one `audio_chat` tool that runs the whole ASR →
+LLM → TTS pipeline in a single MCP call. By default the synthesized reply is written to the artifact store and returned as an `artifact://` URI + transcript/reply; pass `return_audio_base64=true` to
+get the audio inline as base64 instead. Step failures return structured `{"error": ...}` results rather than raising.
 
 ---
 
@@ -523,7 +570,7 @@ A routing step can optionally skip RAG entirely if the LLM determines it can ans
 | GET | `/api/admin/health` | Full health (model endpoints, Qdrant status + per-replica shard placement, PVC) |
 | GET | `/api/admin/models` | Discovered model list (model_name per role) |
 | GET | `/api/admin/connections` | Live-check every configured model endpoint (`/v1/models`) → per-role `healthy` / `not_provided` / `unhealthy` |
-| POST | `/api/datasets` | Create (name, description, caption_with_asr, caption_with_vlm, keep_originals, password) |
+| POST | `/api/datasets` | Create (name, description, caption_with_asr, caption_with_vlm, keep_originals, ocr, password) |
 | POST | `/api/datasets/{name}/verify-password` | Verify password → 200/401/403 |
 | POST | `/api/datasets/{name}/unlock` | Unlock (cached, Redis across pods) |
 | POST | `/api/datasets/{name}/lock` | Revoke unlock |
@@ -536,9 +583,12 @@ A routing step can optionally skip RAG entirely if the LLM determines it can ans
 | POST | `/api/datasets/{name}/documents` | Add raw text/dict docs |
 | POST | `/api/datasets/{name}/files` | Single file upload (multipart) |
 | POST | `/api/datasets/{name}/batch-files` | Multi-file upload with **SSE progress streaming** |
-| POST | `/api/datasets/{name}/batch-urls` | S3/HTTP URL ingestion with SSE streaming |
+| POST | `/api/datasets/{name}/batch-urls` | S3/HTTP URL ingestion with SSE streaming; `sync: true` reconciles an S3 prefix (prunes sources deleted upstream), `sync_dry_run: true` reports the diff without touching anything |
 | GET | `/api/datasets/{name}/upload-status/{job_id}` | Batch job status |
-| GET | `/api/datasets/{name}/search` | Text search (`q`, `top_k`, `use_reranker`, `reranker_top_k`) |
+| GET | `/api/datasets/{name}/search` | Text search (`q`, `top_k`, `use_reranker`, `reranker_top_k`, metadata-filter params) |
+| POST | `/api/search` | **Federated search** across datasets (`datasets` list or `"all"`, `q`, per-dataset `top_k`, `use_reranker`, `filters`) — password-protected datasets are skipped with a note, never unlocked by the call |
+| POST | `/api/admin/datasets/import` | Restore a dataset from an export `.tar.gz` (multipart `file`) or `{"s3_uri": ...}` — re-embeds (exports carry no vectors); optional `new_name`, `overwrite`, `password`; returns a `job_id` |
+| POST | `/api/admin/datasets/{name}/backfill-search-metadata` | Idempotent `metadata.file_type` backfill + filtered-search payload indexes (password-gated) |
 | POST | `/api/datasets/{name}/search` | Multimodal search (body: text + image/video/audio) |
 | GET | `/api/datasets/{name}/documents` | List stored docs (`limit`, default 50, max 1000) |
 | DELETE | `/api/datasets/{name}/documents/{doc_id}` | Delete single doc |
@@ -554,35 +604,57 @@ A routing step can optionally skip RAG entirely if the LLM determines it can ans
 | GET | `/favicon.png` | Frontend icon |
 | GET | `/manage` | HTML storage management view |
 
-**Search parameters:** `q` (required), `top_k` (1–100, default 10), `use_reranker` (bool, default false), `reranker_top_k` (1–50, default 3).
+**Search parameters:** `q` (required), `top_k` (1–100, default 10), `use_reranker` (bool, default false), `reranker_top_k` (1–50, default 3), plus the metadata-filter params (`file_types`, `severities`, `source_prefix`, `date_from`, `date_to` — see Metadata-filtered search). The POST variant accepts the same as a `filters` object.
 
 ---
 
 ## MCP Server
 
-Exposes **9 MCP tools** (`mcp_server.py`):
+Exposes **13 MCP tools** (`mcp_server.py`):
 
 | Tool | Purpose |
 |------|---------|
 | `list_datasets()` | Returns formatted text of all datasets (with `[asr]` / `[vlm]` / `[password]` / `[unlocked]` markers) |
 | `unlock_dataset()` | Verify a dataset password and cache the unlock per-process (default TTL 30 min; the MCP cache is not Redis-backed — pass `password=` per call on multi-replica deployments) |
-| `search_dataset()` | Multimodal search (`dataset_name`, `query`, `image`/`video`/`audio`, `top_k`, `use_reranker`, `reranker_top_k`, `password`, `media_base_url`). Instantiates a `Postprocessor` for modality conversion based on `base_llm_modalities`. |
+| `search_dataset()` | Multimodal search (`dataset_name`, `query`, `image`/`video`/`audio`, `top_k`, `use_reranker`, `reranker_top_k`, `password`, `media_base_url`, plus the metadata-filter params `file_types`/`severities`/`source_prefix`/`date_from`/`date_to`). Instantiates a `Postprocessor` for modality conversion based on `base_llm_modalities`. |
+| `search_datasets()` | **Federated search** across datasets (`datasets` list or `"all"`) — per-dataset `top_k`, concurrent fan-out, dataset-labelled merged results, single optional rerank over the pool, dataset-qualified dedup. Password-protected datasets that are not unlocked are skipped with a note; there is deliberately **no `password` parameter** (passwords stay out of tool signatures). |
 | `get_dataset_files()` | List or retrieve files from a dataset (text inline; binary returns metadata + `download_url`) |
 | `get_dataset_info()` | Returns dataset metadata |
 | `describe_media()` | Standalone VLM description of an image/video (no dataset needed) |
 | `transcribe_audio()` | Standalone ASR transcription of an audio file (no dataset needed) |
 | `add_memory()` | Store an LLM-curated memory into a personal memory dataset. `dataset_name`/`password` optional — resolved from the `X-Memory-Dataset` / `X-Dataset-Password` request headers (or `MEMORY_DATASET` env) so the model does not pass them. Merges provenance metadata (`source`, `memory_kind`, `memory_ts`, `memory_tags`, `session_id`) into the Qdrant payload. Long memories are split into docs of at most `MEMORY_MAX_TOKENS` (default 8192) — the header/provenance block is prepended to **every** chunk (`memory_chunks`/`chunk_index`/`chunk_total`/`memory_truncated` payload fields). A `session_history` memory is **replaced in place** (prior chunks for that `session_id` are deleted first) so a session never accumulates stale copies. |
-| `search_memory()` | Recall from the personal memory dataset; same resolution + retrieval/postproc as `search_dataset` (via the shared `_run_retrieval` helper). |
+| `search_memory()` | Recall from the personal memory dataset; same resolution + retrieval/postproc as `search_dataset` (via the shared retrieval core). |
+| `delete_memory()` | Delete memories **by explicit point ID** (ids come from `search_memory`/`list_memories` results) — no query/similarity-directed deletion, so an LLM can only remove what it has seen listed. Reports a preview of each deleted memory and unknown ids. |
+| `list_memories()` | List stored memories newest-first (`limit`, optional `kind`/`tags` filter; `session_history` hidden unless requested) — each row carries its `memory_id`, kind, timestamp, tags and a text preview. |
+| `forget_session()` | Delete the `session_history` memory for one `session_id` (only ever touches session histories, never curated memories). |
 
-**Long-term memory (opencode):** the `add_memory` / `search_memory` tools back a per-user long-term memory store. An MCP client (e.g. opencode) connects **twice** to the same URL — once as `rag-memory` (sending `X-Memory-Dataset`/`X-Dataset-Password` headers, exposing only `add_memory`/`search_memory`) and once as `rag-knowledge` (exposing the general dataset tools). Per-user isolation is the dataset **password**; the memory headers are read ONLY inside `add_memory`/`search_memory`, so a memory password can never silently unlock another dataset. See `MCP.md`, `MEMORY.md`, `opencode.jsonc`, and `AGENTS.md` for the full pattern.
+**Long-term memory (opencode):** the `add_memory` / `search_memory` tools back a per-user long-term memory store. An MCP client (e.g. opencode) connects **twice** to the same URL — once as
+`rag-memory` (sending `X-Memory-Dataset`/`X-Dataset-Password` headers, exposing only `add_memory`/`search_memory`) and once as `rag-knowledge` (exposing the general dataset tools). Per-user isolation
+is the dataset **password**; the memory headers are read ONLY inside `add_memory`/`search_memory`, so a memory password can never silently unlock another dataset. See `MCP.md`, `MEMORY.md`,
+`opencode.jsonc`, and `AGENTS.md` for the full pattern.
 
-**Transport:** Default `streamable-http` (port 9090 in helm). Also supports `stdio` and `sse`. A `_MemoryHeaderMiddleware` (wired in `main()`) captures the memory-identity headers into `contextvars.ContextVar`s for the memory tools.
+**Transport:** Default `streamable-http` (port 9090 in helm). Also supports `stdio` and `sse`. A `_MemoryHeaderMiddleware` (wired in `main()`) captures the memory-identity headers into
+`contextvars.ContextVar`s for the memory tools.
 
-**Query-vector caching:** `search_dataset`/`search_memory` reuse a stored Qdrant vector when the query media is already in the dataset, else a hash-keyed in-process LRU cache, avoiding re-embedding the same media twice.
+**Query-vector caching:** `search_dataset`/`search_memory` reuse a stored Qdrant vector when the query media is already in the dataset, else a hash-keyed in-process LRU cache, avoiding re-embedding
+the same media twice.
 
 **PVC→HTTP URL conversion:** When `media_base_url` is set (via `MEDIA_BASE_URL` env), `file://` PVC paths in results are rewritten to `{media_base_url}/api/datasets/{name}/files/{path}` HTTP URLs.
 
 **DNS rebinding protection disabled** (`TransportSecuritySettings(enable_dns_rebinding_protection=False)`) for cluster networking.
+
+---
+
+## Observability (Prometheus /metrics)
+
+`GET /metrics` exposes process-local Prometheus counters/histograms (`utils/metrics.py`, import-optional — minimal installs degrade to no-ops):
+
+- **HTTP**: `rag_http_requests_total` + `rag_http_request_seconds` by route template/method/status (outermost ASGI middleware — timings include auth; unmatched paths are labelled `unmatched`).
+- **Ingest**: `rag_ingest_files_total` by outcome (stored/deduplicated/error), `rag_ingest_chunks_total` per dataset, `rag_ingest_jobs_total` by source/terminal state.
+- **Qdrant**: `rag_qdrant_ops_total` + `rag_qdrant_op_seconds` for the batched search ops (the saturation bottleneck the performance audits measured manually — now continuous).
+- **Caches/search**: `rag_cache_events_total` (query-embedding hit/miss, RAG-cache evictions), `rag_search_hybrid_total` (hybrid vs dense).
+
+Labels are strictly bounded (route templates, op names, outcome sets) — never raw paths or query text. The endpoint is unauthenticated like `/healthz` (in-cluster scraper surface); charts ship an opt-in ServiceMonitor (`metrics.serviceMonitor`, default false).
 
 ---
 
@@ -595,79 +667,42 @@ Exposes **9 MCP tools** (`mcp_server.py`):
 - API responses strip the hash and add a `has_password` boolean.
 - Methods: `create_dataset(password=)`, `has_password()`, `verify_password()`, `set_password()`.
 
-**Brute-force throttling:** password failures are bucket-limited per client
-identity (`PW_MAX_FAILURES` within `PW_FAIL_WINDOW`, defaults 10 / 300 s).
-The throttle applies to the REST API *and* the MCP `unlock_dataset` tool.
-Client identity comes from auth-proxy headers (`X-Auth-Request-Email` /
-`X-Auth-Request-User`) or the socket peer IP — `X-Forwarded-For` is
-deliberately **not** trusted (client-supplied / spoofable), so an attacker
-can neither bypass the throttle nor read another identity's cached unlock
-password.
+**Brute-force throttling:** password failures are bucket-limited per client identity (`PW_MAX_FAILURES` within `PW_FAIL_WINDOW`, defaults 10 / 300 s). The throttle applies to the REST API *and* the
+MCP `unlock_dataset` tool. Client identity comes from auth-proxy headers (`X-Auth-Request-Email` / `X-Auth-Request-User`) or the socket peer IP — `X-Forwarded-For` is deliberately **not** trusted
+(client-supplied / spoofable), so an attacker can neither bypass the throttle nor read another identity's cached unlock password.
 
-**Media tokens (required):** both servers refuse to start without
-`MEDIA_TOKEN_SECRET` (helm: `security.mediaTokenSecret`). Media URLs emitted
-by the MCP server always carry a short-lived HMAC `?token=` (scoped to
-`{dataset}:{relpath}`, TTL `MEDIA_TOKEN_TTL`, default 1 h) — the legacy
-`?password=` suffix was removed so the dataset password never appears in MCP
-output, URLs, or logs. The HTML frontend also uses tokens: it mints a
-dataset-scoped token (`POST /api/datasets/{name}/media-token`, wildcard
-`*` path) and appends it to media URLs, so the password only ever travels in
-the `X-Dataset-Password` request header, never in a URL.
+**Media tokens (required):** both servers refuse to start without `MEDIA_TOKEN_SECRET` (helm: `security.mediaTokenSecret`). Media URLs emitted by the MCP server always carry a short-lived HMAC
+`?token=` (scoped to `{dataset}:{relpath}`, TTL `MEDIA_TOKEN_TTL`, default 1 h) — the legacy `?password=` suffix was removed so the dataset password never appears in MCP output, URLs, or logs. The
+HTML frontend also uses tokens: it mints a dataset-scoped token (`POST /api/datasets/{name}/media-token`, wildcard `*` path) and appends it to media URLs, so the password only ever travels in the
+`X-Dataset-Password` request header, never in a URL.
 
-**Model connectivity monitoring:** the embedder is the only *required* model,
-so it is probed automatically every `MODEL_HEALTH_INTERVAL` seconds (default
+**Model connectivity monitoring:** the embedder is the only *required* model, so it is probed automatically every `MODEL_HEALTH_INTERVAL` seconds (default
 60) in the background. The result (`healthy` / `unhealthy`, last check time,
-error) is exposed via `/api/admin/health` under `models.embedder` and shown on
-the management page. After `MODEL_HEALTH_FAIL_THRESHOLD` (default 3)
-consecutive failures a warning is logged — **no probe gates on the embedder**:
-`/healthz` and `/readyz` (API and MCP sidecar) deliberately do not check model
-endpoints, because the embedder is always a remote vLLM/SGLang endpoint and a
-pod restart cannot bring it back (dropping the pod out of Service rotation
-would only reduce remaining capacity). The
-management page's "Test connections" button additionally runs an on-demand
-live check of **every** configured model (`GET /api/admin/connections`) with
-three states: healthy (green), not provided (yellow), unhealthy (red).
-Optional models (reranker, VLM, ASR) that are configured but unreachable only
-log a warning — the system degrades without them.
+error) is exposed via `/api/admin/health` under `models.embedder` and shown on the management page. After `MODEL_HEALTH_FAIL_THRESHOLD` (default 3) consecutive failures a warning is logged — **no
+probe gates on the embedder**: `/healthz` and `/readyz` (API and MCP sidecar) deliberately do not check model endpoints, because the embedder is always a remote vLLM/SGLang endpoint and a pod restart
+cannot bring it back (dropping the pod out of Service rotation would only reduce remaining capacity). The management page's "Test connections" button additionally runs an on-demand live check of
+**every** configured model (`GET /api/admin/connections`) with three states: healthy (green), not provided (yellow), unhealthy (red). Optional models (reranker, VLM, ASR) that are configured but
+unreachable only log a warning — the system degrades without them.
 
-**Hot model-config reload (no rollout):** model URLs/names/keys are normally
-injected via env vars (`envFrom`), which are frozen at container start. The
-charts additionally mount the `-config` ConfigMap and `-model-keys` Secret as
-**file volumes** (`/etc/rag/config:/etc/rag/secrets`, one file per env key)
-and set `CONFIG_DIR`. A daemon watcher in both the API and MCP sidecar
-re-applies those files into `os.environ` every `CONFIG_RELOAD_INTERVAL`
-seconds (default 15) and, on change, rebuilds the four model objects and
-invalidates the RAG cache — kubelet propagates a ConfigMap/Secret edit to the
-mounted files within ~1s, so a model swap takes effect **without a rollout
-restart**. The new embedder is verified against its `/v1/models` before being
-swapped; if unreachable the old configuration is kept and the error logged.
-When `CONFIG_DIR` is unset (e.g. local runs) behaviour is unchanged — a
-rollout is required.
+**Hot model-config reload (no rollout):** model URLs/names/keys are normally injected via env vars (`envFrom`), which are frozen at container start. The charts additionally mount the `-config`
+ConfigMap and `-model-keys` Secret as **file volumes** (`/etc/rag/config:/etc/rag/secrets`, one file per env key) and set `CONFIG_DIR`. A daemon watcher in both the API and MCP sidecar re-applies
+those files into `os.environ` every `CONFIG_RELOAD_INTERVAL` seconds (default 15) and, on change, rebuilds the four model objects and invalidates the RAG cache — kubelet propagates a ConfigMap/Secret
+edit to the mounted files within ~1s, so a model swap takes effect **without a rollout restart**. The new embedder is verified against its `/v1/models` before being swapped; if unreachable the old
+configuration is kept and the error logged. When `CONFIG_DIR` is unset (e.g. local runs) behaviour is unchanged — a rollout is required.
 
-**Local-file allowlist (MCP media):** `describe_media` / `transcribe_audio` /
-audio queries may only read `file://`/local paths under
-`MEDIA_ALLOW_PATH_PREFIXES` (default `DATA_PATH/datasets` +
+**Local-file allowlist (MCP media):** `describe_media` / `transcribe_audio` / audio queries may only read `file://`/local paths under `MEDIA_ALLOW_PATH_PREFIXES` (default `DATA_PATH/datasets` +
 `DATA_PATH/staging`); disallowed paths are refused (fail-closed).
 
 **Remote-URL ingest guards (SSRF):**
-- `INGEST_BLOCK_PRIVATE_HOSTS` blocks private/loopback/link-local targets —
-  **on by default**. `s3://` downloads are unaffected (only `http(s)://`).
-- `INGEST_ALLOW_HOSTS` is an authoritative allowlist: listed hosts bypass the
-  private-block (how in-cluster MinIO/internal ingestions are permitted);
-  when set, hosts not listed are rejected.
-- `MAX_URL_REDIRECTS` (default 5) — every redirect hop is re-checked against
-  the policy, so a public URL can't bounce into an internal address.
+- `INGEST_BLOCK_PRIVATE_HOSTS` blocks private/loopback/link-local targets — **on by default**. `s3://` downloads are unaffected (only `http(s)://`).
+- `INGEST_ALLOW_HOSTS` is an authoritative allowlist: listed hosts bypass the private-block (how in-cluster MinIO/internal ingestions are permitted); when set, hosts not listed are rejected.
+- `MAX_URL_REDIRECTS` (default 5) — every redirect hop is re-checked against the policy, so a public URL can't bounce into an internal address.
 - `MAX_REMOTE_DOWNLOAD_BYTES` (default 512 MiB) — streams are aborted past this.
 
-**Upload caps:** multipart uploads (dataset files + staging) abort past
-`MAX_UPLOAD_BYTES` (default 1 GiB). Non-media staged/dataset files are served
-with `Content-Disposition: attachment` so crafted HTML/SVG can't execute in
-the origin. `/api/admin/*` and media/staging serving are exempt from the
-`RAG_API_KEY` gate by explicit route (not prefix matching).
+**Upload caps:** multipart uploads (dataset files + staging) abort past `MAX_UPLOAD_BYTES` (default 1 GiB). Non-media staged/dataset files are served with `Content-Disposition: attachment` so crafted
+HTML/SVG can't execute in the origin. The `RAG_API_KEY` gate exempts only health/probes, `/metrics`, the HTML pages, and media/staging serving, matched by explicit route (not prefix matching) - everything else, including all `/api/admin/*` routes (recreate, import, backfill), requires the key; the value is present in the pod env (`RAG_API_KEY`), so in-cluster automation can kubectl exec + curl with it, no secret lookup needed.
 
-**TLS:** remote model clients default to `verify=False` for PCAI's
-self-signed endpoints; set `REMOTE_CA_BUNDLE` to a `.crt`/`.pem` bundle to
-pin and verify against it instead.
+**TLS:** remote model clients default to `verify=False` for PCAI's self-signed endpoints; set `REMOTE_CA_BUNDLE` to a `.crt`/`.pem` bundle to pin and verify against it instead.
 
 ---
 
@@ -677,6 +712,7 @@ Beyond local file uploads, the system ingests from:
 
 - **S3 URLs** (`s3://bucket/key`): uses boto3 for download via `_get_s3_client()`.
 - **S3 directory prefixes** (`s3://bucket/prefix/`): lists all supported-type objects under the prefix and ingests them as a batch.
+  - **Sync mode** (`sync: true` on `/batch-urls`): after the ingest, stored documents whose `metadata.source` sits under a synced prefix but is absent from the bucket listing are **pruned** (points deleted, counter decremented) — objects deleted upstream disappear from the dataset instead of lingering. URLs with no stored points are force-re-ingested even when their content hash was recorded (heals a pruned-and-reappeared file). `sync_dry_run: true` returns the `would_ingest`/`would_prune` diff without touching anything. Known limitation: an object whose *content* changed under the same key is re-ingested (its hash changes) but the old version's points remain — source-keyed pruning cannot see versions.
 - **HTTP(S) URLs**: downloaded to temp files and processed through the full pipeline (including resizing).
 
 All remote sources are handled via `add_urls_batch()` with SSE progress streaming and the same retry/batch-score logic as file uploads.
@@ -686,9 +722,11 @@ All remote sources are handled via `add_urls_batch()` with SSE progress streamin
 - `S3_ACCESS_KEY_ID` — access key, stored in Kubernetes Secret
 - `S3_SECRET_ACCESS_KEY` — secret key, stored in Kubernetes Secret
 
-When `S3_ENDPOINT_URL` is unset, the default boto3 credential chain (IAM roles, `~/.aws/credentials`) is used. The Helm `s3` section is optional — excluding it leaves the env vars empty and falls back to default credentials.
+When `S3_ENDPOINT_URL` is unset, the default boto3 credential chain (IAM roles, `~/.aws/credentials`) is used. The Helm `s3` section is optional — excluding it leaves the env vars empty and falls back
+to default credentials.
 
-**Retry logic**: S3 downloads (`_download_s3`) and prefix listings (`_list_s3_prefix`) use `retry_call` with 3 attempts and linear backoff (longer for connection errors), matching the embedding consumer's retry behavior.
+**Retry logic**: S3 downloads (`_download_s3`) and prefix listings (`_list_s3_prefix`) use `retry_call` with 3 attempts and linear backoff (longer for connection errors), matching the embedding
+consumer's retry behavior.
 
 ---
 
@@ -703,13 +741,23 @@ When `S3_ENDPOINT_URL` is unset, the default boto3 credential chain (IAM roles, 
 - `original_source` field preserves the original basename alongside the stored `source` PVC path.
 - Document deletion by Qdrant point ID (`PointIdsList` selector with `wait=True`).
 
-**Endpoint verification** (at startup): the embedder is pinged via OpenAI-compatible `GET /v1/models` and raises `RuntimeError` if unreachable (it is the one required model); reranker/vlm/asr are optional — if unreachable, a warning is logged and startup proceeds without them.
+**Endpoint verification** (at startup): the embedder is pinged via OpenAI-compatible `GET /v1/models` and raises `RuntimeError` if unreachable (it is the one required model); reranker/vlm/asr are
+optional — if unreachable, a warning is logged and startup proceeds without them.
 
-**Admin storage stats:** `/api/admin/storage` returns PVC disk usage (total/used/free/utilization) and per-dataset breakdowns with file-type sub-items (docs + bytes per type). Runs in a thread pool (via `run_in_executor`) so health/readiness probes stay responsive during large collection scans. File-type backfill uses paginated Qdrant scroll (256 points at a time, capped at 50k) with `PayloadSelectorInclude` to fetch only `metadata.source` instead of full payloads — preventing memory spikes and event-loop blocking that previously caused pod crashes on the management page.
+**Admin storage stats:** `/api/admin/storage` returns PVC disk usage (total/used/free/utilization) and per-dataset breakdowns with file-type sub-items (docs + bytes per type). Runs in a thread pool
+(via `run_in_executor`) so health/readiness probes stay responsive during large collection scans. File-type backfill uses paginated Qdrant scroll (256 points at a time, capped at 50k) with
+`PayloadSelectorInclude` to fetch only `metadata.source` instead of full payloads — preventing memory spikes and event-loop blocking that previously caused pod crashes on the management page.
 
-**Qdrant cluster storage view:** `/api/admin/health` additionally reports `qdrant.cluster` — per-replica shard placement from Qdrant's `/cluster` API plus the configured per-replica PVC size (chart sets `QDRANT_PVC_SIZE` from `persistence.qdrant.size`). For a sharded cluster (scale charts, one RWO PVC per replica, none mounted on the API pod) the management page's Qdrant card shows shard counts per replica and total shards instead of "disk usage unavailable"; the single-replica chart keeps showing exact PVC usage via the read-only mount. Exact on-disk bytes per replica are not exposed by Qdrant's API, so this view is for storage-spread awareness, not byte accounting (use `kubectl exec ... df -h /qdrant/storage` or kubelet volume metrics for exact bytes).
+**Qdrant cluster storage view:** `/api/admin/health` additionally reports `qdrant.cluster` — per-replica shard placement from Qdrant's `/cluster` API plus the configured per-replica PVC size (chart
+sets `QDRANT_PVC_SIZE` from `persistence.qdrant.size`). For a sharded cluster (scale charts, one RWO PVC per replica, none mounted on the API pod) the management page's Qdrant card shows shard counts
+per replica and total shards instead of "disk usage unavailable"; the single-replica chart keeps showing exact PVC usage via the read-only mount. Exact on-disk bytes per replica are not exposed by
+Qdrant's API, so this view is for storage-spread awareness, not byte accounting (use `kubectl exec ... df -h /qdrant/storage` or kubelet volume metrics for exact bytes).
 
-**Embedder fingerprint + recreate guard:** each dataset records the embedder model + vector dimension in `meta.json` (`embedder_model`, `embedder_dim`) the first time it is touched. After an embedder change the guard compares the configured embedder against the stored fingerprint and fails loudly (HTTP 409 / `EmbedderMismatchError`) on ingest/search instead of silently mixing vectors — dimension mismatch (collection can't accept the vectors) or same-dimension-different-model (semantically incompatible) both raise. There is **no automatic re-embedding**; rebuild via the "Recreate" button on the management page or `POST /api/admin/datasets/{name}/recreate`, which drops the old collection and re-ingests the dataset's on-disk originals with the current embedder (async; poll `GET /api/datasets/{name}/upload-status/{job_id}`).
+**Embedder fingerprint + recreate guard:** each dataset records the embedder model + vector dimension in `meta.json` (`embedder_model`, `embedder_dim`) the first time it is touched. After an embedder
+change the guard compares the configured embedder against the stored fingerprint and fails loudly (HTTP 409 / `EmbedderMismatchError`) on ingest/search instead of silently mixing vectors — dimension
+mismatch (collection can't accept the vectors) or same-dimension-different-model (semantically incompatible) both raise. There is **no automatic re-embedding**; rebuild via the "Recreate" button on
+the management page or `POST /api/admin/datasets/{name}/recreate`, which drops the old collection and re-ingests the dataset's on-disk originals with the current embedder (async; poll `GET
+/api/datasets/{name}/upload-status/{job_id}`).
 
 ---
 
@@ -726,7 +774,8 @@ The ingestion pipeline minimises HTTP round-trips to external services by batchi
 | **Reranker** | `/rerank` POST with all documents per query; multiple queries concurrent via `asyncio.gather` | 1 per query |
 | **Qdrant payload stripping** | `client.retrieve(ids=[...])` + grouped `client.set_payload` by unique payload | 1 retrieve + N set_payload (N = unique payload groups) |
 
-Text-only and multimodal embedding paths run **concurrently** via `asyncio.gather(text_task, mm_task)` — while the text batch is processed by the GPU, the multimodal path fetches media and fires off individual requests in parallel.
+Text-only and multimodal embedding paths run **concurrently** via `asyncio.gather(text_task, mm_task)` — while the text batch is processed by the GPU, the multimodal path fetches media and fires off
+individual requests in parallel.
 
 For a typical PDF sub-batch (~60 text + ~4 image docs): **~5 HTTP requests** instead of 64. For the Stacks project (~8k chunks, mostly text): ~625 requests instead of ~8,000.
 
@@ -768,11 +817,14 @@ For a typical PDF sub-batch (~60 text + ~4 image docs): **~5 HTTP requests** ins
 
 **XHR upload with progress**: Uses `XMLHttpRequest` instead of `fetch` for real upload progress bars (`📤` → `📦` → `⚙` → `◐` → spinner → `✓`).
 
-**Chunk count accumulation**: Per-file chunk counts are accumulated across sub-batches via `_fileChunkTotal` map. A file split across multiple sub-batches shows its total chunk count (e.g., `✓ 2,048 chunk(s)`) instead of just the last sub-batch's count.
+**Chunk count accumulation**: Per-file chunk counts are accumulated across sub-batches via `_fileChunkTotal` map. A file split across multiple sub-batches shows its total chunk count (e.g., `✓ 2,048
+chunk(s)`) instead of just the last sub-batch's count.
 
-**Estimated chunk totals**: The "preprocessed" progress event includes `total` (estimated total chunks for the file). During embedding, the line shows `128 / (est.) 1,024 chunks embedded…` once the total is known. The estimate arrives after the generator finishes extracting the file — the frontend updates from `128 chunks embedded…` to `128 / (est.) 1,024 chunks embedded…` when it arrives.
+**Estimated chunk totals**: The "preprocessed" progress event includes `total` (estimated total chunks for the file). During embedding, the line shows `128 / (est.) 1,024 chunks embedded…` once the
+total is known. The estimate arrives after the generator finishes extracting the file — the frontend updates from `128 chunks embedded…` to `128 / (est.) 1,024 chunks embedded…` when it arrives.
 
-**Connection drop resilience**: `xhr.onerror` and `xhr.onload` poll `GET /api/datasets/{name}` every 10s for `document_count`. Shows "Processing in background" instead of "Failed". Marks complete when count stabilizes (3 unchanged polls).
+**Connection drop resilience**: `xhr.onerror` and `xhr.onload` poll `GET /api/datasets/{name}` every 10s for `document_count`. Shows "Processing in background" instead of "Failed". Marks complete when
+count stabilizes (3 unchanged polls).
 
 **Timer fix**: The upload timer `setInterval` is cleared in `xhr.upload.onload` so the SSE-driven chunk count summary isn't overwritten with `"Uploading 14 file(s)... 219s"` after upload completes.
 
@@ -813,8 +865,7 @@ Factory functions `build_embedder()`, `build_reranker()`, `build_vlm()`, `build_
 | `qwen3_tts_1_7B` | VoiceModel | TTS with 9 supported voices (not deployed) |
 | `fish_s2_pro_4B` | VoiceModel | TTS (not deployed) |
 
-`pcai_model_classes.py` also defines the composable `SpeechFlowModel`
-(ASR → LLM → TTS `audio_chat` tool — see [LLM Generation](#llm-generation))
-and helpers such as `strip_tool_markers()`.
+`pcai_model_classes.py` also defines the composable `SpeechFlowModel` (ASR → LLM → TTS `audio_chat` tool — see [LLM Generation](#llm-generation)) and helpers such as `strip_tool_markers()`.
 
-**Deployment** (Helm chart): 2-container pod (API server port 8000 + MCP sidecar port 9090), Qdrant StatefulSet with dedicated PVC, PCAI VirtualService on `istio-system/ezaf-gateway` (timeout 660s), AuthorizationPolicy via `oauth2-proxy`, Kyverno pod security policy.
+**Deployment** (Helm chart): 2-container pod (API server port 8000 + MCP sidecar port 9090), Qdrant StatefulSet with dedicated PVC, PCAI VirtualService on `istio-system/ezaf-gateway` (timeout 660s),
+AuthorizationPolicy via `oauth2-proxy`, Kyverno pod security policy.
