@@ -120,44 +120,20 @@ def _media_url_suffix(dataset_name: str, rel_path: str, legacy_password: str | N
 
 
 # Allowlist of prefixes for ``file://`` / local-path media read by the MCP
-# tools (describe_media, transcribe_audio, audio queries).  Paths outside the
+# tools (describe_media, transcribe_audio, audio queries).  The canonical
+# implementation lives in utils/media_paths.py — shared with rag_system,
+# which enforces the same policy on media refs inside user-supplied
+# documents (REST POST /documents, MCP add_memory).  Paths outside the
 # allowed prefixes are refused (fail-closed).  Prefixes are colon-separated
 # (os.pathsep), e.g.
 #   MEDIA_ALLOW_PATH_PREFIXES=/data/datasets:/data/staging
 # When unset, the default is ``DATA_PATH/datasets`` + ``DATA_PATH/staging``
 # (matching the chart's default layout).  An explicitly empty value allows
-# nothing.
-_DEFAULT_DATA_PATH = os.environ.get("DATA_PATH", "/data")
-_MEDIA_ALLOW_DEFAULT = os.pathsep.join(
-    (
-        os.path.join(_DEFAULT_DATA_PATH, "datasets"),
-        os.path.join(_DEFAULT_DATA_PATH, "staging"),
-    )
+# nothing; the special value ``*`` allows any local path (dev/test only).
+from multimodal_rag.utils.media_paths import (  # noqa: E402, F401 — re-exported
+    MediaRefError,
+    _media_path_allowed,
 )
-_MEDIA_ALLOW_PATH_PREFIXES: tuple[str, ...] = tuple(
-    os.path.normpath(p).rstrip(os.sep)
-    for p in os.environ.get("MEDIA_ALLOW_PATH_PREFIXES", _MEDIA_ALLOW_DEFAULT).split(os.pathsep)
-    if p.strip()
-)
-
-
-def _media_path_allowed(raw: str) -> bool:
-    """True if *raw* (a file:// or local path) is inside an allowed prefix.
-
-    With no configured prefixes nothing is allowed (fail-closed).  The env
-    default is ``DATA_PATH``/datasets + ``DATA_PATH``/staging.
-    """
-    if not _MEDIA_ALLOW_PATH_PREFIXES:
-        return False
-    p = raw.removeprefix("file://")
-    try:
-        resolved = os.path.realpath(p)
-    except Exception:
-        return False
-    for prefix in _MEDIA_ALLOW_PATH_PREFIXES:
-        if resolved == prefix or resolved.startswith(prefix + os.sep):
-            return True
-    return False
 
 
 def _classify_by_url_extension(url: str) -> str | None:
@@ -3421,6 +3397,15 @@ def main() -> None:
     os.environ["QDRANT_PORT"] = str(args.qdrant_port)
 
     setup_logger(level=args.log_level)
+
+    # Live autopsy hook: `kill -USR1 <pid>` dumps every thread's stack to the
+    # container log — the definitive way to see where a hung request is
+    # actually parked (pool exhaustion, blocked model call, deadlocked lock).
+    import faulthandler
+    import signal
+
+    faulthandler.register(signal.SIGUSR1)
+    logger.info("Stack-dump hook installed: kill -USR1 <pid> dumps all thread stacks")
 
     # Media URLs are secured with an HMAC token that requires a shared secret.
     # Refuse to start without it rather than falling back to leaking the

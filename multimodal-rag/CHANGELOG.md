@@ -3,6 +3,23 @@
 All notable changes to this project are tracked here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 
+## [3.5.1] — 2026-09-03
+
+### Security
+- **Document media refs are now validated** (input-handling audit H-1): media refs inside user-supplied documents (`POST /api/datasets/{name}/documents`, MCP `add_memory` — the `image`/`video`/`audio`/`preprocessed_*` keys) are checked before the pipeline reads them. The server fetches these refs at embed time and again at query time, so a bare path, `file:///etc/...`, or a blocked http(s) URL in a document dict was an arbitrary-file-read / internal-SSRF channel. New shared modules: `utils/url_policy.py` (the SSRF guards, re-exported from `dataset_manager`) and `utils/media_paths.py` (the `MEDIA_ALLOW_PATH_PREFIXES` allowlist, re-exported from `mcp_server`, plus `MediaRefError`). Enforcement: at `aadd_to_vector_store` entry (validation; `MediaRefError` → HTTP 400 on REST, `ToolError` on MCP) and at the read primitives (`_afetch_media_bytes`, `_file_url_to_data_url`, `_resize_media_in_docs`) so legacy stored payloads fail closed too. http(s) media fetches additionally gained the redirect policy and a `MAX_MEDIA_FETCH_BYTES` (default 512 MB) streamed cap. `s3://` refs in document media fields are rejected (ingest S3 via `/batch-urls`); `MEDIA_ALLOW_PATH_PREFIXES="*"` is the dev/test escape hatch.
+- **Backup-import overwrite is password-gated** (audit H-2): `POST /api/admin/datasets/import` with `overwrite=true` deletes the target dataset — now only after the target name (from `new_name` or the archive's `meta.json`, peeked via the new `DatasetManager.peek_backup_meta` before anything is touched) passes the same `_require_dataset_password` gate as delete/recreate/migrate/backfill. Previously the API key alone could replace a password-protected dataset.
+- **S3 bucket allowlist** (audit M-5): `INGEST_ALLOW_S3_BUCKETS` (comma-separated) — when set, `_download_s3`/`_list_s3_prefix` refuse any bucket not on the list, so ingest credentials can't be pointed at other tenants' buckets on a shared MinIO. Unset preserves current behavior.
+
+### Fixed
+- **CSV/TSV row-grouping budget was dead code** (audit M-2): `_build_docs` measured `r.get("text")` on raw row dicts (always empty for a normal CSV), so the flush condition never fired and an entire CSV collapsed into ONE document — a 500k-row CSV produced a single ~100 MB doc for the embedder. Row groups are now measured against the serialized text actually emitted (verified: 60 rows → 3 budget-sized docs).
+- **Backup import is bounded** (audit M-1): `prepare_import` now audits declared member sizes (`MAX_IMPORT_EXTRACT_BYTES`, default 8 GiB) and member count (`MAX_IMPORT_MEMBERS`, default 20000) before extracting, caps `meta.json` reads at 4 MB, and streams the `documents.jsonl` row count instead of buffering the whole member — closing the gzip-bomb-to-PVC path the ingested-archive path already guarded against.
+- **EPUB decompression bounds** (audit M-3): every `zf.read()` in `ebook_processor` is now gated by declared-size caps (`MAX_EPUB_MEMBER_BYTES`, default 256 MB per member; `MAX_EPUB_TOTAL_BYTES`, default 1 GiB cumulative) — a ZIP-bomb EPUB fails the file instead of ballooning RAM, and the image-read `except (KeyError, Exception): pass` no longer swallows bound violations.
+- **PDF raster geometry guard** (audit M-4): OCR page rasters and the `Matrix(2,2)` page-render image fallback skip rendering when the estimated pixel count exceeds `PDF_MAX_RASTER_PIXELS` (default 64 M) — a crafted huge-MediaBox page can no longer drive a giant pixmap allocation.
+- **Text chunking robustness** (audits L-2/L-3): `_split_by_chars` caps the overlap at 80 % of the chunk size (an overlap ≥ chunk size previously looped forever on a pathological config — the same guard `pdf_processor` already had); `json_processor`/`notebook_processor` handle pathologically deep nesting gracefully (`RecursionError` from both the scanner and the flattener) instead of failing the file with a raw traceback.
+
+### Changed
+- `image_processor.process_url`/`_read_file` are documented as internal-only (they open any path and must never be wired to user-controlled input — API/MCP media refs are validated centrally in `rag_system`).
+
 ## [3.4.0] — 2026-09-01
 
 ### Added

@@ -24,7 +24,11 @@ spec:
           image: busybox:latest
           securityContext:
             runAsUser: 0
-          command: ["sh", "-c", "chown -R 1000:1000 /data"]
+          # Skip the walk when ownership is already correct: the data PVC
+          # can hold hundreds of thousands of files (NFS), and chown -R
+          # over NFS on every pod start stalls the rollout in Init for
+          # many minutes per replica.
+          command: ["sh", "-c", "if [ -n \"$(find /data ! -user 1000 -print 2>/dev/null | head -n 1)\" ]; then echo 'Fixing /data ownership...'; chown -R 1000:1000 /data; else echo 'Ownership already correct; skipping chown'; fi"]
           volumeMounts:
             - name: data
               mountPath: /data

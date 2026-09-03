@@ -62,6 +62,7 @@ from multimodal_rag.rag_system import (
 )
 from multimodal_rag.utils.general_tools import sync_pool
 from multimodal_rag.utils.logging_utils import logging, setup_logger
+from multimodal_rag.utils.media_paths import MediaRefError
 
 logger = logging.getLogger(__name__)
 
@@ -1374,8 +1375,15 @@ async def api_add_documents(
     payload: list[Any]
     if isinstance(body, list):
         payload = body
-    else:
+    elif isinstance(body, (dict, str)):
         payload = [body]
+    else:
+        # A non-JSON body (e.g. form-encoded) surfaces here as an opaque
+        # object that would otherwise flow into the pipeline and crash it
+        # with a 500 several layers deep.
+        raise HTTPException(422, "Send JSON (Content-Type: application/json): a document or an array of documents")
+    if not all(isinstance(d, (str, dict)) for d in payload):
+        raise HTTPException(422, "Each document must be a string or an object")
 
     try:
         dm = await get_manager_async()
@@ -1392,6 +1400,10 @@ async def api_add_documents(
         return resp
     except FileNotFoundError:
         raise HTTPException(404, f"Dataset '{name}' not found")
+    except MediaRefError as exc:
+        # A document carried a media ref the server refuses to read/fetch
+        # (local path outside the allowlist, blocked http host, s3://).
+        raise HTTPException(400, str(exc))
 
 
 # -- Files -------------------------------------------------------------------
@@ -3450,6 +3462,8 @@ async def api_import_dataset(request: Request) -> dict[str, Any]:
             s3_uri = str(body.get("s3_uri") or "").strip()
             if not s3_uri:
                 raise HTTPException(400, "JSON body must provide 's3_uri' (or upload multipart 'file')")
+            if not s3_uri.startswith("s3://"):
+                raise HTTPException(400, "s3_uri must be an s3:// URI (s3://bucket/key.tar.gz)")
             new_name = body.get("new_name") or None
             overwrite = bool(body.get("overwrite", False))
             password = body.get("password") or None
@@ -3458,6 +3472,32 @@ async def api_import_dataset(request: Request) -> dict[str, Any]:
             tmp_path = Path(await loop.run_in_executor(sync_pool, _download_s3, s3_uri))
         else:
             raise HTTPException(415, "Send multipart/form-data with a 'file' field, or JSON with 's3_uri'")
+
+        # Password-gate overwrites of EXISTING datasets: prepare_import
+        # DELETES the target when overwrite=true, and destructive routes are
+        # password-gated (delete/recreate/migrate/backfill all are) — the
+        # import path must not be a bypass.  The target name comes from
+        # new_name or the archive's own meta.json, whichever prepare_import
+        # will use; peek it before anything is touched.
+        if overwrite:
+            try:
+                backup_meta = await loop.run_in_executor(sync_pool, dm.peek_backup_meta, tmp_path)
+            except KeyError as exc:
+                # Not an export archive — map to 400 (KeyError isn't a
+                # ValueError, so the generic handler below would 500 it).
+                raise HTTPException(400, f"Not a dataset export (missing {exc}): cannot determine the overwrite target")
+            except TypeError as exc:
+                raise HTTPException(400, str(exc))
+            candidate = str(new_name or backup_meta.get("name") or "").strip()
+            if candidate:
+                dm._validate_name(candidate)
+                # SECURITY: the fresh variant, not the TTL-cached check — a
+                # pod that cached a stale negative (NFS visibility delay or
+                # the 30s TTL from before the dataset was protected) would
+                # skip this gate and replace a protected dataset without its
+                # password (demonstrated on the 4-replica rollout).
+                if await loop.run_in_executor(sync_pool, dm.has_password_fresh, candidate):
+                    await _require_dataset_password(dm, candidate, password, request)
 
         plan = await loop.run_in_executor(
             sync_pool,
@@ -3588,6 +3628,15 @@ def main():
     os.environ["RAG_REMOTE"] = os.environ.get("RAG_REMOTE", "true")
 
     setup_logger(level=args.log_level)
+
+    # Live autopsy hook: `kill -USR1 <pid>` dumps every thread's stack to the
+    # container log — the definitive way to see where a hung request is
+    # actually parked (pool exhaustion, blocked model call, deadlocked lock).
+    import faulthandler
+    import signal
+
+    faulthandler.register(signal.SIGUSR1)
+    logger.info("Stack-dump hook installed: kill -USR1 <pid> dumps all thread stacks")
 
     # Must share MEDIA_TOKEN_SECRET with the MCP server so protected media is
     # served via short-lived HMAC tokens (never a clear ?password= URL).

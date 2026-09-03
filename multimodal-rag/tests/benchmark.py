@@ -53,12 +53,23 @@ import httpx2
 # Default query pool — diverse, sensible queries that work across datasets
 # ---------------------------------------------------------------------------
 
-DEFAULT_QUERIES: list[str] = [
+# Query pool for the simulated users, split by how the SERVER treats them:
+#
+#   * generic queries are answered from stored content — when a doc carries
+#     an ingest-time VLM caption ("[Image description]: …"), the server
+#     REUSES it and never calls the VLM at query time;
+#   * VLM-specific queries (spatial / count / color / comparison wording)
+#     trip the server's _query_needs_vlm() heuristic: for a TEXT-ONLY caller
+#     (the default) they re-run the VLM once per image hit — realistic, but
+#     far slower; vision-capable callers (--base-llm-modalities text,image)
+#     skip the VLM entirely.
+#
+# DEFAULT_QUERIES (mixed) is kept for backward compatibility.
+DEFAULT_QUERIES_GENERIC: list[str] = [
     # General knowledge
     "What is machine learning?",
     "Explain how neural networks work",
     "What are the benefits of cloud computing?",
-    "Describe the difference between supervised and unsupervised learning",
     "What is a transformer architecture?",
     "How does retrieval-augmented generation work?",
     "What is vector similarity search?",
@@ -95,11 +106,20 @@ DEFAULT_QUERIES: list[str] = [
     "examples",
     # Image / media (for multimodal datasets)
     "The aurora borealis over a snowy mountain",
-    "A skyscraper high above the other buildings in a city on a cloudy day",
-    "The top of a tower with an antenna on an overcast day",
     "Black and white image of a lake reflecting the trees by its side",
     "A man crouching staring down at the tops of clouds from a mountain",
 ]
+DEFAULT_QUERIES_VLM: list[str] = [
+    # From the historical default pool — spatial / comparison wording
+    "Describe the difference between supervised and unsupervised learning",
+    "A skyscraper high above the other buildings in a city on a cloudy day",
+    "The top of a tower with an antenna on an overcast day",
+    # Canonical visual-detail questions (count / color / text-in-image)
+    "How many products are shown in the image?",
+    "What color is the box in the middle of the picture?",
+    "What does the label on the packaging say?",
+]
+DEFAULT_QUERIES: list[str] = DEFAULT_QUERIES_GENERIC + DEFAULT_QUERIES_VLM
 
 
 # ---------------------------------------------------------------------------
@@ -179,12 +199,15 @@ async def run_user(
     duration: float,
     ramp_delay: float,
     stats: BenchmarkStats,
+    api_key: str | None = None,
 ) -> None:
     """Simulate one user sending queries for *duration* seconds."""
     rng = random.Random(user_id)
     headers: dict[str, str] = {}
     if password:
         headers["X-Dataset-Password"] = password
+    if api_key:
+        headers["X-RAG-Api-Key"] = api_key
 
     # Ramp-up: stagger start times
     if ramp_delay > 0:
@@ -242,6 +265,7 @@ async def run_user_mcp(
     duration: float,
     ramp_delay: float,
     stats: BenchmarkStats,
+    base_llm_modalities: list[str] | None = None,
     insecure: bool = False,
     call_timeout: float = 120.0,
 ) -> None:
@@ -275,6 +299,11 @@ async def run_user_mcp(
     }
     if password:
         tool_args_base["password"] = password
+    if base_llm_modalities:
+        # Declare the simulated client's LLM modalities — "text" only (the
+        # default server-side) makes every image hit convert to text via the
+        # VLM; adding "image" passes media through untouched.
+        tool_args_base["base_llm_modalities"] = list(base_llm_modalities)
 
     # When --insecure is set, build an httpx2 client that disables TLS
     # verification while preserving MCP defaults (redirects, timeouts).
@@ -354,11 +383,13 @@ async def check_health(base_url: str, insecure: bool = False) -> bool:
         return False
 
 
-async def discover_datasets(base_url: str, password: str | None = None, insecure: bool = False) -> list[str]:
+async def discover_datasets(base_url: str, password: str | None = None, insecure: bool = False, api_key: str | None = None) -> list[str]:
     """Return a list of dataset names from the server."""
     headers: dict[str, str] = {}
     if password:
         headers["X-Dataset-Password"] = password
+    if api_key:
+        headers["X-RAG-Api-Key"] = api_key
     async with httpx.AsyncClient(timeout=10, verify=not insecure) as c:
         resp = await c.get(f"{base_url}/api/datasets", headers=headers)
         resp.raise_for_status()
@@ -451,7 +482,7 @@ async def run_benchmark(args: argparse.Namespace) -> None:
             sys.exit(1)
         print("No --dataset specified; discovering ...", end=" ", flush=True)
         try:
-            datasets = await discover_datasets(api_url, args.password, insecure=args.insecure)
+            datasets = await discover_datasets(api_url, args.password, insecure=args.insecure, api_key=args.api_key)
             if not datasets:
                 print("none found")
                 print("Error: no datasets available. Create one first.", file=sys.stderr)
@@ -463,8 +494,17 @@ async def run_benchmark(args: argparse.Namespace) -> None:
             sys.exit(1)
 
     # 3. Load queries
-    queries = load_queries(args.queries_file)
-    print(f"Query pool: {len(queries)} queries")
+    if args.queries_file:
+        queries = load_queries(args.queries_file)
+        query_set_label = "custom (--queries-file)"
+    else:
+        queries = {
+            "generic": DEFAULT_QUERIES_GENERIC,
+            "vlm": DEFAULT_QUERIES_VLM,
+            "mixed": DEFAULT_QUERIES,
+        }[args.query_set]
+        query_set_label = args.query_set
+    print(f"Query pool: {len(queries)} queries (set: {query_set_label})")
 
     # 4. Print config
     reranker_status = f"ON (reranker_top_k={args.reranker_top_k})" if args.use_reranker else "OFF"
@@ -510,6 +550,7 @@ async def run_benchmark(args: argparse.Namespace) -> None:
                 duration=args.duration,
                 ramp_delay=i * ramp_step,
                 stats=stats,
+                base_llm_modalities=args.base_llm_modalities,
                 insecure=args.insecure,
                 call_timeout=args.call_timeout,
             )
@@ -539,6 +580,7 @@ async def run_benchmark(args: argparse.Namespace) -> None:
                     duration=args.duration,
                     ramp_delay=i * ramp_step,
                     stats=stats,
+                    api_key=args.api_key,
                 )
                 for i in range(args.N)
             ]
@@ -679,9 +721,34 @@ Examples:
     )
     parser.add_argument("--password", default=None, help="Dataset password (for password-protected datasets)")
     parser.add_argument(
+        "--api-key",
+        default=None,
+        help="RAG API key sent as X-RAG-Api-Key. Required for REST mode when the "
+        "server enforces security.apiKey; dataset discovery uses it too. "
+        "(The MCP sidecar does not enforce the key.)",
+    )
+    parser.add_argument(
+        "--base-llm-modalities",
+        default=None,
+        help="Comma-separated modalities of the simulated LLM for MCP mode "
+        "(e.g. 'text,image'). Default: unset -> the server assumes text-only and "
+        "converts every image hit to text via the VLM, which dominates latency "
+        "for image-heavy datasets.",
+    )
+    parser.add_argument(
         "--queries-file",
         default=None,
-        help="Path to a file with one query per line. If omitted, uses built-in defaults.",
+        help="Path to a file with one query per line. If omitted, uses the built-in pool selected by --query-set.",
+    )
+    parser.add_argument(
+        "--query-set",
+        choices=["generic", "vlm", "mixed"],
+        default="generic",
+        help="Built-in query pool when --queries-file is not given (default: generic). "
+        "'generic' exercises the caption-reuse path (no VLM at query time for "
+        "pre-captioned docs); 'vlm' trips the server's _query_needs_vlm() heuristic "
+        "— for text-only callers this re-runs the VLM per image hit, which is "
+        "realistic but much slower; 'mixed' is the historical combined pool.",
     )
     parser.add_argument("--output", default=None, help="Path to save results as JSON")
     parser.add_argument("--http2", action="store_true", help="Use HTTP/2 (requires h2 package)")

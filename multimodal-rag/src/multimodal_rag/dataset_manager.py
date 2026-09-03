@@ -465,6 +465,7 @@ def _download_s3(s3_url: str, timeout: int = 120) -> str:
     parsed = urlparse(s3_url)
     bucket = parsed.hostname  # s3://bucket/key → hostname = bucket
     key = parsed.path.lstrip("/")
+    _check_s3_bucket(bucket)
 
     basename = Path(key).name or "download"
     suffix = Path(basename).suffix or ""
@@ -557,6 +558,7 @@ def _list_s3_prefix(s3_url: str) -> list[str]:
     parsed = urlparse(s3_url)
     bucket = parsed.hostname
     prefix = parsed.path.lstrip("/")
+    _check_s3_bucket(bucket)
 
     def _list() -> list[str]:
         s3 = _get_s3_client()
@@ -609,122 +611,37 @@ _MAX_REMOTE_DOWNLOAD_BYTES = max(0, int(os.environ.get("MAX_REMOTE_DOWNLOAD_BYTE
 # against the URL policy).
 _MAX_URL_REDIRECTS = max(1, int(os.environ.get("MAX_URL_REDIRECTS", "5")))
 
-# Optional comma-separated allowlist of hosts for http(s) ingest.  An entry
-# like ``.minio.svc.cluster.local`` matches the zone and subdomains.  Empty
-# = all hosts allowed (default, backward compatible).
-_INGEST_ALLOW_HOSTS = tuple(h.strip().lower() for h in os.environ.get("INGEST_ALLOW_HOSTS", "").split(",") if h.strip())
-
-# Private-range block (DNS + literal-IP).  On by default so remote ingest
-# cannot reach internal/loopback targets (SSRF).  Explicitly-allowlisted
-# hosts (INGEST_ALLOW_HOSTS) bypass the block — set that to keep in-cluster
-# MinIO/internal ingestions working.  ``INGEST_BLOCK_PRIVATE_HOSTS=false``
-# restores the legacy permissive behaviour.
-_INGEST_BLOCK_PRIVATE = os.environ.get("INGEST_BLOCK_PRIVATE_HOSTS", "true").lower() in ("1", "true", "yes")
+# Optional comma-separated allowlist of S3 buckets for ingest/sync.  Empty
+# = all buckets the configured credentials can access (default, backward
+# compatible).  When set, _download_s3 / _list_s3_prefix refuse any bucket
+# not on the list — on a shared MinIO this stops one tenant's ingest token
+# from reading another tenant's buckets.
+_INGEST_ALLOW_S3_BUCKETS = tuple(
+    b.strip().lower() for b in os.environ.get("INGEST_ALLOW_S3_BUCKETS", "").split(",") if b.strip()
+)
 
 
-def _host_matches_allowlist(host: str) -> bool:
-    host = host.lower()
-    for pat in _INGEST_ALLOW_HOSTS:
-        if pat.startswith("."):
-            if host == pat[1:] or host.endswith(pat):
-                return True
-        elif host == pat:
-            return True
-    return False
-
-
-def _host_is_private(host: str, allow_loopback: bool = False) -> bool:
-    """Return True if *host* is or resolves to a private/loopback/link-local address.
-
-    With ``allow_loopback=True`` (the query-time media policy) loopback
-    addresses and the literal name ``localhost`` are *not* considered
-    private: clients legitimately hand the server's own media URLs
-    (``http://localhost:8000/api/datasets/...``) back to the query tools.
-    """
-    import ipaddress
-    import socket
-
-    hostname = host.rsplit(":", 1)[0].strip("[]")
-    if hostname == "localhost":
-        return not allow_loopback
-    try:
-        ip = ipaddress.ip_address(hostname)
-    except ValueError:
-        ip = None
-    if ip is not None:
-        if ip.is_loopback and allow_loopback:
-            return False
-        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved
-    try:
-        addrinfos = socket.getaddrinfo(hostname, None)
-    except socket.gaierror:
-        return True  # unresolved — safest to treat as suspicious when blocking is on
-    for info in addrinfos:
-        try:
-            ip = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            continue
-        if ip.is_loopback and allow_loopback:
-            continue
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
-            return True
-    return False
-
-
-def _check_url_policy(url: str) -> None:
-    """Raise :class:`ValueError` if *url* violates the configured URL policy."""
-    if not url.startswith(("http://", "https://")):
+def _check_s3_bucket(bucket: str | None) -> None:
+    """Raise :class:`ValueError` when *bucket* violates INGEST_ALLOW_S3_BUCKETS."""
+    if not _INGEST_ALLOW_S3_BUCKETS:
         return
-    from urllib.parse import urlparse
-
-    host = urlparse(url).hostname or ""
-    # An explicit allowlist is authoritative: hosts not listed are rejected,
-    # and listed hosts are allowed even when they resolve privately (that is
-    # how in-cluster MinIO/internal ingestions are permitted).
-    if _INGEST_ALLOW_HOSTS:
-        if not _host_matches_allowlist(host):
-            raise ValueError(
-                f"URL host '{host}' is not allowed by INGEST_ALLOW_HOSTS"
-                + (f"={','.join(_INGEST_ALLOW_HOSTS)}" if _INGEST_ALLOW_HOSTS else "")
-            )
-        return
-    if _INGEST_BLOCK_PRIVATE and _host_is_private(host):
-        raise ValueError(f"URL host '{host}' resolves to a private/internal address (INGEST_BLOCK_PRIVATE_HOSTS=true)")
-
-
-def _check_media_url_policy(url: str) -> None:
-    """Policy for *user-supplied query-time* media URLs (search with
-    image/video/audio, ``describe_media``, ``transcribe_audio``).
-
-    Ingest-time downloads guard the server against malicious URLs; this
-    guards the same surface for query-time fetches, which previously had no
-    check at all (an internal-SSRF / exfiltration channel: a caller could
-    point the embedder/VLM/ASR at cloud metadata or in-cluster services and
-    read the response back as a description/transcript/embedding match).
-
-    Same rules as :func:`_check_url_policy` with one difference: loopback is
-    allowed by default, because clients legitimately pass the server's own
-    media URLs (``http://localhost:8000/api/datasets/...?token=...``) back
-    to these tools.  ``INGEST_ALLOW_HOSTS`` remains authoritative when set;
-    set ``INGEST_BLOCK_PRIVATE_HOSTS=false`` to disable (not recommended).
-    """
-    if not url.startswith(("http://", "https://")):
-        return
-    from urllib.parse import urlparse
-
-    host = urlparse(url).hostname or ""
-    if _INGEST_ALLOW_HOSTS:
-        if not _host_matches_allowlist(host):
-            raise ValueError(
-                f"URL host '{host}' is not allowed by INGEST_ALLOW_HOSTS"
-                + (f"={','.join(_INGEST_ALLOW_HOSTS)}" if _INGEST_ALLOW_HOSTS else "")
-            )
-        return
-    if _INGEST_BLOCK_PRIVATE and _host_is_private(host, allow_loopback=True):
+    if (bucket or "").lower() not in _INGEST_ALLOW_S3_BUCKETS:
         raise ValueError(
-            f"URL host '{host}' resolves to a private/internal address "
-            f"(INGEST_BLOCK_PRIVATE_HOSTS=true; add it to INGEST_ALLOW_HOSTS to permit)"
+            f"S3 bucket '{bucket}' is not allowed by INGEST_ALLOW_S3_BUCKETS"
+            + (f"={','.join(_INGEST_ALLOW_S3_BUCKETS)}" if _INGEST_ALLOW_S3_BUCKETS else "")
         )
+
+
+# URL-fetch policy (SSRF guards) lives in utils/url_policy.py — re-exported
+# here because mcp_server (and older callers) import these names from
+# dataset_manager.  rag_system imports the module directly (this module
+# imports rag_system, so the reverse would be circular).
+from multimodal_rag.utils.url_policy import (  # noqa: E402, F401 — re-exported
+    _check_media_url_policy,
+    _check_url_policy,
+    _host_is_private,
+    _host_matches_allowlist,
+)
 
 
 def _download_url(url: str, timeout: int = 120) -> str:
@@ -1389,6 +1306,10 @@ class DatasetManager:
         if password:
             meta["password_hash"] = _hash_password(password)
         self._write_meta(name, meta)
+        # A same-name recreate (delete + create, e.g. an import overwrite) on
+        # one pod must not inherit another pod's stale has_password negative
+        # — the import-overwrite gate trusts this value.
+        self._invalidate_has_password(name)
 
         # Signal dataset existence to other pods via Redis (NFS cache bypass)
         _dataset_exist_set(name)
@@ -1416,6 +1337,31 @@ class DatasetManager:
         with self._has_password_lock:
             self._has_password_cache[name] = (now, result)
         return result
+
+    def has_password_fresh(self, name: str) -> bool:
+        """Uncached protection check that tolerates NFS visibility delays.
+
+        Use for SECURITY DECISIONS, not hot paths: the import-overwrite gate
+        consulted the TTL-cached :meth:`has_password`, and on the 4-replica
+        rollout a pod that had recently cached a negative (dataset not yet
+        visible / not yet carrying a hash on this pod) skipped the gate and
+        REPLACED a password-protected dataset without demanding its password.
+        A stale negative is harmless for search throughput but fatal for an
+        authz check.
+
+        Mirrors :meth:`get_dataset`'s bridge over the NFS close-to-open gap:
+        when Redis confirms the dataset exists but ``meta.json`` isn't
+        visible (or is stale) on this pod yet, retry briefly before
+        answering.  The result is deliberately NOT written to the TTL cache.
+        """
+        meta = self._read_meta(name)
+        if not meta and _dataset_exist_check(name):
+            for _ in range(_DATASET_EXIST_RETRY_COUNT):
+                time.sleep(_DATASET_EXIST_RETRY_DELAY)
+                meta = self._read_meta(name)
+                if meta:
+                    break
+        return bool(meta and meta.get("password_hash"))
 
     def _invalidate_has_password(self, name: str) -> None:
         with self._has_password_lock:
@@ -1605,6 +1551,43 @@ class DatasetManager:
         "preprocessed_video",
     )
 
+    # Import bounds (M-1 hardening).  Unlike ingested archives (which go
+    # through archive_processor's pre-extraction audit), a backup .tar.gz
+    # used to be extracted with no cap on member count or total unpacked
+    # size — a ≤MAX_UPLOAD_BYTES tar.gz can expand ~1000× (gzip bomb) and
+    # fill the PVC.  Declared tar sizes are authoritative, so the audit is
+    # cheap.  ``0`` disables a cap.
+    _MAX_IMPORT_EXTRACT_BYTES = max(
+        0, int(os.environ.get("MAX_IMPORT_EXTRACT_BYTES", str(8 * 1024 * 1024 * 1024)))
+    )
+    _MAX_IMPORT_MEMBERS = max(0, int(os.environ.get("MAX_IMPORT_MEMBERS", "20000")))
+    _MAX_IMPORT_META_BYTES = 4 * 1024 * 1024
+
+    @staticmethod
+    def peek_backup_meta(tar_path: str | Path) -> dict[str, Any]:
+        """Read just the ``meta.json`` of a dataset export without extracting.
+
+        Used by the REST import endpoint to learn the *target* dataset name
+        (``new_name`` fallback: the archive's original name) BEFORE
+        :meth:`prepare_import` runs, so an ``overwrite=true`` import of an
+        existing password-protected dataset can demand that dataset's
+        password first (destructive routes are password-gated — deleting
+        must not be easier than reading).
+        """
+        import tarfile
+
+        with tarfile.open(Path(tar_path), "r:*") as tar:
+            info = tar.getmember("meta.json")  # raises KeyError if absent
+            if info.size > DatasetManager._MAX_IMPORT_META_BYTES:
+                raise ValueError("Backup meta.json is implausibly large — not a dataset export")
+            member = tar.extractfile(info)
+            if member is None:
+                raise ValueError("Backup archive has no meta.json — not a dataset export")
+            meta = json.loads(member.read().decode("utf-8"))
+        if not isinstance(meta, dict):
+            raise TypeError("Backup meta.json is malformed")
+        return meta
+
     def prepare_import(
         self,
         tar_path: str | Path,
@@ -1632,6 +1615,17 @@ class DatasetManager:
 
         with tarfile.open(src, "r:*") as tar:
             members = tar.getmembers()
+            if self._MAX_IMPORT_MEMBERS and len(members) > self._MAX_IMPORT_MEMBERS:
+                raise ValueError(
+                    f"Backup archive has too many members ({len(members)} > {self._MAX_IMPORT_MEMBERS}; "
+                    f"tune MAX_IMPORT_MEMBERS)"
+                )
+            total_declared = sum(m.size for m in members)
+            if self._MAX_IMPORT_EXTRACT_BYTES and total_declared > self._MAX_IMPORT_EXTRACT_BYTES:
+                raise ValueError(
+                    f"Backup archive unpacks to {total_declared} bytes — exceeds "
+                    f"MAX_IMPORT_EXTRACT_BYTES ({self._MAX_IMPORT_EXTRACT_BYTES})"
+                )
             for m in members:
                 name = m.name
                 if name not in ("meta.json", "documents.jsonl") and not name.startswith("files/"):
@@ -1642,6 +1636,9 @@ class DatasetManager:
             meta_member = tar.extractfile("meta.json")
             if meta_member is None:
                 raise ValueError("Backup archive has no meta.json — not a dataset export")
+            meta_size = next(m.size for m in members if m.name == "meta.json")
+            if meta_size > self._MAX_IMPORT_META_BYTES:
+                raise ValueError("Backup meta.json is implausibly large — not a dataset export")
             backup_meta = json.loads(meta_member.read().decode("utf-8"))
             if not isinstance(backup_meta, dict):
                 raise TypeError("Backup meta.json is malformed")
@@ -1655,8 +1652,10 @@ class DatasetManager:
                 docs_member = None  # tolerate archives without a documents member
             row_count = 0
             if docs_member is not None:
-                for line in docs_member.read().decode("utf-8").splitlines():
-                    if line.strip():
+                # Stream the count — documents.jsonl can be hundreds of MB and
+                # is only needed line-by-line (never buffered whole).
+                for raw_line in docs_member:
+                    if raw_line.strip():
                         row_count += 1
 
             target = new_name or original_name

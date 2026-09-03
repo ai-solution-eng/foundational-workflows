@@ -22,6 +22,11 @@ from multimodal_rag.utils.general_tools import (
     sync_wrapper_safe,
 )
 from multimodal_rag.utils.logging_utils import logging
+from multimodal_rag.utils.media_paths import (
+    MediaRefError,
+    _media_path_allowed,
+    _validate_document_media_refs,
+)
 from multimodal_rag.utils.model_adapters import (
     MultiModalEmbeddings,
     MultiModalReranker,
@@ -32,6 +37,7 @@ from multimodal_rag.utils.pcai_model_classes import (
     RerankerModel,
     VoiceModel,
 )
+from multimodal_rag.utils.url_policy import _check_media_url_policy
 from multimodal_rag.vector_store import (
     _QDRANT_IO_POOL,
     Document,
@@ -592,26 +598,56 @@ def _media_caption_twin_needed(doc: dict, supported: set[str]) -> bool:
     return _has_caption(doc.get("text") or "")
 
 
+# Cap for one server-side media fetch (embed / query time).  Most refs are
+# ``data:`` URLs or PVC files; an http(s) ref is fetched by the server and
+# must not be able to stream an unbounded response into RAM.  ``0`` disables.
+_MAX_MEDIA_FETCH_BYTES = max(0, int(os.environ.get("MAX_MEDIA_FETCH_BYTES", str(512 * 1024 * 1024))))
+
+
 async def _afetch_media_bytes(url: str, async_client=None) -> bytes:
     if url.startswith(("http://", "https://")):
+        # SSRF policy on EVERY server-side media fetch (embed + query time) —
+        # media refs can be user-supplied (POST /documents, MCP add_memory),
+        # so an internal/cloud-metadata URL must never be fetched.  The
+        # policy resolves DNS (blocking getaddrinfo) — keep it off the loop.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _check_media_url_policy(url)
+        else:
+            await loop.run_in_executor(None, _check_media_url_policy, url)
+        cap = _MAX_MEDIA_FETCH_BYTES
+
+        async def _streamed(client) -> bytes:
+            async with client.stream("GET", url, follow_redirects=True) as resp:
+                resp.raise_for_status()
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf += chunk
+                    if cap and len(buf) > cap:
+                        raise ValueError(
+                            f"Media fetch of {url} exceeds MAX_MEDIA_FETCH_BYTES ({cap} bytes)"
+                        )
+                return bytes(buf)
+
         if async_client is not None:
-            resp = await async_client.get(url, follow_redirects=True)
-            resp.raise_for_status()
-            return resp.content
+            return await _streamed(async_client)
         import httpx
 
         # Bounded timeout: this per-call client previously had none, so a
         # hung media server would hang the enclosing asyncio.gather forever.
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=15.0)) as c:
-            resp = await c.get(url, follow_redirects=True)
-            resp.raise_for_status()
-            return resp.content
+            return await _streamed(c)
     if url.startswith("data:"):
         import re
 
         m = re.match(r"data:[^;]+;base64,(.+)", url)
         return base64.b64decode(m.group(1)) if m else base64.b64decode(url.split(",", 1)[1])
     path = url.removeprefix("file://")
+    if not _media_path_allowed(path):
+        raise MediaRefError(
+            f"Local media path '{path}' is outside the allowed prefixes (MEDIA_ALLOW_PATH_PREFIXES)"
+        )
     with open(path, "rb") as f:
         return f.read()
 
@@ -631,6 +667,13 @@ def _file_url_to_data_url(url: str) -> str:
     import os
 
     path = url.removeprefix("file://")
+    # Fail closed BEFORE touching the filesystem: this runs on refs stored in
+    # Qdrant payloads (user-suppliable via POST /documents / MCP add_memory)
+    # and its output is fed to the base LLM / VLM at query time.
+    if not _media_path_allowed(path):
+        raise MediaRefError(
+            f"Local media path '{path}' is outside the allowed prefixes (MEDIA_ALLOW_PATH_PREFIXES)"
+        )
     if not os.path.exists(path):
         logger.warning("File not found, returning URL as-is: %s", path)
         return url
@@ -1863,6 +1906,15 @@ class MultimodalRAG:
                         resized.append(url)
                         continue
                     path = url  # bare path, no scheme
+                    # A bare path here is opened read and embedded server-side —
+                    # only dataset/staging-local paths may reach this branch
+                    # (refs are validated at aadd_to_vector_store entry; this is
+                    # the defence-in-depth check at the read site itself).
+                    if not _media_path_allowed(path):
+                        raise MediaRefError(
+                            f"Local media path '{path}' is outside the allowed prefixes "
+                            f"(MEDIA_ALLOW_PATH_PREFIXES)"
+                        )
                     if key == "image":
                         with open(path, "rb") as f:
                             raw = f.read()
@@ -2137,6 +2189,21 @@ class MultimodalRAG:
         if dedup_threshold is None:
             dedup_threshold = self.dedup_threshold
         t0 = time.monotonic()
+
+        # ── 0a. Validate media refs in user-supplied documents ─────────────
+        # Documents may arrive from REST POST /documents or MCP add_memory
+        # with arbitrary image/video/audio values.  The server READS those
+        # refs (resize, embed fetch, VLM/ASR captioning, query-time LLM
+        # content), so a bare path or file:// URL pointing anywhere on the
+        # filesystem — or an http(s) URL pointing at internal services —
+        # must never reach the pipeline.  Runs off the event loop: the URL
+        # policy resolves DNS (blocking getaddrinfo).
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _validate_document_media_refs(list(documents))
+        else:
+            await loop.run_in_executor(None, _validate_document_media_refs, list(documents))
 
         # ── 0. Preprocess ───────────────────────────────────────────────────
         processed = await self._preprocess_docs(documents)

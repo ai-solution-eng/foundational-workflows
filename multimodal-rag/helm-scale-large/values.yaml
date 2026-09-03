@@ -14,7 +14,7 @@
 replicaCount: 4
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v3.4.0
+  tag: v3.5.2
   pullPolicy: IfNotPresent
 
 deployment:

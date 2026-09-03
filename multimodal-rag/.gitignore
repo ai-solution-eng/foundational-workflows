@@ -25,7 +25,8 @@ src/multimodal_rag/utils/pcai_models.py
 .env
 *.local
 values-resolved.yaml
-helm-scale-large/.values.yaml
+.values*.yaml
+helm*/local/
 
 # Editor
 .vscode/

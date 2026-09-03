@@ -4,7 +4,7 @@
 #
 # Copies from this repo (foundational-workflows/multimodal-rag):
 #   helm/                          -> <demos>/multimodal-rag/helm/          (full replace, drops stale chart)
-#   rag-mcp-server-3.2.0.tar.gz    -> <demos>/multimodal-rag/                (old packaged chart removed)
+#   rag-mcp-server-*.tar.gz        -> <demos>/multimodal-rag/                (newest one; old packaged chart removed)
 #   src/multimodal_rag/            -> <demos>/multimodal-rag/docker/src/      (caches excluded)
 #   docker/Dockerfile              -> <demos>/multimodal-rag/docker/Dockerfile.txt
 #   docker/requirements.txt        -> <demos>/multimodal-rag/docker/requirements.txt
@@ -24,8 +24,11 @@ DEMO="${HOME}/Code/HPE/pcai-solutions/ai-solution-demos/multimodal-rag"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-[[ -d "${SRC}/helm" ]]             || die "source chart dir not found: ${SRC}/helm"
-[[ -f "${SRC}/rag-mcp-server-3.2.0.tar.gz" ]] || die "source packaged chart not found: ${SRC}/rag-mcp-server-3.2.0.tar.gz"
+# Newest packaged server chart in this repo, whatever its version.
+CHART_TGZ="$(find "${SRC}" -maxdepth 1 -name 'rag-mcp-server-*.tar.gz' | sort -V | tail -n 1)"
+
+[[ -d "${SRC}/helm" ]]  || die "source chart dir not found: ${SRC}/helm"
+[[ -n "${CHART_TGZ}" ]] || die "source packaged chart not found: ${SRC}/rag-mcp-server-*.tar.gz"
 [[ -d "${DEMO}" ]]                 || die "demo dir missing: ${DEMO} (clone ai-solution-demos first)"
 [[ -d "${DEMO}/helm" ]]            || die "demo chart dir missing: ${DEMO}/helm"
 [[ -d "${DEMO}/docker" ]]          || die "demo docker dir missing: ${DEMO}/docker"
@@ -45,8 +48,9 @@ run mkdir -p "${DEMO}/helm"
 run cp -R "${SRC}/helm/." "${DEMO}/helm/"
 
 # 2) Packaged chart: drop every old tarball, copy in the current one.
+echo "  packaged chart: $(basename "${CHART_TGZ}")"
 run rm -f "${DEMO}"/rag-mcp-server-*.tar.gz
-run cp "${SRC}/rag-mcp-server-3.2.0.tar.gz" "${DEMO}/"
+run cp "${CHART_TGZ}" "${DEMO}/"
 
 # 3) Source code, without caches/venvs.
 run rm -rf "${DEMO}/docker/src/multimodal_rag"
