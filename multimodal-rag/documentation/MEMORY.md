@@ -1,7 +1,6 @@
 # Long-term Memory — Setup & Operations Guide
 
-Per-user long-term memory of past LLM interactions, backed by the Multimodal RAG server. Two clients are supported — **opencode** (MCP tools, LLM-curated) and **Open WebUI** (filter inlet/outlet,
-auto-recall + LLM-distilled writes).
+Per-user long-term memory of past LLM interactions, backed by the Multimodal RAG server. Two clients are supported — **opencode** (MCP tools, LLM-curated) and **Open WebUI** (filter inlet/outlet, auto-recall + LLM-distilled writes).
 
 > **See also:** [MCP.md](MCP.md) for the MCP tool reference and connection configs; [FEATURES.md](FEATURES.md) § "MCP Server" for the server-side internals (`_MemoryHeaderMiddleware`, `_run_retrieval`,
 > query-vector caching).
@@ -10,9 +9,8 @@ auto-recall + LLM-distilled writes).
 
 ## 1. How it works
 
-Both clients write memories into password-protected RAG datasets (one Qdrant collection per user). On the opencode side memories come from two places: a `session-memory-logger` plugin that
-**automatically stores a structured history of each session** (prompts, responses, tool calls, file changes), plus the model's own `add_memory` calls for distilled decisions, preferences, and gotchas.
-Open WebUI stores memories via a separate distillation LLM. Raw transcripts are never stored verbatim — session histories are reconstructed into structured summaries.
+Both clients write memories into password-protected RAG datasets (one Qdrant collection per user). On the opencode side memories come from two places: a `session-memory-logger` plugin that **automatically stores a structured history of each session** (prompts, responses, tool calls, file changes), plus the model's own `add_memory` calls for distilled decisions, preferences, and gotchas. Open WebUI
+stores memories via a separate distillation LLM. Raw transcripts are never stored verbatim — session histories are reconstructed into structured summaries.
 
 | | opencode | Open WebUI |
 |---|---|---|
@@ -32,8 +30,7 @@ Both paths land in the same Qdrant collection via `DatasetManager.add_documents`
 Create one password-protected dataset via the RAG HTML frontend (e.g. `andrew-memory`).
 
 ### Config
-Use the two-connection pattern in [`opencode.jsonc`](opencode.jsonc) — `rag-memory` (sends memory headers, exposes only `add_memory` / `search_memory`) and `rag-knowledge` (general dataset tools). See
-[MCP.md](MCP.md) § 3.2 for the full config.
+Use the two-connection pattern in [`opencode.jsonc`](opencode.jsonc) — `rag-memory` (sends memory headers, exposes only `add_memory` / `search_memory`) and `rag-knowledge` (general dataset tools). See [MCP.md](MCP.md) § 3.2 for the full config.
 
 ### Env vars (export before launching opencode)
 
@@ -53,8 +50,7 @@ For memory across all projects, copy the memory section of `AGENTS.md` into your
 
 ### Client-side plugins & tools (shipped in this repo)
 
-`documentation/opencode-memory/` ships the opencode-side glue for automatic memory as **templates** — they are not auto-loaded, so a clone of this repo won't change your opencode until you install
-them. They are no-ops until `RAG_MEMORY_DATASET` is exported:
+`documentation/opencode-memory/` ships the opencode-side glue for automatic memory as **templates** — they are not auto-loaded, so a clone of this repo won't change your opencode until you install them. They are no-ops until `RAG_MEMORY_DATASET` is exported:
 
 | File | What it does |
 |---|---|
@@ -73,10 +69,8 @@ cp documentation/opencode-memory/tools/*.ts  ~/.config/opencode/tools/
 (Plugins load at opencode startup — restart after copying.)
 
 Notes:
-- The session-history plugin talks directly to the memory MCP server over HTTP; it defaults to the `rag-memory` URL from `opencode.jsonc` and can be overridden with `RAG_MEMORY_URL`. It relies on the
-  same private CA opencode already needs to reach these servers (`NODE_EXTRA_CA_CERTS`).
-- Keeping them only in the global config means exactly **one** copy loads; don't also drop them into a project's `.opencode/plugins/` / `.opencode/tools/` or they load twice in that repo (harmless —
-  the server's near-duplicate dedup skips the second write — but wasteful).
+- The session-history plugin talks directly to the memory MCP server over HTTP; it defaults to the `rag-memory` URL from `opencode.jsonc` and can be overridden with `RAG_MEMORY_URL`. It relies on the same private CA opencode already needs to reach these servers (`NODE_EXTRA_CA_CERTS`).
+- Keeping them only in the global config means exactly **one** copy loads; don't also drop them into a project's `.opencode/plugins/` / `.opencode/tools/` or they load twice in that repo (harmless — the server's near-duplicate dedup skips the second write — but wasteful).
 
 ### Verify
 ```bash
@@ -87,16 +81,14 @@ opencode mcp list     # both rag-memory and rag-knowledge should connect
 
 ## 3. Setup — Open WebUI
 
-OWUI uses a filter (`openwebui_extension/filter.py`) with an **inlet** (auto-recall at conversation start) and an **outlet** (LLM-distilled write after each reply). Memory goes through the RAG REST
-API directly — no MCP needed. Full valve reference: [`openwebui_extension/README.md`](../openwebui_extension/README.md).
+OWUI uses a filter (`openwebui_extension/filter.py`) with an **inlet** (auto-recall at conversation start) and an **outlet** (LLM-distilled write after each reply). Memory goes through the RAG REST API directly — no MCP needed. Full valve reference: [`openwebui_extension/README.md`](../openwebui_extension/README.md).
 
 > The extension dir also ships a memory-free variant, `filter_media_strip.py` (strips image/video/audio parts for text-only LLMs, no RAG at all). Use it when you want media handling without a memory
 > store. The former `filter_no_memory.py` fork was removed — the full `filter.py` covers that case by disabling its memory/SQL-lesson valves (`MEMORY_ENABLED`, `SQL_LESSONS_ENABLED`).
 
 ### Per-user isolation (SSO)
 
-OWUI filter Valves are **global** (admin-configured once), so per-user passwords can't live in Valves. The filter derives **two** per-user secrets from the SSO-authenticated `__user__` identity at
-runtime:
+OWUI filter Valves are **global** (admin-configured once), so per-user passwords can't live in Valves. The filter derives **two** per-user secrets from the SSO-authenticated `__user__` identity at runtime:
 
 ```
 dataset_name = MEMORY_DATASET_PREFIX + sanitised(__user__.id)
@@ -148,8 +140,7 @@ Memories carry a `source` field so you can tell them apart:
 - opencode → `"source": "opencode:memory"`
 - OWUI → `"source": "openwebui:memory"`
 
-Recall currently surfaces memories from both apps (no `source` filter at search time). If cross-app recall becomes noisy, a server-side search filter on `source` is a small follow-up — not needed
-today.
+Recall currently surfaces memories from both apps (no `source` filter at search time). If cross-app recall becomes noisy, a server-side search filter on `source` is a small follow-up — not needed today.
 
 ---
 
@@ -169,35 +160,28 @@ There is **no `delete_memory` tool in v1**. To remove a memory:
 
 ### Capping memory size (tokens)
 
-Every memory — session histories *and* LLM-curated notes — is split into documents of at most **`MEMORY_MAX_TOKENS`** tokens each (MCP container env var, default `8192`), mirroring dataset-side text
-splitting. The split uses the bundled tokenizer (`RAG_TOKENIZER_PATH`; falls back to ~4 chars/token). The **header is prepended to every chunk**, so each split carries the session/provenance info
+Every memory — session histories *and* LLM-curated notes — is split into documents of at most **`MEMORY_MAX_TOKENS`** tokens each (MCP container env var, default `8192`), mirroring dataset-side text splitting. The split uses the bundled tokenizer (`RAG_TOKENIZER_PATH`; falls back to ~4 chars/token). The **header is prepended to every chunk**, so each split carries the session/provenance info
 (`session_id` in the payload, header block in the text). Split memories are marked with `memory_chunks` / `chunk_index` / `chunk_total` / `memory_truncated` payload fields.
 
-Set the budget via `extraEnv` in the helm chart (e.g. `extraEnv: {MEMORY_MAX_TOKENS: "8192"}`). Keep it at or below the embedder's context window (the image bundles an 8192-token embedding model) so
-each chunk embeds fully.
+Set the budget via `extraEnv` in the helm chart (e.g. `extraEnv: {MEMORY_MAX_TOKENS: "8192"}`). Keep it at or below the embedder's context window (the image bundles an 8192-token embedding model) so each chunk embeds fully.
 
-**Sessions are replaced in place.** When a `session_history` memory is re-written (a session grows and is re-flushed), `add_memory` first deletes the previous chunks for that session, then stores the
-new ones — so the store keeps **one current history per session** instead of accumulating copies every time the session is restarted.
+**Sessions are replaced in place.** When a `session_history` memory is re-written (a session grows and is re-flushed), `add_memory` first deletes the previous chunks for that session, then stores the new ones — so the store keeps **one current history per session** instead of accumulating copies every time the session is restarted.
 
 ### Rotating the OWUI `MEMORY_SECRET`
 
-Changing `MEMORY_SECRET` re-derives all per-user passwords. Existing datasets (hashed with the old derived passwords) become inaccessible. To rotate: re-create each user's dataset, or update each
-dataset's password via the REST API.
+Changing `MEMORY_SECRET` re-derives all per-user passwords. Existing datasets (hashed with the old derived passwords) become inaccessible. To rotate: re-create each user's dataset, or update each dataset's password via the REST API.
 
 For opencode, "rotation" = changing the dataset's password via the REST API and updating `RAG_MEMORY_PASSWORD` in users' env.
 
 ### Confirming it's working
 
-- **opencode:** `opencode mcp list` shows both connections; watch the tool-call stream for `rag-memory_search_memory` / `rag-memory_add_memory`. The session-history plugin writes `[session-memory] …`
-  diagnostics to `~/.local/share/opencode/log/session-memory.log` (override the directory with `SESSION_MEMORY_LOG_DIR`) and stores records with `kind: session_history`. The plugin never writes to the
+- **opencode:** `opencode mcp list` shows both connections; watch the tool-call stream for `rag-memory_search_memory` / `rag-memory_add_memory`. The session-history plugin writes `[session-memory] …` diagnostics to `~/.local/share/opencode/log/session-memory.log` (override the directory with `SESSION_MEMORY_LOG_DIR`) and stores records with `kind: session_history`. The plugin never writes to the
   terminal — TUI output from plugins would overlap the display.
 - **OWUI:** check the filter logs for `Memory recall: N hit(s)` and `Memory stored in 'owui-memory-…': …`. Recall injects a system message; writes happen silently in the outlet.
 - **Server:** `kubectl logs -l app=rag-mcp-server -c rag-mcp-server` shows tool invocations; `GET /api/datasets/{name}` returns `document_count` to confirm writes are landing.
-- **Multi-replica:** in stateless mode (v1.3.0+), each request logs as a fresh transport (no "Created new transport with session ID" line). The REST unlock cache is shared via Redis (not in-memory) —
-  verify with `kubectl exec deploy/rag-mcp-server-redis -- redis-cli KEYS '*unlock*'`. The MCP unlock cache is per-process; on multi-replica deployments pass `password=` on each MCP tool call instead
-  of relying on `unlock_dataset`.
-- **API-key auth (`RAG_API_KEY`) does not affect the memory plugins:** both the DSH and opencode session-memory plugins talk MCP (`/mcp`, `tools/call`) — the MCP server has no API-key middleware. Only
-  direct REST callers need the `X-RAG-Api-Key` header.
+- **Multi-replica:** in stateless mode (v1.3.0+), each request logs as a fresh transport (no "Created new transport with session ID" line). The REST unlock cache is shared via Redis (not in-memory) — verify with `kubectl exec deploy/rag-mcp-server-redis -- redis-cli KEYS '*unlock*'`. The MCP unlock cache is per-process; on multi-replica deployments pass `password=` on each MCP tool call instead of
+  relying on `unlock_dataset`.
+- **API-key auth (`RAG_API_KEY`) does not affect the memory plugins:** both the DSH and opencode session-memory plugins talk MCP (`/mcp`, `tools/call`) — the MCP server has no API-key middleware. Only direct REST callers need the `X-RAG-Api-Key` header.
 
 
 ### Troubleshooting

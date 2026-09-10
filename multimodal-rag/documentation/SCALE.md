@@ -1,10 +1,8 @@
 # Scaling: the `helm-scale-medium/` and `helm-scale-large/` charts
 
-The base `helm/` chart runs a single API replica with a single Qdrant instance — optimised for simplicity. The `helm-scale-large/` chart trades that for horizontal capacity. This document explains
-every layer of the scale chart and how it achieves its goal.
+The base `helm/` chart runs a single API replica with a single Qdrant instance — optimised for simplicity. The `helm-scale-large/` chart trades that for horizontal capacity. This document explains every layer of the scale chart and how it achieves its goal.
 
-A medium variant, `helm-scale-medium/`, reuses the scale-chart architecture (gunicorn workers, multi-replica Qdrant, Redis unlock cache) but dials the replica counts and per-container resources back
-so it can be tested as a drop-in replacement on a cluster sized for the base chart. The [Resource requirements](#resource-requirements) section compares all three.
+A medium variant, `helm-scale-medium/`, reuses the scale-chart architecture (gunicorn workers, multi-replica Qdrant, Redis unlock cache) but dials the replica counts and per-container resources back so it can be tested as a drop-in replacement on a cluster sized for the base chart. The [Resource requirements](#resource-requirements) section compares all three.
 
 ## 1. Multiple API replicas + load balancing
 
@@ -13,10 +11,8 @@ so it can be tested as a drop-in replacement on a cluster sized for the base cha
 The Deployment runs 4 pods (vs 1 in the base chart). Traffic is distributed across them by:
 
 - A **ClusterIP Service** (`templates/service.yaml`) with `targetPort: http`, which kube-proxy load-balances round-robin.
-- An **Istio VirtualService** (`templates/virtualservice.yaml`) that routes external traffic from the `ezaf-gateway` to the `-api` service. It defines **three timeout tiers** so slow operations don't
-  tie up the gateway:
-  - Batch uploads / SSE streams (`/api/datasets/*/batch-*`):
-    `longTimeout: 3600s`
+- An **Istio VirtualService** (`templates/virtualservice.yaml`) that routes external traffic from the `ezaf-gateway` to the `-api` service. It defines **three timeout tiers** so slow operations don't tie up the gateway:
+  - Batch uploads / SSE streams (`/api/datasets/*/batch-*`): `longTimeout: 3600s`
   - MCP searches (`/mcp` prefix): `longTimeout: 3600s`
   - All other API routes: `timeout: 300s`
 
@@ -24,10 +20,8 @@ The Deployment runs 4 pods (vs 1 in the base chart). Traffic is distributed acro
 
 `templates/deployment.yaml` — gunicorn command
 
-Instead of a single `uvicorn` process, the scale chart runs **gunicorn with `UvicornWorker`** (`values.yaml` → `app.workers`). The large chart defaults to **4 replicas × 4 workers** (16 event loops):
-the shared embed-batcher singleton aggregates text queries cross-process (`RAG_EMBED_BATCH_URL`), so per-worker batch fragmentation no longer applies.  (The old "4 workers → ~8 req/s" result predates
-the singleton and does not reproduce: the same 4×4 shape measured 49.3 req/s @ N=100 and 72.8 req/s @ N=250 on v3.1.8, 100% success.)  Effective concurrency = `replicas × workers × syncPoolSize` = 4 ×
-4 × 64 = **1024 concurrent blocking operations** cluster-wide. Each worker process gets its own `sync_pool`, `httpx` connection pools, and Qdrant clients.
+Instead of a single `uvicorn` process, the scale chart runs **gunicorn with `UvicornWorker`** (`values.yaml` → `app.workers`). The large chart defaults to **4 replicas × 4 workers** (16 event loops): the shared embed-batcher singleton aggregates text queries cross-process (`RAG_EMBED_BATCH_URL`), so per-worker batch fragmentation no longer applies.  (The old "4 workers → ~8 req/s" result predates
+the singleton and does not reproduce: the same 4×4 shape measured 49.3 req/s @ N=100 and 72.8 req/s @ N=250 on v3.1.8, 100% success.)  Effective concurrency = `replicas × workers × syncPoolSize` = 4 × 4 × 64 = **1024 concurrent blocking operations** cluster-wide. Each worker process gets its own `sync_pool`, `httpx` connection pools, and Qdrant clients.
 
 ## 3. Multi-replica Qdrant cluster with sharding
 
@@ -36,31 +30,26 @@ the singleton and does not reproduce: the same 4×4 shape measured 49.3 req/s @ 
 This is the biggest architectural difference. The base chart runs a single Qdrant instance; the scale chart runs a **3-node Qdrant cluster**:
 
 - `QDRANT__CLUSTER__ENABLED=true` and `QDRANT__CLUSTER__P2P_PORT=6335` enable Qdrant's distributed consensus and peer-to-peer bootstrapping.
-- A **headless Service** (`clusterIP: None`, `templates/qdrant-service.yaml`) gives each Qdrant pod a stable DNS identity (`rag-mcp-server-qdrant-0`, `-1`, `-2`) — required for StatefulSet peer
-  discovery.
+- A **headless Service** (`clusterIP: None`, `templates/qdrant-service.yaml`) gives each Qdrant pod a stable DNS identity (`rag-mcp-server-qdrant-0`, `-1`, `-2`) — required for StatefulSet peer discovery.
 - The p2p port (6335) is exposed alongside gRPC (6334) and HTTP (6333) so nodes can coordinate.
 - Collections are **sharded** across the 3 nodes, so read load (every search hits Qdrant) is spread out.
 
 Each Qdrant replica gets its own PVC via `volumeClaimTemplates` with `ReadWriteOnce` (per-pod storage), and larger resources: `16Gi–32Gi` memory, `4–8` CPU (`values.yaml` → `resources.qdrant`).
 
-Because the per-replica Qdrant PVCs are **not** mounted on the API pod (in the base chart they are mounted read-only so `/api/admin/health` can report exact usage), the management page instead
-surfaces per-replica **shard placement** plus the configured per-replica size (`QDRANT_PVC_SIZE` = `persistence.qdrant.size`) from Qdrant's `/cluster` API. This gives a storage-spread estimate (which
+Because the per-replica Qdrant PVCs are **not** mounted on the API pod (in the base chart they are mounted read-only so `/api/admin/health` can report exact usage), the management page instead surfaces per-replica **shard placement** plus the configured per-replica size (`QDRANT_PVC_SIZE` = `persistence.qdrant.size`) from Qdrant's `/cluster` API. This gives a storage-spread estimate (which
 replicas hold how many shards × PVC size) without exec/kubectl. For exact bytes per replica use `kubectl exec <qdrant-N> -- df -h /qdrant/storage`.
 
 ## 4. Redis-backed cross-pod unlock cache
 
 `templates/redis.yaml` + `templates/configmap.yaml`
 
-In the base chart, password-unlocked datasets are cached **in-process memory** (`_UNLOCK_CACHE` dict in `api_server.py`). With 4 replicas × 4 workers = 16 separate processes, a user would have to
-re-enter their password whenever routed to a different pod/worker. The scale chart adds:
+In the base chart, password-unlocked datasets are cached **in-process memory** (`_UNLOCK_CACHE` dict in `api_server.py`). With 4 replicas × 4 workers = 16 separate processes, a user would have to re-enter their password whenever routed to a different pod/worker. The scale chart adds:
 
 - A **Redis Deployment + Service** (`templates/redis.yaml`) running `redis-server` in-memory (no persistence — unlock state is ephemeral).
-- `REDIS_URL` is injected into the ConfigMap, and the backend (`api_server.py`) lazily builds a Redis client. `_unlock_cache_get` / `_unlock_cache_set` use Redis with a TTL (in-app `UNLOCK_TTL`
-  default 1800 s — not chart-configurable) so a single unlock works across all pods.
+- `REDIS_URL` is injected into the ConfigMap, and the backend (`api_server.py`) lazily builds a Redis client. `_unlock_cache_get` / `_unlock_cache_set` use Redis with a TTL (in-app `UNLOCK_TTL` default 1800 s — not chart-configurable) so a single unlock works across all pods.
 - Falls back to in-memory dict if Redis is unavailable.
 
-Unlock identity is also derived from the authenticated user (oauth2-proxy headers: `X-Auth-Request-Email` / `X-Auth-Request-User`) rather than client IP, which is unreliable behind Istio/oauth2-proxy
-(many users may share one proxy IP).
+Unlock identity is also derived from the authenticated user (oauth2-proxy headers: `X-Auth-Request-Email` / `X-Auth-Request-User`) rather than client IP, which is unreliable behind Istio/oauth2-proxy (many users may share one proxy IP).
 
 ## 5. Deferred document-count sync (avoids write races)
 
@@ -71,8 +60,7 @@ In the base chart, every `get_dataset()` / `list_datasets()` call syncs the docu
 1. **Write races** — multiple pods writing `meta.json` concurrently on the NFS PVC.
 2. **Qdrant load** — every read triggers an extra Qdrant round-trip.
 
-The scale chart sets `RAG_DEFER_COUNT_SYNC=true`, which makes `list_datasets()` and `get_dataset()` skip the Qdrant count sync entirely (`dataset_manager.py`). Counts are only synced on explicit admin
-requests. This eliminates both the race and the extra Qdrant load.
+The scale chart sets `RAG_DEFER_COUNT_SYNC=true`, which makes `list_datasets()` and `get_dataset()` skip the Qdrant count sync entirely (`dataset_manager.py`). Counts are only synced on explicit admin requests. This eliminates both the race and the extra Qdrant load.
 
 ## 6. gRPC Qdrant client with hard timeout
 
@@ -107,15 +95,13 @@ Honored in `utils/pcai_model_classes.py`, which builds `httpx.Limits` for the as
 
 `templates/deployment.yaml` + `values.yaml` → `antiAffinity.enabled: true`
 
-A `preferredDuringSchedulingIgnoredDuringExecution` anti-affinity rule with weight 100 tells the scheduler to spread the 4 API pods across different nodes when possible. This means a node failure
-takes down at most one pod, and no single node becomes a CPU/memory hotspot for the RAG workload.
+A `preferredDuringSchedulingIgnoredDuringExecution` anti-affinity rule with weight 100 tells the scheduler to spread the 4 API pods across different nodes when possible. This means a node failure takes down at most one pod, and no single node becomes a CPU/memory hotspot for the RAG workload.
 
 ## 10. Shared file PVC (ReadWriteMany)
 
 `templates/pvc.yaml` + `values.yaml` → `persistence.data`
 
-All 4 API replicas mount the same file PVC (`/data`) as `ReadWriteMany` (NFS-backed via `gl4f-filesystem`). This means any pod can serve any uploaded file — there's no need to replicate files across
-pods. The PVC is also annotated with `helm.sh/resource-policy: keep` so it survives `helm uninstall`.
+All 4 API replicas mount the same file PVC (`/data`) as `ReadWriteMany` (NFS-backed via `gl4f-filesystem`). This means any pod can serve any uploaded file — there's no need to replicate files across pods. The PVC is also annotated with `helm.sh/resource-policy: keep` so it survives `helm uninstall`.
 
 ## Summary table
 
@@ -137,8 +123,7 @@ pods. The PVC is also annotated with `helm.sh/resource-policy: keep` so it survi
 
 ## Resource requirements
 
-The three charts share the same templates and component layout (API Deployment with `rag-api-server` + `rag-mcp-server` sidecar containers, Qdrant StatefulSet, optional Redis). They differ only in
-replica counts, per-container resource requests/limits, and PVC sizing — all driven by `values.yaml`.
+The three charts share the same templates and component layout (API Deployment with `rag-api-server` + `rag-mcp-server` sidecar containers, Qdrant StatefulSet, optional Redis). They differ only in replica counts, per-container resource requests/limits, and PVC sizing — all driven by `values.yaml`.
 
 ### Per-component breakdown
 
@@ -166,8 +151,7 @@ Each API pod runs **two** containers (`rag-api-server` + `rag-mcp-server`), so p
 | **Lim CPU** | 16.0 | 24.5 (+53 %) | 40.5 (+153 %) |
 | **PVC total** | 100 Gi | 100 Gi (+0 %) | 400 Gi (+300 %) |
 
-Percentages are relative to the base chart. The medium variant is tuned so that **total requests are ~50 % above the base chart** while **total PVC stays at 100 Gi** — the data PVC is unchanged at 50
-Gi (no resize needed on upgrade) and the two Qdrant PVCs are 25 Gi each (replacing the base chart's single 50 Gi Qdrant PVC).
+Percentages are relative to the base chart. The medium variant is tuned so that **total requests are ~50 % above the base chart** while **total PVC stays at 100 Gi** — the data PVC is unchanged at 50 Gi (no resize needed on upgrade) and the two Qdrant PVCs are 25 Gi each (replacing the base chart's single 50 Gi Qdrant PVC).
 
 ### PVC layout
 
@@ -177,16 +161,14 @@ Gi (no resize needed on upgrade) and the two Qdrant PVCs are 25 Gi each (replaci
 | Qdrant (RWO, per-replica) | 50 Gi × 1 | 25 Gi × 2 | 100 Gi × 3 |
 | **Total** | **100 Gi** | **100 Gi** | **400 Gi** |
 
-The data PVC is annotated `helm.sh/resource-policy: keep` in all three charts, so it survives `helm uninstall`. The Qdrant PVCs are created via the StatefulSet `volumeClaimTemplates` and are **not**
-kept on uninstall.
+The data PVC is annotated `helm.sh/resource-policy: keep` in all three charts, so it survives `helm uninstall`. The Qdrant PVCs are created via the StatefulSet `volumeClaimTemplates` and are **not** kept on uninstall.
 
 > **Upgrade caveat:** moving from `helm/` to either scale variant changes the Qdrant StatefulSet `volumeClaimTemplates` (access mode and/or size), which Kubernetes treats as immutable. The existing
 > Qdrant StatefulSet and its PVC must be deleted before `helm upgrade`; Qdrant vectors are lost and must be re-indexed. The data PVC is unaffected.
 
 ## Benchmarks
 
-On our SE G2 cluster, with the helm-scale-medium chart, I was able to achieve about 50 requests / second with top_k=10 retrieval from N=100 (emulated) concurrent users. This is up from around 10
-without dynamic batching on the base helm chart, or 4 in a very mutimodal dataset (pre-caching base descriptions).
+On our SE G2 cluster, with the helm-scale-medium chart, I was able to achieve about 50 requests / second with top_k=10 retrieval from N=100 (emulated) concurrent users. This is up from around 10 without dynamic batching on the base helm chart, or 4 in a very mutimodal dataset (pre-caching base descriptions).
 
 ```
 (base) andrew-bydlon@rag-throughput-0:~$ python3 benchmark.py   --mode mcp   --url http://rag-mcp-server-mcp.mm-rag-mcp.svc.cluster.local:9090/mcp   --api-url http://rag-mcp-server-api.mm-rag-mcp.svc.cluster.local   --dataset andrew-test-dataset   --N 100 --duration 120 --top-k 10   --call-timeout 60 

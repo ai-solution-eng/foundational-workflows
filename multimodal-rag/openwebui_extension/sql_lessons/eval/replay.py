@@ -6,8 +6,8 @@ against the agent, score each answer against its expected check, and print a
 before/after comparison. Run it once BEFORE seeding lessons (baseline) and
 again after N promoted lessons to see the delta.
 
-Each eval set is adapter-specific (the checks reference real tables/domain),
-so `--eval` points at an adapter's set. Two scoring modes:
+Each eval set is domain-specific (the checks reference real tables/domain),
+so `--eval` points at your domain's held-out set. Two scoring modes:
 
   --judge-llm    ask a judge LLM whether the answer satisfies the check
   --judge-manual print each answer for a human to grade
@@ -19,7 +19,7 @@ executor, only the questions are printed (dry planning mode).
 
 Usage:
   RAG_API_URL=... python3 replay.py \
-      --eval adapters/toromont/eval.jsonl \
+      --eval eval/<your-domain>-eval.jsonl \
       --executor "python3 run_agent.py --model X" \
       --judge-llm --llm-url https://vllm/v1 --llm-model deepseek-v4-flash \
       > eval/report-before.txt

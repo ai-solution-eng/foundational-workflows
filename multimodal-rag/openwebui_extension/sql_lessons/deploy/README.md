@@ -1,13 +1,11 @@
 # Deploy — SQL-lessons promotion gate (K8s CronJob)
 
-Runs `promote.py` on the target cluster on a schedule, so the loop's
-candidate→curated step happens without a human running it each time.
+Runs `promote.py` on the target cluster on a schedule, so the loop's candidate→curated step happens without a human running it each time.
 
 ## Files
 
 - `Dockerfile` — minimal image for `promote.py` (python:3.12-slim + httpx only).
-- `cronjob.yaml` — the `CronJob` that runs `--auto` promotion against your
-  Toromont RAG server and dataset names.
+- `cronjob.yaml` — the `CronJob` that runs `--auto` promotion against your RAG server and dataset names.
 
 ## Build & push the image (once)
 
@@ -29,8 +27,7 @@ docker push <registry>/sql-lessons-promote:0.1.0
 kubectl apply -f openwebui_extension/sql_lessons/deploy/cronjob.yaml -n <namespace>
 ```
 
-3. **First runs: review before auto.** Change the args to add `--dry-run`
-   and watch the log for a couple of runs:
+3. **First runs: review before auto.** Change the args to add `--dry-run` and watch the log for a couple of runs:
    ```bash
    kubectl get cronjob sql-lessons-promote -n <ns>
    kubectl logs job/<last-job> -n <ns> --tail=50
@@ -49,11 +46,7 @@ kubectl apply -f openwebui_extension/sql_lessons/deploy/cronjob.yaml -n <namespa
 
 ## Modes
 
-- `--auto` — promote any candidate that passes the positive-evidence shape and
-  the near-dup (semantic ≥ 0.90) check. Best default for cron.
-- `--llm-url/--llm-model` — add an LLM review step; requires a reachable
-  OpenAI-compatible endpoint and a token budget per run. Optional.
-- `--review` — interactive; **not** suitable for cron (blocks waiting for
-  input).
-- `--demote-stale` — demote lessons whose usage counters show repeated
-  failures; safe to leave off until counters are wired server-side.
+- `--auto` — promote any candidate that passes the positive-evidence shape and the near-dup (semantic ≥ 0.90) check. Best default for cron.
+- `--llm-url/--llm-model` — add an LLM review step; requires a reachable OpenAI-compatible endpoint and a token budget per run. Optional.
+- `--review` — interactive; **not** suitable for cron (blocks waiting for input).
+- `--demote-stale` — demote lessons whose usage counters show repeated failures; safe to leave off until counters are wired server-side.

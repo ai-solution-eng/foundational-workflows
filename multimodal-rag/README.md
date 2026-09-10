@@ -1,10 +1,8 @@
 # Multimodal RAG
 
-End-to-end multimodal retrieval-augmented generation: ingest documents in 17+ formats (text, PDF, images, video, audio, code, tables, office docs, and more), embed them into a joint multimodal vector
-space, and retrieve at query time with optional cross-encoder reranking — all exposed via a REST API, an HTML frontend, and an MCP server.
+End-to-end multimodal retrieval-augmented generation: ingest documents in 17+ formats (text, PDF, images, video, audio, code, tables, office docs, and more), embed them into a joint multimodal vector space, and retrieve at query time with optional cross-encoder reranking — all exposed via a REST API, an HTML frontend, and an MCP server.
 
-[Video Demonstration](https://storage.googleapis.com/ai-solution-engineering-videos/public/MultimodalRag.mkv) with chapters and subtitles. Highlights models, dataset ingestion, open webui integration,
-and the opencode longterm memory implementation.
+[Video Demonstration](https://storage.googleapis.com/ai-solution-engineering-videos/public/MultimodalRag.mkv) with chapters and subtitles. Highlights models, dataset ingestion, open webui integration, and the opencode longterm memory implementation.
 
 <div align="center"><img src="./documentation/rag_system_flow-1.png" width="700" alt="RAG system flow: dataset building (left) feeding a shared vector store, queried by query-time retrieval (right), with dynamic batching annotations throughout"></div>
 
@@ -13,11 +11,9 @@ and the opencode longterm memory implementation.
 ## Features
 
 - **Joint multimodal embedding** (text, image, video) via Qwen3-VL-Embedding-8B — search with any combination of modalities
-- **Dual-embedding "twins"** — PDFs get a text-only twin so text queries match; images/videos/audio get a caption twin (media + caption) so caption wording is searchable alongside the raw-media
-  embedding; unsupported media degrades to caption-only or is skipped
+- **Dual-embedding "twins"** — PDFs get a text-only twin so text queries match; images/videos/audio get a caption twin (media + caption) so caption wording is searchable alongside the raw-media embedding; unsupported media degrades to caption-only or is skipped
 - **Audio support** via ASR transcription (Cohere Transcribe) — audio is converted to text before embedding
-- **17+ file formats** with format-specific chunking: PDF (page-by-page + image extraction), images, video (overlapping segments), audio, text/markdown, JSON, XML, YAML, CSV/Excel, code (16
-  languages), HTML, Office docs, Jupyter notebooks, EPUB, log files, archives
+- **17+ file formats** with format-specific chunking: PDF (page-by-page + image extraction), images, video (overlapping segments), audio, text/markdown, JSON, XML, YAML, CSV/Excel, code (16 languages), HTML, Office docs, Jupyter notebooks, EPUB, log files, archives
 - **Cross-encoder reranking** via Qwen3-VL-Reranker-8B for improved precision at the cost of latency
 - **Modality conversion** — retrieved media the LLM doesn't support is auto-converted (images/video → VLM description, audio → ASR transcript)
 - **Dataset management** — password-protected datasets, per-dataset Qdrant collections, dedup (cosine ≥ 0.995), S3/HTTP URL ingestion
@@ -80,30 +76,18 @@ Both the API server and MCP server connect to the same Qdrant instance and share
 > editor (or via the PCAI API). Every `--set` in the upstream docs maps 1:1 to a key in `values.yaml`.
 
 To deploy on PCAI:
-1. Pick the chart variant you need and import it into PCAI. a. There are 3 variants: `helm/` (single replica), `helm-scale-medium/`,
-      `helm-scale-large/`.
-b. Scale variants use multiple API and Qdrant replicas to improve
-      throughput. Requests are still routed jointly (for text) to a single
-      request to improve performance.
-2. Set the model endpoints (deployed through MLIS) as `models.*` values: a. The embedder (`models.embedder.url`) is the only required endpoint. b. A VLM/ASR model is often recommended to give
-   images/videos or audios
-      (including video-embedded audio) respectively to the base LLM.
-c. A reranker can be helpful as well, but often the LLM will just call
-      `top_k` with sufficient performance. I have once seen it fail to
-      retrieve with only `top_k`; increase the value to 100 with reranking
-      and it succeeds.
-3. Recommended: generate a `security.mediaTokenSecret` value with `python -c "import secrets; print(secrets.token_hex(32))"` and set it in `values.yaml`. There is a default one in the charts, but it
-   is recommended to change it for security; it governs token generation for password protected datasets.
+1. Pick the chart variant you need and import it into PCAI. a. There are 3 variants: `helm/` (single replica), `helm-scale-medium/`, `helm-scale-large/`. b. Scale variants use multiple API and Qdrant replicas to improve throughput. Requests are still routed jointly (for text) to a single request to improve performance.
+2. Set the model endpoints (deployed through MLIS) as `models.*` values: a. The embedder (`models.embedder.url`) is the only required endpoint. b. A VLM/ASR model is often recommended to give images/videos or audios (including video-embedded audio) respectively to the base LLM. c. A reranker can be helpful as well, but often the LLM will just call `top_k` with sufficient performance. I have once
+   seen it fail to retrieve with only `top_k`; increase the value to 100 with reranking and it succeeds.
+3. Recommended: generate a `security.mediaTokenSecret` value with `python -c "import secrets; print(secrets.token_hex(32))"` and set it in `values.yaml`. There is a default one in the charts, but it is recommended to change it for security; it governs token generation for password protected datasets.
 
-The image does not bundle any ML models — it connects to remote model endpoints (embedder, reranker, VLM, ASR) configured at runtime via the chart's values. See `documentation/DEPLOYMENT.md` for
-details.
+The image does not bundle any ML models — it connects to remote model endpoints (embedder, reranker, VLM, ASR) configured at runtime via the chart's values. See `documentation/DEPLOYMENT.md` for details.
 
 ---
 
 ## Security hardening (opt-in)
 
-The core server is **unauthenticated by default** and is designed to sit behind an ingress auth proxy (Istio + oauth2-proxy). For additional, opt-in protection (per-process env vars, or first-class
-[Helm `security` values]), set any of the following:
+The core server is **unauthenticated by default** and is designed to sit behind an ingress auth proxy (Istio + oauth2-proxy). For additional, opt-in protection (per-process env vars, or first-class [Helm `security` values]), set any of the following:
 
 | Env var | Purpose | Default |
 |---|---|---|
@@ -125,8 +109,7 @@ The core server is **unauthenticated by default** and is designed to sit behind 
 | `RAG_EMBED_BATCH_URL` | Optional URL of a shared (cross-process) embedding query batcher: text-only queries are POSTed there instead of the per-process local batcher, so batch size is independent of worker/pod count. Falls back to local batching when unreachable. | unset (local batching) |
 | `MODEL_EMBED_MAX_CONCURRENCY` | Per-event-loop bound on concurrent multimodal embedding POSTs (one request per converted doc; concurrent ingests multiply this). `0` disables the bound. | 32 |
 
-Some defaults have deliberately shifted from permissive to strict since v1.9 (`MEDIA_TOKEN_SECRET` now required, private-host ingest blocking on, media path allowlist fail-closed). `helm/`,
-`helm-scale-large/` and `helm-scale-medium/` ship a `security:` values block wired to these flags. In PCAI you set them in `values.yaml` (the *Helm Values* editor):
+Some defaults have deliberately shifted from permissive to strict since v1.9 (`MEDIA_TOKEN_SECRET` now required, private-host ingest blocking on, media path allowlist fail-closed). `helm/`, `helm-scale-large/` and `helm-scale-medium/` ship a `security:` values block wired to these flags. In PCAI you set them in `values.yaml` (the *Helm Values* editor):
 
 ```yaml
 # values.yaml

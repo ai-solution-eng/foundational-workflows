@@ -30,8 +30,7 @@
 
 ## 1. Import the chart in PCAI and set the image
 
-The packaged charts ship with `ghcr.io/ai-solution-eng/multimodal-rag-mcp:v3.0.0` as the default `image.repository`/`image.tag` — no image build is required. If you need a custom build, the Dockerfile
-lives at `docker/Dockerfile` and expects the repo root as the build context; push the result to your registry and override the values:
+The packaged charts ship with `ghcr.io/ai-solution-eng/multimodal-rag-mcp:v3.0.0` as the default `image.repository`/`image.tag` — no image build is required. If you need a custom build, the Dockerfile lives at `docker/Dockerfile` and expects the repo root as the build context; push the result to your registry and override the values:
 
 ```yaml
 # values.yaml
@@ -134,8 +133,7 @@ resources:
 
 ## 3. Install / update in PCAI
 
-Import the packaged `rag-mcp-server` chart into PCAI, then set the values above (image, models + `modelSecrets`, `security.mediaTokenSecret`, persistence sizes, `ezua.*`) in the *Helm Values* editor
-and apply. Model URLs and API keys are required.
+Import the packaged `rag-mcp-server` chart into PCAI, then set the values above (image, models + `modelSecrets`, `security.mediaTokenSecret`, persistence sizes, `ezua.*`) in the *Helm Values* editor and apply. Model URLs and API keys are required.
 
 To change a setting later, edit the values in PCAI and apply again — that is the only "upgrade" path you need.
 
@@ -197,8 +195,7 @@ curl http://localhost:8000/api/datasets
 # → {"datasets": []}
 ```
 
-Pods and logs are visible from the PCAI workload view (\cmd{kubectl get pods -l app=rag-mcp-server} and \cmd{kubectl logs -l app=rag-mcp-server -c rag-api-server} work the same as ever for operators
-who have cluster access).
+Pods and logs are visible from the PCAI workload view (\cmd{kubectl get pods -l app=rag-mcp-server} and \cmd{kubectl logs -l app=rag-mcp-server -c rag-api-server} work the same as ever for operators who have cluster access).
 
 ---
 
@@ -282,8 +279,7 @@ When `ezua.enabled=true` (default), the chart also creates:
 
 - **VirtualService** — routes `rag-mcp-server.<domain>` through `istio-system/ezaf-gateway`
 - **AuthorizationPolicy** — enforces OAuth2 authentication at the Istio ingress gateway
-- **Kyverno ClusterPolicy** — auto-labels Pods/Deployments/Services in the release namespace with `hpe-ezua/type: vendor-service` and `hpe-ezua/app: rag-mcp-server` (required for the EZUA ingress to
-  discover the service)
+- **Kyverno ClusterPolicy** — auto-labels Pods/Deployments/Services in the release namespace with `hpe-ezua/type: vendor-service` and `hpe-ezua/app: rag-mcp-server` (required for the EZUA ingress to discover the service)
 
 ---
 

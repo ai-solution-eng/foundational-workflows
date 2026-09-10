@@ -41,7 +41,8 @@ export const inject = ['sessionQuery']
 // so the write must land before teardown rather than only on dispose.
 const DEFAULT_DEBOUNCE_MS = 5_000
 const POST_TIMEOUT_MS = 20_000
-const MAX_TOOL_OUTPUT_CHARS = 2000
+const DEFAULT_TOOL_OUTPUT_CHARS = 200
+const MAX_TOOL_ARGUMENTS_CHARS = 400
 const MAX_HISTORY_CHARS = 32_000
 
 interface MemoryServer {
@@ -66,6 +67,8 @@ export interface Config {
   passwordEnv?: string
   /** Quiet-window before writing, in ms (default 45000). */
   debounceMs?: number
+  /** Per-tool output preview bound in characters (default 200). */
+  toolOutputChars?: number
   /** `source` label stamped on written memories (default "dsh:memory"). */
   source?: string
   /** Set true to disable. */
@@ -76,15 +79,8 @@ export interface Config {
 
 function blockText(block: unknown): string {
   if (!block || typeof block !== 'object') return ''
-  const b = block as { type?: string; text?: unknown; name?: unknown; content?: unknown }
+  const b = block as { type?: string; text?: unknown }
   if (b.type === 'text' && typeof b.text === 'string') return b.text
-  if (b.type === 'tool_use' && typeof b.name === 'string') return `[tool: ${b.name}]`
-  if (b.type === 'tool_result' && b.content) {
-    const c = Array.isArray(b.content)
-      ? (b.content as { text?: string }[]).map((x) => (x && typeof x.text === 'string' ? x.text : '')).join(' ')
-      : String(b.content)
-    return c.slice(0, MAX_TOOL_OUTPUT_CHARS)
-  }
   return ''
 }
 
@@ -93,16 +89,100 @@ function messageText(message: { content?: unknown } | null | undefined): string 
   return (message.content as unknown[]).map(blockText).filter(Boolean).join('\n').trim()
 }
 
+/** One model-requested tool call, kept so its `tool/result` can name the call and its arguments. */
+interface RecordedToolCall {
+  name: string
+  /** Raw JSON argument string exactly as the model produced it. */
+  arguments: string
+}
+
+/** Record the tool calls one assistant message requested, keyed by the call id paired with each `tool/result`. */
+function recordToolCalls(message: { content?: unknown } | null | undefined, calls: Map<string, RecordedToolCall>): void {
+  if (!message || !Array.isArray(message.content)) return
+  for (const part of message.content as unknown[]) {
+    if (typeof part !== 'object' || part === null) continue
+    const b = part as { type?: unknown; id?: unknown; name?: unknown; arguments?: unknown }
+    if (b.type !== 'tool-call') continue
+    if (typeof b.id !== 'string' || typeof b.name !== 'string') continue
+    calls.set(b.id, { name: b.name, arguments: typeof b.arguments === 'string' ? b.arguments : '' })
+  }
+}
+
+/** Bounded plain-text payload of one tool-result block. */
+function toolResultText(block: { content?: unknown } | undefined, bound: number): string {
+  if (!block || !Array.isArray(block.content)) return ''
+  const texts: string[] = []
+  for (const part of block.content as unknown[]) {
+    if (typeof part !== 'object' || part === null) continue
+    const b = part as { type?: unknown; text?: unknown }
+    if (b.type === 'text' && typeof b.text === 'string') texts.push(b.text)
+  }
+  return texts.join('\n').slice(0, bound)
+}
+
+/**
+ * Render one `tool/result` event as a Tool section: the requested call with its
+ * raw arguments when the pairing assistant message is on the surface, then the
+ * preview-bounded result text. A result with neither a pairing call nor
+ * non-empty text renders nothing — an empty result carries no recall value.
+ */
+function toolResultSection(data: unknown, calls: ReadonlyMap<string, RecordedToolCall>, outputBound: number): string {
+  const d = (data ?? {}) as { message?: unknown; error?: { code?: unknown } | null }
+  const message = d.message as { content?: unknown } | undefined
+  const result = Array.isArray(message?.content)
+    ? (message.content as unknown[]).find(part => (part as { type?: unknown } | null)?.type === 'tool-result')
+    : undefined
+  const block = result as { toolCallId?: unknown; content?: unknown; isError?: unknown } | undefined
+  const callId = typeof block?.toolCallId === 'string' ? block.toolCallId : ''
+  const call = callId === '' ? undefined : calls.get(callId)
+  const failure = d.error ?? undefined
+  const code = typeof failure?.code === 'string' ? failure.code : ''
+  const failed = block?.isError === true || failure !== undefined
+  const parts: string[] = []
+  if (call) parts.push(`${call.name}(${call.arguments.slice(0, MAX_TOOL_ARGUMENTS_CHARS)})`)
+  const output = toolResultText(block, outputBound)
+  if (output !== '') parts.push(output)
+  if (parts.length === 0) return ''
+  const name = call ? call.name : 'unknown tool'
+  const heading = `### Tool — ${name}${failed ? ` (error${code === '' ? '' : `: ${code}`})` : ''}`
+  return `${heading}\n\n${parts.join('\n\n')}`
+}
+
 // ---- transcript builder -------------------------------------------------------
 
-export function buildSessionHistory(surface: SessionSurfaceSnapshot): string {
-  const events = surface.events ?? []
-  const sessionId = String(surface.session?.id ?? 'unknown')
-  const title = surface.session?.cwd ?? surface.session?.agentPreset ?? `Session ${sessionId.slice(0, 8)}`
-  const started = surface.session?.createdAt ? String(surface.session.createdAt) : ''
+/** Per-call rendering bounds for the memory document. */
+export interface HistoryBounds {
+  /** Per-tool output preview bound in characters (default 200). */
+  toolOutputChars?: number
+}
+
+/**
+ * Render a session's current surface as the `session_history` memory document.
+ *
+ * `### User` / `### Assistant` sections carry the messages' plain text. Each
+ * `tool/result` becomes a `### Tool — <name>` section holding the call line
+ * `name(rawArguments)` followed by the preview-bounded result text; the call
+ * comes from the `tool-call` block of the assistant message that requested it,
+ * correlated by call id. Failed results add `(error)` or `(error: <code>)` to
+ * the heading. A result with neither a pairing call nor non-empty text is
+ * omitted. A result whose call block was compacted off the surface renders as
+ * `unknown tool` with its result text only.
+ *
+ * @param surface - current model surface from `sessionQuery.readSurface`.
+ * @param bounds - rendering bounds; see {@link HistoryBounds}.
+ * @returns the markdown document, with body content truncated at {@link MAX_HISTORY_CHARS}.
+ */
+export function buildSessionHistory(surface: SessionSurfaceSnapshot, bounds: HistoryBounds = {}): string {
+  const outputBound = bounds.toolOutputChars ?? DEFAULT_TOOL_OUTPUT_CHARS
+  const events = surface.events
+  const sessionId = String(surface.session.id)
+  const title = surface.session.cwd ?? surface.session.agentPreset ?? `Session ${sessionId.slice(0, 8)}`
+  const started = surface.session.createdAt ? String(surface.session.createdAt) : ''
   const lines: string[] = [`# Session History — ${title}`, '', `- **session:** ${sessionId}`]
   if (started) lines.push(`- **started:** ${started}`)
   let total = lines.join('\n').length
+  /** Tool calls requested by assistant messages so far, keyed by call id. */
+  const calls = new Map<string, RecordedToolCall>()
 
   for (const ev of events) {
     const data = (ev as { data?: unknown }).data
@@ -116,15 +196,13 @@ export function buildSessionHistory(surface: SessionSurfaceSnapshot): string {
       }
       case 'assistant/message': {
         const msg = (data && (data as { message?: unknown }).message) ?? data
+        recordToolCalls(msg as { content?: unknown }, calls)
         const text = messageText(msg as { content?: unknown })
         if (text) block = `### Assistant\n\n${text}`
         break
       }
       case 'tool/result': {
-        const d = (data ?? {}) as { tool?: unknown; output?: unknown }
-        const tn = d.tool ? String((d.tool as { name?: string }).name ?? d.tool) : 'result'
-        const out = typeof d.output === 'string' ? d.output : JSON.stringify(d.output ?? '')
-        block = `### Tool — ${tn}\n\n${out.slice(0, MAX_TOOL_OUTPUT_CHARS)}`
+        block = toolResultSection(data, calls, outputBound)
         break
       }
       default:
@@ -179,6 +257,10 @@ export function apply(ctx: Context, config: Config): void {
   const dataset = process.env[config.datasetEnv ?? 'RAG_MEMORY_DATASET'] ?? ''
   const password = process.env[config.passwordEnv ?? 'RAG_MEMORY_PASSWORD'] ?? ''
   const debounceMs = config.debounceMs ?? DEFAULT_DEBOUNCE_MS
+  const toolOutputChars = config.toolOutputChars ?? DEFAULT_TOOL_OUTPUT_CHARS
+  if (!Number.isInteger(toolOutputChars) || toolOutputChars < 0) {
+    throw new Error(`session-memory-logger: toolOutputChars must be a non-negative integer, got ${String(config.toolOutputChars)}`)
+  }
 
   if (config.disabled || !config.url || !dataset || !password) {
     log.warn('disabled — need url + RAG_MEMORY_DATASET/PASSWORD in the dsh process env')
@@ -199,7 +281,7 @@ export function apply(ctx: Context, config: Config): void {
     transport = {
       async post(u, headers, body, ms) {
         const ctl = new AbortController()
-        const t = setTimeout(() => ctl.abort(), ms)
+        const t = setTimeout(() => { ctl.abort() }, ms)
         try {
           const r = await fetch(u, { method: 'POST', headers, body, signal: ctl.signal })
           return { ok: r.ok, body: await r.text() }
@@ -219,7 +301,7 @@ export function apply(ctx: Context, config: Config): void {
     const p = (async () => {
       try {
         const surface = await ctx.sessionQuery.readSurface(SessionId(sessionId))
-        const doc = buildSessionHistory(surface)
+        const doc = buildSessionHistory(surface, { toolOutputChars })
         if (!doc || doc.length < 20) return
         if (!transport) {
           log.warn('no fetch transport; skipping write')
@@ -240,7 +322,7 @@ export function apply(ctx: Context, config: Config): void {
     // Debounce: cancel any pending flush for this session, schedule a fresh one.
     const existing = timers.get(sessionId)
     if (existing !== undefined) clearTimeout(existing)
-    timers.set(sessionId, setTimeout(() => flush(sessionId), debounceMs))
+    timers.set(sessionId, setTimeout(() => { void flush(sessionId) }, debounceMs))
   }
 
   // CRITICAL: `session/event` and `session/disposed` are dispatched scoped to the
@@ -255,7 +337,7 @@ export function apply(ctx: Context, config: Config): void {
     scheduleFlush(sid)
   }, { global: true })
 
-  ctx.on('session/disposed', (session) => void flush(session.id), { global: true })
+  ctx.on('session/disposed', session => void flush(session.id), { global: true })
 
   // Async disposer: Cordis awaits the returned promise, so the final writes for
   // every active session are awaited on a clean stop.

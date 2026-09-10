@@ -21,12 +21,15 @@ tests/**/__pycache__/
 # Secrets / internal model defs with API keys
 src/multimodal_rag/utils/pcai_models.py
 
-# Local env
+# Local env / per-cluster deployment values — helm/local convention
+# (helm/local/README.md explains it; only README + example are trackable)
 .env
 *.local
 values-resolved.yaml
 .values*.yaml
-helm*/local/
+helm*/local/*
+!helm*/local/README.md
+!helm*/local/values.example.yaml
 
 # Editor
 .vscode/

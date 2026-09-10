@@ -1,18 +1,13 @@
 # DeepSeek Harness (DSH) × Multimodal RAG Memory — Integration
 
-This is the DSH counterpart of `documentation/opencode-memory/` (which ships the opencode
-glue). DSH connects to the **same** Multimodal RAG server and shares the same per-user
-memory datasets, so DSH and opencode recall each other's memories. The two DSH-native
-files here are:
+This is the DSH counterpart of `documentation/opencode-memory/` (which ships the opencode glue). DSH connects to the **same** Multimodal RAG server and shares the same per-user memory datasets, so DSH and opencode recall each other's memories. The two DSH-native files here are:
 
 | File | What it is |
 |---|---|
 | `README.md` (this file) | DSH integration design, verified state, recall/write policy, and install guide |
 | `plugins/session-memory-logger.ts` | DSH **host-plugin** template that auto-writes a structured `session_history` to the memory dataset, mirroring `opencode-memory/plugins/session-memory-logger.ts` |
 
-**Status:** Path 1 (manual RAG memory via MCP) is **already wired and verified working** in the
-DSH deployment. Path 2 (automatic session-history logging) is designed below and requires a DSH
-host plugin + rebuild/restart.
+**Status:** Path 1 (manual RAG memory via MCP) is **already wired and verified working** in the DSH deployment. Path 2 (automatic session-history logging) is designed below and requires a DSH host plugin + rebuild/restart.
 
 ---
 
@@ -47,7 +42,8 @@ redis (unlock cache across replicas)
 
 **Models** (all remote, no local GPU): embedder `Qwen3-VL-Embedding-8B` (4096-d, text/image/video), reranker `Qwen3-VL-Reranker-8B`, ASR `Cohere Transcribe`, VLM `Qwen3.8-27B-FP8`.
 
-**Security model (important):** the MCP server scopes the `X-Memory-Dataset` / `X-Dataset-Password` HTTP headers **only** to the `add_memory` / `search_memory` *memory* tools. The general dataset tools (`search_dataset`, `get_dataset_info`, …) **never** read those headers — they require an explicit `password` argument or a prior `unlock_dataset`. This is deliberate isolation, not a bug: a memory password can never silently unlock another dataset.
+**Security model (important):** the MCP server scopes the `X-Memory-Dataset` / `X-Dataset-Password` HTTP headers **only** to the `add_memory` / `search_memory` *memory* tools. The general dataset tools (`search_dataset`, `get_dataset_info`, …) **never** read those headers — they require an explicit `password` argument or a prior `unlock_dataset`. This is deliberate isolation, not a bug: a memory
+password can never silently unlock another dataset.
 
 **9 MCP tools:** `list_datasets`, `unlock_dataset`, `search_dataset`, `add_memory`, `search_memory`, `get_dataset_files`, `get_dataset_info`, `describe_media`, `transcribe_audio`.
 
@@ -79,7 +75,8 @@ redis (unlock cache across replicas)
 - MCP `tools/call add_memory` works over streamable-http directly (curl, doc count 51).
 - The env vars **are** present in the DSH host process (proven by `add_memory` authenticating via the header).
 
-> **Gotcha (why a first look suggested "password missing"):** `RAG_MEMORY_PASSWORD` never shows in a `bash` shell spawned by DSH. DSH scrubs `PASSWORD|KEY|SECRET|TOKEN`-matching env names from child processes (`packages/subprocess/subprocess/src/index.ts` → `SENSITIVE_ENV_PATTERN`), so it is hidden from the model's shell even though the host has it. **Do not conclude the password is missing** just because `env` in the sandbox doesn't show it.
+> **Gotcha (why a first look suggested "password missing"):** `RAG_MEMORY_PASSWORD` never shows in a `bash` shell spawned by DSH. DSH scrubs `PASSWORD|KEY|SECRET|TOKEN`-matching env names from child processes (`packages/subprocess/subprocess/src/index.ts` → `SENSITIVE_ENV_PATTERN`), so it is hidden from the model's shell even though the host has it. **Do not conclude the password is missing** just
+  because `env` in the sandbox doesn't show it.
 
 ---
 
@@ -131,26 +128,23 @@ So the auto-logger must be a **host-composition plugin** (a real package loaded 
 
 ### 5.2 Design (implemented & typechecked)
 
-Mirror `MultimodalRAG/documentation/opencode-memory/plugins/session-memory-logger.ts`
-(the canonical, buildable source is `plugins/session-memory-logger.ts` in this directory,
-which is a DSH host-package entry — `name`/`inject`/`Config`/`apply`):
+Mirror `MultimodalRAG/documentation/opencode-memory/plugins/session-memory-logger.ts` (the canonical, buildable source is `plugins/session-memory-logger.ts` in this directory, which is a DSH host-package entry — `name`/`inject`/`Config`/`apply`):
 
 1. **Trigger:** listen to `session/event` (cordis emit; verified delivered) for `user/message`, `assistant/message`, `assistant/chunk`, `tool/result`; mark the session active and (re)schedule a **debounced** flush (~45s after quiet). Also flush on `session/disposed`.
-2. **Reconstruct the transcript** from `sessionQuery.readSurface(SessionId(sessionId))` → `events` (ordered model surface). Emit a `kind: "session_history"` markdown document (`### User` / `### Assistant` / `### Tool — <name>` transcript) with a provenance header block.
+2. **Reconstruct the transcript** from `sessionQuery.readSurface(SessionId(sessionId))` → `events` (ordered model surface). Emit a `kind: "session_history"` markdown document (`### User` / `### Assistant` / `### Tool — <name>` transcript — each Tool section names the call with its raw arguments and a bounded output preview) with a provenance header block.
 3. **Persist** by POSTing the streamable-http MCP `tools/call add_memory` with `X-Memory-Dataset` / `X-Dataset-Password` headers from `process.env` — the same values the MCP client already uses. Uses host Node `fetch`; best-effort, bounded timeout, never blocks the session loop.
 4. **Dedup / liveness**: only write sessions seen in-process; rely on server-side dedup (cosine ≥ 0.995) and the server's in-place `session_history` replacement per `session_id`.
 
 **Implementation notes learned during the build (all now in the source):**
-- `logger` is a **builtin** on the Cordis Context — do **not** put it in `inject`. Declaring
-  `inject: ['sessionQuery', 'logger']` makes Cordis hold the plugin `pending (waiting for
-  service: logger)` forever, because no plugin ever *provides* a `logger` service. Use
-  `ctx.logger('name')` to get a named logger instead.
+- `logger` is a **builtin** on the Cordis Context — do **not** put it in `inject`. Declaring `inject: ['sessionQuery', 'logger']` makes Cordis hold the plugin `pending (waiting for service: logger)` forever, because no plugin ever *provides* a `logger` service. Use `ctx.logger('name')` to get a named logger instead.
 - The `session/event` `session` param is the full `Session` — read its `.id` (`SessionId`) directly, matching the `acp` package's pattern.
 - `readSurface` takes a branded `SessionId`, so wrap the raw string with `SessionId(sessionId)` (a value import from `@deepseek-ai/dsh-session`).
 - `SessionHeader` has **no `title`** — derive a title from `cwd` / `agentPreset` / a truncated session id.
 - The dynamic-plugin / cordis `ctx.timer` helper is *not* needed in a host plugin: use the global Node `setTimeout`/`clearTimeout` for debounce (typed by `@types/node`), tracking per-session handles and clearing them on unload.
-- **`session/event` and `session/disposed` are scope-filtered by default** — a root host plugin's plain `ctx.on(...)` never fires for them (Cordis only dispatches to listeners whose context is contained in the session's `Scoped<Session>` carrier). **Register both with `{ global: true }`** (the documented persistence-plugin pattern, e.g. `packages/core/session/src/invariant.ts`) to receive them regardless of scope. `session/created` also needs `{ global: true }`. Without this, the plugin silently writes nothing.
-- **Write while alive, not only on dispose.** A hard dsh restart can drop an in-flight async flush, so relying solely on `session/disposed` loses the write. Use a short debounce (`DEFAULT_DEBOUNCE_MS = 5s`) so a session's history lands **while the process is running**; the server replaces the prior `session_history` in place per `session_id`, so frequent writes are idempotent. Additionally, `flush` returns a `Promise` and the `ctx.effect` disposer is `async` and awaits all in-flight writes (`Promise.allSettled`) — Cordis awaits a promise returned by an effect disposer, so a clean `stop` persists the final state.
+- **`session/event` and `session/disposed` are scope-filtered by default** — a root host plugin's plain `ctx.on(...)` never fires for them (Cordis only dispatches to listeners whose context is contained in the session's `Scoped<Session>` carrier). **Register both with `{ global: true }`** (the documented persistence-plugin pattern, e.g. `packages/core/session/src/invariant.ts`) to receive them
+  regardless of scope. `session/created` also needs `{ global: true }`. Without this, the plugin silently writes nothing.
+- **Write while alive, not only on dispose.** A hard dsh restart can drop an in-flight async flush, so relying solely on `session/disposed` loses the write. Use a short debounce (`DEFAULT_DEBOUNCE_MS = 5s`) so a session's history lands **while the process is running**; the server replaces the prior `session_history` in place per `session_id`, so frequent writes are idempotent. Additionally,
+  `flush` returns a `Promise` and the `ctx.effect` disposer is `async` and awaits all in-flight writes (`Promise.allSettled`) — Cordis awaits a promise returned by an effect disposer, so a clean `stop` persists the final state.
 
 **Key verifications feeding this design (all done):**
 - `tools/call add_memory` over streamable-http works with the two headers (curl test → doc 49→51).
@@ -158,12 +152,12 @@ which is a DSH host-package entry — `name`/`inject`/`Config`/`apply`):
 - `sessionQuery.readSurface` returns `{ session, capturedThroughSeq, events }`.
 - `sessionQuery.readSurface` returns `{ session, capturedThroughSeq, events }`.
 - MCP endpoint URL: `https://rag-memory-server.<provider>/mcp`.
-- **End-to-end (2026-08-20, verified):** with the `{ global: true }` fix deployed, the live logger wrote a `session_history` for the active session (`session-e921de6d-…`), confirmed both by the plugin's `write ok=true` log and by `search_dataset` returning the session's live transcript in the logger's own format. Doc count held at 58 across re-writes — confirming in-place `session_id` replacement (overwrite, not duplicate).
+- **End-to-end (2026-08-20, verified):** with the `{ global: true }` fix deployed, the live logger wrote a `session_history` for the active session (`session-e921de6d-…`), confirmed both by the plugin's `write ok=true` log and by `search_dataset` returning the session's live transcript in the logger's own format. Doc count held at 58 across re-writes — confirming in-place `session_id` replacement
+  (overwrite, not duplicate).
 
 ### 5.3 Reference: the opencode plugin it mirrors
 
-Full template ships in the repo at:
-`/home/andrew/Code/HPE/MultimodalRAG/documentation/opencode-memory/plugins/session-memory-logger.ts`
+Full template ships in the repo at: `/home/andrew/Code/HPE/MultimodalRAG/documentation/opencode-memory/plugins/session-memory-logger.ts`
 
 Its POST shape (what the DSH host plugin replicates):
 ```
@@ -179,13 +173,9 @@ body: { "jsonrpc":"2.0","id":1,"method":"tools/call",
 
 ## 6. Installation (host plugin)
 
-The logger is a DSH **host package** (`@deepseek-ai/dsh-session-memory-logger`) at
-`packages/memory/session-memory-logger/`. Installing it requires write access to the harness
-checkout and a DSH rebuild + restart (cannot be done from inside a running session).
+The logger is a DSH **host package** (`@deepseek-ai/dsh-session-memory-logger`) at `packages/memory/session-memory-logger/`. Installing it requires write access to the harness checkout and a DSH rebuild + restart (cannot be done from inside a running session).
 
-The complete, ready-to-apply patch set lives in `~/Code/HPE/dsh-patch/` (a copy of the package
-skeleton + the host-composition row + `tsconfig.host.json` reference + this install guide in
-`dsh-patch/INSTALL.md`). The essential steps:
+The complete, ready-to-apply patch set lives in `~/Code/HPE/dsh-patch/` (a copy of the package skeleton + the host-composition row + `tsconfig.host.json` reference + this install guide in `dsh-patch/INSTALL.md`). The essential steps:
 
 1. **Copy the package** into the harness:
    ```bash
@@ -199,27 +189,21 @@ skeleton + the host-composition row + `tsconfig.host.json` reference + this inst
    ```json
    { "path": "./packages/memory/session-memory-logger" },
    ```
-   `tsc -b tsconfig.host.json` compiles packages through this **explicit** list; without it the
-   package's `lib/types/index.js` is never emitted and the tsdown pass fails.
+   `tsc -b tsconfig.host.json` compiles packages through this **explicit** list; without it the package's `lib/types/index.js` is never emitted and the tsdown pass fails.
 
 3. **Declare it in `apps/cli/package.json`** — add (alphabetically near the `dsh-session*` deps):
    ```json
    "@deepseek-ai/dsh-session-memory-logger": "workspace:^",
    ```
-   This makes pnpm link it into `apps/cli/node_modules`. (Note: the loader does **not** resolve
-   from `apps/cli` directly — that's what step 4 handles.)
+   This makes pnpm link it into `apps/cli/node_modules`. (Note: the loader does **not** resolve from `apps/cli` directly — that's what step 4 handles.)
 
-4. **Symlink it into the shared profile plugin pool** (the step that actually makes the loader
-   resolve it). The loader walks up from `~/.dsh/profiles/web/` and reads
-   `~/.dsh/profiles/node_modules/@deepseek-ai/`, which holds a symlink to every harness plugin.
-   A missing symlink here is what causes `Cannot find package ... imported from ~/.dsh/profiles/web/`:
+4. **Symlink it into the shared profile plugin pool** (the step that actually makes the loader resolve it). The loader walks up from `~/.dsh/profiles/web/` and reads `~/.dsh/profiles/node_modules/@deepseek-ai/`, which holds a symlink to every harness plugin. A missing symlink here is what causes `Cannot find package ... imported from ~/.dsh/profiles/web/`:
    ```bash
    ln -s /home/andrew/Projects/deepseek-harness/apps/cli/node_modules/@deepseek-ai/dsh-session-memory-logger \
          /home/andrew/.dsh/profiles/node_modules/@deepseek-ai/dsh-session-memory-logger
    ```
 
-5. **Add the host composition row** to `~/.dsh/profiles/web/cordis.patch.yml` (host plane — it
-   listens to host `session/event` and writes cross-session memory, so it must NOT go in a preset):
+5. **Add the host composition row** to `~/.dsh/profiles/web/cordis.patch.yml` (host plane — it listens to host `session/event` and writes cross-session memory, so it must NOT go in a preset):
    ```yaml
    - id: session-memory-logger
      name: '@deepseek-ai/dsh-session-memory-logger'
@@ -229,9 +213,7 @@ skeleton + the host-composition row + `tsconfig.host.json` reference + this inst
 
 6. **`pnpm install && pnpm build`**, then restart dsh.
 
-The package's `tsconfig.json` follows the same relative-depth convention as every
-`packages/<cat>/<name>` package: `../../../vendor/...` for vendor deps (3 levels up to root), and
-`../../core/session` / `../../session-query/session-query` for sibling packages (2 levels up to `packages/`).
+The package's `tsconfig.json` follows the same relative-depth convention as every `packages/<cat>/<name>` package: `../../../vendor/...` for vendor deps (3 levels up to root), and `../../core/session` / `../../session-query/session-query` for sibling packages (2 levels up to `packages/`).
 
 ---
 

@@ -110,16 +110,13 @@ array([[0.662, 0.96 , 0.007, 0.006, 0.008, 0.007, 0.015, 0.007, 0.041, 0.033, 0.
 
 ## Full RAG pipeline benchmarks
 
-The full E2E module is [hosted here](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/rag_system.py#L1043) with a test_script
-[here](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/tests/full_pipeline/run_pipeline.py).
+The full E2E module is [hosted here](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/rag_system.py#L1043) with a test_script [here](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/tests/full_pipeline/run_pipeline.py).
 
-Tested with local LLM pdfs, images, and a video of 2 people playing an old video game. Overall, the results were excellent. It could retrieve images when needed, including from within pdfs, as well as
-videos.
+Tested with local LLM pdfs, images, and a video of 2 people playing an old video game. Overall, the results were excellent. It could retrieve images when needed, including from within pdfs, as well as videos.
 
 The flow at query time:
 1. LLM determines if it needs a RAG call.
-2. Data is passed through an optional preprocessor component. This handles any missing modality, (in the current model case, specifically audio for transcribing videos and audio), and converts it to
-   text.
+2. Data is passed through an optional preprocessor component. This handles any missing modality, (in the current model case, specifically audio for transcribing videos and audio), and converts it to text.
 3. The query is embedded, and retrival occurs.
 4. An optional reranking occurs to improve performance and limit results.
 5. A post-processor is applied, for e.g. a VLM to convert images back to text for a text only LLM (such as deepseek v4).
@@ -249,14 +246,11 @@ Challenges encountered while setting up the base models for testing.
 
 ### Embeddings
 
-* For the [embedding client](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/utils/langchain_embed_override.py#L420), close matches between the
-  VLLM implementation highlighted on [huggingface](https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B#vllm-basic-usage-example). Cosine distance ~`1e-4`. This differs slightly from the output of the
+* For the [embedding client](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/utils/langchain_embed_override.py#L420), close matches between the VLLM implementation highlighted on [huggingface](https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B#vllm-basic-usage-example). Cosine distance ~`1e-4`. This differs slightly from the output of the
   [sentence-transformers demonstration](https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B#sentence-transformers) of the same page, but is reasonable.
-* The OpenAI Client with `client.embeddings.create` does not support calling with dictionaries, eliminating the possibility of image calls and also joint text-image calls. See
-  [here](https://github.com/openai/openai-python/blob/main/src/openai/resources/embeddings.py#L178).
-* The Langchain Embeddings class does not produce equivalent representations for Qwen3-VL-Embedding-8B as the local variants, even for simple text. There is a strange design decision to differ from
-  the OpenAI client defaults [that was fixed here](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/utils/pcai_models.py#L85) to match offline
-  text embedding results.
+* The OpenAI Client with `client.embeddings.create` does not support calling with dictionaries, eliminating the possibility of image calls and also joint text-image calls. See [here](https://github.com/openai/openai-python/blob/main/src/openai/resources/embeddings.py#L178).
+* The Langchain Embeddings class does not produce equivalent representations for Qwen3-VL-Embedding-8B as the local variants, even for simple text. There is a strange design decision to differ from the OpenAI client defaults [that was fixed here](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/utils/pcai_models.py#L85) to match offline text
+  embedding results.
 
 ### Comparisons of embeddings
 
@@ -266,8 +260,7 @@ Full tests show equivalence on local tests of base64 to http links, giving confi
 
 #### Embedding Model
 
-Near perfect reproduction of the offline and online versions of vllm. The full results [are
-here](https://github.com/ai-solution-eng/internal-projects/tree/main/multimodal-rag-project/tests/embeddings/comparison.txt).
+Near perfect reproduction of the offline and online versions of vllm. The full results [are here](https://github.com/ai-solution-eng/internal-projects/tree/main/multimodal-rag-project/tests/embeddings/comparison.txt).
 
 Highlights (showing ~5e-4 deltas between the online and offline reference implementations):
 ```
@@ -325,19 +318,14 @@ sentence_transformers Similarities:
 
 ### Reranker
 
-* [This tool](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/utils/langchain_embed_override.py#L509) was developed to serve as a reranker
-  wrapper for remote models.
-* The reference CrossEncoder implementation [highlighted here](https://huggingface.co/Qwen/Qwen3-VL-Reranker-8B#using-sentence-transformers) fails to load with the error `TypeError:
-  LogitScore.__init__() missing 1 required positional argument: 'true_token_id'`. You need to place a file @
-  `~/.cache/huggingface/hub/models--Qwen--Qwen3-VL-Reranker-8B/snapshots/b212dc8c91a8164aef1ea2de9c1a867611e75c04/1_CausalScoreHead/config.json` with contents `{"true_token_id": 9693,
-  "false_token_id": 2152}` to solve it. Then you get sensible results. Results agree with or without base64 encoding.
+* [This tool](https://github.com/ai-solution-eng/internal-projects/blob/main/multimodal-rag-project/src/multimodal_rag/utils/langchain_embed_override.py#L509) was developed to serve as a reranker wrapper for remote models.
+* The reference CrossEncoder implementation [highlighted here](https://huggingface.co/Qwen/Qwen3-VL-Reranker-8B#using-sentence-transformers) fails to load with the error `TypeError: LogitScore.__init__() missing 1 required positional argument: 'true_token_id'`. You need to place a file @
+  `~/.cache/huggingface/hub/models--Qwen--Qwen3-VL-Reranker-8B/snapshots/b212dc8c91a8164aef1ea2de9c1a867611e75c04/1_CausalScoreHead/config.json` with contents `{"true_token_id": 9693, "false_token_id": 2152}` to solve it. Then you get sensible results. Results agree with or without base64 encoding.
 * [The VLLM local implementation](https://huggingface.co/Qwen/Qwen3-VL-Reranker-8B#using-vllm) is thus used for testing, which deploys successfully. Results look very reasonable for reranking.
 
-The reranker puts cross-comparisons on a `[0,1]` scale of similarity. Test data: 18 samples (text, image, joint text-image of 6 reference internet samples). The full results [are
-here](https://github.com/ai-solution-eng/internal-projects/tree/main/multimodal-rag-project/tests/reranker/comparison.txt).
+The reranker puts cross-comparisons on a `[0,1]` scale of similarity. Test data: 18 samples (text, image, joint text-image of 6 reference internet samples). The full results [are here](https://github.com/ai-solution-eng/internal-projects/tree/main/multimodal-rag-project/tests/reranker/comparison.txt).
 
-Comparing the PCAI VLLM implementation used, reasonable ranking parity between all samples used. The values are sorted, so all indices on right side being True means the top results match across
-modalities.
+Comparing the PCAI VLLM implementation used, reasonable ranking parity between all samples used. The values are sorted, so all indices on right side being True means the top results match across modalities.
 
 ```
    text_image_scores

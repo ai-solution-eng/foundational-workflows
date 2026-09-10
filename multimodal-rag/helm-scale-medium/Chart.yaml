@@ -1,8 +1,25 @@
+# Multimodal RAG MCP server — Generation-2 scale variant: the scale-chart
+# architecture (gunicorn workers, multi-replica Qdrant, Redis unlock cache)
+# with a reduced resource footprint for drop-in testing on the current
+# PCAI (HPE Ezmeral Unified Analytics) cluster.
 apiVersion: v2
 name: rag-mcp-scale-medium
-description: Generation-2 scale variant - scale chart architecture (gunicorn workers, multi-replica Qdrant, Redis unlock cache) with a reduced resource footprint for drop-in testing on the current cluster
+description: >-
+  Generation-2 scale variant — scale-chart architecture (gunicorn workers,
+  multi-replica Qdrant, Redis unlock cache) with a reduced resource
+  footprint for drop-in testing on the current cluster.
 type: application
-version: 3.5.2
-appVersion: "3.5.2"
+version: 3.5.3
+appVersion: "3.5.3"
+keywords:
+  - rag
+  - multimodal
+  - qdrant
+  - mcp
+  - scale
+  - hpe
+  - pcai
+maintainers:
+  - name: HPE AI Solution Engineering
 sources:
   - https://github.com/ai-solution-eng/internal-projects/tree/main/multimodal-rag-project

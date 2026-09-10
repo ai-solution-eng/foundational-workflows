@@ -1,8 +1,23 @@
+# Multimodal RAG MCP server — full-scale variant: multi-replica app with
+# gunicorn workers, multi-replica Qdrant, and a Redis-backed unlock cache,
+# for larger PCAI (HPE Ezmeral Unified Analytics) clusters.
 apiVersion: v2
 name: rag-mcp-scale-large
-description: Scale-friendly multi-replica Multi-modal RAG (gunicorn workers, multi-replica Qdrant, Redis-backed unlock cache)
+description: >-
+  Scale-friendly multi-replica Multi-modal RAG (gunicorn workers,
+  multi-replica Qdrant, Redis-backed unlock cache) for larger clusters.
 type: application
-version: 3.5.2
-appVersion: "3.5.2"
+version: 3.5.3
+appVersion: "3.5.3"
+keywords:
+  - rag
+  - multimodal
+  - qdrant
+  - mcp
+  - scale
+  - hpe
+  - pcai
+maintainers:
+  - name: HPE AI Solution Engineering
 sources:
   - https://github.com/ai-solution-eng/internal-projects/tree/main/multimodal-rag-project

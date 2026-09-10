@@ -11,12 +11,12 @@ The default seed is the GENERIC core (`seed/sql-lessons-seed.jsonl` —
 domain-agnostic lessons: canonical-key identity, bounded queries, no free-text
 scans, default window, RAG-vs-SQL routing). Domain-specific lessons are
 layered on with `--adapter <name>`, which also seeds `adapters/<name>/<name>.jsonl`
-(e.g. `--adapter toromont` adds the Toromont governed-surface lessons).
+(e.g. `--adapter myco` adds the lessons in `adapters/myco/myco.jsonl`).
 
 Usage:
     RAG_API_URL=https://rag.example.com \
     [RAG_LESSONS_PASSWORD=secret] \
-    python seed_sql_lessons.py [--dataset sql-lessons] [--adapter toromont]
+    python seed_sql_lessons.py [--dataset sql-lessons] [--adapter <name>]
 
 Endpoints used (Multimodal RAG api_server.py):
     POST /api/datasets                       create a dataset
@@ -130,7 +130,7 @@ def main() -> int:
         "--adapter",
         action="append",
         default=None,
-        help="adapter directory name under adapters/ to also seed, e.g. --adapter toromont "
+        help="adapter directory name under adapters/ to also seed, e.g. --adapter myco "
         "(repeatable; seeds adapters/<name>/<name>.jsonl after the core)",
     )
     args = parser.parse_args()

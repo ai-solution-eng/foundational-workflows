@@ -9,16 +9,14 @@ How to connect any MCP-compatible client (opencode, Claude Desktop, Open WebUI, 
 
 ## 1. Server endpoint
 
-When `mcp.enabled=true` (default in the helm chart), the MCP server runs as a sidecar container in the same pod as the API server. Transport is **`streamable-http`** on port `9090` (default) at path
-`/mcp`.
+When `mcp.enabled=true` (default in the helm chart), the MCP server runs as a sidecar container in the same pod as the API server. Transport is **`streamable-http`** on port `9090` (default) at path `/mcp`.
 
 | Access method | URL |
 |---|---|
 | Via cluster ingress (production) | `https://rag-mcp-server.<your-domain>/mcp` |
 | Via `kubectl port-forward` (local) | `http://localhost:8001/mcp` (after `kubectl port-forward deployment/rag-mcp-server 8001:9090`) |
 
-The MCP container shares the `/data` PVC with the API server, so `file://` paths in staged uploads are directly readable by the MCP tools. See [DEPLOYMENT.md](DEPLOYMENT.md) § Architecture for the pod
-layout.
+The MCP container shares the `/data` PVC with the API server, so `file://` paths in staged uploads are directly readable by the MCP tools. See [DEPLOYMENT.md](DEPLOYMENT.md) § Architecture for the pod layout.
 
 > **`MEDIA_TOKEN_SECRET` is required.** The server refuses to start without it. Converted media URLs always carry a short-lived HMAC `?token=` (never the dataset password), which the API server verifies
 > when serving files.
@@ -145,15 +143,13 @@ opencode connects **twice** to the same URL, splitting memory tools from knowled
 }
 ```
 
-The full template is at [`opencode.jsonc`](opencode.jsonc). The agent policy (when to recall / write) is in [`AGENTS.md`](AGENTS.md). See [MEMORY.md](MEMORY.md) § 3 for the complete opencode setup
-guide.
+The full template is at [`opencode.jsonc`](opencode.jsonc). The agent policy (when to recall / write) is in [`AGENTS.md`](AGENTS.md). See [MEMORY.md](MEMORY.md) § 3 for the complete opencode setup guide.
 
 > **Verify after connecting:** run `opencode mcp list` — both `rag-memory` and `rag-knowledge` should appear. Confirm the prefixed tool names match the `tools` globs above.
 
 ### 3.3 Open WebUI
 
-OWUI does **not** use MCP for memory — the filter handles recall/write via the RAG REST API directly (see [MEMORY.md](MEMORY.md) § 4). To let OWUI search knowledge datasets via MCP, attach the MCP
-server to the model in **Admin Panel → Models → (your model) → Connections / Tools**.
+OWUI does **not** use MCP for memory — the filter handles recall/write via the RAG REST API directly (see [MEMORY.md](MEMORY.md) § 4). To let OWUI search knowledge datasets via MCP, attach the MCP server to the model in **Admin Panel → Models → (your model) → Connections / Tools**.
 
 ### 3.4 stdio transport (local development)
 
