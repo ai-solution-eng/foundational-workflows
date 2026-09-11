@@ -1,357 +1,173 @@
-# Owner: Andrew Bydlon
-# Email: andrew.bydlon@hpe.com
-# Prefer: Slack
-
-# Multimodal RAG MCP server — full-scale variant for PCAI (HPE Ezmeral
-# Unified Analytics): multiple API replicas + gunicorn workers, multi-replica
-# Qdrant, Redis-backed cross-pod unlock cache. See helm/ for the original
-# single-replica chart.
-#
-# 4 replicas x 4 workers is the benchmarked shape: with the shared
-# embed-batcher singleton, batching is cross-process, so process count no
-# longer fragments batches. v3.1.8 measurements (idle early-flush on):
-# 49.3 req/s @ N=100, 72.8 req/s @ N=250, 100% success in both.
-
-# -- Deployment -----------------------------------------------------------------
 replicaCount: 4
-
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v3.5.3
+  tag: v3.6.3
   pullPolicy: IfNotPresent
-
 deployment:
   name: rag-mcp-server
   appName: rag-mcp-server
-
-# -- App server tuning --------------------------------------------------------------
-# Run the API server under gunicorn with UvicornWorker so each pod runs
-# `workers` event loops (one per process). Each worker gets its own
-# `sync_pool`, so effective concurrency = replicaCount * workers *
-# syncPoolSize.
 app:
-  # 4 workers per pod is safe now that the shared embed-batcher singleton
-  # aggregates text queries cross-process (RAG_EMBED_BATCH_URL): per-worker
-  # batch fragmentation no longer applies. The old "4 workers → ~8 req/s"
-  # result predates the singleton and does not reproduce — the same 4x4
-  # shape measured 49.3 req/s @ N=100 and 72.8 req/s @ N=250 on v3.1.8.
   workers: 4
-  # Per-worker thread pool for blocking RAG work (embedding, Qdrant, file
-  # processing). Falls back to 12 if unset (matches the single-replica
-  # chart).
   syncPoolSize: 64
-  # MCP server sync tools are converted to async + offloaded to a thread
-  # pool of this size (per pod). Keep >= syncPoolSize to avoid starving.
   mcpPoolSize: 64
-  # Dynamic query batcher for concurrent text-only search embeddings.
-  # Collects queries arriving within the wait window and sends them as a
-  # single /v1/embeddings call (vLLM processes batched input in one forward
-  # pass). Larger window = bigger batches = fewer HTTP calls, at the cost
-  # of added latency per query.
   embeddingQueryBatchSize: 128
   embeddingQueryBatchWaitMs: 200
-  # Idle early-flush (v2, batch-guarded): when the queue stops growing and
-  # holds at most 2 items, flush it after this many ms instead of waiting
-  # the full window — interactive searches skip most of the wait while
-  # bursts still batch at full size. 0 disables. Benchmarked on v3.1.8:
-  # single-query mean 238ms (was ~370-550 with the full window), no load
-  # penalty at N=100 / N=250.
   embeddingQueryIdleWaitMs: 50
-  # Max images per embedding prompt (vLLM model limit, set in deployment args).
   embeddingMaxImagesPerPrompt: 4
-  # Dynamic Qdrant query batcher for concurrent similarity searches.
-  # Collects queries arriving within the wait window and sends them as a
-  # single query_batch_points gRPC call. Short window (5ms) since the
-  # embedding batcher already synchronises the burst.
   qdrantQueryBatchSize: 128
   qdrantQueryBatchWaitMs: 5
-  # Per-process thread pool for Qdrant I/O (searches, upserts, scrolls).
-  # Must comfortably exceed the concurrent searches a single process serves:
-  # at 250-concurrency / 4 replicas each process serves ~62 searches through
-  # this pool. The old code default (4) oversubscribed ~15x and was the
-  # bottleneck in sustained-saturation benchmarks.
   qdrantPoolSize: 16
-
-# -- Persistence ------------------------------------------------------------------------
 persistence:
   data:
     size: 100Gi
-    storageClass: "gl4f-filesystem"
+    storageClass: gl4f-filesystem
     accessMode: ReadWriteMany
   qdrant:
     size: 100Gi
-    storageClass: "gl4f-filesystem"
-    accessMode: ReadWriteOnce   # per-pod volume via volumeClaimTemplates
-    # Disabled in the scale chart: Qdrant runs as a sharded cluster with one
-    # PVC per replica, so there is no single PVC to mount on the API pods.
+    storageClass: gl4f-filesystem
+    accessMode: ReadWriteOnce
     mountReadOnly: false
-
-# -- Model configuration --------------------------------------------------------------------
-# Each model role has a URL (required to enable), an optional name (auto-
-# detected from the endpoint's /v1/models listing when omitted), an optional
-# className, and optional extra kwargs (serialised as JSON into the ConfigMap).
-# API keys are set separately via `modelSecrets` (Kubernetes Secret).
-# Set url to "" to disable a component.
 models:
   embedder:
-    name: "Qwen/Qwen3-VL-Embedding-8B"
-    url: ""
-    className: "MultiModalEmbeddings"
+    name: Qwen/Qwen3-VL-Embedding-8B
+    url: ''
+    className: MultiModalEmbeddings
     extra:
       embedding_dim: 4096
       chunk_size: 2048
       chunk_overlap: 256
       code_chunk_size: 8192
       code_chunk_overlap: 512
-      tokenizer_name: "Qwen/Qwen3-VL-Embedding-8B"
-      tokenizer_type: "HuggingFace"
+      tokenizer_name: Qwen/Qwen3-VL-Embedding-8B
+      tokenizer_type: HuggingFace
   reranker:
-    name: "Qwen/Qwen3-VL-Reranker-8B"
-    url: ""
-    className: "MultiModalReranker"
+    name: Qwen/Qwen3-VL-Reranker-8B
+    url: ''
+    className: MultiModalReranker
     extra: {}
   vlm:
-    name: "Qwen/Qwen3.8-27B-FP8"
-    url: ""
+    name: Qwen/Qwen3.8-27B-FP8
+    url: ''
     extra: {}
   asr:
-    name: "CohereLabs/cohere-transcribe-03-2026"
-    url: ""
+    name: CohereLabs/cohere-transcribe-03-2026
+    url: ''
     extra: {}
-
-# -- Model API keys (sensitive) ----------------------------------------------------------------
-# Stored in a Kubernetes Secret, not the ConfigMap. Provide via a values
-# overlay or an encrypted values file — never commit real keys.
 modelSecrets:
-  embedderApiKey: ""
-  rerankerApiKey: ""
-  vlmApiKey: ""
-  asrApiKey: ""
-
-# Per-process httpx connection pool limit for model endpoint clients.
-# Raised from the single-replica default of 30 so the embedder (on every
-# search's critical path) is not the bottleneck.
+  embedderApiKey: ''
+  rerankerApiKey: ''
+  vlmApiKey: ''
+  asrApiKey: ''
 modelPool:
   maxConnections: 200
   maxKeepaliveConnections: 50
-
-# -- S3 / MinIO ------------------------------------------------------------------------------------
-# Endpoint URL is stored in the ConfigMap (not sensitive); access keys are
-# stored in the Kubernetes Secret.
 s3:
-  endpointUrl: "http://minio.minio.svc.cluster.local:9000"
-  accessKeyId: ""
-  secretAccessKey: ""
-
-# -- RAG parameters -----------------------------------------------------------------------------------
+  endpointUrl: http://minio.minio.svc.cluster.local:9000
+  accessKeyId: ''
+  secretAccessKey: ''
 rag:
-  ocr: false           # OCR fallback for scanned PDF pages via tesseract (per-dataset API flag still overrides; costs nothing on text pages)
-  captionWithAsr: true  # Transcribe video audio tracks via ASR (auto-disables when no ASR model)
-  captionWithVlm: true  # VLM-describe images/videos at ingest (enables VLM-skip at retrieval; auto-disables if no VLM)
-  remote: false         # true = model URLs used as-is. false = URLs containing
-                        # ".serving." are rewritten to their in-cluster
-                        # .svc.cluster.local form; local endpoints verify TLS
-                        # with system CAs, remote ones need REMOTE_CA_BUNDLE
-                        # (else verification is off with a startup warning).
-  dedupThreshold: 0.995  # Cosine similarity above which a doc is considered a duplicate (0.0–1.0)
-  # When true, get_dataset() does NOT auto-sync document_count from Qdrant
-  # on every read. Counts are synced only on explicit admin requests. This
-  # avoids cross-replica meta.json write races and cuts Qdrant load.
+  ocr: false
+  captionWithAsr: true
+  captionWithVlm: true
+  remote: false
+  dedupThreshold: 0.995
   deferCountSync: true
-
-# -- Qdrant (multi-replica, built-in sharding for read scaling) --------------------------------------------
 qdrant:
   replicas: 3
   image:
     repository: qdrant/qdrant
-    tag: "v1.19.0"
+    tag: v1.19.0
     pullPolicy: IfNotPresent
   grpcPort: 6334
   httpPort: 6333
-  # Clients connect over gRPC (more efficient than HTTP at high QPS) with
-  # a hard timeout so a hung Qdrant cannot pin a sync_pool thread forever.
   client:
     preferGrpc: true
     timeout: 30
-    # Scalar quantization for new collections: "int8" (default, 4x memory
-    # reduction, ~1-2% recall loss, faster search) or "none" (full float32).
-    # Only affects newly created collections; existing ones keep their config.
     quantization: int8
-    # Pin quantized vectors in RAM for fast search (default true).
-    # Disable for very large datasets (2M+ points) to avoid OOM — quantized
-    # vectors will be read from disk per-search instead.
     quantizationAlwaysRam: true
-
-# -- Redis (cross-pod unlock cache) ---------------------------------------------------------------------------
-# When enabled, dataset unlock state is shared across API replicas so a user
-# only unlocks once. When disabled, each pod keeps its own in-memory cache
-# (a user may be prompted to re-unlock if routed to a different pod).
+  telemetryDisabled: true
 redis:
   enabled: true
   image:
     repository: redis
-    tag: "7-alpine"
+    tag: 7-alpine
     pullPolicy: IfNotPresent
   port: 6379
-  # Optional password for the Redis unlock cache (any random string, e.g.
-  # python -c "import secrets; print(secrets.token_urlsafe(24))"). Empty =
-  # unauthenticated (cluster-internal only). When set, redis-server requires
-  # auth and the API passes it from the Secret.
-  password: ""
-
-# -- MCP server (optional sidecar) ------------------------------------------------------------------------------
-# Runs alongside the API server and exposes the same retrieval pipeline
-# as MCP tools over SSE transport. Tools are async + thread-offloaded.
+  password: ''
 mcp:
   enabled: true
   port: 9090
-
-# -- Shared embedding query batcher --------------------------------------------------------------------------------
-# A singleton aggregator: every API/MCP pod POSTs text-only embedding queries
-# here, and this single process collects them into one /v1/embeddings call.
-# This makes batch size independent of the number of app processes, so app
-# scaling no longer degrades embedder throughput (with per-process batchers,
-# 4+ batchers split the batch pool and throughput collapses to ~5-8 r/s).
-# Disable to fall back to the per-process _QueryBatcher.
 embedBatcher:
   enabled: true
   port: 8002
-
-# -- Service configuration -------------------------------------------------------------------------------------------
 service:
   api:
     type: ClusterIP
     port: 80
   mcp:
     type: ClusterIP
-
-# -- Resources ----------------------------------------------------------------------------------------------------------
 resources:
   app:
     requests:
-      memory: "4Gi"
+      memory: 4Gi
       cpu: 2
     limits:
-      memory: "8Gi"
+      memory: 8Gi
       cpu: 4
   qdrant:
     requests:
-      memory: "16Gi"
-      cpu: "4"
+      memory: 16Gi
+      cpu: '4'
     limits:
-      memory: "32Gi"
-      cpu: "8"
+      memory: 32Gi
+      cpu: '8'
   redis:
     requests:
-      memory: "256Mi"
-      cpu: "100m"
+      memory: 256Mi
+      cpu: 100m
     limits:
-      memory: "512Mi"
-      cpu: "500m"
+      memory: 512Mi
+      cpu: 500m
   embedBatcher:
     requests:
-      memory: "512Mi"
+      memory: 512Mi
       cpu: 500m
     limits:
-      memory: "1Gi"
-      cpu: "2"
-
-# -- Pod anti-affinity (spread replicas across nodes) -----------------------------------------------------------------------
+      memory: 1Gi
+      cpu: '2'
 antiAffinity:
   enabled: true
-
-# -- Extra environment variables ----------------------------------------------------------------------------------------------
 extraEnv: {}
-
-# -- Security hardening ----------------------------------------------------------------------------------------------------------
-# `mediaTokenSecret` is REQUIRED: both the API and MCP containers refuse to
-# start without it (media URLs are served via short-lived HMAC tokens, never
-# a clear ?password=). The other guards default to their safe setting.
 security:
-  # REST API-key auth: when non-empty, every /api/* call must send
-  # X-RAG-Api-Key (or Authorization: Bearer). Exempt: health/readiness
-  # probes, the HTML pages (the served page embeds the key for its JS),
-  # dataset media serving (password/token protected), and staged media.
-  # The HTML UI and the Open WebUI filter (RAG_API_KEY valve) pick it up
-  # automatically; direct/scripted callers must send the header.
-  # NOTE: a chart-known default is readable by anyone with chart access —
-  # change it for real deployments (same tradeoff as mediaTokenSecret).
-  apiKey: "Zst_qoSr9RcPRI0G44CxsdXbN2_02UnG"
-  # REQUIRED. Generate with:
-  #   python -c "import secrets; print(secrets.token_hex(32))"
-  # Default one ships so first-time deploys work out of the box; CHANGE IT
-  # for any real deployment (it governs media-token generation for password
-  # protected datasets — a chart-known value is forgeable by chart readers).
-  mediaTokenSecret: "48b00cdf6d0979891ada5b3e51a5dd883ee752a5a1256b578c8271c30569944d"
-  # Media-token lifetime (seconds). Short = safer (leaked links expire
-  # sooner) but links embedded in old LLM replies stop working sooner.
+  apiKey: Zst_qoSr9RcPRI0G44CxsdXbN2_02UnG
+  mediaTokenSecret: 48b00cdf6d0979891ada5b3e51a5dd883ee752a5a1256b578c8271c30569944d
   mediaTokenTtl: 3600
-  # Comma-separated host allowlist for http(s) URL ingestion (and query-
-  # time media). ".example.com" matches subdomains. When SET it is
-  # authoritative: hosts not listed are rejected and listed hosts are
-  # allowed even when private (how in-cluster MinIO endpoints are
-  # permitted). Empty = policy falls back to blockPrivateHosts.
-  ingestAllowHosts: ""
-  # Reject http(s) URLs resolving to private/loopback/link-local/
-  # multicast/reserved addresses (SSRF guard) — checked at ingest AND at
-  # query-time media fetch (loopback stays allowed at query time so
-  # clients can pass the server's own media URLs back). Unresolved hosts
-  # are treated as private (fail-closed).
+  ingestAllowHosts: ''
   blockPrivateHosts: true
-  # Per-download cap in bytes (Content-Length pre-check + streamed
-  # abort). Applies to remote URL and S3 ingests.
   maxDownloadBytes: 536870912
-  # Archive-bomb guards: total unpacked bytes / per-member bytes / entry
-  # count (zip/tar/rar incl. nested archives; audited from headers before
-  # extraction and re-checked on the extracted bytes). 0 disables a check.
   archiveMaxTotalBytes: 2147483648
   archiveMaxMemberBytes: 1073741824
   archiveMaxEntries: 10000
-  # `:`-separated absolute-path allowlist for the MCP tools' file:// reads
-  # (describe_media / transcribe_audio / audio queries). Realpath-resolved,
-  # fail-closed when empty.
-  mediaAllowPathPrefixes: "/data/datasets:/data/staging"
-  # Password brute-force throttle: max failures per identity within the
-  # sliding window (seconds) before 429s. Identity = auth-proxy header
-  # when trustProxyIdentity else the socket peer. Per-process budget.
+  mediaAllowPathPrefixes: /data/datasets:/data/staging
   pwMaxFailures: 10
   pwFailWindow: 300
-  # Trust X-Auth-Request-*/X-Email/X-User identity headers for unlock-cache
-  # scoping and password-throttling. Keep true ONLY when an enforcing auth
-  # proxy (e.g. oauth2-proxy) overwrites these headers on every request.
   trustProxyIdentity: true
-
-# -- Metrics (optional) --------------------------------------------------------------------------------------------------------------
-# Prometheus exposition lives on the API container at /metrics (unauthenticated
-# like the health endpoints — intended for in-cluster scrapers; bound the
-# exposure with a NetworkPolicy / AuthorizationPolicy if the pod is broadly
-# reachable). Enable the ServiceMonitor when the cluster runs the Prometheus
-# Operator.
 metrics:
   serviceMonitor: false
-  interval: "30s"
-
-# -- Backups (optional) ------------------------------------------------------------------------------------------------------------------
-# Opt-in CronJob: exports every non-password-protected dataset via the
-# /export endpoint and uploads the .tar.gz to the S3/MinIO bucket below
-# (reuses the app image + the existing S3_* credentials). Protected
-# datasets are skipped — exports require the dataset password, which backups
-# deliberately do not hold.
+  interval: 30s
 backups:
   enabled: false
-  schedule: "0 3 * * *"
-  bucket: ""          # required when enabled, e.g. "mm-rag-backups"
-  retentionDays: 0    # prune exports older than N days (0 = keep forever)
-
-# -- PCAI (HPE Ezmeral Unified Analytics) integration ----------------------------------------------------------------------------------------
+  schedule: 0 3 * * *
+  bucket: ''
+  retentionDays: 0
 ezua:
   enabled: true
   virtualService:
-    endpoint: "rag-mcp-server.${DOMAIN_NAME}"
-    istioGateway: "istio-system/ezaf-gateway"
-    timeout: 300s          # Default for normal API calls (search, list, read)
-    longTimeout: 3600s     # For batch uploads, SSE streams, and MCP
+    endpoint: rag-mcp-server.${DOMAIN_NAME}
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 300s
+    longTimeout: 3600s
   authorizationPolicy:
     enabled: true
-    namespace: "istio-system"
-    providerName: "oauth2-proxy"
+    namespace: istio-system
+    providerName: oauth2-proxy

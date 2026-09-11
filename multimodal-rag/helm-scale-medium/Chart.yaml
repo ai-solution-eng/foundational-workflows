@@ -9,8 +9,8 @@ description: >-
   multi-replica Qdrant, Redis unlock cache) with a reduced resource
   footprint for drop-in testing on the current cluster.
 type: application
-version: 3.5.3
-appVersion: "3.5.3"
+version: 3.6.3
+appVersion: "3.6.3"
 keywords:
   - rag
   - multimodal

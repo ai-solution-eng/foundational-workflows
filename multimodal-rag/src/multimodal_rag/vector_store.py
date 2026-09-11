@@ -536,7 +536,16 @@ class QdrantVectorStore(VectorStore):
                         break
             capable = bool(sparse.get(bm25_lane.BM25_VECTOR_NAME)) and dense_name is not None
         except Exception as exc:
-            logger.debug("Hybrid capability probe failed for %s: %s", self.collection_name, exc)
+            # Transient failure (observed live: probes fired during the
+            # qdrant consensus outage of 2026-09-11 failed cluster-wide and
+            # healed minutes later).  A failed probe must NOT be cached —
+            # caching turned a 60-second outage into a permanent capability
+            # regression on every worker that probed during the window.
+            logger.warning(
+                "Hybrid capability probe failed for %s (will retry on the "
+                "next call): %s", self.collection_name, exc,
+            )
+            return False
         self._bm25_capable = capable
         self._dense_vector_name = dense_name
         self._bm25_probed_at = now
@@ -546,8 +555,63 @@ class QdrantVectorStore(VectorStore):
         """The dense lane using-target: the detected named vector on
         bm25-capable collections; else the store's configured name (None
         = unnamed default on legacy collections).
+
+        The trailing ``or "dense"`` is the v3.6.1 fix for the live failure
+        where BOTH terms resolved falsy (probe failed during an outage +
+        no configured name) and qdrant received ``using=""`` — failing every
+        batched dataset search with "Not existing vector name" (2026-09-11:
+        ~30 errors/10min while ALL collections were named-dense, so the
+        fallback is safe fleet-wide).
         """
-        return self._dense_vector_name or self.vector_name
+        return self._dense_vector_name or self.vector_name or "dense"
+
+    @staticmethod
+    def _embedding_scores_enabled() -> bool:
+        """Whether hybrid results should carry the true dense cosine.
+
+        Recomputed client-side from the dense vector the fusion response
+        carries back (``with_vector`` — Qdrant fetches vectors by id after
+        fusing, so this costs no extra query and no second HNSW traversal).
+        Disable via ``RAG_HYBRID_EMBEDDING_SCORES=0`` to skip the vector
+        transfer (very large k / very high-dimensional embedders).
+        """
+        return os.environ.get("RAG_HYBRID_EMBEDDING_SCORES", "1").strip().lower() not in ("0", "false", "no", "off")
+
+    def _stamp_dense_cosines(
+        self,
+        query_emb: list[float],
+        points: list[Any],
+        per_query: list[tuple[Document, float]],
+    ) -> None:
+        """Recompute the dense cosine client-side and stamp it on each doc.
+
+        The fusion response's points arrive in the same order as
+        ``per_query`` (both are built from the same response), so pairing is
+        positional — no point-id plumbing needed.  Best-effort: any shape or
+        numeric surprise (dimension drift, unexpected vector type, zero
+        vector) leaves the score unset and consumers show it as unknown.
+        """
+        q = np.asarray(query_emb, dtype=np.float32)
+        qnorm = float(np.linalg.norm(q))
+        if not np.isfinite(qnorm) or qnorm == 0.0:
+            return
+        dense_name = self._dense_using()
+        for pt, (doc, _fused) in zip(points, per_query):
+            vec = pt.vector
+            if isinstance(vec, dict):
+                vec = vec.get(dense_name)
+            if not isinstance(vec, (list, tuple)) or len(vec) != len(q):
+                continue
+            try:
+                v = np.asarray(vec, dtype=np.float32)
+            except (TypeError, ValueError):
+                continue
+            vnorm = float(np.linalg.norm(v))
+            if not np.isfinite(vnorm) or vnorm == 0.0:
+                continue
+            cos = float(np.dot(q, v) / (qnorm * vnorm))
+            if np.isfinite(cos):
+                doc.metadata["_embedding_score"] = round(cos, 4)
 
     def _bm25_stats(self) -> dict[str, Any] | None:
         """Fresh df stats for the query weighting, or ``None`` when unusable.
@@ -582,6 +646,7 @@ class QdrantVectorStore(VectorStore):
         stats = self._bm25_stats() if hybrid else None
         lightweight = _lightweight_payload_selector()
         out: list[tuple[Any, bool]] = []
+        want_dense_vectors = self._embedding_scores_enabled()
         for emb, k, need_media, filters, query_text in queries:
             flt = build_payload_filter(filters)
             with_payload: Any = True if need_media else lightweight
@@ -604,7 +669,11 @@ class QdrantVectorStore(VectorStore):
                             ],
                             limit=k,
                             with_payload=with_payload,
-                            with_vector=False,
+                            # Carrying the stored dense vectors back on the SAME
+                            # fusion response (fetched by id post-fusion) lets the
+                            # caller recompute the true dense cosine client-side —
+                            # no extra query, no second HNSW traversal.
+                            with_vector=[self._dense_using()] if want_dense_vectors else False,
                         ),
                         True,
                     )
@@ -709,7 +778,27 @@ class QdrantVectorStore(VectorStore):
         for _, is_hybrid in executed:
             SEARCH_HYBRID.labels(mode="hybrid" if is_hybrid else "dense").inc()
 
-        return _points_to_docs(responses)
+        results = _points_to_docs(responses)
+        # Annotate hybrid-lane results.  An RRF-fusion score is rank
+        # arithmetic (Σ 1/(rank+2) over the lanes) — NOT a cosine similarity —
+        # so every consumer that displays or thresholds these scores must be
+        # able to tell them apart ("_score_kind").  Dense-only results keep
+        # raw cosine and stay unstamped (consumers default to "cosine").
+        #
+        # When RAG_HYBRID_EMBEDDING_SCORES is on (default), the fusion request
+        # also carries back each point's stored dense vector, and the TRUE
+        # dense cosine is recomputed here against the query embedding we
+        # already hold — including for points the dense lane never ranked
+        # (sparse-only hits), which is exactly the score fusion hides.
+        want_vectors = self._embedding_scores_enabled()
+        for q_idx, ((_, is_hybrid), per_query) in enumerate(zip(executed, results)):
+            if not is_hybrid:
+                continue
+            for doc, _ in per_query:
+                doc.metadata["_score_kind"] = "rrf"
+            if want_vectors:
+                self._stamp_dense_cosines(queries[q_idx][0], responses[q_idx].points, per_query)
+        return results
 
     def _batcher(self) -> _QdrantBatcher:
         """Per-event-loop batcher (created lazily, one per running loop)."""

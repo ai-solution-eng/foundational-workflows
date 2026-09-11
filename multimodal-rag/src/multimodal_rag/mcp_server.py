@@ -1606,6 +1606,24 @@ def _format_retrieval_result(
     Returns a plain string instead in the degenerate case where no result
     carried any textual content (the historical behaviour).
     """
+    # -- Score-kind labels --
+    # ``scores[i]`` is the reranker relevance when a rerank ran, else the
+    # retrieval score — a true cosine on dense-only lanes, but RRF
+    # rank-fusion arithmetic (Σ 1/(rank+2) over the dense+BM25 lanes) on
+    # hybrid ones.  Label every result so consumers never read a rank
+    # score as a similarity.
+    kinds: list[str] = []
+    for doc in retrieved_docs:
+        if isinstance(doc, dict):
+            if "_reranker_score" in doc:
+                kinds.append("reranker")
+            elif doc.get("_score_kind") == "rrf":
+                kinds.append("rrf")
+            else:
+                kinds.append("cosine")
+        else:
+            kinds.append("cosine")
+
     # -- Format context for the LLM --
     context_parts: list[str] = []
     for i, doc in enumerate(postprocessed):
@@ -1629,22 +1647,36 @@ def _format_retrieval_result(
             text = str(doc)
 
         if text:
-            context_parts.append(f"[Result {i + 1}] (score: {scores[i]:.4f})\n{text}")
+            context_parts.append(f"[Result {i + 1}] ({kinds[i]} score: {scores[i]:.4f})\n{text}")
 
     if not context_parts:
         return "No textual content found in results."
 
     context = "\n\n".join(context_parts)
+    if "rrf" in kinds:
+        context = (
+            "(rrf scores are reciprocal-rank-fusion values over the dense + BM25 "
+            "lanes — rank-based, not similarity; trust the order, not the magnitude)\n\n"
+            + context
+        )
 
     # -- Also include raw results as JSON for clients that want structured data --
     raw_results: list[dict[str, Any]] = []
     for i, doc in enumerate(retrieved_docs):
-        entry: dict[str, Any] = {"score": scores[i]}
+        entry: dict[str, Any] = {"score": scores[i], "score_kind": kinds[i]}
         if isinstance(doc, str):
             entry["text"] = doc
         elif isinstance(doc, dict):
-            entry["embedding_score"] = doc.pop("_embedding_score", entry["score"])
+            # True embedder cosine only when the retrieval lane carried one;
+            # under hybrid RRF the pre-rerank score is rank arithmetic, so it
+            # travels as ``retrieval_score`` instead of posing as a cosine,
+            # and ``embedding_score`` is null rather than aliased to it.
+            entry["embedding_score"] = doc.pop("_embedding_score", None)
+            retrieval_score = doc.pop("_retrieval_score", None)
+            if retrieval_score is not None:
+                entry["retrieval_score"] = retrieval_score
             entry["reranker_score"] = doc.pop("_reranker_score", None)
+            doc.pop("_score_kind", None)
             # Surface tier-2 preprocessed_* media (PVC files) as the
             # primary image/video/audio keys so the LLM cites a
             # user-viewable version, not the tier-3 data URL stored
@@ -1994,8 +2026,9 @@ def _merge_federated_sections(
 
     # The context is grouped per dataset (stable, readable); the structured
     # results array is the ranking — score-ordered across datasets (score is
-    # the reranker score when the merged rerank ran, else the embedding
-    # score).  Stable sort: ties keep the dataset order.
+    # the reranker score when the merged rerank ran, else the retrieval
+    # score: cosine on dense-only lanes, RRF fusion on hybrid ones).  Stable
+    # sort: ties keep the dataset order.
     merged_results.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
 
     if not formatted:

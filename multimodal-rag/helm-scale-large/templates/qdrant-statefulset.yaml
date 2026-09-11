@@ -53,6 +53,12 @@ spec:
               value: "6335"
             - name: QDRANT__TELEMETRY__DETAIL_LEVEL
               value: "full"
+            {{- if .Values.qdrant.telemetryDisabled }}
+            # telemetry.qdrant.io is unreachable from in-cluster qdrant
+            # (no egress) — hourly ERROR spam otherwise (721 in 9 days).
+            - name: QDRANT__TELEMETRY_DISABLED
+              value: "true"
+            {{- end }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:

@@ -250,8 +250,11 @@ async def _arerank_with(
     # reranked[0] is a list of result dicts, e.g.
     # [{"index": 2, "relevance_score": 0.95, ...},
     #  {"index": 0, "relevance_score": 0.87, ...}]
-    # Map each index back to its reranker score, then attach
-    # both the embedding score and the reranker score to each doc.
+    # Map each index back to its reranker score, then attach the reranker
+    # score plus the score each doc arrived with — labelled honestly: on
+    # dense-only lanes the incoming score IS the embedder cosine
+    # (``_embedding_score``), but on hybrid RRF lanes it is rank-fusion
+    # arithmetic (``_retrieval_score``), never a cosine.
     score_by_idx: dict[int, float] = {}
     for r in reranked[0] if reranked else []:
         score_by_idx[r.get("index", -1)] = r.get("relevance_score", r.get("score", 0.0))
@@ -263,7 +266,10 @@ async def _arerank_with(
             # caller's dicts (e.g. the `documents=` path passes the
             # caller's own objects through here).
             d = dict(d)
-            d["_embedding_score"] = round(emb_score, 4)
+            if d.get("_score_kind") == "rrf":
+                d["_retrieval_score"] = round(emb_score, 4)
+            else:
+                d["_embedding_score"] = round(emb_score, 4)
             d["_reranker_score"] = round(rerank_score, 4)
         paired.append((d, rerank_score))
     paired.sort(key=lambda x: x[1], reverse=True)

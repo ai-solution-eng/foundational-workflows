@@ -3,6 +3,16 @@
 All notable changes to this project are tracked here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 
+## [3.6.3] — 2026-09-11
+
+### Fixed
+- **Hybrid search scores were mislabeled as embedding similarities** — the "why is every memory-recall score exactly 0.5?" bug. Text queries on bm25-capable collections run as Qdrant RRF-fusion requests whose score is rank arithmetic (`Σ 1/(rank+2)` per lane, K=2) — not a cosine similarity. The fused value passed through `_points_to_docs` verbatim and `_format_retrieval_result` printed it as `score: %.4f`; worse, with no reranker running it was **aliased into `embedding_score`** in the MCP result JSON, so callers read `embedding_score: 1.0` for a short query vs an 8k-token chunk (a structurally impossible cosine — that 1.0 is "#1 in both lanes") and `0.5` for a certain keyword hit that won exactly one lane and missed the other lane's top-k. That single-lane-win pattern is the modal outcome for memory/session-history stores, where the dense and BM25 lanes disagree at rank 1 almost every query (boilerplate-heavy near-duplicate chunks + rare-token queries are dense noise), which is why the same handful of discrete values (0.5 / 0.3333 / 0.25 / 0.6667 / 1.0) kept recurring. `_arerank_with` had the same defect: it stamped the pre-rerank score as `_embedding_score` on every path, so even reranked hybrid results reported the RRF value as the embedder cosine.
+
+### Added
+- **Honest score labeling across the retrieval surface**: every result now carries a `score_kind` (`rrf` | `cosine` | `reranker`) in both the formatted context (`[Result 1] (rrf score: 0.5000)`) and the JSON entries; hybrid responses additionally get an explanatory header ("rank-based, not similarity — trust the order, not the magnitude"). `embedding_score` is now `null` instead of an aliased fused score, and the pre-rerank value travels as `retrieval_score` when a rerank ran. The vector store stamps `_score_kind` on hybrid-lane results in `similarity_search_with_score_by_vector_batch` (dense-only results default to cosine); `_arerank_with` labels the incoming score truthfully per lane.
+- **True dense cosines for hybrid results at zero extra query cost**: Qdrant's fusion API cannot return per-lane scores (verified against qdrant-client 1.19.0 models and the hybrid-queries docs: `QueryRequest`/`Prefetch` expose no intermediate-score surface and `ScoredPoint` carries exactly one `score`) — but the fusion request itself can carry back each point's **stored dense vector** (`with_vector=["dense"]`; Qdrant fetches vectors by id after fusing). Hybrid requests now do exactly that, and the store recomputes the true dense cosine client-side against the query embedding it already holds — no second query, no second HNSW traversal — including for sparse-only hits the dense lane never ranked (exactly the score fusion hides). Kill-switch: `RAG_HYBRID_EMBEDDING_SCORES=0` skips the vector transfer. Covered by `test_hybrid_results_carry_true_dense_cosine`, which cross-checks the recomputed cosine against a direct dense-only search over the same stored vectors.
+
+
 ## [3.5.1] — 2026-09-03
 
 ### Security

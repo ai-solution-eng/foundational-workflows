@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "multimodal-rag"
+version = "3.6.3"
+description = "Multimodal RAG MCP server — ingestion, hybrid retrieval (dense + bm25), memory"
+requires-python = ">=3.12"
+# Dependency source of truth for the IMAGE is docker/requirements.txt (the
+# Dockerfile installs from it directly).  This list mirrors it so local
+# editable installs and test runs resolve the same environment.
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "gunicorn>=21.2.0",
+    "jinja2>=3.1.0",
+    "python-multipart>=0.0.9",
+    "aiofiles>=23.0.0",
+    "qdrant-client>=1.19.0,<2",
+    "openai",
+    "openai-agents>=0.20.0",
+    "mcp>=2.0.0",
+    "httpx>=0.27.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -545,6 +545,56 @@ def test_hybrid_query_returns_fused_results():
         rig.close()
 
 
+def test_hybrid_results_carry_true_dense_cosine():
+    """RRF-fused results must be labelled AND carry the true dense cosine.
+
+    Qdrant's fusion response cannot expose per-lane scores, but it can carry
+    the stored dense vectors back on the same request (with_vector) — the
+    store recomputes the cosine client-side, including for sparse-only hits
+    the dense lane never ranked (here: the lexical hit, since the stub
+    embedder's scores are uncorrelated noise).
+    """
+    rig = _HybridRig()
+    try:
+        _ingest(
+            rig,
+            [
+                {"text": "WebSocketHandler negotiate the handshake upgrade", "source": "/tmp/x/ws.py"},
+                {"text": "The calm sea at sunset with gentle waves", "source": "/tmp/x/sea.txt"},
+                {"text": "Quarterly revenue figures for the fiscal year", "source": "/tmp/x/rev.txt"},
+            ],
+        )
+        results = asyncio.run(rig.rag.aretrieve("WebSocketHandler", top_k=3))
+        assert results
+        for doc, _fused in results:
+            assert doc.get("_score_kind") == "rrf", "hybrid results must be labelled rrf"
+            cos = doc.get("_embedding_score")
+            assert isinstance(cos, float) and -1.0 <= cos <= 1.0
+
+        # The recomputed cosine must equal a direct dense-only search over the
+        # same stored vectors (deterministic stub embedder → same numbers up
+        # to float rounding).
+        dense_hits = asyncio.run(
+            rig.store.asimilarity_search_with_score_by_vector(rig.emb.model.embed_query("WebSocketHandler"), 10)
+        )
+        dense_by_text = {d.page_content: s for d, s in dense_hits}
+        matched = 0
+        for doc, _fused in results:
+            expected = dense_by_text.get(doc.get("text"))
+            if expected is not None:
+                matched += 1
+                assert abs(doc["_embedding_score"] - expected) < 1e-3
+        assert matched == len(results), "every fused hit must be cross-checked against the dense lane"
+
+        # The knob turns the vector transfer (and the stamp) off.
+        with _env(RAG_HYBRID_EMBEDDING_SCORES="0"):
+            off = asyncio.run(rig.rag.aretrieve("WebSocketHandler", top_k=3))
+        assert off and all(d.get("_score_kind") == "rrf" for d, _ in off)
+        assert all("_embedding_score" not in d for d, _ in off)
+    finally:
+        rig.close()
+
+
 def test_hybrid_query_counts_metric():
     if not metrics.AVAILABLE:
         return  # prometheus_client absent — counter is a no-op
