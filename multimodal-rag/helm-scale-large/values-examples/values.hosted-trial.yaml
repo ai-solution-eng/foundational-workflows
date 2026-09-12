@@ -1,0 +1,280 @@
+# =============================================================================
+# Multimodal RAG — HOSTED TRIAL values (sanitized) — scale-large chart.
+#
+# Variant: helm-scale-large/  (chart rag-mcp-scale-large: 4 API replicas x
+# 4 workers, 3-shard Qdrant, Redis unlock cache, shared embed-batcher).
+# Choose this variant for throughput deployments — many simultaneous
+# searches/ingests; the shared embed-batcher keeps embedding batch size
+# independent of process count (v3.1.8 benchmark: 49.3 req/s @ N=100,
+# 72.8 req/s @ N=250). For pilots / single-team use see helm/.
+#
+# Sanitized hosted-trial deployment for a CUSTOMER PCAI cluster:
+#   - ${DOMAIN_NAME} placeholder — PCAI substitutes it before rendering.
+#   - oauth2-proxy AuthorizationPolicy on (customer SSO at the gateway).
+#   - The chart installs a Kyverno vendor-label ClusterPolicy as a pre-install
+#     hook (add-vendor-app-labels-<release>-<chart>) that labels Pods,
+#     Deployments and Services with hpe-ezua/* — the customer admin may need
+#     to permit ClusterPolicy creation on locked-down clusters.
+#   - ALL credentials are fillers. This folder is hardlinked to the public
+#     delivery repo — never put real credentials here. Real per-site values
+#     live in helm-scale-large/local/ (gitignored + hardlink-ignored +
+#     never packaged).
+#
+# PCAI usage: import the packaged chart once, paste this whole file into the
+# release's Helm Values editor, adjust the '# SITE:' lines, apply.
+# Operators with cluster access may render-check first:
+#   helm template <release> helm-scale-large/ -f helm-scale-large/values-examples/values.hosted-trial.yaml
+# =============================================================================
+
+# -- Deployment -----------------------------------------------------------------
+replicaCount: 4
+
+image:
+  # Packaged with the chart — leave as-is unless you built your own image.
+  repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
+  tag: v3.6.3
+  pullPolicy: IfNotPresent
+
+deployment:
+  name: rag-mcp-server
+  appName: rag-mcp-server
+
+# -- App server tuning --------------------------------------------------------------
+# Each pod runs `workers` gunicorn event loops; effective concurrency =
+# replicaCount * workers * syncPoolSize. Query batching folds concurrent
+# text-only searches into single embedder calls.
+app:
+  workers: 4
+  syncPoolSize: 64
+  mcpPoolSize: 64
+  embeddingQueryBatchSize: 128
+  embeddingQueryBatchWaitMs: 200
+  # Idle early-flush (batch-guarded): a small stalled queue flushes after
+  # 50ms instead of the full window — interactive latency down ~4x, bursts
+  # never split.
+  embeddingQueryIdleWaitMs: 50
+  embeddingMaxImagesPerPrompt: 4
+  qdrantQueryBatchSize: 128
+  qdrantQueryBatchWaitMs: 5
+  qdrantPoolSize: 16
+
+# -- Persistence ------------------------------------------------------------------------
+persistence:
+  data:
+    # SITE: size to the corpus (RWX storage class required)
+    size: 100Gi
+    storageClass: gl4f-filesystem
+    accessMode: ReadWriteMany
+  qdrant:
+    # SITE: size to the corpus (one RWX PVC per Qdrant shard)
+    size: 100Gi
+    storageClass: gl4f-filesystem
+    accessMode: ReadWriteOnce
+    mountReadOnly: false
+
+# -- Model configuration --------------------------------------------------------------------
+# Point each role at the customer's model-serving (MLIS) endpoint; the
+# embedder is the only required one. Leave url "" to disable a role.
+models:
+  embedder:
+    name: Qwen/Qwen3-VL-Embedding-8B
+    # SITE: paste the site's embedder endpoint (only REQUIRED model)
+    url: ""
+    className: MultiModalEmbeddings
+    extra:
+      embedding_dim: 4096
+      chunk_size: 2048
+      chunk_overlap: 256
+      code_chunk_size: 8192
+      code_chunk_overlap: 512
+      tokenizer_name: Qwen/Qwen3-VL-Embedding-8B
+      tokenizer_type: HuggingFace
+  reranker:
+    name: Qwen/Qwen3-VL-Reranker-8B
+    # SITE: optional — precision at the cost of latency
+    url: ""
+    className: MultiModalReranker
+    extra: {}
+  vlm:
+    name: Qwen/Qwen3.8-27B-FP8
+    # SITE: optional — captions images/videos, converts them at query time
+    url: ""
+    extra: {}
+  asr:
+    name: CohereLabs/cohere-transcribe-03-2026
+    # SITE: optional — transcribes audio + video soundtracks
+    url: ""
+    extra: {}
+
+# -- Model API keys (sensitive — fillers here) -----------------------------------------
+# Rendered into the <name>-model-keys Secret (env MODEL_*_API_KEY).
+modelSecrets:
+  # SITE: paste the real API key for each endpoint you enabled
+  embedderApiKey: "<EMBEDDER_API_KEY>"
+  rerankerApiKey: "<RERANKER_API_KEY>"
+  vlmApiKey: "<VLM_API_KEY>"
+  asrApiKey: "<ASR_API_KEY>"
+
+# -- Model client pool ---------------------------------------------------------------------
+# Raised above the single-replica default so the embedder (on every search's
+# critical path) is not the bottleneck under concurrency.
+modelPool:
+  maxConnections: 200
+  maxKeepaliveConnections: 50
+
+# -- S3 / MinIO ----------------------------------------------------------------------------
+s3:
+  # SITE: point at the site's MinIO/S3 if batch-URL ingest or backups are used
+  endpointUrl: http://minio.minio.svc.cluster.local:9000
+  accessKeyId: ""
+  secretAccessKey: ""
+
+# -- RAG parameters ---------------------------------------------------------------------------
+rag:
+  ocr: false
+  captionWithAsr: true
+  captionWithVlm: true
+  # Keep false when the model endpoints are in-cluster (".serving." URLs are
+  # rewritten to their in-cluster .svc.cluster.local form). Set true only for
+  # endpoints outside the cluster.
+  remote: false
+  dedupThreshold: 0.995
+  # Multi-replica: do not auto-sync document counts from Qdrant on every read
+  # (avoids cross-replica meta.json write races).
+  deferCountSync: true
+
+# -- Qdrant (multi-replica, built-in sharding) -----------------------------------------------
+qdrant:
+  replicas: 3
+  image:
+    repository: qdrant/qdrant
+    tag: v1.19.0
+    pullPolicy: IfNotPresent
+  grpcPort: 6334
+  httpPort: 6333
+  # gRPC + hard timeout + int8 quantization for new collections.
+  client:
+    preferGrpc: true
+    timeout: 30
+    quantization: int8
+    quantizationAlwaysRam: true
+  telemetryDisabled: true
+
+# -- Redis (cross-pod unlock cache) ---------------------------------------------------------------
+# Shares dataset unlock state across API replicas so a user unlocks once.
+redis:
+  enabled: true
+  image:
+    repository: redis
+    tag: 7-alpine
+    pullPolicy: IfNotPresent
+  port: 6379
+  # SITE: optional — any random string (python -c "import secrets; print(secrets.token_urlsafe(24))")
+  password: ""
+
+# -- MCP server (sidecar) ---------------------------------------------------------------------------
+mcp:
+  enabled: true
+  port: 9090
+
+# -- Shared embedding query batcher (singleton) --------------------------------------------------------
+# Every API/MCP pod POSTs text-only embedding queries here, so batch size is
+# independent of the number of app processes — without it, per-process
+# batchers split the pool and throughput collapses.
+embedBatcher:
+  enabled: true
+  port: 8002
+
+# -- Service configuration -----------------------------------------------------------------------------
+service:
+  api:
+    type: ClusterIP
+    port: 80
+  mcp:
+    type: ClusterIP
+
+# -- Resources ---------------------------------------------------------------------------------------------
+# SITE: tune to the namespace quota
+resources:
+  app:
+    requests:
+      memory: 4Gi
+      cpu: 2
+    limits:
+      memory: 8Gi
+      cpu: 4
+  qdrant:
+    requests:
+      memory: 16Gi
+      cpu: '4'
+    limits:
+      memory: 32Gi
+      cpu: '8'
+  redis:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: 500m
+  embedBatcher:
+    requests:
+      memory: 512Mi
+      cpu: 500m
+    limits:
+      memory: 1Gi
+      cpu: '2'
+
+# -- Pod anti-affinity (spread replicas across nodes) ----------------------------------------------------------
+antiAffinity:
+  enabled: true
+
+extraEnv: {}
+
+# -- Security hardening ------------------------------------------------------------------------------------------
+# mediaTokenSecret is REQUIRED: both the API and MCP containers refuse to
+# start without it. Generate: python -c "import secrets; print(secrets.token_hex(32))"
+security:
+  # SITE: replace both fillers (the packaged chart defaults are chart-known
+  # and must not be used on a customer cluster)
+  apiKey: "<RAG_API_KEY>"
+  mediaTokenSecret: "<MEDIA_TOKEN_SECRET>"
+  mediaTokenTtl: 3600
+  ingestAllowHosts: ''
+  blockPrivateHosts: true
+  maxDownloadBytes: 536870912
+  archiveMaxTotalBytes: 2147483648
+  archiveMaxMemberBytes: 1073741824
+  archiveMaxEntries: 10000
+  mediaAllowPathPrefixes: /data/datasets:/data/staging
+  pwMaxFailures: 10
+  pwFailWindow: 300
+  # Keep true: behind oauth2-proxy the identity headers are authoritative.
+  trustProxyIdentity: true
+
+# -- Metrics (optional) -----------------------------------------------------------------------------------------------
+metrics:
+  serviceMonitor: false
+  interval: 30s
+
+# -- Backups (optional) ---------------------------------------------------------------------------------------------------
+backups:
+  enabled: false
+  schedule: 0 3 * * *
+  bucket: ''
+  retentionDays: 0
+
+# -- PCAI (HPE Ezmeral Unified Analytics) integration -----------------------------------------------------------------------
+ezua:
+  enabled: true
+  virtualService:
+    # SITE: ${DOMAIN_NAME} is substituted by PCAI; change only the host prefix
+    endpoint: rag-mcp-server.${DOMAIN_NAME}
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 300s
+    longTimeout: 3600s
+  authorizationPolicy:
+    # Enabled for hosted trials: customer SSO via oauth2-proxy at the gateway.
+    enabled: true
+    namespace: istio-system
+    providerName: oauth2-proxy

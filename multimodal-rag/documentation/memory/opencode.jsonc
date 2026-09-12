@@ -2,19 +2,22 @@
   "$schema": "https://opencode.ai/config.json",
 
   // This is a TEMPLATE — copy to your project root (or load via
-  // OPENCODE_CONFIG=documentation/opencode.jsonc) before running opencode.
-  // AGENTS.md is symlinked at the repo root → documentation/AGENTS.md, so
-  // opencode auto-loads it (no "instructions" field needed).
+  // OPENCODE_CONFIG=documentation/memory/opencode.jsonc) before running opencode.
+  // The agent recall/write policy lives in documentation/memory/opencode.md —
+  // point the "instructions" field at it (or copy it into
+  // ~/.config/opencode/AGENTS.md for memory across all projects).
 
   // ── Multimodal RAG MCP server ───────────────────────────────────────────
   // TWO connections to the SAME server, exposing DIFFERENT tool subsets:
-  //   • rag-memory    → personal long-term memory (add_memory / search_memory)
+  //   • rag-memory    → personal long-term memory (add_memory / search_memory
+  //                     / delete_memory / list_memories / forget_session)
   //   • rag-knowledge → general project/knowledge datasets (search_dataset, …)
   //
   // Per-user isolation comes from the memory dataset PASSWORD (resolved from
   // the X-Dataset-Password header / RAG_MEMORY_PASSWORD env var). The memory
   // dataset name comes from RAG_MEMORY_DATASET. The model itself never sees
-  // these — see documentation/AGENTS.md for when the model should recall / write memories.
+  // these — see documentation/memory/opencode.md for when the model should
+  // recall / write memories.
   //
   // REQUIRED env vars (export before launching opencode):
   //   RAG_MEMORY_DATASET   e.g. "andrew-memory"  (a password-protected dataset
@@ -36,7 +39,7 @@
       "headers": {
         // Keep while going through the oauth2-proxy ingress; drop for port-forward.
         "Authorization": "Bearer {env:RAG_INGRESS_TOKEN}",
-        // These two are read ONLY by add_memory / search_memory server-side,
+        // These two are read ONLY by the memory tools server-side,
         // so a memory password can never silently unlock another dataset.
         "X-Memory-Dataset": "{env:RAG_MEMORY_DATASET}",
         "X-Dataset-Password": "{env:RAG_MEMORY_PASSWORD}"
@@ -51,11 +54,12 @@
     }
   },
 
-  // Scope each connection to its intended tool subset. opencode prefixes MCP
-  // tools with the server name + "_" (verify the exact names with
-  // `opencode mcp list` after connecting, then adjust these patterns if needed).
+  // Scope each connection to its intended tool subset (13 tools exist on every
+  // connection; opencode prefixes MCP tools with the server name + "_"). Verify
+  // the exact names with `opencode mcp list` after connecting, then adjust.
   "tools": {
     "rag-memory_search_dataset": false,
+    "rag-memory_search_datasets": false,
     "rag-memory_list_datasets": false,
     "rag-memory_get_dataset_files": false,
     "rag-memory_get_dataset_info": false,
@@ -64,6 +68,9 @@
     "rag-memory_transcribe_audio": false,
 
     "rag-knowledge_add_memory": false,
-    "rag-knowledge_search_memory": false
+    "rag-knowledge_search_memory": false,
+    "rag-knowledge_delete_memory": false,
+    "rag-knowledge_list_memories": false,
+    "rag-knowledge_forget_session": false
   }
 }

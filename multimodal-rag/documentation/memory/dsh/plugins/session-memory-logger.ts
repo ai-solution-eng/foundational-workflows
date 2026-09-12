@@ -6,8 +6,8 @@
  * Multimodal RAG memory dataset as a `kind: "session_history"` memory, so future
  * DSH/opencode sessions can recall it with `search_memory`.
  *
- * Mirrors MultimodalRAG/documentation/opencode-memory/plugins/session-memory-logger.ts.
- * Design + verification notes: MultimodalRAG/documentation/dsh-memory/README.md
+ * Mirrors MultimodalRAG/documentation/memory/opencode/plugins/session-memory-logger.ts.
+ * Design + verification notes: MultimodalRAG/documentation/memory/dsh/README.md
  *
  * HOST-PLANE plugin (not a dynamic plugin): it needs the full Node globals
  * `process` (env) and `fetch` (network), which the dynamic-package sandbox blocks.

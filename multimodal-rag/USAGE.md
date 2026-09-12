@@ -1,6 +1,6 @@
 # Usage Guide
 
-How to use the HTML frontend and the Python programmatic API. For MCP tool access see [documentation/MCP.md](documentation/MCP.md); for deployment see [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md).
+How to use the HTML frontend and the Python programmatic API. For MCP tool access and the REST API reference see [documentation/FEATURES.md](documentation/FEATURES.md); for deployment see [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md).
 
 ---
 
