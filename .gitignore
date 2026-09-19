@@ -28,3 +28,6 @@ dist/
 .idea/
 .vscode/
 .DS_Store
+
+# Memory/DB backups contain private data + potential secrets — never commit.
+multimodal-rag/backups/

@@ -27,6 +27,7 @@ import os
 import sys
 import tarfile
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -55,16 +56,16 @@ def _make_dm(tmpdir: Path) -> tuple[DatasetManager, dict[str, Any]]:
 
     dm._invalidate_has_password = lambda name: None  # type: ignore[method-assign]
     dm.delete_dataset = lambda name: recorded["deleted"].append(name)  # type: ignore[method-assign]
-    dm.recreate_dataset = (  # type: ignore[method-assign]
-        lambda name, file_entries=None, progress_callback=None: (
-            recorded["recreated"].append(name),
-            {"status": "ok", "file_count": len(file_entries or []) or 2},
-        )[1]
-    )
 
-    def _add_documents(ds_name: str, docs: list[dict]) -> list[str]:
-        recorded["added"].append(list(docs))
-        return [f"id{i}" for i in range(len(docs))]
+    def _recreate_dataset(dataset_name: str, file_entries=None, progress_callback=None) -> dict[str, Any]:
+        recorded["recreated"].append(dataset_name)
+        return {"status": "ok", "file_count": len(file_entries or []) or 2}
+
+    dm.recreate_dataset = _recreate_dataset  # type: ignore[method-assign]
+
+    def _add_documents(dataset_name: str, documents: Sequence[str | dict[str, Any]]) -> list[str]:
+        recorded["added"].append(list(documents))
+        return [f"id{i}" for i in range(len(documents))]
 
     dm.add_documents = _add_documents  # type: ignore[method-assign]
     return dm, recorded
@@ -278,6 +279,8 @@ def test_import_restores_password():
 
 
 def test_import_empty_backup_raises():
+    """A nothing-restorable archive raises and leaves NOTHING behind — in
+    particular it must not delete the dataset it was asked to replace."""
     with tempfile.TemporaryDirectory() as td:
         dm, recorded = _make_dm(Path(td))
         tar = Path(td) / "backup.tar.gz"
@@ -287,7 +290,35 @@ def test_import_empty_backup_raises():
             raise AssertionError("expected ValueError for empty backup")
         except ValueError as exc:
             assert "nothing to restore" in str(exc)
-        assert recorded["deleted"] == ["ds1"], "half-made dataset is cleaned up"
+        assert recorded["deleted"] == [], "staging failure must not delete anything"
+        assert not (dm.datasets_path / "ds1").exists(), "no half-made dataset left behind"
+        assert not any(p.name.startswith(".ds1.importing") for p in dm.datasets_path.iterdir()), (
+            "staging dir is cleaned up"
+        )
+
+
+def test_import_bad_archive_overwrite_preserves_original():
+    """Regression (delete-then-fail ordering): an archive that turns out to be
+    unrestorable must NOT destroy the existing dataset it was meant to
+    replace — the swap only happens after the archive is fully staged."""
+    with tempfile.TemporaryDirectory() as td:
+        dm, recorded = _make_dm(Path(td))
+        original = dm.datasets_path / "ds1"
+        original.mkdir()
+        (original / "meta.json").write_text(json.dumps({"name": "ds1", "document_count": 5}))
+        (original / "files").mkdir()
+        (original / "files" / "precious.txt").write_bytes(b"keep me")
+
+        tar = Path(td) / "empty.tar.gz"
+        _build_export(tar, name="ds1", files={}, rows=[])
+        try:
+            dm.prepare_import(tar, overwrite=True)
+            raise AssertionError("expected ValueError for empty backup")
+        except ValueError:
+            pass
+        assert recorded["deleted"] == [], "original dataset must not be deleted on a staging failure"
+        assert (original / "files" / "precious.txt").read_bytes() == b"keep me"
+        assert json.loads((original / "meta.json").read_text())["document_count"] == 5
 
 
 if __name__ == "__main__":

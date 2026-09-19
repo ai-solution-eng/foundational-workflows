@@ -32,7 +32,7 @@ import json
 import logging
 from typing import Any
 
-import httpx
+import httpx2
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ async def recall_lessons(
     url = f"{api}/api/datasets/{dataset_name}/search"
     params = {"q": query[:500], "top_k": top_k}
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx2.AsyncClient(timeout=timeout) as client:
             resp = await client.get(url, params=params, headers=_auth_headers(password))
             resp.raise_for_status()
             results = resp.json().get("results", [])
@@ -162,7 +162,7 @@ async def store_candidate(
     api = rag_api_url.rstrip("/")
     url = f"{api}/api/datasets/{dataset_name}/documents"
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx2.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, json=[doc], headers=_auth_headers(password))
             resp.raise_for_status()
     except Exception:
@@ -203,7 +203,7 @@ async def distill_candidates(
         "temperature": 0.1,
     }
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx2.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             raw = resp.json()["choices"][0]["message"]["content"].strip()

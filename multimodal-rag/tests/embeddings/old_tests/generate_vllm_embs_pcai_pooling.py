@@ -2,7 +2,7 @@ import json
 from os.path import join as pj
 from pathlib import Path
 
-import httpx
+import httpx2
 import numpy as np
 from HPE.MultimodalRAG.tests.old_tests.shared_queries_and_documents_old import (
     all_inputs,
@@ -35,7 +35,7 @@ def get_emb(data):
         data["input"] = data.pop("prompt")
     assert "input" in data
 
-    response = httpx.post(
+    response = httpx2.post(
         qwen3_vl_8B.base_url[:-3] + "/pooling",
         json=data,
         headers={"Authorization": f"Bearer {qwen3_vl_8B.api_key}"},

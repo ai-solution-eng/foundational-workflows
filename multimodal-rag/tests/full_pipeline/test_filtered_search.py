@@ -79,9 +79,7 @@ def _client() -> QdrantClient:
         client.delete_collection(COLL)
     except Exception:
         pass
-    client.create_collection(
-        COLL, vectors_config=VectorParams(size=DIM, distance=Distance.COSINE)
-    )
+    client.create_collection(COLL, vectors_config=VectorParams(size=DIM, distance=Distance.COSINE))
     return client
 
 
@@ -89,7 +87,7 @@ def _dm_with(client: QdrantClient) -> DatasetManager:
     dm = DatasetManager.__new__(DatasetManager)
     vs = QdrantVectorStore(client, COLL, embedding=_StubEmbedder())
     rag = type("_RagStub", (), {"vector_store": vs})()
-    dm._get_rag = lambda ds, check_embedder=True: rag  # type: ignore[method-assign]
+    dm._get_rag = lambda dataset_name, check_embedder=True: rag  # type: ignore[method-assign]
     return dm
 
 
@@ -233,12 +231,8 @@ def test_store_filtered_search_all_axes():
 
     async def _run():
         out = {}
-        out["pdf"] = await vs.asimilarity_search_with_relevance_scores(
-            "q", 10, filters={"file_types": ["pdf"]}
-        )
-        out["err"] = await vs.asimilarity_search_with_relevance_scores(
-            "q", 10, filters={"severities": ["ERROR"]}
-        )
+        out["pdf"] = await vs.asimilarity_search_with_relevance_scores("q", 10, filters={"file_types": ["pdf"]})
+        out["err"] = await vs.asimilarity_search_with_relevance_scores("q", 10, filters={"severities": ["ERROR"]})
         out["logs"] = await vs.asimilarity_search_with_relevance_scores(
             "q", 10, filters={"source_prefix": "/data/datasets/ds/files/logs/"}
         )

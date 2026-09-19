@@ -35,7 +35,7 @@ def _png_bytes(color: tuple[int, int, int]) -> bytes:
     return buf.getvalue()
 
 
-def _build_pdf(path: Path, images: list[bytes], placements_per_image: int = 2) -> None:
+def _build_pdf(path: Path, images: list[tuple[int, int, int]], placements_per_image: int = 2) -> None:
     """One page placing each image *placements_per_image* times.
 
     Inserting the same stream repeatedly makes PyMuPDF list one

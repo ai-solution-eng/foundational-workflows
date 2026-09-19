@@ -77,7 +77,7 @@ persistence:
 # embedder is the only required one. Leave url "" to disable a role.
 models:
   embedder:
-    name: Qwen/Qwen3-VL-Embedding-8B
+    name: RamManavalan/Qwen3-VL-Embedding-8B-FP8
     # SITE: paste the site's embedder endpoint (only REQUIRED model)
     url: ""
     className: MultiModalEmbeddings
@@ -89,6 +89,10 @@ models:
       code_chunk_overlap: 512
       tokenizer_name: Qwen/Qwen3-VL-Embedding-8B
       tokenizer_type: HuggingFace
+      # Same-embedder alias for the dataset fingerprint guard: datasets indexed
+      # under this id keep working after the FP8 swap (vectors agree to >=0.95 cosine).
+      # Requires an image with alias support — v4.0.0 rejects unknown extra keys.
+      alias: Qwen/Qwen3-VL-Embedding-8B
   reranker:
     name: Qwen/Qwen3-VL-Reranker-8B
     # SITE: optional — precision at the cost of latency
@@ -174,6 +178,10 @@ redis:
 
 # -- MCP server (sidecar) ---------------------------------------------------------------------------
 mcp:
+  apiKey:
+    existingSecret: "mcp-fleet-apikeys"
+    existingSecretKey: "api-keys"
+
   enabled: true
   port: 9090
 
@@ -235,10 +243,18 @@ extraEnv: {}
 # mediaTokenSecret is REQUIRED: both the API and MCP containers refuse to
 # start without it. Generate: python -c "import secrets; print(secrets.token_hex(32))"
 security:
-  # SITE: replace both fillers (the packaged chart defaults are chart-known
-  # and must not be used on a customer cluster)
+  # SITE: the chart ships NO key material (hidden 2026-09, P0-7). Replace
+  # both fillers, leave '' to let the chart auto-generate per install, or
+  # point security.existingSecret at a Secret you manage. Rotation is
+  # OPTIONAL and operator-initiated — read helm/ROTATION.md first
+  # (repo path: MultimodalRAG/helm/ROTATION.md).
   apiKey: "<RAG_API_KEY>"
   mediaTokenSecret: "<MEDIA_TOKEN_SECRET>"
+  # Optional: Secret you manage providing both keys (key names in
+  # existingSecretApiKey / existingSecretMediaTokenKey).
+  existingSecret: ''
+  existingSecretApiKey: RAG_API_KEY
+  existingSecretMediaTokenKey: MEDIA_TOKEN_SECRET
   mediaTokenTtl: 3600
   ingestAllowHosts: ''
   blockPrivateHosts: true

@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import httpx
+import httpx2
 
 JUDGE_SYSTEM_PROMPT = (
     "You are grading an LLM SQL agent's answer against an expected check. "
@@ -94,7 +94,7 @@ def judge_llm(url: str, model: str, api_key: str, q: dict, answer: str) -> str:
     hdrs = {"Content-Type": "application/json"}
     if api_key:
         hdrs["Authorization"] = f"Bearer {api_key}"
-    r = httpx.post(f"{url.rstrip('/')}/chat/completions", json=payload, headers=hdrs, timeout=60.0)
+    r = httpx2.post(f"{url.rstrip('/')}/chat/completions", json=payload, headers=hdrs, timeout=60.0)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"].strip().upper()
 

@@ -263,20 +263,24 @@ def test_classify_file() -> None:
 
 
 # ---------------------------------------------------------------------------
-# DatasetManager integration test (requires embedding endpoint)
+# DatasetManager integration test (offline under pytest via conftest
+# fixtures; standalone --with-storage passes a live env-built embedder)
 # ---------------------------------------------------------------------------
 
 
-def test_dataset_manager_integration(base_path: str, nb_path: str, epub_path: str, log_path: str) -> None:
+def test_dataset_manager_integration(base_path: str, nb_path: str, epub_path: str, log_path: str, embedder) -> None:
     """Run files through DatasetManager.add_file().
 
     This exercises the full ingestion pipeline including file copying,
-    processor dispatch, and vector storage.  Requires a running embedding
-    endpoint (e.g. a Qwen3-VL service).
+    processor dispatch, and vector storage.  Under pytest the ``embedder``
+    fixture (tests/conftest.py) supplies the offline stub, so the whole
+    pipeline runs without any model endpoint; standalone (``--with-storage``)
+    passes a live env-built embedder instead (``main()`` below).
     """
     dm = DatasetManager(
         base_path=base_path,
         qdrant_host="",  # local in-memory Qdrant
+        embedder=embedder,
     )
     dataset_name = "test_new_modalities"
     try:
@@ -354,7 +358,14 @@ def main() -> None:
         make_sample_log(log_path)
 
         try:
-            test_dataset_manager_integration(base_dir, nb_path, epub_path, log_path)
+            # DatasetManager no longer builds models from the environment
+            # itself — pass the env-built embedder explicitly (raises with
+            # the constructor's own message when MODEL_EMBEDDER_URL is not
+            # configured).
+            from multimodal_rag.model_config import build_all
+
+            env_embedder, _, _, _ = build_all()
+            test_dataset_manager_integration(base_dir, nb_path, epub_path, log_path, embedder=env_embedder)
             print("\nDatasetManager integration test passed!")
         finally:
             shutil.rmtree(base_dir, ignore_errors=True)

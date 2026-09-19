@@ -32,7 +32,7 @@ import os
 import sys
 from pathlib import Path
 
-import httpx
+import httpx2
 
 CURATED = "sql-lessons"
 CANDIDATES = "sql-lessons-candidates"
@@ -66,13 +66,13 @@ def headers() -> dict[str, str]:
     return h
 
 
-def list_datasets(client: httpx.Client, api: str) -> set[str]:
+def list_datasets(client: httpx2.Client, api: str) -> set[str]:
     r = client.get(f"{api}/api/datasets")
     r.raise_for_status()
     return {d.get("name") for d in r.json().get("datasets", [])}
 
 
-def create_dataset(client: httpx.Client, api: str, name: str, desc: str) -> None:
+def create_dataset(client: httpx2.Client, api: str, name: str, desc: str) -> None:
     r = client.post(
         f"{api}/api/datasets",
         json={
@@ -92,7 +92,7 @@ def create_dataset(client: httpx.Client, api: str, name: str, desc: str) -> None
     print(f"  created dataset '{name}'")
 
 
-def upload_documents(client: httpx.Client, api: str, name: str, docs: list[dict]) -> None:
+def upload_documents(client: httpx2.Client, api: str, name: str, docs: list[dict]) -> None:
     r = client.post(f"{api}/api/datasets/{name}/documents", json=docs, headers=headers())
     r.raise_for_status()
     resp = r.json()
@@ -152,7 +152,7 @@ def main() -> int:
         docs.extend(extra)
         print(f"  + adapter '{adapter}': {len(extra)} lessons from {apath.name}")
 
-    with httpx.Client(timeout=60.0) as client:
+    with httpx2.Client(timeout=60.0) as client:
         existing = list_datasets(client, api)
         if curated not in existing:
             create_dataset(client, api, curated, CURATED_DESC)

@@ -211,7 +211,7 @@ def main() -> None:
         reranker=qwen3_vl_reranker_8B,
         vlm=gemma4_31B,
         asr=cohere_transcribe_3_2b,
-        caption_video=True,
+        caption_with_vlm=True,
         remote=True,
         vector_store={
             "qdrant_path": args.qdrant_path,

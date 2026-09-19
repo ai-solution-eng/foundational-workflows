@@ -35,7 +35,7 @@ import os
 import sys
 from typing import Any
 
-import httpx
+import httpx2
 
 CURATED = "sql-lessons"
 CANDIDATES = "sql-lessons-candidates"
@@ -73,7 +73,7 @@ def headers() -> dict[str, str]:
     return h
 
 
-def list_candidates(client: httpx.Client, api: str, dataset: str) -> list[dict[str, Any]]:
+def list_candidates(client: httpx2.Client, api: str, dataset: str) -> list[dict[str, Any]]:
     """Return [{id, text, kind, trigger, tables, tags, status, ...}]."""
     r = client.get(f"{api}/api/datasets/{dataset}/documents", params={"limit": 1000}, headers=headers())
     r.raise_for_status()
@@ -88,7 +88,7 @@ def list_candidates(client: httpx.Client, api: str, dataset: str) -> list[dict[s
     return out
 
 
-def upload_curated(client: httpx.Client, api: str, dataset: str, docs: list[dict[str, Any]]) -> int:
+def upload_curated(client: httpx2.Client, api: str, dataset: str, docs: list[dict[str, Any]]) -> int:
     if not docs:
         return 0
     r = client.post(f"{api}/api/datasets/{dataset}/documents", json=docs, headers=headers())
@@ -96,12 +96,12 @@ def upload_curated(client: httpx.Client, api: str, dataset: str, docs: list[dict
     return r.json().get("count", len(docs))
 
 
-def delete_candidate(client: httpx.Client, api: str, dataset: str, doc_id: str) -> None:
+def delete_candidate(client: httpx2.Client, api: str, dataset: str, doc_id: str) -> None:
     r = client.delete(f"{api}/api/datasets/{dataset}/documents/{doc_id}", headers=headers())
     r.raise_for_status()
 
 
-def search_curated(client: httpx.Client, api: str, dataset: str, text: str, top_k: int = 5) -> list[dict[str, Any]]:
+def search_curated(client: httpx2.Client, api: str, dataset: str, text: str, top_k: int = 5) -> list[dict[str, Any]]:
     r = client.get(
         f"{api}/api/datasets/{dataset}/search",
         params={"q": text[:500], "top_k": top_k},
@@ -111,7 +111,7 @@ def search_curated(client: httpx.Client, api: str, dataset: str, text: str, top_
     return r.json().get("results", [])
 
 
-def near_dup_score(client: httpx.Client, api: str, curated_ds: str, text: str) -> float:
+def near_dup_score(client: httpx2.Client, api: str, curated_ds: str, text: str) -> float:
     results = search_curated(client, api, curated_ds, text)
     if not results:
         return 0.0
@@ -142,7 +142,7 @@ def llm_review(
     if api_key:
         hdrs["Authorization"] = f"Bearer {api_key}"
     try:
-        r = httpx.post(
+        r = httpx2.post(
             f"{url.rstrip('/')}/chat/completions",
             json=payload,
             headers=hdrs,
@@ -170,7 +170,7 @@ def is_candidate_positive(candidate: dict[str, Any]) -> bool:
 
 
 def demote_stale(
-    client: httpx.Client,
+    client: httpx2.Client,
     api: str,
     dataset: str,
     min_hits: int = 3,
@@ -259,7 +259,7 @@ def main() -> int:
     curated_ds = args.curated_dataset.strip() or CURATED
     cand_ds = args.candidates_dataset.strip() or CANDIDATES
 
-    with httpx.Client(timeout=60.0) as client:
+    with httpx2.Client(timeout=60.0) as client:
         candidates = list_candidates(client, api, cand_ds)
         if not candidates:
             print("No candidates to promote.")

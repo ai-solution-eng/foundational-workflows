@@ -6,7 +6,7 @@ from os.path import join as pj
 from pathlib import Path
 from typing import Any
 
-import httpx
+import httpx2
 import numpy as np
 import openai
 from openai.types.create_embedding_response import CreateEmbeddingResponse
@@ -54,7 +54,7 @@ def _get_image_mime_type(file_path: str) -> str:
     return "image/jpeg"
 
 
-async def _fetch_image_async(url: str, http_client: httpx.AsyncClient) -> tuple[str, str]:
+async def _fetch_image_async(url: str, http_client: httpx2.AsyncClient) -> tuple[str, str]:
     """
     Fetch image and return (base64_data, mime_type).
     """
@@ -96,7 +96,7 @@ def _add_extras(requests: list[dict[str, Any]]):
 
 async def _convert_to_openai_client_friendly_parallel(
     inputs: list[dict[str, Any]],
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     convert_to_bytes: bool = True,
 ):
     """
@@ -187,7 +187,7 @@ async def get_all_embeddings(
 
 async def main():
     # Get async clients
-    async_http_client = httpx.AsyncClient()
+    async_http_client = httpx2.AsyncClient()
     async_client = qwen3_vl_8B.async_client
 
     # Convert inputs (async, parallel image fetching)

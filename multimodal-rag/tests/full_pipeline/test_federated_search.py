@@ -33,7 +33,7 @@ import hashlib
 import os
 import sys
 import uuid
-from typing import Any
+from typing import Any, cast
 
 # Ensure the source package shadows any installed version
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
@@ -44,6 +44,7 @@ from qdrant_client.models import Distance, PointStruct, VectorParams
 from multimodal_rag.api_server import _federated_rest_search
 from multimodal_rag.mcp_server import _afederated_search
 from multimodal_rag.rag_system import (
+    EmbeddingModel,
     MultimodalRAG,
     dedup_federated_results,
     federated_identity_key,
@@ -98,7 +99,9 @@ class _DatasetRig:
             pass
         self.client.create_collection(self.coll, vectors_config=VectorParams(size=DIM, distance=Distance.COSINE))
         self.store = QdrantVectorStore(self.client, self.coll, embedding=_StubEmbedder())
-        self.rag = MultimodalRAG(embedder=_StubEmbedder(), vector_store=self.store, preprocess=False)
+        self.rag = MultimodalRAG(
+            embedder=cast("EmbeddingModel", _StubEmbedder()), vector_store=self.store, preprocess=False
+        )
         self.calls: list[dict[str, Any]] = []
 
         original = self.rag.aretrieve
@@ -107,7 +110,7 @@ class _DatasetRig:
             self.calls.append({"query": query, **kwargs})
             return await original(query, **kwargs)
 
-        self.rag.aretrieve = _spy  # type: ignore[method-assign]
+        self.rag.aretrieve = _spy  # type: ignore[assignment]
         self._upsert(docs)
 
     def _upsert(self, docs: list[dict[str, Any]]) -> None:

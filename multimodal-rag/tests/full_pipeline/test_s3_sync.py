@@ -98,9 +98,9 @@ def _dm_with(client) -> tuple[DatasetManager, dict[str, Any]]:
     dm = DatasetManager.__new__(DatasetManager)
     vs = QdrantVectorStore(client, COLL, embedding=None)
     rag = type("_RagStub", (), {"vector_store": vs})()
-    dm._get_rag = lambda ds, check_embedder=True: rag  # type: ignore[method-assign]
+    dm._get_rag = lambda dataset_name, check_embedder=True: rag  # type: ignore[method-assign]
     recorded: dict[str, Any] = {"decrements": [], "ingested": [], "force": None}
-    dm._decrement_count = lambda ds, n: recorded["decrements"].append(n)  # type: ignore[method-assign]
+    dm._decrement_count = lambda name, n, file_type=None: recorded["decrements"].append(n)  # type: ignore[method-assign]
 
     def _add_files_batch(ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None):
         recorded["ingested"].append([name for _, name in file_entries])

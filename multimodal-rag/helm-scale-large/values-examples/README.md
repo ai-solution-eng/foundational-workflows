@@ -5,6 +5,13 @@ mirrored by the hardlinker into the public delivery repo (GitHub), so it must st
 **intentionally secret-free**: no tokens, no platform JWTs, no real API keys. Credentials
 are always role-named `<PLACEHOLDER>` values (see *Placeholder convention* below).
 
+**Secrets mechanism (2026-09, P0-7):** the chart ships NO key material — `security.apiKey`
+and `security.mediaTokenSecret` are sourced from the release Secret (auto-generated per
+install, reused on upgrade) or from a Secret you own via `security.existingSecret`.
+Rotation is OPTIONAL and operator-initiated; the runbook (every former location, the
+replacement recipes, the "old keys stop working" warning) is
+`MultimodalRAG/helm/ROTATION.md`.
+
 ## Placeholder convention
 
 Every value **you** must replace is wrapped in angle brackets and named for

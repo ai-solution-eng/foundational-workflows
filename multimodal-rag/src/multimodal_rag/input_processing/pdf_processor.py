@@ -838,11 +838,7 @@ class PDFProcessor:
             if not table_regions or not bbox:
                 return False
             cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-            return any(
-                tx0 <= cx <= tx1 and ty0 <= cy <= ty1
-                for (tx0, ty0, tx1, ty1), _ in table_regions
-            )
-
+            return any(tx0 <= cx <= tx1 and ty0 <= cy <= ty1 for (tx0, ty0, tx1, ty1), _ in table_regions)
 
         # Extract all images on this page first
         image_regions: list[dict[str, Any]] = []
@@ -934,11 +930,7 @@ class PDFProcessor:
                 # (dict-block x region) bbox match would append its own doc
                 # and fan out combinatorially.  One doc per distinct image.
                 for ir in image_regions:
-                    if (
-                        ir["bbox"]
-                        and _bbox_close(ir["bbox"], bbox)
-                        and ir["data_url"] not in matched_urls
-                    ):
+                    if ir["bbox"] and _bbox_close(ir["bbox"], bbox) and ir["data_url"] not in matched_urls:
                         matched_urls.add(ir["data_url"])
                         blocks.append(
                             {

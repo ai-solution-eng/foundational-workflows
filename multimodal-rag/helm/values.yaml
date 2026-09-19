@@ -1,7 +1,7 @@
 replicaCount: 1
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v3.6.3
+  tag: v4.0.4
   pullPolicy: IfNotPresent
 deployment:
   name: rag-mcp-server
@@ -18,7 +18,7 @@ persistence:
     mountReadOnly: true
 models:
   embedder:
-    name: Qwen/Qwen3-VL-Embedding-8B
+    name: RamManavalan/Qwen3-VL-Embedding-8B-FP8
     url: ''
     className: MultiModalEmbeddings
     extra:
@@ -29,6 +29,10 @@ models:
       code_chunk_overlap: 512
       tokenizer_name: Qwen/Qwen3-VL-Embedding-8B
       tokenizer_type: HuggingFace
+      # Same-embedder alias for the dataset fingerprint guard: datasets indexed
+      # under this id keep working after the FP8 swap (vectors agree to >=0.95 cosine).
+      # Requires an image with alias support — v4.0.0 rejects unknown extra keys.
+      alias: Qwen/Qwen3-VL-Embedding-8B
   reranker:
     name: Qwen/Qwen3-VL-Reranker-8B
     url: ''
@@ -68,6 +72,34 @@ qdrant:
 mcp:
   enabled: true
   port: 9090
+  # OPTIONAL API-key auth for the MCP endpoints (fleet decision 2026-09,
+  # fleet pattern: K8S-MCP). When existingSecret is set, the chart wires
+  # RAG_API_KEYS from that Secret's key and every /mcp request needs a valid
+  # key (X-API-Key or Bearer). Leave empty for gateway-fronted deployments —
+  # the server then runs open (with a loud startup warning). Comma-separated
+  # keys all authenticate: that is the rotation mechanism — append the new
+  # key, move clients over, drop the old one, no downtime. The fleet-universal
+  # MCP_API_KEYS env is honored too (either var authenticates).
+  apiKey:
+    existingSecret: ""
+    existingSecretKey: api-keys
+  # D15 (OPT-IN) multi-user API keys → dataset ACLs. Leave BOTH empty for the
+  # default single-key behaviour (nothing rendered, nothing enforced — the
+  # default chart render stays byte-identical). Enabling changes the auth
+  # model:
+  #   apiKeyClients: "alice:s3cr3t-a;bob:s3cr3t-b"   (name:key pairs,
+  #     ';'-separated; keys must not contain ':' or ';') — mints per-user keys
+  #     accepted by the REST and MCP surfaces alongside the deployment keys.
+  #   datasetAcls: "alice:reports,notes;bob:*"       (name:dataset[,dataset…];
+  #     '*' = all datasets) — binds each name to its datasets. A registry key
+  #     with NO matching ACL entry gets NO datasets (fail-closed). The plain
+  #     deployment keys (security.apiKey / the MCP key set) keep FULL (admin)
+  #     access. ACL'd keys cannot reach /api/admin/* nor create datasets
+  #     (unless granted '*').
+  # These values are KEY MATERIAL: pass them from a Secret pipeline
+  # (--set-string), never commit real keys into a values file.
+  apiKeyClients: ""
+  datasetAcls: ""
 service:
   api:
     type: ClusterIP
@@ -91,8 +123,26 @@ resources:
       cpu: '8'
 extraEnv: {}
 security:
-  apiKey: Zst_qoSr9RcPRI0G44CxsdXbN2_02UnG
-  mediaTokenSecret: 48b00cdf6d0979891ada5b3e51a5dd883ee752a5a1256b578c8271c30569944d
+  # REST API-key (RAG_API_KEY) + media-token HMAC secret (MEDIA_TOKEN_SECRET,
+  # 64 hex): the chart ships NO key material (P0-7, 2026-09 — the previously
+  # committed default literals were removed from the delivery path; the values
+  # themselves are private and were NOT rotated). Sourcing precedence —
+  #   1. security.existingSecret: a Secret you own provides both keys
+  #      (existingSecretApiKey / existingSecretMediaTokenKey names below)
+  #   2. inline value here (kept for back-compat with existing values files)
+  #   3. the value already stored in the release Secret — reused on upgrade,
+  #      so upgrading never rotates a secret under a running deployment
+  #   4. fresh auto-generation on first install
+  # Retrieve an auto-generated key: kubectl -n <ns> get secret \
+  #   <deployment.name>-model-keys -o jsonpath='{.data.RAG_API_KEY}' | base64 -d
+  # Rotation is OPTIONAL and operator-initiated — read helm/ROTATION.md first.
+  apiKey: ''
+  mediaTokenSecret: ''
+  # Optional Secret (you manage it) providing both keys; when set the chart
+  # renders neither key into its own Secret.
+  existingSecret: ''
+  existingSecretApiKey: RAG_API_KEY
+  existingSecretMediaTokenKey: MEDIA_TOKEN_SECRET
   mediaTokenTtl: 3600
   ingestAllowHosts: ''
   blockPrivateHosts: true
@@ -104,12 +154,24 @@ security:
   pwMaxFailures: 10
   pwFailWindow: 300
   trustProxyIdentity: true
+  # Gate the /metrics exposition behind an API key (env RAG_METRICS_AUTH).
+  # false (default) = public in-cluster exposition, unchanged behaviour.
+  # true = every scrape must present X-RAG-Api-Key / X-API-Key / a Bearer key
+  # (RAG_API_KEY plus the MCP key set MCP_API_KEYS / RAG_API_KEYS are all
+  # accepted); the ServiceMonitor then needs metrics.serviceMonitorBearerSecret.
+  metricsAuth: false
 redis:
   enabled: false
   password: ''
 metrics:
   serviceMonitor: false
   interval: 30s
+  # When security.metricsAuth is on, name a Secret whose <key> holds a valid
+  # API key; the ServiceMonitor presents it as the scrape bearer token
+  # (prometheus-operator: endpoints[].bearerTokenSecret).  Empty = no token
+  # on the scrape (only valid while metricsAuth stays off).
+  serviceMonitorBearerSecret: ''
+  serviceMonitorBearerSecretKey: RAG_API_KEY
 backups:
   enabled: false
   schedule: 0 3 * * *

@@ -197,7 +197,7 @@ def _dm_for_rig(rig: _HybridRig) -> DatasetManager:
     ``_bm25_stats_path("ds")`` resolves to the rig's own sidecar.
     """
     dm = DatasetManager.__new__(DatasetManager)
-    dm._get_rag = lambda ds, check_embedder=True: rig.rag  # type: ignore[method-assign]
+    dm._get_rag = lambda dataset_name, check_embedder=True: rig.rag  # type: ignore[method-assign]
     dm.datasets_path = Path(rig.tmp.name)  # type: ignore[attr-defined]
     return dm
 

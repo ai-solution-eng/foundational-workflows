@@ -36,8 +36,7 @@ def _read_member(zf: Any, name: str, budget: dict[str, int]) -> bytes:
         budget["total"] += info.file_size
         if budget["total"] > _MAX_EPUB_TOTAL_BYTES:
             raise ValueError(
-                f"EPUB members total {budget['total']} bytes — exceeds "
-                f"MAX_EPUB_TOTAL_BYTES ({_MAX_EPUB_TOTAL_BYTES})"
+                f"EPUB members total {budget['total']} bytes — exceeds MAX_EPUB_TOTAL_BYTES ({_MAX_EPUB_TOTAL_BYTES})"
             )
     return zf.read(name)
 

@@ -104,7 +104,9 @@ def _validate_media_ref(ref: str, key: str = "media") -> None:
             f"POST /api/datasets/{{name}}/batch-urls instead"
         )
     if not _media_path_allowed(ref):
-        prefixes = os.environ.get("MEDIA_ALLOW_PATH_PREFIXES") or f"{_DEFAULT_DATA_PATH}/datasets:{_DEFAULT_DATA_PATH}/staging"
+        prefixes = (
+            os.environ.get("MEDIA_ALLOW_PATH_PREFIXES") or f"{_DEFAULT_DATA_PATH}/datasets:{_DEFAULT_DATA_PATH}/staging"
+        )
         raise MediaRefError(
             f"Document field '{key}': local media path '{ref}' is outside the allowed prefixes "
             f"(MEDIA_ALLOW_PATH_PREFIXES={prefixes})"

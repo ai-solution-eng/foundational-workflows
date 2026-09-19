@@ -55,9 +55,7 @@ def _client() -> QdrantClient:
         client.delete_collection(COLL)
     except Exception:
         pass
-    client.create_collection(
-        COLL, vectors_config=VectorParams(size=DIM, distance=Distance.COSINE)
-    )
+    client.create_collection(COLL, vectors_config=VectorParams(size=DIM, distance=Distance.COSINE))
     return client
 
 
@@ -66,9 +64,9 @@ def _dm_with(client: QdrantClient) -> tuple[DatasetManager, list[int]]:
     dm = DatasetManager.__new__(DatasetManager)
     vs = QdrantVectorStore(client, COLL, embedding=None)
     rag = type("_RagStub", (), {"vector_store": vs})()
-    dm._get_rag = lambda ds, check_embedder=True: rag  # type: ignore[method-assign]
+    dm._get_rag = lambda dataset_name, check_embedder=True: rag  # type: ignore[method-assign]
     decrements: list[int] = []
-    dm._decrement_count = lambda ds, n: decrements.append(n)  # type: ignore[method-assign]
+    dm._decrement_count = lambda name, n, file_type=None: decrements.append(n)  # type: ignore[method-assign]
     return dm, decrements
 
 
@@ -139,7 +137,11 @@ def _seed_store(client: QdrantClient) -> dict[str, str]:
             client, "chose tabs", memory_kind="decision", memory_ts="2026-08-30T10:00:00", memory_tags=["style"]
         ),
         "preference": _upsert(
-            client, "prefers uv", memory_kind="preference", memory_ts="2026-08-31T09:00:00", memory_tags=["tooling", "auth"]
+            client,
+            "prefers uv",
+            memory_kind="preference",
+            memory_ts="2026-08-31T09:00:00",
+            memory_tags=["tooling", "auth"],
         ),
         "note": _upsert(client, "plain note", memory_kind="note", memory_ts="2026-08-29T08:00:00"),
         "session": _upsert(
