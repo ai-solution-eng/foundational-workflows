@@ -7,8 +7,8 @@ description: >-
   Scale-friendly multi-replica Multi-modal RAG (gunicorn workers,
   multi-replica Qdrant, Redis-backed unlock cache) for larger clusters.
 type: application
-version: 4.0.7
-appVersion: "4.0.7"
+version: 4.4.1
+appVersion: "4.4.1"
 keywords:
   - rag
   - multimodal

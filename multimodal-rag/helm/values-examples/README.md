@@ -11,6 +11,25 @@ install, reused on upgrade) or from a Secret you own via `security.existingSecre
 Rotation is OPTIONAL and operator-initiated; the runbook (every former location, the
 replacement recipes, the "old keys stop working" warning) is `helm/ROTATION.md`.
 
+**Do this FIRST (both profiles) — the one required secret decision:** point
+`security.existingSecret` at a Secret you own carrying BOTH `RAG_API_KEY` and
+`MEDIA_TOKEN_SECRET` (the containers refuse to start without the media secret):
+
+```bash
+kubectl -n <ns> create secret generic rag-platform-keys \
+  --from-literal=RAG_API_KEY="$(openssl rand -hex 16)" \
+  --from-literal=MEDIA_TOKEN_SECRET="$(openssl rand -hex 32)"
+```
+
+`values.g2.yaml` wires exactly that (`existingSecret: rag-platform-keys`);
+`values.hosted-trial.yaml` shows the inline-filler alternative (or leave both empty and
+let the chart auto-generate into `<deployment.name>-model-keys` on first install).
+Everything else in the files is optional tuning. Since D20 (2026-09-24) a deployment with
+no key configured anywhere is fail-closed (anonymous callers reach only the memory
+dataset); any configured key restores normal access. The other Secret touchpoints —
+`mcp.apiKey.existingSecret` (MCP-only keys) and `modelSecrets.*ApiKey` (model tokens →
+the chart's model-keys Secret) — are marked `# SITE:` in both files.
+
 ## Placeholder convention
 
 Every value **you** must replace is wrapped in angle brackets and named for

@@ -233,6 +233,21 @@ spec:
                   name: {{ .Values.mcp.apiKey.existingSecret }}
                   key: {{ .Values.mcp.apiKey.existingSecretKey }}
             {{- end }}
+            {{- if or .Values.mcp.apiKeyClients .Values.mcp.datasetAcls }}
+            # D15 (opt-in) multi-user API keys + dataset ACLs — rendered ONLY
+            # when set (default render byte-identical). The registry serves
+            # BOTH containers (REST + MCP must resolve the same identities).
+            # Values are key material: provide them from a Secret pipeline
+            # (--set-string), never commit real keys to values files.
+            {{- if .Values.mcp.apiKeyClients }}
+            - name: RAG_API_KEY_CLIENTS
+              value: {{ .Values.mcp.apiKeyClients | quote }}
+            {{- end }}
+            {{- if .Values.mcp.datasetAcls }}
+            - name: RAG_DATASET_ACLS
+              value: {{ .Values.mcp.datasetAcls | quote }}
+            {{- end }}
+            {{- end }}
             {{- range $key, $val := .Values.extraEnv }}
             - name: {{ $key }}
               value: {{ $val | quote }}

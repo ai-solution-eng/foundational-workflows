@@ -245,18 +245,36 @@ def _bearer(key: str):
     return [(b"authorization", f"Bearer {key}".encode())]
 
 
-def test_middleware_registry_unset_delegates_byte_identical(monkeypatch):
-    """No registry: the parent's semantics — open when no keys, 401 on a
-    wrong key, 200 on a right key, and NO identity bound either way."""
+def test_middleware_registry_unset_binds_anonymous_memory_identity(monkeypatch):
+    """No registry (D20, ratified 2026-09-24): the deployment is fail-closed
+    EXCEPT the backwards-compatible memory path — the middleware binds an
+    anonymous client identity whose ONLY grant is the MEMORY_DATASET env
+    (empty when unset).  With MCP API keys configured, the parent's key
+    semantics still govern (401 on a wrong key)."""
     monkeypatch.delenv("MCP_API_KEYS", raising=False)
     monkeypatch.delenv("RAG_API_KEYS", raising=False)
+    monkeypatch.delenv("MEMORY_DATASET", raising=False)
     messages, captured = asyncio.run(_drive(_mw(), _scope()))
-    assert messages[0]["status"] == 200  # open dev mode (parent behaviour)
-    assert captured["identity"] is None
+    assert messages[0]["status"] == 200  # request proceeds (no gate refusal)
+    ident = captured["identity"]
+    assert ident is not None and ident.kind == "client"
+    assert ident.name == "__anonymous__"
+    assert ident.datasets == frozenset()  # no MEMORY_DATASET → no grants
 
+    # With MEMORY_DATASET set: exactly that one grant.
+    monkeypatch.setenv("MEMORY_DATASET", "andrew-memory")
+    _, captured = asyncio.run(_drive(_mw(), _scope()))
+    ident = captured["identity"]
+    assert ident is not None and ident.datasets == frozenset({"andrew-memory"})
+
+    # MCP API keys configured → the anon branch is skipped; the presented
+    # key resolves instead (an MCP keyset key IS an admin key on this
+    # surface — D19 source-aware resolution binds it).
     monkeypatch.setenv("RAG_API_KEYS", "k1")
     messages, captured = asyncio.run(_drive(_mw(), _scope(headers=_bearer("k1"))))
-    assert messages[0]["status"] == 200 and captured["identity"] is None
+    assert messages[0]["status"] == 200
+    ident = captured["identity"]
+    assert ident is not None and ident.is_admin
     messages, _ = asyncio.run(_drive(_mw(), _scope(headers=_bearer("wrong"))))
     assert messages[0]["status"] == 401
     assert messages[1]["body"] == (b'{"error": "unauthorized: missing or invalid API key"}')

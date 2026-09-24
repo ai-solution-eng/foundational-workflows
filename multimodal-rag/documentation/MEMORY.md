@@ -29,6 +29,13 @@ Both paths land in the same Qdrant collection via `DatasetManager.add_documents`
 ### One-time (cluster side)
 Create one password-protected dataset via the RAG HTML frontend (e.g. `andrew-memory`).
 
+> **The key-only path (D16 access store, chart default `security.accessStore: true`):** with
+> per-user registry keys (D15/D17) you can skip the env vars entirely — open the `/access`
+> page, paste YOUR API key, select your memory dataset once (entering its password once —
+> it is saved server-side per identity), and ★ it. `add_memory` / `search_memory` then
+> resolve dataset + password from the ★ binding on every call. Resolution order: explicit
+> arg → request header → the caller's ★ binding → `RAG_MEMORY_DEFAULT` → `MEMORY_DATASET`.
+
 ### Config
 Use the two-connection pattern in [`opencode.jsonc`](opencode.jsonc) — `rag-memory` (sends memory headers, exposes only `add_memory` / `search_memory`) and `rag-knowledge` (general dataset tools). See [MCP.md](MCP.md) § 3.2 for the full config.
 

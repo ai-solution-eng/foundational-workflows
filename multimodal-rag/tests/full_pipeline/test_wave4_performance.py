@@ -176,9 +176,9 @@ class _RerankRig:
         original = self.store.asimilarity_search_with_relevance_scores
         widths: list[int] = []
 
-        async def spy(query: str, k: int, need_media: bool = True, filters: Any = None):
+        async def spy(query: str, k: int, need_media: bool = True, filters: Any = None, rrf: Any = None):
             widths.append(k)
-            return await original(query, k=k, need_media=need_media, filters=filters)
+            return await original(query, k=k, need_media=need_media, filters=filters, rrf=rrf)
 
         self.store.asimilarity_search_with_relevance_scores = spy  # type: ignore[method-assign]
         return widths
@@ -446,9 +446,7 @@ def dm_with_mixed_case_datasets(tmp_path: Path) -> DatasetManager:
     for name in ("Zebra", "apple", "MLS", "mls", "bravo"):
         d = tmp_path / name
         (d / "files").mkdir(parents=True)
-        (d / "meta.json").write_text(
-            json.dumps({"name": name, "description": name, "document_count": 1})
-        )
+        (d / "meta.json").write_text(json.dumps({"name": name, "description": name, "document_count": 1}))
     return _dm_shell(tmp_path)
 
 

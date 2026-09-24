@@ -1,7 +1,7 @@
 replicaCount: 4
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v4.0.7
+  tag: v4.4.1
   pullPolicy: IfNotPresent
 deployment:
   name: rag-mcp-server
@@ -76,6 +76,29 @@ rag:
   remote: false
   dedupThreshold: 0.995
   deferCountSync: true
+  # Ingest-time contextual retrieval (feature: contextual retrieval).
+  # false = new datasets stamp contextual:false and ingest exactly as
+  # before (zero behaviour change).  true = NEW datasets are created with
+  # the flag on (an explicit "contextual" in the POST /api/datasets body
+  # always wins; existing datasets are untouched — PATCH or Recreate them).
+  # Cost: one small LLM call per real-text chunk at ingest — review
+  # POST /api/admin/datasets/{name}/contextual-preview before enabling.
+  contextual: false
+  # Weighted-RRF per-dataset create-time defaults (RAG_RRF_DEFAULT).
+  # enabled: false = no default stamped; new datasets inherit the global
+  # 1.0/1.0 (rank order unchanged).  When enabled, NEW datasets are stamped
+  # dense/sparse[/k] at create time (existing datasets untouched; a body
+  # "rrf" object on POST /api/datasets always wins).
+  rrfDefault:
+    enabled: false
+    dense: 1.0
+    sparse: 1.0
+    k: 2
+  # Unlock TTL bound (RAG_UNLOCK_MAX_TTL): 60..N seconds for explicit unlock
+  # TTLs (default 86400 = the historical 24h cap).  The special value 0 opts
+  # the deployment into NO-EXPIRY unlocks (ttl=0 lasts until an explicit
+  # lock — the /access page's "No expiry (0)" option becomes meaningful).
+  unlockMaxTtl: 86400
 qdrant:
   replicas: 3
   image:
@@ -104,6 +127,23 @@ mcp:
   apiKey:
     existingSecret: ""
     existingSecretKey: api-keys
+  # D15 (OPT-IN) multi-user API keys → dataset ACLs. Leave BOTH empty for the
+  # default single-key behaviour (nothing rendered, nothing enforced — the
+  # default chart render stays byte-identical). Enabling changes the auth
+  # model:
+  #   apiKeyClients: "alice:s3cr3t-a;bob:s3cr3t-b"   (name:key pairs,
+  #     ';'-separated; keys must not contain ':' or ';') — mints per-user keys
+  #     accepted by the REST and MCP surfaces alongside the deployment keys.
+  #   datasetAcls: "alice:reports,notes;bob:*"       (name:dataset[,dataset…];
+  #     '*' = all datasets) — binds each name to its datasets. A registry key
+  #     with NO matching ACL entry gets NO datasets (fail-closed). The plain
+  #     deployment keys (security.apiKey / the MCP key set) keep FULL (admin)
+  #     access. ACL'd keys cannot reach /api/admin/* nor create datasets
+  #     (unless granted '*').
+  # These values are KEY MATERIAL: pass them from a Secret pipeline
+  # (--set-string), never commit real keys into a values file.
+  apiKeyClients: ""
+  datasetAcls: ""
 embedBatcher:
   enabled: true
   port: 8002
@@ -144,7 +184,14 @@ resources:
       cpu: '2'
 antiAffinity:
   enabled: true
+# Extra env vars for BOTH containers (API + MCP) — the pass-through for the
+# env-only knobs: MEMORY_DATASET (the D20 anonymous grant / memory fallback),
+# RAG_MEMORY_PASSWORD, INGEST_ALLOW_S3_BUCKETS (the multi-tenant bucket
+# allowlist that watchedSources also obeys server-side), HTTPS_PROXY/NO_PROXY
+# (hosted-trial egress), etc.
 extraEnv: {}
+#  extraEnv:
+#    MEMORY_DATASET: "team-memory"
 security:
   # REST API-key (RAG_API_KEY) + media-token HMAC secret (MEDIA_TOKEN_SECRET,
   # 64 hex): the chart ships NO key material (P0-7, 2026-09 — the previously
@@ -177,6 +224,22 @@ security:
   pwMaxFailures: 10
   pwFailWindow: 300
   trustProxyIdentity: true
+  # Self-service dataset selection + per-identity access store (decision D16,
+  # env RAG_ACCESS_STORE).  false (default) = operator-managed ACLs only
+  # (RAG_DATASET_ACLS), byte-identical behaviour.  true = registry-key users
+  # manage their own dataset set on the /access page (checkboxes; protected
+  # datasets demand their password once, saved per identity under
+  # /data/access — the shared PVC).  Effective access = operator ACL ∪
+  # selections.  Requires mcp.apiKeyClients (per-user keys) to be useful.
+  accessStore: true
+  # Comma-separated dataset names that can never be self-selected (D16
+  # ceiling protection, env RAG_ACCESS_DENY_SELECT).  Empty = everything
+  # selectable (with proof).  Read per request; rotation without restart.
+  accessDenySelect: ''
+  # Deployment-wide fallback memory dataset (env RAG_MEMORY_DEFAULT) — used
+  # when a caller has no personal ★ binding and no client headers/env.
+  # Empty = unset (the pre-existing MEMORY_DATASET env remains the fallback).
+  memoryDefault: ''
   # Gate the /metrics exposition behind an API key (env RAG_METRICS_AUTH).
   # false (default) = public in-cluster exposition, unchanged behaviour.
   # true = every scrape must present X-RAG-Api-Key / X-API-Key / a Bearer key
@@ -186,11 +249,39 @@ security:
 metrics:
   serviceMonitor: false
   interval: 30s
+  # When security.metricsAuth is on, name a Secret whose <key> holds a valid
+  # API key; the ServiceMonitor presents it as the scrape bearer token
+  # (prometheus-operator: endpoints[].bearerTokenSecret).  Empty = no token
+  # on the scrape (only valid while metricsAuth stays off).
+  serviceMonitorBearerSecret: ''
+  serviceMonitorBearerSecretKey: RAG_API_KEY
 backups:
   enabled: false
   schedule: 0 3 * * *
   bucket: ''
   retentionDays: 0
+# Watched S3 sources (opt-in reconciler CronJob): on each tick the job POSTs
+# every source's prefixes to POST /api/datasets/{name}/batch-urls with
+# sync=true (ingest new/changed objects, prune deleted ones; unchanged objects
+# are skipped via the per-dataset ETag/Size state).  Disabled by default —
+# deployments without S3 render nothing.  Validation (helm template):
+#   * every prefix must be an s3:// directory URL (single-object s3://file
+#     URLs and http(s) URLs are rejected — sync reconciles prefixes only)
+#   * every source needs a dataset name and at least one prefix
+# A `type:` field is reserved for forward compatibility (SharePoint stays a
+# follow-up per decision 2026-09); unknown types are rejected in v1.
+watchedSources:
+  enabled: false
+  schedule: '*/30 * * * *'
+  sources: []
+  # sources:
+  #   - dataset: reports
+  #     prefixes:
+  #       - s3://mm-rag-drop/reports/
+  #   - dataset: logs
+  #     prefixes:
+  #       - s3://mm-rag-drop/logs/
+  #       - s3://mm-rag-drop/trace-exports/
 ezua:
   enabled: true
   virtualService:

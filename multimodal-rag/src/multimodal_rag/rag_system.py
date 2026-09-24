@@ -15,6 +15,7 @@ from typing import Any, NamedTuple
 import numpy as np
 
 import multimodal_rag.utils.bm25 as bm25_lane
+from multimodal_rag.utils import contextualizer
 from multimodal_rag.utils.general_tools import (
     cosine_sim,
     list_chunker,
@@ -42,6 +43,7 @@ from multimodal_rag.vector_store import (
     Document,
     InMemoryVectorStore,
     QdrantVectorStore,
+    RrfParams,
     VectorStore,
     ensure_search_payload_indexes,
     filters_to_predicate,
@@ -1525,6 +1527,11 @@ class MultimodalRAG:
     preprocess: bool = True
     preprocess_chunk_size: int = 128
     dedup_threshold: float = 0.995
+    # Ingest-time contextual retrieval (feature: contextual retrieval): when
+    # True, aadd_to_vector_store runs the utils/contextualizer stage 0a½ —
+    # one small LLM call per real-text chunk prepends a "[Document context]:"
+    # line before embedding.  No-op without a VLM; fail-open on LLM errors.
+    contextualize: bool = False
 
     # VectorStore option — pass a ``VectorStore`` instance, a config dict for
     # auto-creation, or ``None`` (in-memory retrieval via ``documents`` param).
@@ -1546,6 +1553,13 @@ class MultimodalRAG:
                 "caption_with_asr is enabled but no ASR model is configured; "
                 "video audio-track captioning will be skipped (auto-disabled). "
                 "Set MODEL_ASR_URL or pass an `asr` model to enable it."
+            )
+
+        if self.contextualize and self.vlm is None:
+            logger.warning(
+                "contextualize is enabled but no VLM model is configured; "
+                "ingest-time contextual retrieval is a no-op (chunks are stored "
+                "plain). Set MODEL_VLM_URL or pass a `vlm` model to enable it."
             )
 
         self._preprocessor = Preprocessor(
@@ -1695,6 +1709,7 @@ class MultimodalRAG:
             ("vlm", _mn(self.vlm) if self.vlm else "(none)"),
             ("asr", _mn(self.asr) if self.asr else "(none)"),
             ("caption_with_asr", str(self.caption_with_asr)),
+            ("contextualize", str(self.contextualize)),
             ("preprocess", str(self.preprocess)),
             ("remote", str(self.remote)),
             ("vector_store", _vs(self.vector_store)),
@@ -2352,6 +2367,26 @@ class MultimodalRAG:
             len(processed),
         )  # type: ignore[attr-defined]
 
+        # ── 0a½. Ingest-time contextual retrieval (feature: contextual) ─────
+        # One small LLM call per real-text chunk prepends a
+        # "[Document context]: …" line before embedding — BEFORE the
+        # sub-batch loop so the whole set is contextualized in producer order
+        # (prefix caching pays only when a document's chunks are consecutive)
+        # and both the base embedding AND the text-only twins embed the
+        # contextualized text.  Skips pure-media docs (no _has_real_text — a
+        # context line would newly count as real text and shift the twin
+        # gating) and memory_kind-tagged docs (memories stay verbatim).
+        # Fail-open: an LLM error stores the plain chunk + ingest warning.
+        # No VLM configured → identity pass-through (the module's gate).
+        if self.contextualize and self.vlm is not None:
+            t_ctx = time.monotonic()
+            processed = await contextualizer.acontextualize_docs(processed, self.vlm)
+            logger.verbose(  # type: ignore[attr-defined]
+                "  %.2fs add_vs  — contextualize (%d docs)",
+                time.monotonic() - t_ctx,
+                len(processed),
+            )  # type: ignore[attr-defined]
+
         # ── 0d helper (used inside sub-batch loop) ────────────────────────
         def _replace_audio(d: dict[str, Any]) -> dict[str, Any]:
             if "audio" not in d:
@@ -2802,6 +2837,7 @@ class MultimodalRAG:
         query_vector: list[float] | None = None,
         need_media: bool | None = None,
         filters: dict[str, Any] | None = None,
+        rrf: "RrfParams | None" = None,
     ) -> list[tuple[Any, float]]:
         """Sync wrapper around :meth:`aretrieve`."""
         return sync_wrapper_safe(
@@ -2815,6 +2851,7 @@ class MultimodalRAG:
                 "query_vector": query_vector,
                 "need_media": need_media,
                 "filters": filters,
+                "rrf": rrf,
             },
         )
 
@@ -2828,6 +2865,7 @@ class MultimodalRAG:
         query_vector: list[float] | None = None,
         need_media: bool | None = None,
         filters: dict[str, Any] | None = None,
+        rrf: "RrfParams | None" = None,
     ) -> list[tuple[Any, float]]:
         rerank_active = use_reranker and self.reranker is not None
 
@@ -2850,6 +2888,16 @@ class MultimodalRAG:
         # Applies to the vector-store path only: caller-provided documents
         # carry their media in memory already, so there is no transfer to save.
         media_lite = rerank_active and _rerank_media_lite() and documents is None
+
+        # Weighted RRF (feature: weighted RRF).  The override is meaningful
+        # only on the hybrid lane — it threads through to the text-query
+        # vector-store call below; multimodal (vector-supplied) queries and
+        # caller-provided documents have no fusion to weight and ignore it.
+        # ``None`` (the default) keeps the default fusion request
+        # byte-identical; the ruling for this slice is that caller weights
+        # win uniformly and per-dataset defaults are out of scope.
+        if not isinstance(rrf, RrfParams):
+            rrf = None
 
         # Auto-compute need_media: base64 media payloads are needed when the
         # reranker will consume them — except under media-lite rerank, where
@@ -2903,6 +2951,7 @@ class MultimodalRAG:
                     k=fetch_k,
                     need_media=fetch_need_media,
                     filters=filters,
+                    rrf=rrf,
                 )
             results = [(self._extract_doc(doc), score) for doc, score in docs_and_scores]
 
@@ -3346,12 +3395,18 @@ class MultiModalRAGSystem:
     async def aadd_to_vector_store(self, documents, **kwargs):
         return await self._rag.aadd_to_vector_store(documents, **kwargs)
 
-    def retrieve(self, query, documents=None, top_k=10, use_reranker=True, reranker_top_k=3, query_vector=None):
-        return self._rag.retrieve(query, documents, top_k, use_reranker, reranker_top_k, query_vector=query_vector)
+    def retrieve(
+        self, query, documents=None, top_k=10, use_reranker=True, reranker_top_k=3, query_vector=None, rrf=None
+    ):
+        return self._rag.retrieve(
+            query, documents, top_k, use_reranker, reranker_top_k, query_vector=query_vector, rrf=rrf
+        )
 
-    async def aretrieve(self, query, documents=None, top_k=10, use_reranker=False, reranker_top_k=3, query_vector=None):
+    async def aretrieve(
+        self, query, documents=None, top_k=10, use_reranker=False, reranker_top_k=3, query_vector=None, rrf=None
+    ):
         return await self._rag.aretrieve(
-            query, documents, top_k, use_reranker, reranker_top_k, query_vector=query_vector
+            query, documents, top_k, use_reranker, reranker_top_k, query_vector=query_vector, rrf=rrf
         )
 
     def list_documents(self, limit=50):

@@ -52,18 +52,33 @@ def _make_manager(tmpdir: Path) -> DatasetManager:
 def _make_test_video(path: Path, seconds: int = 2, fps: int = 30, scale: bool = True) -> None:
     """A small but real H.264/AAC MP4 (the race needs a real muxer)."""
     cmd = [
-        FFMPEG, "-v", "error",
-        "-f", "lavfi", "-i", f"testsrc2=size=320x240:rate={fps}",
-        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
-        "-t", str(seconds),
+        FFMPEG,
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        f"testsrc2=size=320x240:rate={fps}",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=44100",
+        "-t",
+        str(seconds),
     ]
     if scale:
         cmd += ["-vf", "scale=640:480"]
     cmd += [
-        "-c:v", "libx264", "-preset", "ultrafast",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        "-y", str(path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        "-y",
+        str(path),
     ]
     r = sp.run(cmd, capture_output=True)
     assert r.returncode == 0, r.stderr.decode(errors="replace")
@@ -159,9 +174,7 @@ def test_concurrent_preprocess_writers_leave_valid_output():
         assert not errors, errors
         out = d / "abc123_src_preprocessed.mp4"
         assert out.exists(), "preprocessed sibling must exist"
-        assert _media_file_ok(out), (
-            f"concurrent writers left a broken file: boxes={_boxes(out)}"
-        )
+        assert _media_file_ok(out), f"concurrent writers left a broken file: boxes={_boxes(out)}"
         # No leftover temp siblings
         leftovers = [p.name for p in d.iterdir() if ".tmp" in p.name]
         assert not leftovers, f"temp files leaked: {leftovers}"
@@ -312,12 +325,23 @@ def test_webm_is_never_transcoded():
         # oversized so a transcode would also be attempted-and-slow).
         sp.run(
             [
-                FFMPEG, "-v", "error",
-                "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10",
-                "-t", "1",
-                "-c:v", "libvpx-vp9", "-b:v", "200k",
-                "-c:a", "libopus",
-                "-y", str(src),
+                FFMPEG,
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=10",
+                "-t",
+                "1",
+                "-c:v",
+                "libvpx-vp9",
+                "-b:v",
+                "200k",
+                "-c:a",
+                "libopus",
+                "-y",
+                str(src),
             ],
             capture_output=True,
         )

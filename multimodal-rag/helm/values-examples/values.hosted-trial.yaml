@@ -29,7 +29,7 @@ replicaCount: 1
 image:
   # Packaged with the chart — leave as-is unless you built your own image.
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v3.6.3
+  tag: v4.4.1
   pullPolicy: IfNotPresent
 
 deployment:
@@ -115,7 +115,36 @@ rag:
   # endpoints outside the cluster.
   remote: false
   dedupThreshold: 0.995
+  # Ingest-time contextual retrieval (RAG_CONTEXTUAL_DEFAULT) — COMMENTED /
+  # off. The per-dataset checkbox on each dataset's page is the recommended
+  # path (blast radius = one dataset); enabling THIS deploy default stamps
+  # every NEW dataset contextual:true; cost = one small LLM call per
+  # real-text chunk at ingest (check
+  # POST /api/admin/datasets/{name}/contextual-preview first); existing
+  # datasets are untouched (PATCH or Recreate to adopt). To enable:
+  # contextual: true
+  contextual: false
 
+  # Weighted-RRF per-dataset create-time defaults (RAG_RRF_DEFAULT) —
+  # present but DISABLED on purpose: a global non-neutral default silently
+  # shifts EVERY new dataset's ranking. The showcase path is per-dataset:
+  # set the weights per dataset from the home page's dataset-defaults
+  # editor (or pass sparse_weight/dense_weight per search call). When you
+  # do want a deploy-wide default, enable and set sparse_weight > dense
+  # for code/log-heavy corpora (weights are rank-space tilts, not score
+  # multipliers — trust the order, not the magnitude):
+  rrfDefault:
+    enabled: false
+    dense: 1.0
+    sparse: 1.0
+    k: 2
+
+  # Unlock TTL bound (RAG_UNLOCK_MAX_TTL): caps explicit unlock TTLs on both
+  # surfaces (default 86400 = the historical 24h cap; the chart default equals
+  # the built-in default, so this line is informational). The special value 0
+  # opts the deployment into NO-EXPIRY unlocks (ttl=0 lasts until an explicit
+  # lock — the /access page's "No expiry (0)" option becomes selectable).
+  unlockMaxTtl: 86400
 # -- Qdrant --------------------------------------------------------------------------------------
 # Single-replica chart: Qdrant runs as one StatefulSet; the API mounts its
 # PVC read-only (mountReadOnly above) to report disk usage.
@@ -131,8 +160,16 @@ qdrant:
 # -- MCP server (sidecar) --------------------------------------------------------------------------
 mcp:
   apiKey:
+    # SITE: pre-create the Secret before applying — the chart never creates
+    # or inlines this key:
+    #   kubectl -n <ns> create secret generic mcp-fleet-apikeys \
+    #     --from-literal='api-keys=<key1>,<key2>'
     existingSecret: "mcp-fleet-apikeys"
     existingSecretKey: "api-keys"
+  # D15 per-user registry keys + dataset ACLs — KEY MATERIAL (provide from a
+  # Secret pipeline, never commit). Empty = single-key behaviour.
+  apiKeyClients: ""
+  datasetAcls: ""
 
   enabled: true
   port: 9090
@@ -193,6 +230,25 @@ security:
   # Keep true: behind oauth2-proxy the identity headers are authoritative.
   trustProxyIdentity: true
 
+  # Self-service dataset selection (decision D16, env RAG_ACCESS_STORE) —
+  # off here. With accessStore: true AND per-user keys minted (mcp.apiKeyClients
+  # in helm/values.yaml), registry-key users manage their own dataset set on the
+  # /access page: every key sees all dataset names, selects what it needs
+  # (protected datasets demand their password once — saved per identity under
+  # /data/access), and stars its memory dataset server-side. Effective access =
+  # operator ACL (mcp.datasetAcls) ∪ selections.
+  accessStore: false
+  # Datasets that can never be self-selected (comma-separated; renders only
+  # when non-empty). Empty = everything selectable with proof.
+  accessDenySelect: ''
+  # Deployment-wide fallback memory dataset (RAG_MEMORY_DEFAULT) for callers
+  # without a personal ★ binding. Empty = unset.
+  memoryDefault: ''
+  # Gate /metrics behind an API key (env RAG_METRICS_AUTH) — keep false here:
+  # in-cluster Prometheus scrapes the exposition without a token. When true,
+  # the ServiceMonitor needs a bearer Secret (metrics.serviceMonitorBearerSecret).
+  metricsAuth: false
+
 # -- Redis (unused by the single-replica chart; kept for template uniformity) ---------------------------------------
 redis:
   enabled: false
@@ -202,6 +258,10 @@ redis:
 metrics:
   serviceMonitor: false
   interval: 30s
+  # When security.metricsAuth is on, name a Secret whose <key> holds a valid
+  # API key; the ServiceMonitor presents it as the scrape bearer token.
+  serviceMonitorBearerSecret: ''
+  serviceMonitorBearerSecretKey: RAG_API_KEY
 
 # -- Backups (optional) ---------------------------------------------------------------------------------------------------
 backups:
@@ -209,6 +269,30 @@ backups:
   schedule: 0 3 * * *
   bucket: ''
   retentionDays: 0
+
+# -- Watched S3 sources (SHOWCASE — enabled) ---------------------------------------------------------------------
+# Reconciler CronJob: every 15 minutes, POST each source's s3:// prefixes to
+# /api/datasets/{dataset}/batch-urls with sync=true — new/changed objects are
+# ingested, objects deleted upstream are pruned, unchanged objects are skipped
+# via the per-dataset ETag/Size state (files/.watched_state.json).  Prefixes
+# must be s3:// directory URLs (validated at render time).  The CronJob
+# presents X-RAG-Api-Key from the <name>-model-keys Secret (envFrom) — the
+# API-key requirement is already handled by this chart's Secret wiring.
+# SITE: the bucket/prefix names below are PLAUSIBLE DEFAULTS — change them to
+# a prefix your site's S3 (s3.endpointUrl above) actually holds; if the
+# INGEST_ALLOW_S3_BUCKETS env is set on the deployment, the bucket must be on
+# it.  Turn the feature off with enabled: false (renders nothing).
+watchedSources:
+  enabled: false
+  schedule: '*/15 * * * *'
+  sources: []
+  # sources:
+  #   - dataset: showcase-docs
+  #     prefixes:
+  #       - s3://mlis-models/showcase-docs/      # SITE: change me — bucket/prefix your S3 holds
+  #   - dataset: showcase-reports
+  #     prefixes:
+  #       - s3://mlis-models/showcase-reports/   # SITE: change me (or delete this source)
 
 # -- PCAI (HPE Ezmeral Unified Analytics) integration -----------------------------------------------------------------------
 ezua:

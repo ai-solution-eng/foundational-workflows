@@ -24,7 +24,10 @@ by precedence:
    `security.existingSecretApiKey` / `security.existingSecretMediaTokenKey`, defaults
    `RAG_API_KEY` / `MEDIA_TOKEN_SECRET`). The chart then renders **neither** key into its
    own Secret, and `templates/deployment.yaml` wires both env vars from your Secret via
-   `secretKeyRef` (both containers).
+   `secretKeyRef` (both containers). **2026-09: the watched-sources and backup CronJobs
+   wire the same two `secretKeyRef`s when `existingSecret` is set** — their `envFrom`
+   of the chart Secret alone would otherwise leave `RAG_API_KEY` empty in that mode
+   (401 on every cron tick; found while switching g2 to `rag-platform-keys`).
 2. **Inline values** `security.apiKey` / `security.mediaTokenSecret` — kept for
    **back-compat**: an existing values file that sets them behaves exactly as before.
 3. **Lookup reuse** — `lookup "v1" "Secret" .Release.Namespace <deployment.name>-model-keys`:
@@ -106,6 +109,15 @@ rotation, which was explicitly not wanted**:
 |---|---|---|
 | `helm-scale-large/local/values.g2.yaml` (ex-se_g2.yaml; deleted 2026-09-18 — merged into values.g2.yaml) | `security.apiKey`, `security.mediaTokenSecret` | `_55_V…PoPd`, `5787d…a7dd` |
 | `helm-scale-large/local/values.g2.yaml` (57-60, 144-145) | `modelSecrets.*ApiKey` (4 model-serving **JWTs**), `security.apiKey`, `security.mediaTokenSecret` | JWTs (`eyJhbG…`), `_55_V…PoPd`, `5787d…a7dd` |
+
+> **2026-09 update (g2):** the `security.apiKey` / `security.mediaTokenSecret` literals were
+> removed from `helm-scale-large/local/values.g2.yaml` and the release now provisions both
+> keys from the operator-owned Secret `rag-platform-keys` (ns `mm-rag`) via
+> `security.existingSecret` — fresh values generated with `openssl rand -hex 16` (API key)
+> / `openssl rand -hex 32` (media secret), i.e. the old inline values above were **rotated
+> away** (D1 consequences applied: old REST key dead, previously issued media tokens
+> invalid). The model-serving JWTs and MinIO credentials remain in the file (gitignored),
+> still listed here as the working credentials.
 | `helm-scale-large/local/values.omnilife.yaml` (ex-omnilife.yaml, restored 2026-09-18) (88-104, 215-216) | `modelSecrets` JWTs, `s3.accessKeyId`/`s3.secretAccessKey` (MinIO), `security.apiKey`/`mediaTokenSecret` | JWTs, `iZEud…Cbu6`, `MYSwK…Qw81`, `Y4GlF…5M5g`, `ed735…06be` |
 | `helm-scale-large/local/migrate-my-memory.py` (31) | `API_KEY` (G2 REST key baked into the helper script) | `_55_V…PoPd` |
 | `MultimodalRAG/.g2_cluster.yaml` (100-103, 243; repo root) | `modelSecrets.*ApiKey` JWTs + `security.mediaTokenSecret` | JWTs (`eyJhbG…`), `5787d…a7dd` |

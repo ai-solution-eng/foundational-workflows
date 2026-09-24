@@ -18,6 +18,7 @@ import functools
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import threading
@@ -37,9 +38,11 @@ from multimodal_rag.rag_system import (
     merge_federated_results,
     resolve_federated_targets,
 )
+from multimodal_rag.utils import access_store as _access
 from multimodal_rag.utils import clients_registry as _clients
 from multimodal_rag.utils.logging_utils import logging, setup_logger
 from multimodal_rag.utils.mcp_auth import UNIVERSAL_API_KEYS_ENV, ApiKeyAuthMiddleware
+from multimodal_rag.vector_store import RrfParams
 
 logger = logging.getLogger(__name__)
 
@@ -433,24 +436,44 @@ def _mcp_pw_reset_failures(cid: str) -> None:
 
 
 def _is_unlocked(dataset_name: str) -> str | None:
-    """Return the cached password if *dataset_name* is still unlocked (for this client), else None."""
+    """Return the cached password if *dataset_name* is still unlocked (for this client), else None.
+
+    Falls back to the identity's SAVED selection password (D16): selecting a
+    protected dataset on the /access page (or via the select_dataset tool)
+    verified the password once — the selection IS the unlock, so MCP tools
+    work without any password argument.  Identity-scoped like everything else
+    in the unlock path (an identity can only ever read its own store).
+    """
     key = (dataset_name, _unlock_client_id())
     with _unlocked_lock:
         entry = _unlocked.get(key)
-        if entry is None:
-            return None
-        expiry, pw = entry
-        if time.monotonic() >= expiry:
-            del _unlocked[key]
-            return None
-        return pw
+        if entry is not None:
+            expiry, pw = entry
+            if time.monotonic() >= expiry:
+                del _unlocked[key]
+            else:
+                return pw
+    # D16: a saved selection password (exact-identity store read; the
+    # identity was resolved from the presented key by the middleware).
+    return _access.selection_password(_current_key_identity(), dataset_name)
+
+
+_MCP_UNLOCK_NO_EXPIRY = float("inf")  # in-memory sentinel for ttl=0 (no expiry)
 
 
 def _cache_unlock(dataset_name: str, password: str, ttl: int | None = None) -> None:
-    """Cache the password for *dataset_name* (for this client) for *ttl* seconds."""
+    """Cache the password for *dataset_name* (for this client) for *ttl* seconds.
+
+    ``ttl=0`` means NO expiry (the RAG_UNLOCK_MAX_TTL=0 deployment opt-in):
+    the entry persists until an explicit unlock-cache eviction — the in-memory
+    store's bounded-entry guard still applies, so a no-expiry entry under
+    cache pressure may be evicted (fail-soft: the caller is asked to
+    re-unlock).
+    """
     key = (dataset_name, _unlock_client_id())
+    expiry = _MCP_UNLOCK_NO_EXPIRY if (ttl is not None and ttl <= 0) else time.monotonic() + (ttl or _UNLOCK_TTL)
     with _unlocked_lock:
-        _bounded_cache_put(_unlocked, key, (time.monotonic() + (ttl or _UNLOCK_TTL), password), _MAX_UNLOCK_ENTRIES)
+        _bounded_cache_put(_unlocked, key, (expiry, password), _MAX_UNLOCK_ENTRIES)
 
 
 def _check_unlocked_or_password(
@@ -540,6 +563,25 @@ def _shared_unlock_enabled() -> bool:
     pre-D10 shared behaviour.  Read per call so a config change needs no
     restart."""
     return os.environ.get("RAG_MCP_SHARED_UNLOCK", "").strip().lower() in ("1", "true", "yes")
+
+
+# Mirror of api_server._unlock_ttl_max (the D10 mirror convention): the
+# configured upper bound for explicit unlock TTLs.  0 = the deployment has
+# opted into NO-EXPIRY unlocks (ttl=0 persists until an explicit lock).
+# Read per call so a config change needs no restart.
+_UNLOCK_TTL_MAX_ENV = "RAG_UNLOCK_MAX_TTL"
+
+
+def _unlock_ttl_max() -> int:
+    """Configured max unlock TTL (default 86400); 0 = no-expiry allowed."""
+    raw = os.environ.get(_UNLOCK_TTL_MAX_ENV, "").strip()
+    if not raw:
+        return 86400
+    try:
+        val = int(raw)
+    except ValueError:
+        return 86400
+    return val if val >= 0 else 86400
 
 
 def _request_identity(identity_header_value: str | None, forwarded_for: str | None, peer: str | None) -> str | None:
@@ -684,21 +726,25 @@ def _current_key_identity():
 
 
 def _identity_dataset_allowed(dataset_name: str) -> bool:
-    """ACL predicate over dataset names for the current request identity."""
-    return _clients.dataset_allowed(_clients.current_identity(), dataset_name)
+    """Dataset predicate for the current request identity (D15 ACL ∪ D16
+    self-selections when the access store is enabled — the union helper
+    falls back to the pure operator ACL when it is not)."""
+    return _access.dataset_allowed(_current_key_identity(), dataset_name)
 
 
 def _require_dataset_acl(dataset_name: str) -> None:
     """Raise ToolError when the caller's key identity may not touch
-    *dataset_name* (D15).  Denies without confirming existence, so the error
-    is not a dataset-existence oracle."""
-    ident = _clients.current_identity()
+    *dataset_name* (D15 + D16).  Denies without confirming existence, so the
+    error is not a dataset-existence oracle."""
+    ident = _current_key_identity()
     if ident is None:
         return
-    try:
-        _clients.require_dataset_access(ident, dataset_name)
-    except _clients.DatasetAccessDenied as exc:
-        raise ToolError(str(exc))
+    if _access.dataset_allowed(ident, dataset_name):
+        return
+    raise ToolError(
+        f"Dataset '{dataset_name}' is not permitted for this API key "
+        "(dataset ACLs/selections are configured)."
+    )
 
 
 class _RagClientAuthMiddleware(ApiKeyAuthMiddleware):
@@ -716,11 +762,38 @@ class _RagClientAuthMiddleware(ApiKeyAuthMiddleware):
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http" or not self._needs_auth(scope.get("path", "")):
             return await super().__call__(scope, receive, send)
-        if not _clients.registry_configured():
-            return await super().__call__(scope, receive, send)
-        from multimodal_rag.utils.mcp_auth import presented_keys
+        from multimodal_rag.utils.mcp_auth import configured_keys
 
-        identity = _clients.resolve_presented(presented_keys(scope))
+        if not configured_keys(("MCP_API_KEYS", "RAG_API_KEYS")) and not _clients.registry_configured():
+            # Ratified default posture (2026-09-24, D20): an unconfigured MCP
+            # deployment is FAIL-CLOSED except for the backwards-compatible
+            # memory path — bind an anonymous registry-client identity whose
+            # ONLY grant is the deployment's memory dataset (MEMORY_DATASET
+            # env, when set).  Memory tools then work against exactly that
+            # dataset; every other tool refuses (no datasets).  When any key
+            # IS configured (MCP keyset or registry), the normal resolution
+            # below governs instead.
+            memory_ds = os.environ.get("MEMORY_DATASET", "").strip()
+            anon = _clients.Identity(
+                kind="client",
+                name="__anonymous__",
+                datasets=frozenset({memory_ds} if memory_ds else ()),
+            )
+            token = _clients.set_current_identity(anon)
+            try:
+                return await self.app(scope, receive, send)
+            finally:
+                _clients.reset_current_identity(token)
+        from multimodal_rag.utils.mcp_auth import presented_keys_with_source
+
+        # D19 delegation precedence: X-API-Key outranks a co-forwarded
+        # Authorization Bearer (a gateway's own platform/admin token), so a
+        # per-key override to a registry identity is honored even when the
+        # gateway also authenticates itself as admin.
+        pairs = presented_keys_with_source(scope)
+        identity = _clients.resolve_presented(
+            [k for k, _ in pairs], [via for _, via in pairs]
+        )
         if identity is None:
             from multimodal_rag.utils.mcp_auth import UNAUTHORIZED_BODY
 
@@ -740,20 +813,39 @@ class _RagClientAuthMiddleware(ApiKeyAuthMiddleware):
 
 
 def _resolve_memory_dataset(dataset_name: str | None) -> str:
-    """Resolve the memory dataset name: explicit arg → request header → env."""
-    ds = dataset_name or _memory_dataset_ctx.get() or os.environ.get("MEMORY_DATASET")
+    """Resolve the memory dataset name: explicit arg → request header → the
+    caller's saved ★ binding (D16 access store) → MEMORY_DATASET env."""
+    ds = dataset_name or _memory_dataset_ctx.get()
+    if not ds:
+        ds = _access.memory_dataset_for(_current_key_identity(), os.environ.get("MEMORY_DATASET"))
     if not ds:
         raise ToolError(
             "No memory dataset specified. Provide 'dataset_name', send the "
-            "'X-Memory-Dataset' header from your MCP client, or set the "
-            "MEMORY_DATASET environment variable on the server."
+            "'X-Memory-Dataset' header from your MCP client, or mark a dataset "
+            "as your memory dataset on the /access page."
         )
     return ds
 
 
 def _resolve_memory_password(password: str | None) -> str | None:
-    """Resolve the memory dataset password: explicit arg → request header."""
-    return password if password else _memory_password_ctx.get()
+    """Resolve the memory dataset password: explicit arg → request header →
+    the caller's saved selection password (D16 — for the header dataset, or
+    the caller's bound ★ dataset when no header is present) → the
+    RAG_MEMORY_PASSWORD env (last; backwards compatibility for bare single-
+    user deployments that configure memory entirely via env vars)."""
+    if password:
+        return password
+    header_pw = _memory_password_ctx.get()
+    if header_pw:
+        return header_pw
+    ident = _current_key_identity()
+    ds = _memory_dataset_ctx.get() or _access.memory_dataset_for(ident, None)
+    if ds:
+        saved = _access.selection_password(ident, ds)
+        if saved:
+            return saved
+    env_pw = os.environ.get("RAG_MEMORY_PASSWORD", "").strip()
+    return env_pw or None
 
 
 def _resolve_session_id(existing: str | None = None) -> str | None:
@@ -1648,6 +1740,7 @@ async def _acore_retrieval(
     reranker_top_k: int,
     base_llm_modalities: list[str] | None,
     filters: dict[str, Any] | None = None,
+    rrf: "RrfParams | None" = None,
 ) -> "tuple[list[Any], list[float]] | None":
     """Retrieval half of :func:`_arun_retrieval`.
 
@@ -1660,7 +1753,8 @@ async def _acore_retrieval(
     Split out of ``_arun_retrieval`` so federated search (roadmap feature 8)
     can run this exact retrieval path per dataset, merge the pools, and only
     then post-process/format — without changing what the single-dataset
-    tools return.
+    tools return.  *rrf* (weighted RRF) threads through to ``aretrieve``;
+    ``None`` keeps the default fusion request unchanged.
     """
     llm_modalities = _llm_modality_set(base_llm_modalities)
 
@@ -1716,6 +1810,7 @@ async def _acore_retrieval(
         query_vector=query_vector,
         need_media=reranker_needs_media,
         filters=filters,
+        rrf=rrf,
     )
     if not results:
         return None
@@ -1737,6 +1832,7 @@ async def _acore_retrieval(
             query_vector=query_vector,
             need_media=True,
             filters=filters,
+            rrf=rrf,
         )
         retrieved_docs = [doc for doc, _ in results]
 
@@ -1844,6 +1940,7 @@ def _format_retrieval_result(
 
     # -- Also include raw results as JSON for clients that want structured data --
     raw_results: list[dict[str, Any]] = []
+    rrf_block: dict[str, Any] | None = None
     for i, doc in enumerate(retrieved_docs):
         entry: dict[str, Any] = {"score": scores[i], "score_kind": kinds[i]}
         if isinstance(doc, str):
@@ -1859,6 +1956,18 @@ def _format_retrieval_result(
                 entry["retrieval_score"] = retrieval_score
             entry["reranker_score"] = doc.pop("_reranker_score", None)
             doc.pop("_score_kind", None)
+            # Weighted RRF: fold the per-doc weights stamp into a single
+            # request-level block on the FIRST entry (it describes the
+            # executed request, not any individual hit).  An unweighted /
+            # dense-degraded search produces no block at all.
+            stamp = doc.pop("_rrf", None)
+            if rrf_block is None and isinstance(stamp, dict):
+                rrf_block = {
+                    "dense": stamp.get("dense", 1.0),
+                    "sparse": stamp.get("sparse", 1.0),
+                    "k": stamp.get("k"),
+                    "applied": True,
+                }
             # Surface tier-2 preprocessed_* media (PVC files) as the
             # primary image/video/audio keys so the LLM cites a
             # user-viewable version, not the tier-3 data URL stored
@@ -1994,10 +2103,13 @@ def _format_retrieval_result(
             "so the user can open the source files:\n" + "\n".join(doc_link_lines)
         )
 
-    return {
+    payload: dict[str, Any] = {
         "context": context,
         "results": raw_results,
     }
+    if rrf_block is not None:
+        payload["rrf"] = rrf_block
+    return payload
 
 
 async def _arun_retrieval(
@@ -2012,6 +2124,7 @@ async def _arun_retrieval(
     verified_password: str | None,
     media_base_url: str | None,
     filters: dict[str, Any] | None = None,
+    rrf: "RrfParams | None" = None,
 ) -> str:
     """Run retrieval, post-process modalities, and format the JSON result.
 
@@ -2047,6 +2160,7 @@ async def _arun_retrieval(
         reranker_top_k,
         base_llm_modalities,
         filters,
+        rrf,
     )
     if core is None:
         return "No results found."
@@ -2087,14 +2201,15 @@ def _resolve_federated_targets(
     per-client unlock cache as the unlock predicate and a malformed
     *datasets* argument surfaced as a ``ToolError``.
 
-    ``allowed`` (D15): when omitted, derived from the request's registry-key
-    identity — a client identity's ACL restricts the fan-out exactly like a
-    password lock (skipped with a note, never a hard failure).
+    ``allowed`` (D15/D16): when omitted, derived from the request's
+    registry-key identity — a client identity's ACL ∪ self-selections
+    restricts the fan-out exactly like a password lock (skipped with a note,
+    never a hard failure).
     """
     if allowed is None:
         ident = _clients.current_identity()
         if ident is not None and not ident.is_admin:
-            allowed = lambda name: _clients.dataset_allowed(ident, name)
+            allowed = lambda name: _access.dataset_allowed(ident, name)
     try:
         # _is_unlocked returns the cached password (truthy = unlocked); the
         # adapter contract wants a bool predicate, so normalize explicitly.
@@ -2395,6 +2510,47 @@ def _clamp_tool_limit(value: Any, name: str, maximum: int, default: int = 1) -> 
     return min(n, maximum)
 
 
+# Weighted-RRF weight bounds (feature: weighted RRF) — shared discipline for
+# the MCP and REST search surfaces.  Weights are rank-space tilts (qdrant
+# computes ``1/((pos+1)/w + k − 1)`` per lane), not score multipliers, so the
+# accepted range is deliberately modest: beyond ~10 a single lane fully
+# dominates any realistic rank pool.  Three decimals keep the accepted grid
+# exact — the stamped ``rrf`` block must report exactly what was applied.
+_RRF_WEIGHT_MAX = 10.0
+
+
+def _clamp_rrf_weight(value: Any, name: str) -> float:
+    """Coerce an MCP/REST weight to a float clamped to ``[0.0, 10.0]``, 3 decimals.
+
+    Non-numeric input raises (``ToolError`` on the MCP surface).  ``None``
+    never reaches here — callers gate on presence so the default path sends
+    no override at all.  Rounding happens after clamping so the reported
+    value is the value applied.
+    """
+    try:
+        w = float(value)
+    except (TypeError, ValueError):
+        raise ToolError(f"'{name}' must be a number.")
+    if math.isnan(w) or math.isinf(w):
+        raise ToolError(f"'{name}' must be a finite number.")
+    w = min(max(w, 0.0), _RRF_WEIGHT_MAX)
+    return round(w, 3)
+
+
+def _clamp_rrf_k(value: Any) -> int:
+    """Coerce the optional RRF ranking constant ``k`` to an int in ``[1, 1000]``.
+
+    Same clamp-not-reject discipline as the weights: a chatty agent's
+    ``k: 0`` degrades to the minimum sane constant instead of failing the
+    search.
+    """
+    try:
+        k = int(value)
+    except (TypeError, ValueError):
+        raise ToolError("'k' must be an integer.")
+    return max(1, min(k, 1000))
+
+
 try:
     from mcp.server import MCPServer
     from mcp.server.mcpserver.exceptions import ToolError
@@ -2429,9 +2585,17 @@ try:
                     raise ToolError(str(exc))
                 datasets = page["datasets"]
                 next_cursor = page["next_cursor"]
-            # D15: a registry-key identity only sees its ACL'd datasets.
+            # D15/D16: a registry-key identity's listing shows ONLY its
+            # effective datasets (operator ACL ∪ self-selections) — access
+# isolation is the design: names a key cannot use are hidden, not shown
+            # for discovery. (The ratified 2026-09-24 ruling REVERSED the
+            # earlier discovery-mode flip: users learn dataset names from
+            # their grants/admin, not from the listing.)
             hidden = 0
-            if _clients.registry_configured():
+            # Filter whenever an identity is bound (D20: the anonymous
+            # identity of an unconfigured deployment is fail-closed too —
+            # its only grant is the MEMORY_DATASET env, when set).
+            if _clients.current_identity() is not None:
                 total = len(datasets)
                 datasets = [d for d in datasets if _identity_dataset_allowed(str(d.get("name", "")))]
                 hidden = total - len(datasets)
@@ -2475,6 +2639,11 @@ try:
         ``get_dataset_info``) will accept requests without the ``password``
         parameter for the duration of the TTL (default 30 minutes).
 
+        TTL bounds: 60..86400 seconds (the deployment may lower/raise the
+        cap via ``RAG_UNLOCK_MAX_TTL``).  ``ttl=0`` = NO expiry — the unlock
+        lasts until the deployment restarts (or the cache evicts it) — and
+        requires the deployment opt-in ``RAG_UNLOCK_MAX_TTL=0``.
+
         Parameters
         ----------
         dataset_name:
@@ -2482,12 +2651,19 @@ try:
         password:
             The dataset password.
         ttl:
-            Unlock duration in seconds (default 1800 = 30 min).
+            Unlock duration in seconds (default 1800 = 30 min; 0 = no expiry
+            when the deployment enables it via RAG_UNLOCK_MAX_TTL=0).
         """
 
         def _impl() -> str:
-            if ttl < 60 or ttl > 86400:
-                raise ToolError("TTL must be between 60 seconds and 86400 seconds (24 hours).")
+            ttl_max = _unlock_ttl_max()
+            if ttl == 0:
+                if ttl_max != 0:
+                    raise ToolError(
+                        "ttl=0 (no expiry) is disabled on this deployment (set RAG_UNLOCK_MAX_TTL=0 to enable)."
+                    )
+            elif ttl < 60 or ttl > ttl_max:
+                raise ToolError(f"TTL must be between 60 and {ttl_max} seconds (or 0 for no expiry when enabled).")
             cid = _unlock_client_id()
             _mcp_pw_check_throttle(cid)
             _require_dataset_acl(dataset_name)
@@ -2503,11 +2679,136 @@ try:
                 raise ToolError(f"Incorrect password for dataset '{dataset_name}'.")
             _mcp_pw_reset_failures(cid)
             _cache_unlock(dataset_name, password, ttl=ttl)
+            if ttl == 0:
+                return f"Dataset '{dataset_name}' unlocked with no expiry (until the server restarts)."
             return (
                 f"Dataset '{dataset_name}' unlocked for {ttl // 60} minutes "
                 f"(until approximately "
                 f"{datetime.fromtimestamp(time.time() + ttl).strftime('%H:%M:%S')})."
             )
+
+        return await _offload(_impl)
+
+    @mcp.tool()
+    async def select_dataset(
+        dataset_name: str,
+        password: str | None = None,
+    ) -> str:
+        """Add a dataset to YOUR key's accessible set (self-service, D16).
+
+        Mirrors the /access page's checkbox: a public dataset needs nothing;
+        a password-protected dataset needs its CORRECT password (verified
+        server-side, then saved so every other tool works without any
+        password argument).  The selection persists for this API key until
+        you call ``deselect_dataset``.  Operator-ACL grants cannot be
+        revoked here, and denylisted datasets (RAG_ACCESS_DENY_SELECT) are
+        refused outright.
+
+        Parameters
+        ----------
+        dataset_name:
+            Name of the dataset to select (see list_datasets).
+        password:
+            The dataset password — required when the dataset is protected.
+        """
+
+        def _impl() -> str:
+            ident = _current_key_identity()
+            if ident is None or ident.is_admin:
+                raise ToolError("select_dataset applies to per-user API keys (registry keys) — admin keys see everything already.")
+            _mcp_pw_check_throttle(_unlock_client_id())
+            dm = get_manager()
+            try:
+                dm.get_dataset(dataset_name)
+            except FileNotFoundError:
+                raise ToolError(f"Dataset '{dataset_name}' not found.")
+            try:
+                entry = _access.verify_and_select(
+                    ident,
+                    dataset_name,
+                    password,
+                    dm.has_password,
+                    dm.verify_password,
+                )
+            except ValueError as exc:
+                # Wrong/missing password → count it in the caller's throttle
+                # bucket (same brute-force discipline as unlock_dataset).
+                if password:
+                    _mcp_pw_record_failure(_unlock_client_id())
+                raise ToolError(str(exc))
+            _mcp_pw_reset_failures(_unlock_client_id())
+            # Selection IS the unlock for this identity: warm the session
+            # cache so even store-less read paths see it immediately.
+            if entry.get("password"):
+                _cache_unlock(dataset_name, entry["password"], ttl=86400)
+            if entry.get("source") == "acl":
+                return f"Dataset '{dataset_name}' is already granted to your key by the operator ACL — nothing to add."
+            if entry.get("source") == "acl+pw":
+                # ACL-granted, password proven anyway: saved as a password-only
+                # sidecar (the memory-binding case).
+                return (f"Password saved for '{dataset_name}' (already ACL-granted) — "
+                        f"memory tools need no password argument now.")
+            protected = " (password saved — no password argument needed on any tool)" if entry.get("password") else ""
+            return f"Dataset '{dataset_name}' selected for your key{protected}."
+
+        return await _offload(_impl)
+
+    @mcp.tool()
+    async def deselect_dataset(
+        dataset_name: str,
+    ) -> str:
+        """Remove a dataset from YOUR key's self-selected set (D16).
+
+        Only removes selections YOU made (password-proof ones); an
+        operator-ACL grant is untouched.  The saved password is dropped with
+        the selection.
+
+        Parameters
+        ----------
+        dataset_name:
+            Name of the dataset to deselect.
+        """
+
+        def _impl() -> str:
+            ident = _current_key_identity()
+            if ident is None or ident.is_admin:
+                raise ToolError("deselect_dataset applies to per-user API keys (registry keys).")
+            removed = _access.deselect_dataset(ident, dataset_name)
+            if removed:
+                return f"Dataset '{dataset_name}' deselected (saved password removed)."
+            return f"No self-selection for '{dataset_name}' on your key — nothing removed."
+
+        return await _offload(_impl)
+
+    @mcp.tool()
+    async def set_memory_dataset(
+        dataset_name: str | None = None,
+    ) -> str:
+        """Mark which dataset is YOUR long-term memory store (the /access page's ★).
+
+        With no argument, clears the binding.  The bound dataset must be
+        accessible to your key (operator ACL or a prior ``select_dataset``).
+        Once bound, ``add_memory`` / ``search_memory`` need neither
+        ``dataset_name`` nor ``password`` — the binding (and any saved
+        password) is resolved server-side per identity.
+
+        Parameters
+        ----------
+        dataset_name:
+            The dataset to bind as your memory store; omit to unbind.
+        """
+
+        def _impl() -> str:
+            ident = _current_key_identity()
+            if ident is None or ident.is_admin:
+                raise ToolError("set_memory_dataset applies to per-user API keys (registry keys).")
+            try:
+                bound = _access.set_memory_dataset(ident, dataset_name)
+            except _access.SelectionDenied as exc:
+                raise ToolError(str(exc))
+            if bound:
+                return f"Memory dataset bound: '{bound}' (per-key, server-side — memory tools need no dataset_name/password)."
+            return "Memory dataset binding cleared."
 
         return await _offload(_impl)
 
@@ -2529,6 +2830,9 @@ try:
         source_prefix: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        dense_weight: float | None = None,
+        sparse_weight: float | None = None,
+        k: int | None = None,
     ) -> str:
         """Search a multimodal RAG dataset and return formatted context.
 
@@ -2558,8 +2862,10 @@ try:
             audio → ASR transcription → text.
         password:
             Optional if the dataset was previously unlocked with
-            ``unlock_dataset``; required otherwise.  When provided this
-            also acts as an implicit unlock for future calls.
+            ``unlock_dataset`` or selected with your key (``select_dataset``
+            / the /access page — the saved password resolves silently);
+            required otherwise.  When provided this also acts as an implicit
+            unlock for future calls.
         media_base_url:
             External base URL of the API server (the value of
             ``MEDIA_BASE_URL``). When set, ``file://`` PVC paths in results
@@ -2583,6 +2889,23 @@ try:
         date_from / date_to:
             Optional metadata filters (ISO-8601 datetimes) on a document's
             ``timestamp_start`` — log entries and timestamped documents.
+        dense_weight / sparse_weight:
+            Optional weighted-RRF lane weights (default 1.0 / 1.0, clamped
+            0.0–10.0).  Rank-space tilts, NOT score multipliers: qdrant
+            scores each lane ``1/((pos+1)/w + k − 1)``, so a higher weight
+            makes that lane's rank positions count more — trust the order,
+            not the magnitude.  Text-only searches on a hybrid-capable
+            dataset fuse dense + BM25 lanes; multimodal (media-only) or
+            dense-degraded searches cannot fuse, and the response's
+            ``rrf.applied`` is then ``false``.  When BOTH weights are
+            omitted, the dataset's stored per-dataset defaults apply
+            (settable by the operator on the home page or via the create /
+            PATCH API) — an explicit weight here always wins, and the
+            response's ``rrf`` block reports the effective parameters.
+        k:
+            Optional RRF ranking constant (default 2, clamped 1–1000).
+            Only sent when an override is present: the default request keeps
+            the fusion form exactly as before.
         """
 
         # Sync setup — cheap (cached singleton, meta.json read, cached RAG).
@@ -2596,13 +2919,35 @@ try:
                 raise ToolError(f"Dataset '{dataset_name}' not found.")
             verified_password = _resolve_and_unlock(dm, dataset_name, password)
             rag = dm._get_rag(dataset_name)
-            return rag, verified_password
+            # Effective weighted-RRF params for the no-override case:
+            # dataset meta defaults (override wins below).  One meta.json
+            # read, same offloaded block as the ACL/unlock checks.
+            return rag, verified_password, dm._effective_rrf(dataset_name, None)
 
-        rag, verified_password = await _offload(_setup)
+        rag, verified_password, dataset_rrf_default = await _offload(_setup)
 
         # Clamp paging/ranking params to safe bounds (see _clamp_tool_limit).
         top_k = _clamp_tool_limit(top_k, "top_k", maximum=100)
         reranker_top_k = _clamp_tool_limit(reranker_top_k, "reranker_top_k", maximum=min(50, top_k))
+
+        # Weighted RRF (feature: weighted RRF, dataset-defaults slice).
+        # Caller weights win uniformly (the ruling); when NO override is
+        # given, the dataset's stored per-dataset defaults (meta["rrf"],
+        # settable via POST /api/datasets body + PATCH) apply to THIS
+        # single-dataset search.  Federated search_datasets does NOT thread
+        # per-dataset defaults (one merged pool cannot honour differing
+        # per-dataset weights) — it also takes no weight parameters at all.
+        # A default equal to the global default resolves to None, keeping
+        # the fusion request byte-identical (the k-default trap rule).
+        rrf: RrfParams | None = None
+        if dense_weight is not None or sparse_weight is not None or k is not None:
+            rrf = RrfParams(
+                dense_weight=_clamp_rrf_weight(dense_weight, "dense_weight") if dense_weight is not None else 1.0,
+                sparse_weight=_clamp_rrf_weight(sparse_weight, "sparse_weight") if sparse_weight is not None else 1.0,
+                k=_clamp_rrf_k(k) if k is not None else None,
+            )
+        else:
+            rrf = dataset_rrf_default
 
         # Metadata filters (feature: filtered search) — validated here so a
         # bad date surfaces as a tool error instead of a silent no-op filter.
@@ -2666,6 +3011,7 @@ try:
             verified_password,
             media_base_url,
             filters,
+            rrf,
         )
 
     @mcp.tool()
@@ -2725,6 +3071,12 @@ try:
         first, then call again).  A dataset that fails to search is reported
         under ``errors`` and never fails the whole call; each remaining
         dataset still contributes its results.
+
+        Weighted RRF: per-dataset defaults are deliberately IGNORED here by
+        ruling — one merged pool cannot honour differing per-dataset
+        weights, so every dataset is searched with the default fusion
+        request.  (Per-dataset defaults apply only to single-dataset
+        searches; there is deliberately no weight parameter on this tool.)
         """
 
         # Clamp paging/ranking params to safe bounds (see _clamp_tool_limit).
@@ -3315,8 +3667,10 @@ try:
             Number of files to skip for pagination (default 0).
         password:
             Optional if the dataset was previously unlocked with
-            ``unlock_dataset``; required otherwise.  When provided this
-            also acts as an implicit unlock for future calls.
+            ``unlock_dataset`` or selected with your key (``select_dataset``
+            / the /access page — the saved password resolves silently);
+            required otherwise.  When provided this also acts as an implicit
+            unlock for future calls.
         """
 
         def _impl() -> str:
@@ -3448,8 +3802,10 @@ try:
             Name of the dataset.
         password:
             Optional if the dataset was previously unlocked with
-            ``unlock_dataset``; required otherwise.  When provided this
-            also acts as an implicit unlock for future calls.
+            ``unlock_dataset`` or selected with your key (``select_dataset``
+            / the /access page — the saved password resolves silently);
+            required otherwise.  When provided this also acts as an implicit
+            unlock for future calls.
         """
 
         def _impl() -> str:
@@ -3547,7 +3903,8 @@ try:
             Raw documents (plain strings) — the ``POST /documents`` twin.
         password:
             Optional if the dataset was previously unlocked with
-            ``unlock_dataset``; required otherwise (implicit unlock on
+            ``unlock_dataset`` or selected with your key (saved password
+            resolves silently); required otherwise (implicit unlock on
             success).
 
         Returns the REST twins' result shape: the batch result

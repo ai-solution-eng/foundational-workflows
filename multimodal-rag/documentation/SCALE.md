@@ -20,21 +20,21 @@ The Deployment runs 4 pods (vs 1 in the base chart). Traffic is distributed acro
 
 `templates/deployment.yaml` — gunicorn command
 
-Instead of a single `uvicorn` process, the scale chart runs **gunicorn with `UvicornWorker`** (`values.yaml` → `app.workers`). The large chart defaults to **4 replicas × 4 workers** (16 event loops): the shared embed-batcher singleton aggregates text queries cross-process (`RAG_EMBED_BATCH_URL`), so per-worker batch fragmentation no longer applies.  (The old "4 workers → ~8 req/s" result predates
-the singleton and does not reproduce: the same 4×4 shape measured 49.3 req/s @ N=100 and 72.8 req/s @ N=250 on v3.1.8, 100% success.)  Effective concurrency = `replicas × workers × syncPoolSize` = 4 × 4 × 64 = **1024 concurrent blocking operations** cluster-wide. Each worker process gets its own `sync_pool`, `httpx` connection pools, and Qdrant clients.
+Instead of a single `uvicorn` process, the scale chart runs **gunicorn with `UvicornWorker`** (`app.workers`). The large chart defaults to **4 replicas × 4 workers** (16 event loops) (`app.workers: 4`); the medium chart dials this to **2 replicas × 2 workers**. The shared embed-batcher singleton aggregates text queries cross-process (`RAG_EMBED_BATCH_URL`), so per-worker batch fragmentation no longer applies.  (The old "4 workers → ~8 req/s" result predates
+the singleton and does not reproduce: the same 4×4 shape measured 49.3 req/s @ N=100 and 72.8 req/s @ N=250 on v3.1.8, 100% success.)  Effective concurrency = `replicas × workers × app.syncPoolSize` = 4 × 4 × 64 = **1024 concurrent blocking operations** cluster-wide. Each worker process gets its own `sync_pool`, `httpx` connection pools, and Qdrant clients.
 
 ## 3. Multi-replica Qdrant cluster with sharding
 
-`templates/qdrant-statefulset.yaml` — `replicas: 3` with cluster mode
+`templates/qdrant-statefulset.yaml` — `qdrant.replicas` (large: 3, medium: 2) with cluster mode
 
-This is the biggest architectural difference. The base chart runs a single Qdrant instance; the scale chart runs a **3-node Qdrant cluster**:
+This is the biggest architectural difference. The base chart runs a single Qdrant instance; the scale charts run a **multi-node Qdrant cluster** (`qdrant.replicas`: 3 on large, 2 on medium):
 
 - `QDRANT__CLUSTER__ENABLED=true` and `QDRANT__CLUSTER__P2P_PORT=6335` enable Qdrant's distributed consensus and peer-to-peer bootstrapping.
 - A **headless Service** (`clusterIP: None`, `templates/qdrant-service.yaml`) gives each Qdrant pod a stable DNS identity (`rag-mcp-server-qdrant-0`, `-1`, `-2`) — required for StatefulSet peer discovery.
 - The p2p port (6335) is exposed alongside gRPC (6334) and HTTP (6333) so nodes can coordinate.
-- Collections are **sharded** across the 3 nodes, so read load (every search hits Qdrant) is spread out.
+- Collections are **sharded** across the nodes, so read load (every search hits Qdrant) is spread out.
 
-Each Qdrant replica gets its own PVC via `volumeClaimTemplates` with `ReadWriteOnce` (per-pod storage), and larger resources: `16Gi–32Gi` memory, `4–8` CPU (`values.yaml` → `resources.qdrant`).
+Each Qdrant replica gets its own PVC via `volumeClaimTemplates` with `ReadWriteOnce` (per-pod storage; `persistence.qdrant.accessMode` — the volumeClaimTemplate mode, distinct from the base chart's `ReadWriteMany` shared claim), and larger resources: `10–32Gi` memory, `3–8` CPU (`resources.qdrant`, the same dotted paths as the base chart). The large chart additionally retains per-replica PVCs on scale-down/uninstall (`persistentVolumeClaimRetentionPolicy: Retain`); delete the PVCs explicitly to wipe Qdrant data.
 
 Because the per-replica Qdrant PVCs are **not** mounted on the API pod (in the base chart they are mounted read-only so `/api/admin/health` can report exact usage), the management page instead surfaces per-replica **shard placement** plus the configured per-replica size (`QDRANT_PVC_SIZE` = `persistence.qdrant.size`) from Qdrant's `/cluster` API. This gives a storage-spread estimate (which
 replicas hold how many shards × PVC size) without exec/kubectl. For exact bytes per replica use `kubectl exec <qdrant-N> -- df -h /qdrant/storage`.
@@ -43,10 +43,11 @@ replicas hold how many shards × PVC size) without exec/kubectl. For exact bytes
 
 `templates/redis.yaml` + `templates/configmap.yaml`
 
-In the base chart, password-unlocked datasets are cached **in-process memory** (`_UNLOCK_CACHE` dict in `api_server.py`). With 4 replicas × 4 workers = 16 separate processes, a user would have to re-enter their password whenever routed to a different pod/worker. The scale chart adds:
+In the base chart, password-unlocked datasets are cached **in-process memory** (`_UNLOCK_CACHE` dict in `api_server.py`). With 4 replicas × 4 workers = 16 separate processes, a user would have to re-enter their password whenever routed to a different pod/worker. The scale charts add:
 
-- A **Redis Deployment + Service** (`templates/redis.yaml`) running `redis-server` in-memory (no persistence — unlock state is ephemeral).
+- A **Redis Deployment + Service** (`templates/redis.yaml`) running `redis-server` in-memory (no persistence — unlock state is ephemeral). `redis.enabled: true` on both scale charts (the base chart keeps `redis.enabled: false`, which renders nothing); `redis.image` (`redis:7-alpine`, `redis.image.repository`/`redis.image.tag`/`redis.image.pullPolicy`) and `redis.port` (6379) are overridable.
 - `REDIS_URL` is injected into the ConfigMap, and the backend (`api_server.py`) lazily builds a Redis client. `_unlock_cache_get` / `_unlock_cache_set` use Redis with a TTL (in-app `UNLOCK_TTL` default 1800 s — not chart-configurable) so a single unlock works across all pods.
+- `redis.password` (default empty = unauthenticated) — when set, `redis-server` starts with `--requirepass` and the app connects with the password from the model-keys Secret (`REDIS_PASSWORD`).
 - Falls back to in-memory dict if Redis is unavailable.
 
 Unlock identity is also derived from the authenticated user (oauth2-proxy headers: `X-Auth-Request-Email` / `X-Auth-Request-User`) rather than client IP, which is unreliable behind Istio/oauth2-proxy (many users may share one proxy IP).
@@ -55,71 +56,119 @@ Unlock identity is also derived from the authenticated user (oauth2-proxy header
 
 `values.yaml` — `rag.deferCountSync: true` → `RAG_DEFER_COUNT_SYNC=true`
 
-In the base chart, every `get_dataset()` / `list_datasets()` call syncs the document count from Qdrant and writes it back to `meta.json` on the shared PVC. With 4 replicas, this causes:
+In the base chart, every `get_dataset()` / `list_datasets()` call syncs the document count from Qdrant and writes it back to `meta.json` on the shared PVC. With multiple replicas, this causes:
 
 1. **Write races** — multiple pods writing `meta.json` concurrently on the NFS PVC.
 2. **Qdrant load** — every read triggers an extra Qdrant round-trip.
 
-The scale chart sets `RAG_DEFER_COUNT_SYNC=true`, which makes `list_datasets()` and `get_dataset()` skip the Qdrant count sync entirely (`dataset_manager.py`). Counts are only synced on explicit admin requests. This eliminates both the race and the extra Qdrant load.
+The scale charts set `rag.deferCountSync: true`, which makes `list_datasets()` and `get_dataset()` skip the Qdrant count sync entirely (`dataset_manager.py`). Counts are only synced on explicit admin requests. This eliminates both the race and the extra Qdrant load.
 
 ## 6. gRPC Qdrant client with hard timeout
 
 `values.yaml` → `qdrant.client` → `templates/configmap.yaml`
 
-The base chart uses HTTP to talk to Qdrant (no timeout). The scale chart sets:
+The base chart uses HTTP to talk to Qdrant. The scale charts set:
 
-- `QDRANT_PREFER_GRPC=true` — gRPC is more efficient than HTTP at high QPS (binary framing, multiplexed streams). Honored in `rag_system.py`.
-- `QDRANT_CLIENT_TIMEOUT=30` — a hard 30s timeout so a hung Qdrant node can't pin a `sync_pool` thread indefinitely. With limited thread-pool slots, one hung request could otherwise cascade.
+- `qdrant.client.preferGrpc: true` → `QDRANT_PREFER_GRPC=true` — gRPC is more efficient than HTTP at high QPS (binary framing, multiplexed streams). Honored in `rag_system.py`.
+- `qdrant.client.timeout: 30` → `QDRANT_CLIENT_TIMEOUT=30` — a hard 30s timeout so a hung Qdrant node can't pin a `sync_pool` thread indefinitely. With limited thread-pool slots, one hung request could otherwise cascade.
+- `qdrant.client.quantization: int8` → `QDRANT_QUANTIZATION=int8` — new collections get int8 scalar quantization (4x vector-memory reduction, ~1–2% recall loss, faster search; no rescoring pass). `none` disables.
+- `qdrant.client.quantizationAlwaysRam: true` → `QDRANT_QUANTIZATION_ALWAYS_RAM=true` — quantized vectors are pinned in RAM for fast search. Set `false` for very large datasets (2M+ points) to avoid OOM (quantized vectors then read from disk per search).
+
+Quantization applies to *newly created* collections only — existing collections keep their original config.
 
 ## 7. Larger, tuned thread pools
 
 `values.yaml` → `app.syncPoolSize` / `app.mcpPoolSize` → `templates/configmap.yaml`
 
-The blocking RAG work (embedding, Qdrant calls, file processing) runs in a `ThreadPoolExecutor`. The scale chart raises:
+The blocking RAG work (embedding, Qdrant calls, file processing) runs in a `ThreadPoolExecutor`. The scale charts raise:
 
-- `SYNC_POOL_SIZE: 64` (base default: 12) — per-worker thread pool for `sync_wrapper_safe` (`utils/general_tools.py`). Each of the 4 workers × 4 pods gets 64 threads.
-- `MCP_POOL_SIZE: 64` — per-pod thread pool for offloading MCP tool bodies (`mcp_server.py`), so a single slow search can't stall every concurrent MCP client.
+- `app.syncPoolSize` → `SYNC_POOL_SIZE: 64` (large) / `32` (medium) — per-worker thread pool for `sync_wrapper_safe` (`utils/general_tools.py`). Effective concurrency = `replicaCount × app.workers × app.syncPoolSize`.
+- `app.mcpPoolSize` → `MCP_POOL_SIZE: 64` (large) / `32` (medium) — per-pod thread pool for offloading MCP tool bodies (`mcp_server.py`), so a single slow search can't stall every concurrent MCP client.
+- `app.qdrantPoolSize` → `QDRANT_POOL_SIZE: 16` — per-process thread pool around the Qdrant client (`vector_store.py`); queries and upserts fan through it so one slow shard can't serialize the rest.
 
 ## 8. Larger httpx connection pools for model endpoints
 
 `values.yaml` → `modelPool` → `templates/configmap.yaml`
 
-The embedder is on every search's critical path. The base chart defaults to `max_connections=30`. The scale chart raises:
+The embedder is on every search's critical path. The base chart defaults to `max_connections=30`. The scale charts raise:
 
-- `MODEL_POOL_MAX_CONNECTIONS: 200`
-- `MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS: 50`
+- `modelPool.maxConnections` → `MODEL_POOL_MAX_CONNECTIONS: 200` (large) / `100` (medium)
+- `modelPool.maxKeepaliveConnections` → `MODEL_POOL_MAX_KEEPALIVE_CONNECTIONS: 50` (large) / `25` (medium)
 
 Honored in `utils/pcai_model_classes.py`, which builds `httpx.Limits` for the async model clients. This prevents the embedder's HTTP connection pool from becoming the bottleneck under concurrent load.
+
+## 8b. Dynamic query batching (embedding + Qdrant)
+
+`values.yaml` → `app.*` → `templates/configmap.yaml`
+
+Both search-path hotspots batch concurrent queries so N simultaneous searches cost fewer model/store round-trips:
+
+**Embedding queries** (`utils/model_adapters.py`):
+
+- `app.embeddingQueryBatchSize` → `EMBEDDING_QUERY_BATCH_SIZE: 128` — fold up to this many concurrent text-embedding queries into one embedder call.
+- `app.embeddingQueryBatchWaitMs` → `EMBEDDING_QUERY_BATCH_WAIT_MS: 200` — max ms the batcher holds a query waiting for company before flushing.
+- `app.embeddingQueryIdleWaitMs` → `EMBEDDING_QUERY_IDLE_WAIT_MS: 50` — idle early-flush (batch-guarded): a small *stalled* queue (≤2 items) flushes after this many ms instead of the full window; bursts never split. `0` = always wait the full window.
+- `app.embeddingMaxImagesPerPrompt` → `EMBEDDING_MAX_IMAGES_PER_PROMPT: 4` — cap on images embedded in a single multimodal prompt (bounds embedder request size).
+- Large chart only: `embedBatcher.enabled: true` runs a **singleton** `multimodal_rag.embed_batcher` Deployment (`embedBatcher.port: 8002`); all API/MCP pods then route text-only queries to it (`RAG_EMBED_BATCH_URL`), so the effective batch size no longer depends on the number of app processes. Replicas must stay at 1 — more would split the batch pool again. Batcher pod sizing comes from `resources.embedBatcher` (`requests` 512Mi/500m, `limits` 1Gi/2 cpu on large). The medium chart omits the embedBatcher section entirely (per-process batching only).
+
+**Qdrant queries** (`vector_store.py`):
+
+- `app.qdrantQueryBatchSize` → `QDRANT_QUERY_BATCH_SIZE: 128` — fold up to this many concurrent Qdrant searches into one batched call.
+- `app.qdrantQueryBatchWaitMs` → `QDRANT_QUERY_BATCH_WAIT_MS: 5` — max ms the batcher waits before flushing (kept small: Qdrant batches are cheap).
 
 ## 9. Pod anti-affinity (spreads replicas across nodes)
 
 `templates/deployment.yaml` + `values.yaml` → `antiAffinity.enabled: true`
 
-A `preferredDuringSchedulingIgnoredDuringExecution` anti-affinity rule with weight 100 tells the scheduler to spread the 4 API pods across different nodes when possible. This means a node failure takes down at most one pod, and no single node becomes a CPU/memory hotspot for the RAG workload.
+A `preferredDuringSchedulingIgnoredDuringExecution` anti-affinity rule with weight 100 tells the scheduler to spread the API pods across different nodes when possible. This means a node failure takes down at most one pod, and no single node becomes a CPU/memory hotspot for the RAG workload.
 
 ## 10. Shared file PVC (ReadWriteMany)
 
 `templates/pvc.yaml` + `values.yaml` → `persistence.data`
 
-All 4 API replicas mount the same file PVC (`/data`) as `ReadWriteMany` (NFS-backed via `gl4f-filesystem`). This means any pod can serve any uploaded file — there's no need to replicate files across pods. The PVC is also annotated with `helm.sh/resource-policy: keep` so it survives `helm uninstall`.
+All API replicas mount the same file PVC (`/data`) as `persistence.data.accessMode: ReadWriteMany` (NFS-backed via `persistence.data.storageClass: gl4f-filesystem`). This means any pod can serve any uploaded file — there's no need to replicate files across pods. The PVC is also annotated with `helm.sh/resource-policy: keep` so it survives `helm uninstall`. (`persistence.data.accessMode` / `persistence.data.storageClass` are the same standard-Kubernetes knobs as the base chart — see DEPLOYMENT.md.)
+
+## 11. Standard Kubernetes knobs (scale charts)
+
+Same families as the base chart (defaults differ — see the per-component tables
+below); documented once there and repeated here so coverage is explicit:
+
+| Key | Large default | Medium default | Effect |
+|---|---|---|---|
+| `deployment.appName` | `rag-mcp-server` | `rag-mcp-server` | `app` label on every rendered resource |
+| `image.pullPolicy` | `IfNotPresent` | `IfNotPresent` | Pull policy for the app image (all containers + CronJobs) |
+| `resources.app.requests.memory` / `requests.cpu` | 4Gi / 2 | 2.5Gi / 1.5 | Per-container requests (×2 containers per pod) |
+| `resources.app.limits.memory` / `limits.cpu` | 8Gi / 4 | 8Gi / 3 | Per-container limits |
+| `resources.qdrant.requests.memory` / `requests.cpu` | 16Gi / 4 | 10Gi / 3 | Per-replica Qdrant requests |
+| `resources.qdrant.limits.memory` / `limits.cpu` | 32Gi / 8 | 20Gi / 6 | Per-replica Qdrant limits |
+| `resources.redis.requests.memory` / `resources.redis.requests.cpu` | 256Mi / 100m | 256Mi / 100m | Redis pod requests |
+| `resources.redis.limits.memory` / `resources.redis.limits.cpu` | 512Mi / 500m | 512Mi / 500m | Redis pod limits |
+| `resources.embedBatcher.requests.memory` / `resources.embedBatcher.requests.cpu` | 512Mi / 500m | — (no embedBatcher) | Embed-batcher singleton requests |
+| `resources.embedBatcher.limits.memory` / `resources.embedBatcher.limits.cpu` | 1Gi / 2 | — (no embedBatcher) | Embed-batcher singleton limits |
+| `redis.image.repository` / `redis.image.tag` | `redis` / `7-alpine` | same | Redis server image |
+| `redis.image.pullPolicy` | `IfNotPresent` | `IfNotPresent` | Redis image pull policy |
 
 ## Summary table
 
 | Dimension | Base chart (`helm/`) | Medium chart (`helm-scale-medium/`) | Large chart (`helm-scale-large/`) |
 |---|---|---|---|
-| API replicas | 1 | 2 | 2 |
-| Server | `uvicorn` (1 event loop) | `gunicorn` + 2 `UvicornWorker`s | `gunicorn` + 2 `UvicornWorker`s |
+| API replicas | 1 | 2 | 4 |
+| Server | `uvicorn` (1 event loop) | `gunicorn` + 2 `UvicornWorker`s | `gunicorn` + 4 `UvicornWorker`s |
 | Qdrant | 1 instance (HTTP) | 2-node cluster (gRPC, sharded) | 3-node cluster (gRPC, sharded) |
 | Qdrant client timeout | 30s | 30s | 30s |
 | Unlock cache | in-process dict | Redis (cross-pod) | Redis (cross-pod) |
 | Unlock identity | client IP | authenticated user (oauth2-proxy) | authenticated user (oauth2-proxy) |
 | Count sync on read | every call | deferred (admin-only) | deferred (admin-only) |
-| Sync thread pool | 12 | 32 per worker | 64 per worker |
-| MCP thread pool | 64 (default) | 32 (explicit) | 64 (explicit) |
-| Model HTTP pool | 30 connections | 100 connections | 200 connections |
-| Pod anti-affinity | no | yes (spread across nodes) | yes (spread across nodes) |
+| Sync thread pool (`app.syncPoolSize`) | 12 (base default) | 32 per worker | 64 per worker |
+| MCP thread pool (`app.mcpPoolSize`) | 64 (default) | 32 (explicit) | 64 (explicit) |
+| Model HTTP pool (`modelPool.maxConnections`) | 30 connections | 100 connections | 200 connections |
+| Pod anti-affinity (`antiAffinity.enabled`) | no | yes (spread across nodes) | yes (spread across nodes) |
 | File PVC | 50Gi RWMany | 50Gi RWMany | 100Gi RWMany |
 | Qdrant PVC | 50Gi RWMany (shareable) | 25Gi RWOnce per replica | 100Gi RWOnce per replica |
+| Embed-batcher singleton | — | no | yes (`embedBatcher.enabled`) |
+| Redis unlock cache | — | `redis.enabled: true` | `redis.enabled: true` |
+
+Everything not listed above (model URLs, `security.*` hardening, `s3.*`, `ezua.*`, `backups.*`, `watchedSources.*`, `metrics.*`, the `models.*`/`modelSecrets.*` blocks) is identical to the base chart's `values.yaml` — see [DEPLOYMENT.md](DEPLOYMENT.md) for those keys.
 
 ## Resource requirements
 
@@ -133,7 +182,7 @@ Each API pod runs **two** containers (`rag-api-server` + `rag-mcp-server`), so p
 |---|---|---|---|---|---|
 | **App** (2 ctr/pod) | `helm/` | 1 | 4 Gi / 4 cpu | 16 Gi / 8 cpu | — |
 | | `helm-scale-medium/` | 2 | 5 Gi / 3 cpu | 16 Gi / 6 cpu | — |
-| | `helm-scale-large/` | 2 | 8 Gi / 4 cpu | 16 Gi / 8 cpu | — |
+| | `helm-scale-large/` | 4 | 8 Gi / 4 cpu | 16 Gi / 8 cpu | — |
 | **Qdrant** | `helm/` | 1 | 16 Gi / 4 cpu | 32 Gi / 8 cpu | 50 Gi |
 | | `helm-scale-medium/` | 2 | 10 Gi / 3 cpu | 20 Gi / 6 cpu | 25 Gi × 2 |
 | | `helm-scale-large/` | 3 | 16 Gi / 4 cpu | 32 Gi / 8 cpu | 100 Gi × 3 |
@@ -145,11 +194,13 @@ Each API pod runs **two** containers (`rag-api-server` + `rag-mcp-server`), so p
 
 | | `helm/` (base) | `helm-scale-medium/` | `helm-scale-large/` |
 |---|---|---|---|
-| **Req memory** | 20 Gi | 30.25 Gi (+51 %) | 64.25 Gi (+221 %) |
-| **Req CPU** | 8.0 | 12.1 (+51 %) | 20.1 (+151 %) |
-| **Lim memory** | 48 Gi | 72.5 Gi (+51 %) | 128.5 Gi (+168 %) |
-| **Lim CPU** | 16.0 | 24.5 (+53 %) | 40.5 (+153 %) |
+| **Req memory** | 20 Gi | 30.25 Gi (+51 %) | 104.25 Gi (+421 %) |
+| **Req CPU** | 8.0 | 12.1 (+51 %) | 36.1 (+351 %) |
+| **Lim memory** | 48 Gi | 72.5 Gi (+51 %) | 176.5 Gi (+268 %) |
+| **Lim CPU** | 16.0 | 24.5 (+53 %) | 64.5 (+303 %) |
 | **PVC total** | 100 Gi | 100 Gi (+0 %) | 400 Gi (+300 %) |
+
+> The totals are the **`values.yaml` defaults** (large = 4 API replicas × 4 workers). The actual SE-G2 scale-large deployment ran a reduced shape (2.5Gi/1.5 app, 10Gi/3 qdrant requests — see `helm-scale-large/values-examples/values.g2.yaml`); size to your own namespace quota.
 
 Percentages are relative to the base chart. The medium variant is tuned so that **total requests are ~50 % above the base chart** while **total PVC stays at 100 Gi** — the data PVC is unchanged at 50 Gi (no resize needed on upgrade) and the two Qdrant PVCs are 25 Gi each (replacing the base chart's single 50 Gi Qdrant PVC).
 

@@ -9,6 +9,7 @@
 #   docker/Dockerfile              -> <demos>/multimodal-rag/docker/Dockerfile.txt
 #   docker/requirements.txt        -> <demos>/multimodal-rag/docker/requirements.txt
 #   openwebui_extension/filter.py  -> <demos>/multimodal-rag/extensions/openwebui-filter/filter.py
+#   documentation/opencode-memory  -> <demos>/multimodal-rag/extensions/opencode-memory (plugins/tools/config)
 #
 # The demo repo's README.md is maintained separately there and is never touched.
 #
@@ -67,6 +68,14 @@ run cp "${SRC}/docker/requirements.txt" "${DEMO}/docker/requirements.txt"
 # 5) Open WebUI extension: only the filter.
 run mkdir -p "${DEMO}/extensions/openwebui-filter"
 run cp "${SRC}/openwebui_extension/filter.py" "${DEMO}/extensions/openwebui-filter/filter.py"
+
+# 6) opencode-memory extension: plugins/tools/config (source of truth here in fw).
+run mkdir -p "${DEMO}/extensions/opencode-memory/plugins" "${DEMO}/extensions/opencode-memory/tools"
+run cp "${SRC}/documentation/opencode-memory/plugins/memory-provenance.ts"      "${DEMO}/extensions/opencode-memory/plugins/"
+run cp "${SRC}/documentation/opencode-memory/plugins/session-memory-logger.ts"  "${DEMO}/extensions/opencode-memory/plugins/"
+run cp "${SRC}/documentation/opencode-memory/tools/session-id.ts"               "${DEMO}/extensions/opencode-memory/tools/"
+run cp "${SRC}/documentation/AGENTS.md"                                         "${DEMO}/extensions/opencode-memory/AGENTS.md"
+run cp "${SRC}/documentation/opencode.jsonc"                                    "${DEMO}/extensions/opencode-memory/opencode.jsonc"
 
 (( DRY_RUN )) && echo "Dry run complete — nothing was modified." \
               || echo "Done. Review with: git -C \"${DEMO%/multimodal-rag}\" status"

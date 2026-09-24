@@ -12,6 +12,7 @@ import contextlib
 import contextvars
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import re
@@ -56,6 +57,15 @@ from multimodal_rag.input_processing import (
 from multimodal_rag.rag_system import MultimodalRAG, _record_ingest_warning, _store_write_guard
 from multimodal_rag.utils.general_tools import retry_call
 from multimodal_rag.utils.logging_utils import logging
+from multimodal_rag.vector_store import RrfParams
+
+# Per-dataset weighted-RRF defaults (feature: weighted RRF, dataset-defaults
+# slice).  Stored in meta.json as ``meta["rrf"] = {"dense_weight": …,
+# "sparse_weight": …, "k": …}``.  Resolution order at search time is
+# per-call override > dataset meta default > global default (1.0/1.0 with no
+# pinned k).  The clamp discipline mirrors the API slices exactly: weights
+# clamp to ``[0.0, 10.0]`` rounded to 3 decimals, ``k`` to ``[1, 1000]``.
+_RRF_WEIGHT_MAX = 10.0
 
 logger = logging.getLogger(__name__)
 
@@ -513,6 +523,18 @@ _LOG_EXTS = frozenset({".log", ".txt.log"})
 _ARCHIVE_EXTS = frozenset({".zip", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".tbz2", ".txz", ".rar"})
 _INGESTED_HASHES_FILE = ".ingested_hashes.json"
 
+# Watched S3 sources (feature: watched sources): per-dataset skip-state sidecar
+# next to .hashes.json / .bm25_stats.json.  Key = the object's canonical S3 URL
+# (``s3://bucket/key``), value = ``{"etag": ..., "size": ...}`` — the fingerprint
+# of the last successfully ingested version of that object.  On the next sync,
+# an object whose listed ETag+Size still matches is dropped from the download
+# set entirely (no re-download, no re-embed attempt); a changed ETag+Size (the
+# content-changed-under-same-key case) or a new key re-ingests.  ETag+Size is
+# the fingerprint because S3 ETags of multipart uploads are opaque (not MD5) —
+# together the pair catches every realistic mutation.  No ETag use existed in
+# the repo before this feature (verified).
+_WATCHED_STATE_FILE = ".watched_state.json"
+
 
 def _sha256_file(path: str | Path) -> str:
     """Return the SHA-256 hex digest of a file's contents (streamed)."""
@@ -523,6 +545,76 @@ def _sha256_file(path: str | Path) -> str:
         while chunk := f.read(8192):
             h.update(chunk)
     return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Watched S3 sources: per-dataset ETag/Size skip state (.watched_state.json)
+# ---------------------------------------------------------------------------
+# The reconciler CronJob re-lists its prefixes every tick and ingests what it
+# finds.  Without state, every tick re-downloads every object (the content-hash
+# ingest dedup then discards the identical bytes — network + disk I/O for
+# nothing, and the skip hides would-be "changed" objects until after the
+# download).  This sidecar mirrors the ``.bm25_stats.json`` discipline: a JSON
+# file in the dataset's files/ directory, read/write under the same
+# cross-process fcntl lock, atomically promoted so a crash mid-write never
+# truncates it.  Written ONLY after a successful ingest of the object.
+
+# module-level read cache (mtime-keyed) — the same shape as _load_hash_index's
+_watched_state_cache: dict[Path, tuple[int, dict[str, dict[str, Any]]]] = {}
+_watched_state_cache_lock = threading.Lock()
+
+
+def _canonical_s3_url(url: str) -> str:
+    """Canonical state key for an S3 URL: query stripped, no trailing slash.
+
+    Matches how ``metadata.source`` records URL ingests
+    (``url.split("?")[0].rstrip("/")``), so a state key and a stored source
+    are the same string.
+    """
+    return url.split("?")[0].rstrip("/")
+
+
+def _load_watched_state(p: Path) -> dict[str, dict[str, Any]]:
+    """Return the parsed watched-source state for *p* (mtime-cached).
+
+    Corrupt/missing file → empty state (a re-ingest of everything is the safe
+    recovery; the state is an optimisation, never a correctness gate).
+    """
+    try:
+        mtime = p.stat().st_mtime_ns if p.exists() else 0
+    except OSError:
+        return {}
+    with _watched_state_cache_lock:
+        cached = _watched_state_cache.get(p)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+    state: dict[str, dict[str, Any]] = {}
+    if mtime:
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                state = {str(k): dict(v) for k, v in raw.items() if isinstance(v, dict)}
+        except (json.JSONDecodeError, OSError, ValueError):
+            logger.debug("Unable to parse watched-source state %s — starting empty", p, exc_info=True)
+    with _watched_state_cache_lock:
+        _watched_state_cache[p] = (mtime, state)
+        if len(_watched_state_cache) > 100:  # bound across many datasets
+            _watched_state_cache.pop(next(iter(_watched_state_cache)), None)
+    return state
+
+
+def _save_watched_state(p: Path, state: dict[str, dict[str, Any]]) -> None:
+    """Atomically persist *state* and refresh the read cache.
+
+    Caller holds the cross-process lock (the read→modify→write must be
+    serialised across pods sharing the RWX PVC).
+    """
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, p)
+    with _watched_state_cache_lock:
+        _watched_state_cache[p] = (p.stat().st_mtime_ns, state)
 
 
 # ── Preprocessing limits for files stored on PVC ─────────────────────────
@@ -721,11 +813,18 @@ def _sync_prefixes(urls: list[str]) -> list[str]:
 
 
 def _list_s3_prefix(s3_url: str) -> list[str]:
-    """List all supported-file-type objects under an S3 prefix.
+    """List all supported-file-type objects under an S3 prefix, **recursively**.
 
     Returns full ``s3://bucket/key`` URLs for every object whose extension
-    is recognised by :func:`_classify_file`.  Directories (common prefixes)
-    are **not** recursed — only the immediate level is listed.
+    is recognised by :func:`_classify_file`.  The listing paginates
+    ``list_objects_v2`` with the ``Prefix`` filter only — that is a recursive
+    walk of the whole subtree, not just the immediate level (directories are
+    not recursed *as directories*; every object under the prefix shows up).
+    Directory marker keys (``key/``) are skipped.
+
+    (Historical bug fixed 2026-09: the docstring used to claim only the
+    immediate level was listed — the code has always been recursive, which is
+    exactly the behaviour S3 sync and watched sources rely on.)
     """
     from urllib.parse import urlparse
 
@@ -755,6 +854,47 @@ def _list_s3_prefix(s3_url: str) -> list[str]:
         raise ValueError(f"Failed to list S3 prefix {s3_url}: {e}")
 
     return urls
+
+
+def _list_s3_prefix_fingerprints(s3_url: str) -> dict[str, dict[str, Any]]:
+    """List an S3 prefix (same recursive walk as :func:`_list_s3_prefix`) and
+    return a per-object fingerprint map: ``s3://bucket/key → {etag, size}``.
+
+    Watched-sources helper: the ETag+Size pair is the object fingerprint —
+    ETag alone is not comparable across multipart uploads (S3 renders it as
+    ``<md5>-N`` there) and Size alone misses same-length edits.  Bucket
+    allowlist and the supported-file-type filter apply exactly as in the
+    plain listing.  Objects without an ETag (shouldn't happen on real S3/
+    MinIO listings) are still returned with ``etag: None`` so a missing
+    fingerprint can never falsely "unchanged"-match.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(s3_url)
+    bucket = parsed.hostname
+    prefix = parsed.path.lstrip("/")
+    _check_s3_bucket(bucket)
+
+    def _list() -> dict[str, dict[str, Any]]:
+        s3 = _get_s3_client()
+        paginator = s3.get_paginator("list_objects_v2")
+        out: dict[str, dict[str, Any]] = {}
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key: str = obj["Key"]
+                if key.endswith("/"):
+                    continue
+                if _classify_file(key) != "unknown":
+                    out[f"s3://{bucket}/{key}"] = {
+                        "etag": obj.get("ETag"),
+                        "size": obj.get("Size"),
+                    }
+        return out
+
+    try:
+        return retry_call(_list, max_attempts=3, base_delay=2.0, connection_delay=10.0)
+    except Exception as e:
+        raise ValueError(f"Failed to list S3 prefix {s3_url}: {e}")
 
 
 def _expand_urls(raw_urls: list[str]) -> list[str]:
@@ -1479,6 +1619,7 @@ class DatasetManager:
         caption_with_vlm: bool = False,
         remote: bool = True,
         dedup_threshold: float = 0.995,
+        contextualize: bool = False,
     ):
         self.base_path = Path(base_path)
         self.datasets_path = self.base_path / "datasets"
@@ -1503,6 +1644,12 @@ class DatasetManager:
         self.caption_with_vlm = caption_with_vlm
         self.remote = remote
         self.dedup_threshold = dedup_threshold
+        # Per-dataset default for the contextual flag on CREATE when the
+        # request body omits it (RAG_CONTEXTUAL_DEFAULT, chart values
+        # rag.contextual — disabled by default).  Also what the fingerprint
+        # guard reads as "the mode the manager would ingest with" before
+        # meta stamps anything.  Feature module: utils/contextualizer.py.
+        self.contextualize = bool(contextualize)
 
         self._verify_endpoints()
 
@@ -1649,6 +1796,8 @@ class DatasetManager:
         keep_originals: bool = True,
         password: str | None = None,
         ocr: bool = False,
+        rrf: "dict[str, Any] | None" = None,
+        contextual: bool = False,
     ) -> dict[str, Any]:
         """Create a new dataset.
 
@@ -1678,6 +1827,30 @@ class DatasetManager:
             Off by default — OCR on a large scan is expensive and must be
             opted into.  Requires the tesseract binary in the image (shipped
             in the Dockerfile); without it the flag is a no-op.
+        rrf:
+            Optional per-dataset weighted-RRF defaults (feature: weighted
+            RRF, dataset-defaults slice): ``{"dense_weight": …,
+            "sparse_weight": …, "k": …}``, all optional keys.  Stored in
+            meta.json; validated with the same clamp discipline as the
+            REST/MCP search surfaces (weights 0.0–10.0 rounded to 3
+            decimals, k 1–1000).  ``None``/empty stores nothing — the
+            dataset then simply inherits the global default (1.0/1.0).
+            Query-time only: no recreate, no schema change; applies to
+            single-dataset searches when the caller passes no explicit
+            override (federated search ignores per-dataset defaults).
+        contextual:
+            Whether ingest-time contextual retrieval runs for this dataset
+            (feature: contextual retrieval, DECISIONS.md 2026-09): one small
+            LLM call per real-text chunk writes 1–2 sentences of
+            document-level context, prepended as a ``[Document context]:``
+            line before embedding.  Off by default — one LLM call per chunk
+            is real cost and must be opted into (the
+            ``/api/admin/datasets/{name}/contextual-preview`` endpoint makes
+            it visible before the flag flips).  Requires a VLM model; without
+            one the flag is a no-op.  Affects NEW ingests only — enabling it
+            on an existing dataset does NOT re-contextualize stored content
+            (content-hash dedup would skip the re-embed anyway); run Recreate
+            to re-contextualize existing files.
         """
         self._validate_name(name)
         dataset_dir = self.datasets_path / name
@@ -1693,6 +1866,7 @@ class DatasetManager:
             "caption_with_vlm": caption_with_vlm,
             "keep_originals": keep_originals,
             "ocr": bool(ocr),
+            "contextual": bool(contextual),
             "created": datetime.now().isoformat(),
             "document_count": 0,
             # The collection _get_rag creates below uses the current schema
@@ -1701,6 +1875,9 @@ class DatasetManager:
             # recreate.
             "schema_version": DATASET_SCHEMA_VERSION,
         }
+        rrf_meta = self._sanitize_rrf_meta(rrf)
+        if rrf_meta is not None:
+            meta["rrf"] = rrf_meta
         if password:
             meta["password_hash"] = _hash_password(password)
         self._write_meta(name, meta)
@@ -1714,7 +1891,13 @@ class DatasetManager:
 
         # Pre-create the Qdrant collection by initialising the RAG instance
         self._get_rag(name)
-        logger.info("Created dataset '%s' (caption_with_asr=%s)", name, caption_with_asr)
+        logger.info(
+            "Created dataset '%s' (caption_with_asr=%s, rrf_defaults=%s, contextual=%s)",
+            name,
+            caption_with_asr,
+            rrf_meta is not None,
+            bool(contextual),
+        )
         return self._strip_password(meta)
 
     def has_password(self, name: str) -> bool:
@@ -1930,6 +2113,9 @@ class DatasetManager:
         # previously-ingested content hash as "already ingested" and skip the
         # file — leaving a freshly-dropped, empty collection.
         self._clear_ingested_hashes(dataset_name)
+        # Same reasoning for the watched-source skip state: the collection was
+        # dropped, so every watched prefix must re-ingest on the next sync.
+        self._watched_state_clear(dataset_name)
         return self.add_files_batch(dataset_name, file_entries, progress_callback=progress_callback)
 
     # ------------------------------------------------------------------
@@ -2328,6 +2514,11 @@ class DatasetManager:
         rebuilt so the new settings apply to subsequent ingests and
         retrievals without a restart. Only affects future operations;
         already-ingested content keeps its stored captions.
+
+        The weighted-RRF defaults (``{"rrf": {…}}``) are query-time only —
+        they are read per search, so no RAG rebuild or re-ingest is needed;
+        the change takes effect on the next search of this dataset from any
+        replica (meta.json is re-read per query).
         """
         with self._get_meta_lock(name):
             meta = self._read_meta(name)
@@ -2341,6 +2532,30 @@ class DatasetManager:
                         caption_changed = key != "ocr"  # ocr needs no RAG rebuild (read per file at ingest)
                     else:
                         meta[key] = updates[key]
+            # Contextual retrieval (feature: contextual retrieval): a plain
+            # boolean that rides the SAME cached-RAG invalidation as the
+            # caption flags — the flag is baked into the MultimodalRAG
+            # instance (contextualize=), so a flip must rebuild the cached
+            # RAG to apply to subsequent ingests.  Affects NEW ingests only;
+            # already-ingested content keeps its stored form (content-hash
+            # dedup would skip the re-embed anyway) — Recreate is the
+            # adoption path for existing files.
+            if "contextual" in updates:
+                meta["contextual"] = bool(updates["contextual"])
+                caption_changed = True
+            # Weighted-RRF defaults (feature: weighted RRF, dataset-defaults
+            # slice): PATCH ``{"rrf": {"dense_weight": …, "sparse_weight": …,
+            # "k": …}}`` with any subset of keys.  Clamped/validated like the
+            # create-time surface; an empty object or a payload that reduces
+            # to the global default (1.0/1.0, no k) REMOVES the stored
+            # default entirely, so ``meta["rrf"]`` never claims a default
+            # that behaves like "no default".
+            if "rrf" in updates:
+                rrf_meta = self._sanitize_rrf_meta(updates["rrf"])
+                if rrf_meta is None:
+                    meta.pop("rrf", None)
+                else:
+                    meta["rrf"] = rrf_meta
             self._write_meta(name, meta)
         # Rebuild the cached RAG so the new caption flags take effect now.
         if caption_changed:
@@ -3093,11 +3308,47 @@ class DatasetManager:
         touching anything.  Known limitation: an object whose *content*
         changed under the same key is re-ingested (its hash changes) but the
         old version's points stay — source-keyed pruning cannot see versions.
+
+        **Watched-source skip state** (feature: watched sources): sync paths
+        consult the per-dataset ``files/.watched_state.json`` sidecar —
+        ``s3://bucket/key → {etag, size}`` of the last successfully ingested
+        version of each object.  A listed object whose ETag+Size still
+        matches its state entry is dropped from the download set before any
+        bytes move (no re-download, no re-embed attempt); the state is written
+        back after the batch for every object whose ingest demonstrably
+        succeeded.  The fingerprint is ETag+Size together, so content changed
+        under the same key re-ingests (the ETag flips even when the size
+        doesn't).  Consequences worth knowing: an empty state changes nothing
+        (the first sync of a dataset behaves exactly as before and populates
+        the state), and — once state exists — deleting a source's documents
+        out-of-band (``dataset_delete_documents`` / the prune filter) sticks:
+        the reconciler no longer resurrects them on the next tick.  The state
+        is an optimisation, never a correctness gate: any parse/IO failure
+        degrades to re-downloading everything.  ``sync_dry_run`` reports the
+        split as ``would_download`` (objects that would move) vs ``unchanged``
+        (objects the state would skip).
         """
-        # Expand S3 directory prefixes to individual file URLs
-        expanded = _expand_urls(urls)
+        sync_mode = sync or sync_dry_run
+        # Expand S3 directory prefixes to individual file URLs.  On sync
+        # paths the per-prefix listing is the *fingerprinting* variant — the
+        # same recursive walk and filter as _expand_urls uses (identical URL
+        # set, same order), but it also carries each object's ETag/Size, so
+        # the watched-state skip costs zero extra S3 calls.  Non-sync paths
+        # keep the plain expansion byte-identical.
+        expanded: list[str] = []
+        listed_fingerprints: dict[str, dict[str, Any]] = {}
+        if sync_mode:
+            for u in urls:
+                if u.startswith("s3://") and _is_s3_directory_url(u):
+                    fps = _list_s3_prefix_fingerprints(u)
+                    listed_fingerprints.update(fps)
+                    expanded.extend(fps.keys())
+                else:
+                    expanded.append(u)
+        else:
+            expanded = _expand_urls(urls)
         if not expanded:
-            if sync or sync_dry_run:
+            if sync_mode:
                 return {
                     "status": "dry-run" if sync_dry_run else "ok",
                     "file_count": 0,
@@ -3108,7 +3359,7 @@ class DatasetManager:
 
         sync_prefixes = _sync_prefixes(urls)
         stored_sources: set[str] = set()
-        if sync or sync_dry_run:
+        if sync_mode:
             non_s3 = [u for u in expanded if not u.startswith("s3://")]
             if non_s3:
                 raise ValueError(
@@ -3116,19 +3367,41 @@ class DatasetManager:
                 )
             stored_sources = self._stored_sources(dataset_name, sync_prefixes)
 
+        # Watched-state skip: unchanged = listed object whose ETag+Size still
+        # matches the recorded fingerprint of a successful ingest.  Only
+        # fingerprint-listed objects (S3 prefix expansions) can match; plain
+        # URLs are always attempted.
+        unchanged: set[str] = set()
+        if sync_mode:
+            state = self._watched_state_load(dataset_name)
+            if state:
+                for u in expanded:
+                    key = _canonical_s3_url(u)
+                    fp = listed_fingerprints.get(key)
+                    st = state.get(key)
+                    if fp is not None and st and st.get("etag") == fp.get("etag") and st.get("size") == fp.get("size"):
+                        unchanged.add(key)
+
         if sync_dry_run:
-            expected = {u.split("?")[0].rstrip("/") for u in expanded}
+            expected = {_canonical_s3_url(u) for u in expanded}
+            download = [u for u in expanded if _canonical_s3_url(u) not in unchanged]
             return {
                 "status": "dry-run",
                 "scope": sync_prefixes,
                 "listed": sorted(expected),
-                "would_ingest": sorted(expected - stored_sources),
+                "would_ingest": sorted({_canonical_s3_url(u) for u in download} - stored_sources),
                 "would_prune": sorted(stored_sources - expected),
+                # Watched-source skip split (feature: watched sources).
+                "would_download": sorted({_canonical_s3_url(u) for u in download}),
+                "unchanged": sorted(unchanged),
             }
 
+        # Objects the state says are unchanged are NOT downloaded and NOT
+        # force-re-ingested — their recorded ingest is still current.
+        download = [u for u in expanded if _canonical_s3_url(u) not in unchanged]
         # Force-re-ingest URLs with no stored points (see docstring): keyed by
         # the original file name the producer loop sees.
-        force_names = {Path(u.split("?")[0].rstrip("/")).name for u in expanded if u not in stored_sources}
+        force_names = {Path(_canonical_s3_url(u)).name for u in download if u not in stored_sources}
 
         file_entries: list[tuple[str, str]] = []
         tmp_paths: list[str] = []
@@ -3136,13 +3409,16 @@ class DatasetManager:
             # Notify the frontend about each expanded file before downloading
             if progress_callback and len(expanded) > len(urls):
                 for url in expanded:
-                    clean = url.split("?")[0].rstrip("/")
+                    clean = _canonical_s3_url(url)
                     orig_name = Path(clean).name or "download"
-                    progress_callback({"file": orig_name, "status": "listed"})
+                    if clean in unchanged:
+                        progress_callback({"file": orig_name, "status": "unchanged"})
+                    else:
+                        progress_callback({"file": orig_name, "status": "listed"})
 
-            for url in expanded:
+            for url in download:
                 # Derive a human-readable original name from the URL
-                clean = url.split("?")[0].rstrip("/")
+                clean = _canonical_s3_url(url)
                 orig_name = Path(clean).name or "download"
 
                 tmp_path = _download_url(url)
@@ -3158,8 +3434,17 @@ class DatasetManager:
             )
             if sync:
                 result["sync"] = self._prune_sources(
-                    dataset_name, sync_prefixes, expected={u.split("?")[0].rstrip("/") for u in expanded}
+                    dataset_name, sync_prefixes, expected={_canonical_s3_url(u) for u in expanded}
                 )
+                # Sources the prune deleted upstream are gone: forget their
+                # fingerprints so a pruned-and-reappeared object (even with an
+                # identical ETag) re-ingests instead of state-skipping — sync's
+                # documented heal path must keep working.
+                pruned = (result["sync"] or {}).get("pruned_sources") or []
+                if pruned:
+                    self._watched_state_forget(dataset_name, pruned)
+            if sync_mode:
+                self._record_watched_ingest_state(dataset_name, download, listed_fingerprints, result)
             return result
         finally:
             for tmp_path in tmp_paths:
@@ -3167,6 +3452,42 @@ class DatasetManager:
                     os.unlink(tmp_path)
                 except Exception:
                     logger.debug("Suppressed exception", exc_info=True)
+
+    def _record_watched_ingest_state(
+        self,
+        dataset_name: str,
+        attempted_urls: list[str],
+        fingerprints: dict[str, dict[str, Any]],
+        batch_result: dict[str, Any],
+    ) -> None:
+        """Record watched-state fingerprints for URLs whose ingest succeeded.
+
+        Success = the file shows up in the batch result without an error AND
+        with either stored chunks or a content-hash dedup skip (its content is
+        in the dataset either way).  Files that failed, produced no chunks, or
+        are missing from the result stay unrecorded — the next reconcile
+        re-downloads and re-attempts them (fail-soft: a wasted download, never
+        a silently skipped hole).  Basename collisions inside one batch (two
+        prefixes holding the same file name) cannot be resolved per-file and
+        stay unrecorded for the same reason.  Pruned (upstream-deleted) sources
+        were already forgotten by the caller.
+        """
+        if not fingerprints or not attempted_urls:
+            return
+        by_name: dict[str, list[str]] = {}
+        for u in attempted_urls:
+            by_name.setdefault(Path(_canonical_s3_url(u)).name or "download", []).append(u)
+        succeeded: set[str] = set()
+        for f in batch_result.get("files") or []:
+            if not isinstance(f, dict) or f.get("error"):
+                continue
+            urls_for_name = by_name.get(str(f.get("file") or "")) or []
+            if len(urls_for_name) != 1:
+                continue
+            if (f.get("chunks") or 0) > 0 or f.get("deduplicated"):
+                succeeded.add(_canonical_s3_url(urls_for_name[0]))
+        if succeeded:
+            self._watched_state_update(dataset_name, fingerprints, only_urls=succeeded)
 
     def _add_file_processed(
         self,
@@ -4260,6 +4581,7 @@ class DatasetManager:
         use_reranker: bool = False,
         reranker_top_k: int = 3,
         filters: dict[str, Any] | None = None,
+        rrf: "RrfParams | None" = None,
     ) -> list[dict[str, Any]]:
         """Search a dataset and return ranked results.
 
@@ -4269,8 +4591,32 @@ class DatasetManager:
         ``vector_store.build_payload_filter``): ``file_types``, ``severities``,
         ``source_prefix``, ``date_from``/``date_to`` — all optional,
         AND-combined, applied server-side in Qdrant before ranking.
+
+        *rrf* is the optional weighted-RRF override (feature: weighted RRF):
+        when set, the hybrid lane runs ``RrfQuery(rrf=Rrf(k=…,
+        weights=[dense, sparse]))`` and every fused entry gains an ``"rrf"``
+        block recording ``{dense, sparse, k, applied}`` — the exact
+        parameters the executed request used.  The override only ever
+        applies to a fusion request: dense-only results (hybrid disabled,
+        no BM25 stats, no query text) stay unstamped here and the block
+        reports ``applied=false`` rather than labelling dense results with
+        weights.  Default path (no override) returns results exactly as
+        before, with no ``"rrf"`` key.
+
+        When *rrf* is ``None`` the dataset's stored weighted-RRF defaults
+        (``meta["rrf"]``, settable at create time and via PATCH) apply —
+        per-call overrides always win over them, and both lose to nothing:
+        when the effective parameters equal the global default (1.0/1.0,
+        no pinned k) the request stays byte-identical to the historical
+        fusion form.  The ``"rrf"`` block reports the EFFECTIVE parameters.
+        Per-dataset defaults are IGNORED by federated multi-dataset search
+        by ruling — one caller-facing merged pool cannot honour per-dataset
+        weights; only an explicit caller override may apply there.
         """
         rag = self._get_rag(dataset_name)
+        # Effective weights: per-call override > dataset meta default >
+        # global default (None → byte-identical default fusion request).
+        effective_rrf = self._effective_rrf(dataset_name, rrf)
         results = rag.retrieve(
             query,
             top_k=top_k,
@@ -4278,8 +4624,24 @@ class DatasetManager:
             reranker_top_k=reranker_top_k,
             need_media=use_reranker and rag.reranker is not None,
             filters=filters,
+            rrf=effective_rrf,
         )
-        output = []
+        # The rrf block rides on the FIRST entry only (same convention as the
+        # hybrid score-kind stamping: it describes the executed request, not
+        # any individual hit).  applied=false when the lane degraded to
+        # dense-only — never label a dense result with weights.  The block
+        # reports the EFFECTIVE parameters (override or dataset default),
+        # which is exactly what the executed request used.
+        rrf_block: dict[str, Any] | None = None
+        if isinstance(effective_rrf, RrfParams):
+            applied = bool(results) and all(isinstance(doc, dict) and "_rrf" in doc for doc, _ in results)
+            rrf_block = {
+                "dense": effective_rrf.dense_weight,
+                "sparse": effective_rrf.sparse_weight,
+                "k": effective_rrf.k,
+                "applied": applied,
+            }
+        output: list[dict[str, Any]] = []
         for doc, score in results:
             entry: dict[str, Any] = {"content": doc, "score": round(score, 4)}
             if isinstance(doc, dict):
@@ -4289,6 +4651,20 @@ class DatasetManager:
                     entry["embedding_score"] = emb
                 if rerank is not None:
                     entry["reranker_score"] = rerank
+                # Pop the private per-doc stamp after folding it into the
+                # first entry's request-level block (it must not leak into
+                # the content payload).
+                stamp = doc.pop("_rrf", None)
+            else:
+                stamp = None
+            if rrf_block is not None and not any("rrf" in e for e in output):
+                first_stamp: dict[str, Any] | None = stamp if isinstance(stamp, dict) else None
+                entry["rrf"] = {
+                    "dense": first_stamp["dense"] if first_stamp else rrf_block["dense"],
+                    "sparse": first_stamp["sparse"] if first_stamp else rrf_block["sparse"],
+                    "k": first_stamp["k"] if first_stamp else rrf_block["k"],
+                    "applied": bool(first_stamp),
+                }
             output.append(entry)
         return output
 
@@ -4677,6 +5053,98 @@ class DatasetManager:
         meta = self._read_meta(dataset_name) or {}
         return bool(meta.get("ocr", False))
 
+    # ------------------------------------------------------------------
+    # Per-dataset weighted-RRF defaults (feature: weighted RRF, dataset-
+    # defaults slice).  Resolution order at search time: per-call override >
+    # dataset meta default > global default (1.0/1.0, no pinned k).  A meta
+    # default that EQUALS the global default must behave exactly like "no
+    # default at all" — no override reaches the store, so the fusion request
+    # stays byte-identical (the k-default trap rule from the wave-1 slice).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clamp_rrf_weight(value: Any, name: str) -> float:
+        """Clamp a meta weight to ``[0.0, 10.0]``, rounded to 3 decimals.
+
+        Non-numeric values raise ``ValueError`` (the PATCH/create caller
+        surfaces it as HTTP 400).  ``None`` never reaches here — callers
+        gate on key presence so an omitted key keeps the global default.
+        """
+        try:
+            w = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"rrf.{name} must be a number") from None
+        if math.isnan(w) or math.isinf(w):
+            raise ValueError(f"rrf.{name} must be a finite number")
+        return round(min(max(w, 0.0), _RRF_WEIGHT_MAX), 3)
+
+    @staticmethod
+    def _clamp_rrf_k(value: Any) -> int:
+        """Clamp the meta RRF ranking constant to ``[1, 1000]``.
+
+        Same clamp-not-reject discipline as the REST/MCP surfaces: a bad
+        ``k: 0`` degrades to the minimum sane constant instead of failing.
+        """
+        try:
+            k = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("rrf.k must be an integer") from None
+        return max(1, min(k, 1000))
+
+    @classmethod
+    def _sanitize_rrf_meta(cls, rrf: Any) -> "dict[str, Any] | None":
+        """Normalize a create/PATCH ``rrf`` payload to the stored meta shape.
+
+        Accepts ``None`` / non-dict → ``None`` (nothing stored).  A dict is
+        cleaned key by key: unknown keys are dropped (forward compatibility,
+        same tolerance as the public filter dict), present keys are clamped
+        with the API-slice discipline.  A payload that clamps to pure
+        defaults (1.0/1.0, no k) returns ``None`` — storing it would make
+        ``meta["rrf"]`` LOOK set while behaving like the global default,
+        which would then need default-identity logic on every read.
+        """
+        if not isinstance(rrf, dict):
+            return None
+        out: dict[str, Any] = {}
+        if "dense_weight" in rrf and rrf["dense_weight"] is not None:
+            out["dense_weight"] = cls._clamp_rrf_weight(rrf["dense_weight"], "dense_weight")
+        if "sparse_weight" in rrf and rrf["sparse_weight"] is not None:
+            out["sparse_weight"] = cls._clamp_rrf_weight(rrf["sparse_weight"], "sparse_weight")
+        if "k" in rrf and rrf["k"] is not None:
+            out["k"] = cls._clamp_rrf_k(rrf["k"])
+        if not out:
+            return None
+        if out.get("dense_weight", 1.0) == 1.0 and out.get("sparse_weight", 1.0) == 1.0 and out.get("k") is None:
+            # Rank-arithmetic-identical to the global default — store nothing.
+            return None
+        return out
+
+    def _effective_rrf(self, dataset_name: str, rrf: "RrfParams | None" = None) -> "RrfParams | None":
+        """Resolve the effective weighted-RRF params for one search.
+
+        Order: the per-call override wins after its existence check (it was
+        already clamped at the API boundary); otherwise the dataset's
+        ``meta["rrf"]`` default; otherwise ``None`` — the global default,
+        which keeps the fusion request byte-identical (no ``RrfQuery``).
+
+        A meta default that equals the global default (1.0/1.0, no k) also
+        returns ``None``: emitting an ``RrfQuery`` for it would pin the
+        implicit client ``k`` and silently change rank arithmetic on every
+        default query (the k-default trap from the wave-1 slice).
+        """
+        if isinstance(rrf, RrfParams):
+            return rrf
+        meta = self._read_meta(dataset_name) or {}
+        stored = meta.get("rrf")
+        if not isinstance(stored, dict) or not stored:
+            return None
+        dense = self._clamp_rrf_weight(stored.get("dense_weight", 1.0), "dense_weight")
+        sparse = self._clamp_rrf_weight(stored.get("sparse_weight", 1.0), "sparse_weight")
+        k = self._clamp_rrf_k(stored["k"]) if stored.get("k") is not None else None
+        if dense == 1.0 and sparse == 1.0 and k is None:
+            return None
+        return RrfParams(dense_weight=dense, sparse_weight=sparse, k=k)
+
     def _get_rag(self, dataset_name: str, check_embedder: bool = True) -> MultimodalRAG:
         """Return (or create and cache) a MultimodalRAG for *dataset_name*.
 
@@ -4703,6 +5171,7 @@ class DatasetManager:
                         asr=self.asr,
                         caption_with_asr=ds_caption_with_asr,
                         caption_with_vlm=ds_caption_with_vlm,
+                        contextualize=bool(meta.get("contextual", False)),
                         remote=self.remote,
                         dedup_threshold=self.dedup_threshold,
                         vector_store={
@@ -4768,16 +5237,27 @@ class DatasetManager:
         that a later embedder swap is detected.  No embedding call is made
         when a matching fingerprint already exists (verified once per
         dataset per process).
+
+        The contextual-retrieval mode rides the same fingerprint: a new
+        ingest whose ``contextualize`` setting differs from the stored one
+        is allowed but loudly warned — per the decision, mixed-embedding
+        datasets (contextualized + plain chunks) are explicitly permitted,
+        so this is an introspectability nudge (per-point
+        ``metadata.contextualized`` says which is which), never an error.
         """
         stored_dim = None
         stored_name = ""
+        stored_contextual: bool | None = None
         meta = self._read_meta(dataset_name) or {}
         if meta:
             stored_dim = meta.get("embedder_dim")
             stored_name = meta.get("embedder_model") or ""
+            if "contextual" in meta:
+                stored_contextual = bool(meta.get("contextual"))
 
         cur_name = (getattr(self.embedder, "model_name", "") or "") if self.embedder else ""
         cur_dim = self._embedder_dimension()
+        cur_contextual = bool(getattr(self, "contextualize", False))
         # Alias group: ids the operator declared equivalent to the configured
         # embedder (e.g. a quantized redeploy of the same base model).  A
         # dataset fingerprinted under any of them passes the name check.
@@ -4809,6 +5289,22 @@ class DatasetManager:
                 "semantically incompatible — recreate the dataset to rebuild it "
                 "(POST /api/admin/datasets/{name}/recreate)."
             )
+        # Contextual-mode mismatch: allowed (the decision explicitly permits
+        # mixed-embedding datasets — the per-point ``contextualized`` stamp
+        # keeps them introspectable), so WARN rather than raise.  Recreate
+        # remains the way to make a dataset uniformly (un-)contextualized.
+        if stored_contextual is not None and stored_contextual != cur_contextual:
+            logger.warning(
+                "Dataset '%s' was indexed with contextual retrieval %s; ingesting now with "
+                "contextual retrieval %s. Mixed context modes are allowed (per-point "
+                "metadata.contextualized records which is which); Recreate the dataset "
+                "(POST /api/admin/datasets/%s/recreate) to make it uniformly %s.",
+                dataset_name,
+                "ENABLED" if stored_contextual else "disabled",
+                "enabled" if cur_contextual else "DISABLED",
+                dataset_name,
+                "contextualized" if cur_contextual else "plain",
+            )
 
     def _nudge_schema_upgrade(self, dataset_name: str) -> None:
         """Warn once per process when a dataset predates the current schema.
@@ -4836,13 +5332,23 @@ class DatasetManager:
             )
 
     def _write_embedder_fingerprint(self, dataset_name: str) -> None:
-        """Persist the current embedder's model name + dimension to meta.json."""
+        """Persist the current embedder's model name + dimension to meta.json.
+
+        The dataset's contextual-retrieval mode rides along (``contextual``
+        next to ``embedder_model``/``embedder_dim``): a later mode flip is
+        detected and warned about (never an error — mixed-embedding datasets
+        are allowed per the decision) instead of being invisible.  The value
+        recorded is the DATASET's own meta flag (create/PATCH set it), not
+        the manager's deployment-wide default — the fingerprint describes
+        this dataset.
+        """
         with self._get_meta_lock(dataset_name):
             meta = self._read_meta(dataset_name)
             if not meta:
                 return
             meta["embedder_model"] = (getattr(self.embedder, "model_name", "") or "") if self.embedder else ""
             meta["embedder_dim"] = self._embedder_dimension()
+            meta["contextual"] = bool(meta.get("contextual", getattr(self, "contextualize", False)))
             meta["embedder_updated_at"] = datetime.now().isoformat()
             self._write_meta(dataset_name, meta)
 
@@ -4892,6 +5398,77 @@ class DatasetManager:
                             self._write_meta(name, fresh)
         except Exception:
             pass  # Best-effort: don't fail if Qdrant is unreachable
+
+    def contextualize_preview(self, dataset_name: str) -> dict[str, Any]:
+        """Cost preview for enabling contextual retrieval (feature: contextual
+        retrieval).
+
+        The estimate is deliberately simple and LABELED as an estimate: the
+        live Qdrant point count (multiplied by 2 when the collection is
+        bm25/hybrid-capable, because real-text chunks get text-only twins that
+        carry the same context line) × the token math of one context call
+        (shared preamble + chunk input + ~OUTPUT_TOKENS_PER_CHUNK output) +
+        the configured model name.  It is a *count-based* projection of what
+        the NEXT ingest of this much content would cost — not a measured
+        figure, and not a promise about content not yet uploaded.
+
+        Raises ``FileNotFoundError`` when the dataset does not exist.
+        """
+        from multimodal_rag.utils import contextualizer
+
+        meta = self._read_meta(dataset_name)
+        if not meta:
+            raise FileNotFoundError(f"Dataset '{dataset_name}' not found")
+
+        # The live count IS the estimate basis (D12 note: when
+        # RAG_DEFER_COUNT_SYNC defers syncing, meta["document_count"] may be
+        # stale — read Qdrant directly so the preview never quotes a stale
+        # number).
+        points = 0
+        hybrid_capable = False
+        try:
+            rag = self._get_rag(dataset_name, check_embedder=False)
+            vs = rag.vector_store
+            if vs is not None and not isinstance(vs, dict):
+                client = vs._client  # type: ignore[attr-defined]
+                info = client.get_collection(vs.collection_name)  # type: ignore[attr-defined]
+                points = int(info.points_count or 0)
+                hybrid_capable = bool(getattr(vs, "supports_hybrid", lambda: False)())
+        except Exception:
+            logger.debug("contextualize_preview: Qdrant count unavailable for %s", dataset_name, exc_info=True)
+            points = int(meta.get("document_count", 0) or 0)
+
+        chunk_count = points * 2 if hybrid_capable else points
+        model_name = (getattr(self.vlm, "model_name", "") or "") if self.vlm else ""
+
+        digest_n = contextualizer.digest_chars()
+        preamble_tokens = contextualizer.sample_preamble_tokens(digest_n)
+        # Average chunk: the embedder chunk budget (tokens), roughly — chars/4
+        # back into tokens.  Raw-document drops can exceed it; the preview is
+        # an estimate.
+        chunk_tokens = max(1, int(getattr(self.embedder, "chunk_size", 2048) or 2048))
+        input_per_chunk = preamble_tokens + chunk_tokens
+        output_per_chunk = contextualizer.OUTPUT_TOKENS_PER_CHUNK
+        total_tokens = chunk_count * (input_per_chunk + output_per_chunk)
+
+        return {
+            "dataset": dataset_name,
+            "model": model_name,
+            "estimated_chunk_count": chunk_count,
+            "point_count": points,
+            "hybrid_twin_multiplier": 2 if hybrid_capable else 1,
+            "count_source": "qdrant" if points else "meta_document_count",
+            "estimate_basis": (
+                f"{chunk_count} chunk context call(s) — {preamble_tokens} cached-preamble tokens "
+                f"(shared per document), ~{chunk_tokens} chunk-input tokens, ~{output_per_chunk} "
+                "output tokens per chunk. ESTIMATE — actual cost depends on real chunk sizes "
+                "and the serving engine's prefix-cache hit rate."
+            ),
+            "estimated_input_tokens_per_chunk": input_per_chunk,
+            "estimated_output_tokens_per_chunk": output_per_chunk,
+            "estimated_total_tokens": total_tokens,
+            "contextual_now": bool(meta.get("contextual", False)),
+        }
 
     def _get_meta_lock(self, name: str) -> contextlib.AbstractContextManager:
         """Return a cross-process lock for *meta.json* read→modify→write.
@@ -4968,6 +5545,94 @@ class DatasetManager:
                 logger.warning("Could not clear ingest-dedup index %s", p)
             with _ingested_hashes_cache_lock:
                 _ingested_hashes_cache.pop(p, None)
+
+    # ------------------------------------------------------------------
+    # Watched S3 sources (feature: watched sources): the per-dataset
+    # ETag/Size skip state in files/.watched_state.json — the sidecar the
+    # reconciler's skip logic reads and the successful ingest writes.
+    # Same discipline as the dedup hashes: fcntl-locked read→modify→write,
+    # atomic promote, mtime-cached reads; the state is an optimisation, so
+    # any failure degrades to "re-download everything", never to a wrong skip.
+    # ------------------------------------------------------------------
+
+    def _watched_state_path(self, dataset_name: str) -> Path:
+        return self._dataset_dir(dataset_name) / "files" / _WATCHED_STATE_FILE
+
+    def _watched_state_load(self, dataset_name: str) -> dict[str, dict[str, Any]]:
+        """Read the watched-source skip state for *dataset_name* (may be empty)."""
+        return _load_watched_state(self._watched_state_path(dataset_name))
+
+    def _watched_state_update(
+        self,
+        dataset_name: str,
+        fingerprints: dict[str, dict[str, Any]],
+        only_urls: set[str] | None = None,
+    ) -> None:
+        """Record *fingerprints* (``s3://bucket/key → {etag, size}``) as the
+        last-successfully-ingested versions, merged under the cross-process
+        lock.
+
+        Entries the batch did NOT see are left untouched (a prefix A sync must
+        not invalidate prefix B's state).  ``only_urls`` optionally narrows the
+        merge to those canonical URLs (the URLs actually attempted this run) —
+        a listed-but-failed object must not get a state entry, or the next run
+        would wrongly skip it.
+        """
+        if not fingerprints:
+            return
+        p = self._watched_state_path(dataset_name)
+        with _cross_process_lock(p.with_suffix(".lock")):
+            state = _load_watched_state(p)
+            for url, fp in fingerprints.items():
+                key = _canonical_s3_url(url)
+                if only_urls is not None and key not in only_urls:
+                    continue
+                state[key] = {"etag": fp.get("etag"), "size": fp.get("size")}
+            try:
+                _save_watched_state(p, state)
+            except OSError:
+                # Best-effort: losing the state only costs re-downloads.
+                logger.warning("Could not write watched-source state %s", p, exc_info=True)
+
+    def _watched_state_clear(self, dataset_name: str) -> None:
+        """Forget every watched-source fingerprint for *dataset_name*.
+
+        Called by :meth:`recreate_dataset` (the collection was dropped — every
+        source must re-ingest, exactly like the dedup-hash clear beside it).
+        """
+        p = self._watched_state_path(dataset_name)
+        with _cross_process_lock(p.with_suffix(".lock")):
+            try:
+                if p.exists():
+                    p.unlink()
+            except OSError:
+                logger.warning("Could not clear watched-source state %s", p)
+            with _watched_state_cache_lock:
+                _watched_state_cache.pop(p, None)
+
+    def _watched_state_forget(self, dataset_name: str, urls: list[str]) -> None:
+        """Drop the state entries for *urls* (canonicalised).
+
+        Sync's prune half deletes a source's points when its object leaves the
+        bucket — its fingerprint entry must go too, so a pruned-and-reappeared
+        object is treated as new (and the force-re-ingest path embeds it).
+        """
+        if not urls:
+            return
+        p = self._watched_state_path(dataset_name)
+        with _cross_process_lock(p.with_suffix(".lock")):
+            state = _load_watched_state(p)
+            changed = False
+            for url in urls:
+                key = _canonical_s3_url(url)
+                if key in state:
+                    del state[key]
+                    changed = True
+            if changed:
+                try:
+                    _save_watched_state(p, state)
+                except OSError:
+                    logger.warning("Could not update watched-source state %s", p, exc_info=True)
 
     def _finish_ingest(self, dataset_name: str, content_hash: str | None, result: dict[str, Any]) -> dict[str, Any]:
         """Mark *content_hash* ingested when the result stored vectors, then return it."""

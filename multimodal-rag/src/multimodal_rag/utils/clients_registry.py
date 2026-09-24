@@ -133,22 +133,65 @@ parse_acls(os.environ.get(ACLS_ENV, ""))
 
 
 def registry_clients() -> dict:
-    """``{key: name}`` for the configured registry (re-read per request)."""
-    return parse_clients(os.environ.get(CLIENTS_ENV, ""))
+    """``{key: name}`` for the configured registry (re-read per request).
+
+    D17: the env registry is UNIONED with the file-backed admin overlay
+    (``utils/admin_registry.py`` — entries minted from the /access page with
+    an admin key).  An env key that also appears in the overlay keeps its
+    ENV name (the operator's hand-written config is authoritative on
+    conflict).  When the overlay is disabled this is exactly the env parse.
+    """
+    env = parse_clients(os.environ.get(CLIENTS_ENV, ""))
+    try:
+        from multimodal_rag.utils import admin_registry
+
+        overlay = admin_registry.overlay_clients()
+    except Exception:  # overlay broken/absent → env-only (fail-open to env authority)
+        return env
+    merged = dict(overlay)
+    merged.update(env)
+    return merged
 
 
 def dataset_acls() -> dict:
-    """``{name: frozenset(datasets)}`` (re-read per request)."""
-    return parse_acls(os.environ.get(ACLS_ENV, ""))
+    """``{name: frozenset(datasets)}`` (re-read per request).
+
+    D17: env ACLs are UNIONED per name with the overlay's grants (an overlay
+    client with no env entry is added wholesale; a name in BOTH keeps the
+    union — neither source can silently revoke the other).  Disabled overlay
+    → exactly the env parse.
+    """
+    env = parse_acls(os.environ.get(ACLS_ENV, ""))
+    try:
+        from multimodal_rag.utils import admin_registry
+
+        overlay = admin_registry.overlay_acls()
+    except Exception:
+        return env
+    merged = {name: set(ds) for name, ds in env.items()}
+    for name, ds in overlay.items():
+        merged.setdefault(name, set()).update(ds)
+    return {name: frozenset(ds) for name, ds in merged.items()}
 
 
 def registry_configured() -> bool:
-    """True when ``RAG_API_KEY_CLIENTS`` is set (D15 enforcement active).
+    """True when multi-user key enforcement is active (D15/D17).
 
-    Read per request: configuring the registry enables enforcement without a
-    restart; leaving it unset keeps the single-key behaviour byte-identical.
+    Either the env registry is set OR the D17 admin overlay is enabled (an
+    admin must resolve an identity even on a fresh deployment whose overlay
+    file is still empty — the /access mint panel needs the admin identity).
+    Read per request: configuring either source enables enforcement without
+    a restart; leaving both unset keeps the single-key behaviour
+    byte-identical.
     """
-    return bool(os.environ.get(CLIENTS_ENV, "").strip())
+    if bool(os.environ.get(CLIENTS_ENV, "").strip()):
+        return True
+    try:
+        from multimodal_rag.utils import admin_registry
+
+        return admin_registry.admin_file_enabled()
+    except Exception:
+        return False
 
 
 def admin_keys() -> list:
@@ -176,22 +219,60 @@ def _match(presented: list, valid: list) -> bool:
     return False
 
 
-def resolve_presented(presented: list) -> "Identity | None":
+def resolve_presented(presented: list, presenters: "list | None" = None) -> "Identity | None":
     """Resolve presented key(s) to an :class:`Identity`, or ``None``.
 
     Admin keys win (deployment semantics), then registry keys.  A registry
     key with no ACL entry resolves to an identity with NO datasets
     (fail-closed).  Callers decide what ``None`` means for their surface —
     on a protected path it is 401.
+
+    Delegation precedence (fleet decision D19, 2026-09-24): when *presenters*
+    is provided it carries, per candidate key, the header that presented it
+    (``"x-api-key"`` or ``"authorization"``).  A key presented via
+    ``X-API-Key`` takes precedence over a key presented via
+    ``Authorization: Bearer`` WHEN the two disagree: ``Authorization`` is
+    transport/platform auth (a proxy or LLM gateway forwards its OWN admin
+    token next to the caller's chosen ``X-API-Key``), and an explicit
+    ``X-API-Key`` is the caller's DELEGATED service identity.  Resolution
+    then follows the X-API-Key candidate alone — an admin-token holder can
+    only ever DE-ESCALATE itself by also sending an X-API-Key (it could use
+    that client key directly anyway), never escalate a client key to admin,
+    so the precedence is safe.
+
+    Without *presenters* (legacy callers, single-header requests) the
+    historical admin-first order applies unchanged.
     """
     presented = [k for k in (presented or []) if k]
     if not presented:
         return None
+    if presenters is not None and len(presenters) == len(presented):
+        xkey = [k for k, via in zip(presented, presenters) if via == "x-api-key"]
+        if xkey:
+            # Delegation mode: the X-API-Key candidate IS the caller's
+            # chosen identity — resolve on it alone (never escalate to
+            # admin from the co-forwarded Authorization token).
+            return _resolve_registry_only(xkey) or _admin_identity_for(xkey)
     admins = admin_keys()
     if admins and _match(presented, admins):
         return Identity(kind="admin", name=None, datasets=None)
+    return _resolve_registry_only(presented)
+
+
+def _admin_identity_for(candidates: list) -> "Identity | None":
+    """Admin identity iff one of *candidates* IS an admin key (used after
+    delegation resolution finds no registry match — an X-API-Key carrying
+    the deployment key is still a legitimate admin presentation)."""
+    admins = admin_keys()
+    if admins and _match(candidates, admins):
+        return Identity(kind="admin", name=None, datasets=None)
+    return None
+
+
+def _resolve_registry_only(candidates: list) -> "Identity | None":
+    """Match *candidates* against the REGISTRY only (never admin_keys)."""
     clients = registry_clients()
-    for candidate in presented:
+    for candidate in candidates:
         for key, name in clients.items():
             if hmac.compare_digest(candidate.encode("utf-8"), key.encode("utf-8")):
                 acls = dataset_acls().get(name, frozenset())

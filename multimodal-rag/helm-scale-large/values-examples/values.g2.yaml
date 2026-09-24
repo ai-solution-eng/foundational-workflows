@@ -27,7 +27,7 @@ replicaCount: 4
 image:
   # Packaged with the chart — leave as-is unless you built your own image.
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v3.6.3
+  tag: v4.4.1
   pullPolicy: IfNotPresent
 
 deployment:
@@ -142,7 +142,27 @@ rag:
   # Multi-replica: do not auto-sync document counts from Qdrant on every read
   # (avoids cross-replica meta.json write races).
   deferCountSync: true
+  # Ingest-time contextual retrieval (RAG_CONTEXTUAL_DEFAULT).  Keep false
+  # unless the per-chunk LLM cost is understood — check
+  # POST /api/admin/datasets/{name}/contextual-preview first.
+  contextual: false
 
+  # Weighted-RRF per-dataset create-time defaults (RAG_RRF_DEFAULT).
+  # enabled: false = no default stamped; new datasets inherit the global
+  # 1.0/1.0 (rank order unchanged).  When enabled, NEW datasets are stamped
+  # dense/sparse[/k] at create time (existing datasets untouched).
+  rrfDefault:
+    enabled: false
+    dense: 1.0
+    sparse: 1.0
+    k: 2
+
+  # Unlock TTL bound (RAG_UNLOCK_MAX_TTL): caps explicit unlock TTLs on both
+  # surfaces (default 86400 = the historical 24h cap; the chart default equals
+  # the built-in default, so this line is informational). The special value 0
+  # opts the deployment into NO-EXPIRY unlocks (ttl=0 lasts until an explicit
+  # lock — the /access page's "No expiry (0)" option becomes selectable).
+  unlockMaxTtl: 0
 # -- Qdrant (multi-replica, built-in sharding) -----------------------------------------------
 qdrant:
   # SITE: shard count
@@ -176,8 +196,17 @@ redis:
 # -- MCP server (sidecar) ---------------------------------------------------------------------------
 mcp:
   apiKey:
+    # SITE: pre-create the Secret before applying — the chart never creates
+    # or inlines this key:
+    #   kubectl -n <ns> create secret generic mcp-fleet-apikeys \
+    #     --from-literal='api-keys=<key1>,<key2>'
     existingSecret: "mcp-fleet-apikeys"
     existingSecretKey: "api-keys"
+  # D15 per-user registry keys + dataset ACLs — KEY MATERIAL (provide from a
+  # Secret pipeline, never commit). Empty on this site: per-user keys are
+  # minted on the /access page (D17 overlay) instead.
+  apiKeyClients: ""
+  datasetAcls: ""
 
   enabled: true
   port: 9090
@@ -246,11 +275,16 @@ security:
   # point security.existingSecret at a Secret you manage. Rotation is
   # OPTIONAL and operator-initiated — read helm/ROTATION.md first
   # (repo path: MultimodalRAG/helm/ROTATION.md).
-  apiKey: "<RAG_API_KEY>"
-  mediaTokenSecret: "<MEDIA_TOKEN_SECRET>"
-  # Optional: Secret you manage providing both keys (key names in
-  # existingSecretApiKey / existingSecretMediaTokenKey).
-  existingSecret: ''
+  # SITE (P0-7): key material lives in a Secret YOU manage — the chart
+  # renders neither RAG_API_KEY nor MEDIA_TOKEN_SECRET into its own Secret
+  # when existingSecret is set; both containers read them via secretKeyRef.
+  # Your Secret must carry BOTH keys (the containers refuse to start
+  # without MEDIA_TOKEN_SECRET):
+  #   kubectl -n <ns> create secret generic rag-platform-keys \
+  #     --from-literal=RAG_API_KEY='<deployment key>' \
+  #     --from-literal=MEDIA_TOKEN_SECRET='<64-hex secret>'
+  # Rotation = update your Secret + roll the pods (env binds at pod start).
+  existingSecret: "rag-platform-keys"
   existingSecretApiKey: RAG_API_KEY
   existingSecretMediaTokenKey: MEDIA_TOKEN_SECRET
   mediaTokenTtl: 3600
@@ -267,10 +301,40 @@ security:
   # (oauth2-proxy) overwrites the identity headers on every request.
   trustProxyIdentity: true
 
+  # Self-service dataset selection (decision D16, env RAG_ACCESS_STORE) —
+  # off here. With accessStore: true AND per-user keys minted (mcp.apiKeyClients
+  # in helm/values.yaml), registry-key users manage their own dataset set on the
+  # /access page: every key sees all dataset names, selects what it needs
+  # (protected datasets demand their password once — saved per identity under
+  # /data/access), and stars its memory dataset server-side. Effective access =
+  # operator ACL (mcp.datasetAcls) ∪ selections.
+  accessStore: true
+  # Datasets that can never be self-selected (comma-separated; renders only
+  # when non-empty). Empty = everything selectable with proof.
+  accessDenySelect: ''
+  # Deployment-wide fallback memory dataset (RAG_MEMORY_DEFAULT) for callers
+  # without a personal ★ binding. Empty = unset.
+  memoryDefault: ''
+  # REST/MCP key + media-token HMAC secret — empty here because
+  # security.existingSecret above supplies both (set these ONLY as a
+  # back-compat alternative when no Secret is managed).
+  apiKey: ''
+  mediaTokenSecret: ''
+  # Gate /metrics behind an API key (env RAG_METRICS_AUTH) — keep false here:
+  # in-cluster Prometheus scrapes the exposition without a token. (When
+  # enabling, also set metrics.serviceMonitorBearerSecret so the scraper
+  # presents the key as its bearer token.)
+  metricsAuth: false
+
 # -- Metrics (optional) -----------------------------------------------------------------------------------------------
 metrics:
   serviceMonitor: false
   interval: 30s
+  # When security.metricsAuth is on, name a Secret whose <key> holds a valid
+  # API key; the ServiceMonitor presents it as the scrape bearer token (same
+  # keys as the base chart). Empty = no token on the scrape.
+  serviceMonitorBearerSecret: ''
+  serviceMonitorBearerSecretKey: RAG_API_KEY
 
 # -- Backups (optional) ---------------------------------------------------------------------------------------------------
 backups:
@@ -278,6 +342,22 @@ backups:
   schedule: 0 3 * * *
   bucket: ''
   retentionDays: 0
+
+# -- Watched S3 sources (optional) -----------------------------------------------------------------------------------------------
+# Opt-in reconciler CronJob: every tick, POST each source's s3:// prefixes to
+# /api/datasets/{dataset}/batch-urls with sync=true — new/changed objects are
+# ingested, objects deleted upstream are pruned, unchanged objects are skipped
+# via the per-dataset ETag/Size state (files/.watched_state.json).  Prefixes
+# must be s3:// directory URLs (validated at render time).  Disabled by
+# default renders nothing.
+watchedSources:
+  enabled: false
+  schedule: '*/30 * * * *'
+  sources: []
+  # sources:
+  #   - dataset: reports
+  #     prefixes:
+  #       - s3://mm-rag-drop/reports/
 
 # -- PCAI (HPE Ezmeral Unified Analytics) integration -----------------------------------------------------------------------
 ezua:

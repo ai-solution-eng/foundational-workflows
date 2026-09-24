@@ -14,8 +14,10 @@ import argparse
 import asyncio
 import contextvars
 import datetime
+import html
 import io
 import json
+import math
 import mimetypes
 import os
 import random
@@ -66,10 +68,13 @@ from multimodal_rag.rag_system import (
     merge_federated_results,
     resolve_federated_targets,
 )
+from multimodal_rag.utils import access_store as _access_store
+from multimodal_rag.utils import admin_registry as _admin_registry
 from multimodal_rag.utils import clients_registry as _clients_registry
 from multimodal_rag.utils.general_tools import sync_pool
 from multimodal_rag.utils.logging_utils import logging, setup_logger
 from multimodal_rag.utils.media_paths import MediaRefError
+from multimodal_rag.vector_store import RrfParams
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +294,24 @@ RAG_OCR_DEFAULT = os.environ.get("RAG_OCR_DEFAULT", "false").lower() in (
     "1",
     "yes",
 )
+# Weighted-RRF create-time default (feature: weighted RRF, dataset-defaults
+# slice; chart values rag.rrfDefault).  Disabled by default: when unset the
+# server stamps NO per-dataset defaults and new datasets inherit the global
+# 1.0/1.0 code default (no behaviour change for existing deployments or
+# existing datasets — the env only affects NEW datasets at create time).
+# Format: "dense,sparse[,k]" e.g. "1.0,3.0" or "1.0,0.5,2".
+RAG_RRF_DEFAULT = os.environ.get("RAG_RRF_DEFAULT", "").strip()
+# Contextual-retrieval create-time default (feature: contextual retrieval;
+# chart values rag.contextual).  Disabled by default: when false, new datasets
+# stamp contextual: false and ingest exactly as before (the per-request body
+# "contextual" value always wins).  One small LLM call per real-text chunk at
+# ingest — the preview endpoint exists so the operator sees the cost before
+# flipping this deployment-wide.
+RAG_CONTEXTUAL_DEFAULT = os.environ.get("RAG_CONTEXTUAL_DEFAULT", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 RAG_CAPTION_WITH_ASR = os.environ.get("RAG_CAPTION_WITH_ASR", "false").lower() in (
     "true",
     "1",
@@ -352,6 +375,7 @@ def get_manager() -> DatasetManager:
             caption_with_vlm=rag_caption_with_vlm,
             remote=rag_remote,
             dedup_threshold=rag_dedup_threshold,
+            contextualize=RAG_CONTEXTUAL_DEFAULT,
         )
         logger.info(
             "DatasetManager initialised: data=%s qdrant=%s:%s remote=%s",
@@ -388,6 +412,34 @@ async def get_manager_async() -> DatasetManager:
 _UNLOCK_CACHE: dict[tuple[str, str], tuple[float, str]] = {}
 _UNLOCK_CACHE_LOCK = threading.Lock()
 _UNLOCK_TTL = int(os.environ.get("UNLOCK_TTL", "1800"))  # seconds, default 30 min
+
+# Upper bound an explicit unlock TTL may take (the /unlock endpoint clamps
+# into this; default 86400 = 24 h, the historical hard cap).  The special
+# value 0 OPTS THE DEPLOYMENT INTO NO-EXPIRY UNLOCKS: a caller may then pass
+# ttl=0 and the unlock persists until explicitly revoked (POST /lock) — the
+# /access page's "No expiry (0)" option is meaningful only when this knob is
+# 0.  Any positive value caps ALL unlocks at that many seconds; 0 is
+# deliberately opt-in because a no-expiry unlock caches a dataset's password
+# plaintext in the unlock store indefinitely (Redis when configured — treat
+# that store with the same care as the dataset passwords themselves).
+# Read per call so a config change needs no restart (the env-var convention).
+_UNLOCK_TTL_MAX_ENV = "RAG_UNLOCK_MAX_TTL"
+
+
+def _unlock_ttl_max() -> int:
+    """Configured max unlock TTL (default 86400); 0 = no-expiry unlocks allowed.
+
+    Read per call (config without restart).  Negative or malformed values
+    fall back to the historical 24-hour cap.
+    """
+    raw = os.environ.get(_UNLOCK_TTL_MAX_ENV, "").strip()
+    if not raw:
+        return 86400
+    try:
+        val = int(raw)
+    except ValueError:
+        return 86400
+    return val if val >= 0 else 86400
 
 # Optional Redis backend for cross-pod unlock sharing.  Enabled when
 # REDIS_URL is set (the scale chart sets it); otherwise the per-process
@@ -492,6 +544,9 @@ def _unlock_cache_key(dataset: str, cid: str) -> str:
     return f"unlock:{dataset}:{cid}"
 
 
+_UNLOCK_NO_EXPIRY = float("inf")  # in-memory sentinel for ttl=0 (no expiry)
+
+
 def _unlock_cache_get(dataset: str, cid: str) -> str | None:
     """Return a cached password if present and unexpired, else None."""
     r = _get_redis()
@@ -509,7 +564,7 @@ def _unlock_cache_get(dataset: str, cid: str) -> str | None:
     if entry is None:
         return None
     expiry, cached_pw = entry
-    if time.monotonic() < expiry:
+    if time.monotonic() < expiry:  # _UNLOCK_NO_EXPIRY is always in the future
         return cached_pw
     with _UNLOCK_CACHE_LOCK:
         _UNLOCK_CACHE.pop((dataset, cid), None)
@@ -517,15 +572,27 @@ def _unlock_cache_get(dataset: str, cid: str) -> str | None:
 
 
 def _unlock_cache_set(dataset: str, cid: str, password: str, ttl: int | None = None) -> None:
+    """Cache an unlock.  ``ttl=0`` means NO expiry (persists until revoked).
+
+    In-memory: the expiry is ``_UNLOCK_NO_EXPIRY`` (always in the future).
+    Redis: the key is set WITHOUT ``ex`` — the operator is responsible for
+    the store's own retention (``RAG_UNLOCK_MAX_TTL=0`` is the explicit
+    opt-in for this; the /access page surfaces it as "No expiry (0)").
+    """
+    no_expiry = ttl is not None and ttl <= 0
     r = _get_redis()
     if r is not None:
         try:
-            r.set(_unlock_cache_key(dataset, cid), password, ex=(ttl if ttl is not None else _UNLOCK_TTL))
+            if no_expiry:
+                r.set(_unlock_cache_key(dataset, cid), password)
+            else:
+                r.set(_unlock_cache_key(dataset, cid), password, ex=(ttl if ttl is not None else _UNLOCK_TTL))
             return
         except Exception:
             pass
+    expiry = _UNLOCK_NO_EXPIRY if no_expiry else time.monotonic() + (ttl if ttl is not None else _UNLOCK_TTL)
     with _UNLOCK_CACHE_LOCK:
-        _UNLOCK_CACHE[(dataset, cid)] = (time.monotonic() + (ttl if ttl is not None else _UNLOCK_TTL), password)
+        _UNLOCK_CACHE[(dataset, cid)] = (expiry, password)
 
 
 def _unlock_cache_set_ttl(dataset: str, cid: str, password: str, ttl: int) -> None:
@@ -667,6 +734,14 @@ async def _require_dataset_password(
         return
     cid = _unlock_client_id(request) if request is not None else "unknown"
 
+    # 0. D16: a saved selection password (the identity verified it once at
+    #    selection time — selecting a protected dataset IS the unlock).
+    if request is not None:
+        identity = _clients_registry.current_identity()
+        saved = _access_store.selection_password(identity, name)
+        if saved:
+            return
+
     # 1. If a password was supplied, verify and cache it
     if password:
         _check_pw_throttle(cid)
@@ -772,7 +847,7 @@ _model_health: dict[str, Any] = {
     }
 }
 
-_PUBLIC_PATHS = frozenset({"/healthz", "/readyz", "/favicon.png", "/", "/manage"})
+_PUBLIC_PATHS = frozenset({"/healthz", "/readyz", "/favicon.png", "/", "/manage", "/access"})
 
 # Routes that must stay reachable without the API key, matched by the
 # endpoint function name so future prefix-based routes are NOT silently
@@ -787,6 +862,7 @@ _PUBLIC_ENDPOINT_NAMES = frozenset(
         "favicon",
         "index",
         "manage",
+        "access",  # per-user key page (self-authenticating; no key injected)
         "api_serve_file",  # dataset media (password/token protected)
         "api_staging_serve",  # staged media (short-lived ids)
     }
@@ -804,14 +880,19 @@ def _is_public_path(path: str, endpoint: Any = None) -> bool:
 
 
 def _rag_acl_path_denial(path: str, method: str, identity) -> "str | None":
-    """D15 REST enforcement for a registry-key identity: the denial reason for
-    *path*, or None when allowed.
+    """D15/D16 REST enforcement for a registry-key identity: the denial
+    reason for *path*, or None when allowed.
 
     Rules (fail-closed; matching the MCP tool checks):
       * ``/api/admin/*``      — admin surface, never reachable with a client key.
       * ``POST /api/datasets`` — dataset creation ("manage"): only with the
         ``*`` grant (a named-ACL key cannot mint datasets outside its grant).
-      * ``/api/datasets/{name}(/…)`` — dataset must be in the key's ACL.
+      * ``POST /api/datasets/{name}/select`` — ALWAYS allowed for a client
+        key (D16: selecting is how access is GAINED; the endpoint itself
+        enforces the password proof / denylist — the middleware must not
+        pre-empt it, or self-service could never add anything).
+      * ``/api/datasets/{name}(/…)`` — dataset must be in the key's ACL ∪
+        self-selections (D16: the access store widens, never narrows).
       * everything else (federated /api/search, staging, …) — allowed; the
         federated resolution filters ACL-denied datasets itself.
     """
@@ -822,18 +903,23 @@ def _rag_acl_path_denial(path: str, method: str, identity) -> "str | None":
             return "Dataset ACLs are configured (D15): this API key cannot create datasets."
         return None
     name = _clients_registry.dataset_name_from_path(path)
-    if name is not None and not _clients_registry.dataset_allowed(identity, name):
-        return _clients_registry.DatasetAccessDenied(
-            f"Dataset '{name}' is not permitted for this API key (dataset ACLs are configured — D15)."
-        ).args[0]
+    if name is not None:
+        if method == "POST" and path.endswith("/select"):
+            return None  # D16: the select endpoint enforces its own proof
+        if not _access_store.dataset_allowed(identity, name):
+            return _clients_registry.DatasetAccessDenied(
+                f"Dataset '{name}' is not permitted for this API key (dataset ACLs are configured — D15)."
+            ).args[0]
     return None
 
 
 @app.middleware("http")
 async def _api_key_auth(request: Request, call_next):
     registry_on = _clients_registry.registry_configured()
-    if not _RAG_API_KEY and not registry_on:
-        return await call_next(request)
+    # D20 fail-closed default handled below, AFTER the public-path
+    # exemptions (media/staged serving authorize themselves; healthz,
+    # pages and probes stay public).
+    unconfigured = not _RAG_API_KEY and not registry_on
     # Resolve the matched endpoint EXPLICITLY.  An http middleware runs
     # BEFORE routing, so scope["route"] is not set here — relying on it made
     # every endpoint-name exemption silently fail the moment auth was
@@ -856,14 +942,47 @@ async def _api_key_auth(request: Request, call_next):
                 break
     if _is_public_path(request.url.path, endpoint):
         return await call_next(request)
-    key = request.headers.get("X-RAG-Api-Key") or ""
-    if not key:
-        auth = request.headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            key = auth[len("Bearer ") :]
+    if unconfigured:
+        # Ratified default posture (2026-09-24, D20): an unconfigured
+        # deployment is FAIL-CLOSED, not open.  Bind an anonymous
+        # registry-client identity whose ONLY grant is the deployment's
+        # memory dataset (MEMORY_DATASET env, when set) — backwards
+        # compatibility for single-user memory setups — so listings are
+        # empty, dataset paths 403, admin 403, and the memory tools keep
+        # working against exactly that one dataset.  Public paths (above)
+        # stay public: pages, probes, and self-authorizing media/staged
+        # serving.
+        memory_ds = os.environ.get("MEMORY_DATASET", "").strip()
+        anon = _clients_registry.Identity(
+            kind="client",
+            name="__anonymous__",
+            datasets=frozenset({memory_ds} if memory_ds else ()),
+        )
+        denial = _rag_acl_path_denial(request.url.path, request.method, anon)
+        if denial is not None:
+            return JSONResponse({"detail": denial}, status_code=403)
+        reset_handle = _clients_registry.set_current_identity(anon)
+        try:
+            return await call_next(request)
+        finally:
+            _clients_registry.reset_current_identity(reset_handle)
+    # D19 delegation precedence: X-RAG-Api-Key (REST's X-API-Key analogue)
+    # and X-API-Key both outrank a co-forwarded Authorization Bearer token
+    # (a gateway's own platform/admin auth).  Collect (key, header-source)
+    # pairs so resolve_presented can honor the caller's DELEGATED identity
+    # instead of escalating to admin via the forwarded token.
+    presented: list[tuple[str, str]] = []
+    for header, via in (("X-RAG-Api-Key", "x-api-key"), ("X-API-Key", "x-api-key"), ("Authorization", "authorization")):
+        val = request.headers.get(header) or ""
+        if via == "authorization":
+            if val.startswith("Bearer ") and val[len("Bearer "):].strip():
+                presented.append((val[len("Bearer "):].strip(), via))
+        elif val.strip():
+            presented.append((val.strip(), via))
+    key = presented[0][0] if presented else ""
     import secrets
 
-    if _RAG_API_KEY and secrets.compare_digest(key, _RAG_API_KEY):
+    if _RAG_API_KEY and key and secrets.compare_digest(key, _RAG_API_KEY):
         # Deployment key: full access. Bind the (admin) identity so the D15
         # surfaces resolve it consistently.
         reset_handle = None
@@ -877,7 +996,9 @@ async def _api_key_auth(request: Request, call_next):
             if reset_handle is not None:
                 _clients_registry.reset_current_identity(reset_handle)
     if registry_on:
-        identity = _clients_registry.resolve_presented([key] if key else [])
+        identity = _clients_registry.resolve_presented(
+            [k for k, _ in presented], [via for _, via in presented]
+        )
         if identity is not None and identity.is_admin:
             # An MCP-keyset key (MCP_API_KEYS / RAG_API_KEYS) — admin semantics.
             reset_handle = _clients_registry.set_current_identity(identity)
@@ -1244,6 +1365,20 @@ async def api_create_dataset(body: dict[str, Any] = Body(...)):
     full-quality files are kept on disk after preprocessing.
     ``password`` is optional — if set, all read operations on the dataset
     will require it.
+    ``rrf`` is optional per-dataset weighted-RRF defaults
+    (``{"dense_weight": …, "sparse_weight": …, "k": …}``, any subset) —
+    applied to single-dataset searches that carry no explicit override.
+    Omitted keys / an omitted ``rrf`` fall back to the deployment default
+    (``RAG_RRF_DEFAULT``, chart values ``rag.rrfDefault`` — disabled by
+    default) and beyond that the global 1.0/1.0.  Existing datasets are
+    never touched by the env; it only stamps NEW datasets at create time.
+    ``contextual`` enables ingest-time contextual retrieval for this dataset
+    (one small LLM call per real-text chunk at ingest — see
+    ``POST /api/admin/datasets/{name}/contextual-preview`` for the cost
+    estimate).  Omitted → the deployment default (``RAG_CONTEXTUAL_DEFAULT``,
+    chart values ``rag.contextual`` — disabled by default); an explicit value
+    in the body always wins.  Affects new ingests only; Recreate
+    re-contextualizes existing files.
 
     Whitespace runs in ``name`` are auto-converted to ``_`` before creation
     (``"my dataset"`` → ``"my_dataset"``) — the common hand-typo, and the
@@ -1270,18 +1405,45 @@ async def api_create_dataset(body: dict[str, Any] = Body(...)):
     # chart values rag.ocr); explicit false in the body always wins.
     body_ocr = body.get("ocr")
     ocr = bool(body_ocr) if body_ocr is not None else RAG_OCR_DEFAULT
+    # Contextual retrieval opt-in: omitted -> server-wide default
+    # (RAG_CONTEXTUAL_DEFAULT, chart values rag.contextual); an explicit
+    # value in the body always wins.  Cost is real (one LLM call per
+    # real-text chunk) — the UI confirm line next to the checkbox and the
+    # contextual-preview endpoint exist to make that visible first.
+    body_contextual = body.get("contextual")
+    contextual = bool(body_contextual) if body_contextual is not None else RAG_CONTEXTUAL_DEFAULT
+    # Weighted-RRF defaults (feature: weighted RRF, dataset-defaults slice):
+    # an explicit body ``rrf`` object wins; omitted → the deployment default
+    # (RAG_RRF_DEFAULT, chart values rag.rrfDefault) when that is enabled;
+    # both absent → no per-dataset default (global 1.0/1.0).  Validation and
+    # clamping live in _sanitize_rrf_meta — a bad value is a 400, not a
+    # silent store.
+    body_rrf = body.get("rrf")
+    if body_rrf is not None and not isinstance(body_rrf, dict):
+        raise HTTPException(400, "Field 'rrf' must be an object")
+    if body_rrf is not None:
+        try:
+            rrf_meta = dm._sanitize_rrf_meta(body_rrf)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    else:
+        rrf_meta = _rrf_default_meta_from_env()
     try:
         loop = asyncio.get_running_loop()
         meta = await loop.run_in_executor(
             sync_pool,
-            dm.create_dataset,
-            name,
-            description,
-            bool(caption_with_asr),
-            bool(caption_with_vlm),
-            bool(keep_originals),
-            password,
-            ocr,
+            partial(
+                dm.create_dataset,
+                name,
+                description,
+                bool(caption_with_asr),
+                bool(caption_with_vlm),
+                bool(keep_originals),
+                password,
+                ocr,
+                rrf=rrf_meta,
+                contextual=bool(contextual),
+            ),
         )
         return {"status": "ok", "dataset": meta}
     except FileExistsError as e:
@@ -1317,15 +1479,18 @@ async def api_verify_dataset_password(name: str, request: Request, body: dict[st
 
 @app.post("/api/datasets/{name}/unlock")
 async def api_unlock_dataset(name: str, request: Request, body: dict[str, Any] = Body(...)):
-    """Unlock a password-protected dataset for 30 minutes.
+    """Unlock a password-protected dataset (default 30 minutes).
 
     Request body::
 
         {"password": "secret", "ttl": 1800}   # ttl in seconds (optional)
 
     Once unlocked, subsequent API calls to this dataset from the same
-    client IP can omit the ``X-Dataset-Password`` header for the TTL
-    duration.
+    client identity (D10/D15) can omit the ``X-Dataset-Password`` header
+    for the TTL duration.  TTL bounds: 60..RAG_UNLOCK_MAX_TTL seconds
+    (default max 86400 = 24 h).  ``ttl=0`` = NO expiry — the unlock lasts
+    until ``POST /lock`` — and requires the deployment opt-in
+    ``RAG_UNLOCK_MAX_TTL=0`` (the /access page exposes it when enabled).
     """
     dm = await get_manager_async()
     loop = asyncio.get_running_loop()
@@ -1350,13 +1515,32 @@ async def api_unlock_dataset(name: str, request: Request, body: dict[str, Any] =
     _pw_reset_failures(cid)
 
     ttl = body.get("ttl", _UNLOCK_TTL)
-    if not isinstance(ttl, int) or ttl < 60 or ttl > 86400:
-        raise HTTPException(400, "TTL must be between 60 and 86400 seconds")
+    if not isinstance(ttl, int) or isinstance(ttl, bool):
+        raise HTTPException(400, "TTL must be an integer number of seconds")
+    ttl_max = _unlock_ttl_max()
+    if ttl == 0:
+        # "No expiry" is an explicit deployment opt-in (RAG_UNLOCK_MAX_TTL=0):
+        # the unlock persists until POST /lock.  Unconfigured deployments
+        # keep the bounded-by-default posture.
+        if ttl_max != 0:
+            raise HTTPException(
+                400,
+                "ttl=0 (no expiry) is disabled on this deployment (set RAG_UNLOCK_MAX_TTL=0 to enable)",
+            )
+    elif ttl < 60 or (ttl_max and ttl > ttl_max):
+        raise HTTPException(400, f"TTL must be between 60 and {ttl_max} seconds (or 0 for no expiry when enabled)")
 
     # Use the shared cache writer so unlocked state is visible across API
-    # replicas (Redis when configured, in-process otherwise).
+    # replicas (Redis when configured, in-process otherwise).  ttl=0 (the
+    # RAG_UNLOCK_MAX_TTL=0 opt-in) persists until POST /lock.
     _unlock_cache_set_ttl(name, cid, password, ttl)
 
+    if ttl == 0:
+        return {
+            "status": "ok",
+            "message": f"Dataset '{name}' unlocked with no expiry (until locked).",
+            "ttl_seconds": 0,
+        }
     return {
         "status": "ok",
         "message": f"Dataset '{name}' unlocked for {ttl // 60} minutes.",
@@ -1382,6 +1566,287 @@ async def api_lock_dataset(name: str, request: Request):
     return {"status": "ok", "message": f"Dataset '{name}' was not unlocked."}
 
 
+# ---------------------------------------------------------------------------
+# D16 self-service dataset selection (/access page + MCP select_dataset)
+# ---------------------------------------------------------------------------
+
+
+def _require_select_identity() -> Any:
+    """The registry-key identity for selection endpoints, or a 4xx.
+
+    Admin keys and store-off deployments have nothing to select INTO; an
+    unauthenticated store-off deployment never reaches here via client keys
+    (the middleware resolved the identity already — we re-read the context).
+    """
+    if not _access_store.store_enabled():
+        raise HTTPException(409, "Dataset selection is not enabled on this deployment (RAG_ACCESS_STORE).")
+    identity = _clients_registry.current_identity()
+    if identity is None or identity.is_admin:
+        raise HTTPException(409, "Dataset selection applies to per-user API keys (registry keys).")
+    return identity
+
+
+@app.get("/api/access/selections")
+async def api_access_selections(request: Request):
+    """The caller's selection state (D16) — per-identity, password-free.
+
+    Returns ``{"enabled", "selections": {name: {selected_at, source,
+    has_password}}, "memory_dataset"}`` for the presented key.  Selection
+    passwords are NEVER returned — only whether one is saved.
+    """
+    identity = _clients_registry.current_identity()
+    enabled = _access_store.store_enabled()
+    sels: dict[str, dict[str, Any]] = {}
+    memory = None
+    if enabled and identity is not None and not identity.is_admin:
+        st = _access_store.stats(identity)
+        memory = st.get("memory_dataset")
+        for name in sorted(_access_store.selections_for(identity)):
+            entry = _access_store.selection_entry(identity, name) or {}
+            sels[name] = {
+                "selected_at": entry.get("selected_at"),
+                "source": entry.get("source"),
+                "has_password": bool(entry.get("password")),
+            }
+    return {"enabled": enabled, "selections": sels, "memory_dataset": memory}
+
+
+@app.post("/api/datasets/{name}/select")
+async def api_select_dataset(name: str, request: Request, body: dict[str, Any] = Body(default=None)):
+    """Select a dataset for YOUR key (D16 self-service; the checkbox model).
+
+    Request body (optional)::
+
+        {"password": "secret"}   # required when the dataset is protected
+
+    A public dataset needs no body at all.  A protected dataset is selected
+    only with its correct password — which is then SAVED per identity, so
+    every REST/MCP call for this key works without sending it again.
+    Fail-closed elsewhere: denylisted datasets refuse regardless of proof;
+    operator-ACL'd datasets are accepted as a no-op (the ACL already grants).
+    """
+    dm = await get_manager_async()
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(sync_pool, dm.get_dataset, name, False)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Dataset '{name}' not found")
+    identity = _require_select_identity()
+    cid = _unlock_client_id(request)
+    password = (body or {}).get("password") if isinstance(body, dict) else None
+    _check_pw_throttle(cid)
+    try:
+        entry = await loop.run_in_executor(
+            sync_pool,
+            lambda: _access_store.verify_and_select(
+                identity, name, password, dm.has_password, dm.verify_password
+            ),
+        )
+    except ValueError as exc:
+        _pw_record_failure(cid)  # wrong/missing password → throttle bucket
+        raise HTTPException(403, str(exc))
+    _pw_reset_failures(cid)
+    if entry.get("password"):
+        # Selection IS the unlock for this identity — warm the cache too.
+        _unlock_cache_set(name, cid, entry["password"])
+    if entry.get("source") == "acl":
+        return {
+            "status": "ok",
+            "message": f"Dataset '{name}' is already granted to your key by the operator ACL — nothing to add.",
+            "source": "acl",
+        }
+    if entry.get("source") == "acl+pw":
+        # ACL-granted, but the caller proved the password anyway: saved as a
+        # password-only sidecar (the memory-binding case — the ★ binding can
+        # now resolve the password for the memory tools).
+        return {
+            "status": "ok",
+            "message": f"Password saved for '{name}' (already ACL-granted) — memory tools and reads need no password now.",
+            "source": "acl+pw",
+        }
+    protected = " (password saved — no password header needed)" if entry.get("password") else ""
+    return {"status": "ok", "message": f"Dataset '{name}' selected for your key{protected}.", "source": "self"}
+
+
+@app.post("/api/datasets/{name}/deselect")
+async def api_deselect_dataset(name: str, request: Request):
+    """Remove a dataset from YOUR key's self-selected set (D16).
+
+    Only the caller's OWN selections are removed (an operator-ACL grant is
+    untouched); the saved password is dropped with the selection.
+    """
+    identity = _require_select_identity()
+    removed = _access_store.deselect_dataset(identity, name)
+    if removed:
+        return {"status": "ok", "message": f"Dataset '{name}' deselected (saved password removed)."}
+    return {"status": "ok", "message": f"No self-selection for '{name}' on your key — nothing removed."}
+
+
+@app.post("/api/access/memory-dataset")
+async def api_set_memory_dataset(request: Request, body: dict[str, Any] = Body(default=None)):
+    """Bind YOUR memory dataset (the /access page's ★, server-side).
+
+    Request body (optional)::
+
+        {"dataset": "andrew-memory"}   # omit the field to clear the binding
+
+    The bound dataset must be accessible to the key (operator ACL or a prior
+    ``/select``).  Once bound, the MCP memory tools resolve dataset and
+    password from this binding — opencode needs no memory env vars.
+    """
+    identity = _require_select_identity()
+    name = (body or {}).get("dataset") if isinstance(body, dict) else None
+    try:
+        bound = _access_store.set_memory_dataset(identity, name)
+    except _access_store.SelectionDenied as exc:
+        raise HTTPException(409, str(exc))
+    if bound:
+        return {"status": "ok", "message": f"Memory dataset bound: '{bound}'.", "memory_dataset": bound}
+    return {"status": "ok", "message": "Memory dataset binding cleared.", "memory_dataset": None}
+
+
+# ---------------------------------------------------------------------------
+# D17 admin key registry (mint / grant / revoke from the /access page)
+# ---------------------------------------------------------------------------
+
+
+def _require_admin_identity() -> Any:
+    """The ADMIN identity for the registry endpoints, or 403.
+
+    Registry (per-user) keys are NEVER admitted — key minting is exactly the
+    power a registry key must not have.  With the middleware's admin surface
+    check already denying ``/api/admin/*`` to clients, these endpoints are
+    admin-key-only by construction; the explicit check here is defense in
+    depth (and gives the page a clean 403 to branch on).
+    """
+    identity = _clients_registry.current_identity()
+    if identity is None or not identity.is_admin:
+        raise HTTPException(403, "Client key management requires an ADMIN API key.")
+    return identity
+
+
+def _require_admin_file() -> None:
+    """409 when the D17 overlay is disabled (nothing to write into)."""
+    if not _admin_registry.admin_file_enabled():
+        raise HTTPException(
+            409,
+            "The admin key registry is not enabled (set RAG_ACCESS_STORE=1, the D16 knob).",
+        )
+
+
+@app.get("/api/admin/clients")
+async def api_admin_list_clients():
+    """List the per-user registry (env ∪ overlay) — key material masked.
+
+    Admin-key only.  Overlay entries are editable from the page; env entries
+    are listed for visibility but remain authoritative in the env (the page
+    shows them as ``source: env`` and refuses to overwrite their keys).
+    """
+    _require_admin_file()
+    _require_admin_identity()
+    loop = asyncio.get_running_loop()
+    return {"clients": await loop.run_in_executor(sync_pool, _admin_registry.list_clients)}
+
+
+@app.post("/api/admin/clients")
+async def api_admin_mint_client(request: Request, body: dict[str, Any] = Body(...)):
+    """Mint (or key-rotate) a per-user client — ADMIN key required.
+
+    Request body::
+
+        {"name": "alice", "datasets": ["reports", "notes"], "key": "…optional…"}
+
+    The generated key is returned ONCE in ``key`` (masked everywhere else) —
+    this response is the only time the operator sees it.  An existing name
+    rotates its key (the old key stops authenticating immediately).
+    """
+    _require_admin_file()
+    _require_admin_identity()
+    name = body.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise HTTPException(400, "Field 'name' is required")
+    datasets = body.get("datasets", [])
+    if not isinstance(datasets, list):
+        raise HTTPException(400, "Field 'datasets' must be a list of dataset names")
+    custom = body.get("key")
+    if custom is not None and (not isinstance(custom, str) or not custom.strip()):
+        raise HTTPException(400, "Field 'key' must be a non-empty string when provided")
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            sync_pool,
+            lambda: _admin_registry.mint_client(name, datasets=datasets, key=custom),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    logger.info("Admin minted/rotated client '%s' (%d dataset(s)) via /access", result["name"], len(result["datasets"]))
+    return {
+        "status": "ok",
+        "name": result["name"],
+        "key": result["key"],  # the ONLY full-key response — copy it now
+        "datasets": result["datasets"],
+        "rotated": result["rotated"],
+        "message": (
+            f"Key rotated for '{result['name']}' — the previous key no longer authenticates."
+            if result["rotated"]
+            else f"Client '{result['name']}' minted."
+        ),
+    }
+
+
+@app.patch("/api/admin/clients/{name}")
+async def api_admin_grant_client(name: str, request: Request, body: dict[str, Any] = Body(...)):
+    """Replace a client's dataset grant (the checkbox set) — ADMIN key only.
+
+    Request body::
+
+        {"datasets": ["reports", "notes"]}   # ["*"] = everything, [] = none
+
+    The key itself is untouched.  Applies on the next request (no restart).
+    """
+    _require_admin_file()
+    _require_admin_identity()
+    datasets = body.get("datasets")
+    if not isinstance(datasets, list):
+        raise HTTPException(400, "Field 'datasets' must be a list of dataset names")
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            sync_pool, lambda: _admin_registry.grant_datasets(name, datasets)
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except KeyError:
+        raise HTTPException(404, f"Client '{name}' not found in the admin registry")
+    logger.info("Admin updated grants for '%s' → %s", name, result["datasets"])
+    return {"status": "ok", "name": name, "datasets": result["datasets"],
+            "message": f"Grants for '{name}' updated: {', '.join(result['datasets']) or '(none)'}."}
+
+
+@app.delete("/api/admin/clients/{name}")
+async def api_admin_revoke_client(name: str):
+    """Revoke an overlay client (its key stops working immediately) — ADMIN
+    key only.  An env-side client with the same name is NOT removable here
+    (the env registry keeps authority); the response says so explicitly.
+    """
+    _require_admin_file()
+    _require_admin_identity()
+    loop = asyncio.get_running_loop()
+    try:
+        removed = await loop.run_in_executor(sync_pool, _admin_registry.revoke_client, name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if removed:
+        logger.info("Admin revoked client '%s' via /access", name)
+        return {"status": "ok", "message": f"Client '{name}' revoked — its key no longer authenticates."}
+    # Distinguish "never existed" from "exists only in env" for the UI.
+    from multimodal_rag.utils.clients_registry import registry_clients
+
+    if name in set(registry_clients().values()):
+        return {"status": "ok", "message": f"'{name}' is defined in the ENV registry (RAG_API_KEY_CLIENTS) — remove it there; the page cannot edit env config."}
+    raise HTTPException(404, f"Client '{name}' not found in the admin registry")
+
+
 @app.post("/api/datasets/{name}/media-token")
 async def api_media_token(name: str, request: Request):
     """Mint a short-lived HMAC token for fetching this dataset's media files.
@@ -1404,18 +1869,48 @@ async def api_media_token(name: str, request: Request):
 
 
 def _rag_acl_filter_datasets(datasets: list) -> tuple:
-    """D15: drop datasets the caller's registry-key identity may not see.
+    """D15/D16: drop datasets the caller's identity cannot use.
 
-    Returns ``(visible, hidden_count)``.  With the registry unconfigured (the
-    default) or an admin identity, nothing is filtered — byte-identical list.
+    Returns ``(visible, hidden_count)``.  The visible set is the caller's
+    EFFECTIVE access: operator ACL ∪ self-selections (the D16 union) —
+    access isolation is the design (the ratified 2026-09-24 ruling REVERSED
+    the earlier discovery-mode flip: a listing never shows names the key
+    cannot use).  Admin identities see everything; the anonymous identity
+    (unconfigured deployment, D20) sees only its memory-dataset grant, so
+    the filter runs whenever an identity is bound — not only when the
+    registry is configured.
     """
-    if not _clients_registry.registry_configured():
-        return datasets, 0
     identity = _clients_registry.current_identity()
     if identity is None or identity.is_admin:
         return datasets, 0
-    visible = [d for d in datasets if _clients_registry.dataset_allowed(identity, str(d.get("name", "")))]
+    visible = [d for d in datasets if _access_store.dataset_allowed(identity, str(d.get("name", "")))]
     return visible, len(datasets) - len(visible)
+
+
+def _annotate_acl_granted(datasets: list) -> None:
+    """Stamp ``acl_granted: true`` on datasets the caller's identity can
+    already reach via the OPERATOR ACL (env registry or the D17 admin
+    overlay) — i.e. WITHOUT a self-selection.
+
+    The /access page uses it to PRE-CHECK those rows (your grants are yours
+    already — a user should never have to "select" what was granted) and to
+    distinguish the three checkbox states the D16 store keeps:
+
+      * ``acl_granted`` + no selection entry        → granted, no password saved
+      * selection entry with ``has_password``       → password saved (memory-ready)
+      * selection entry without ``has_password``    → self-selected public dataset
+
+    Admin identities and the store-off case: nothing is stamped (the page
+    treats an absent field as false) — byte-identical responses elsewhere.
+    """
+    if not _clients_registry.registry_configured():
+        return
+    identity = _clients_registry.current_identity()
+    if identity is None or identity.is_admin:
+        return
+    for ds in datasets:
+        if _access_store.dataset_allowed(identity, str(ds.get("name", ""))):
+            ds["acl_granted"] = True
 
 
 @app.get("/api/datasets")
@@ -1440,6 +1935,7 @@ async def api_list_datasets(
             for ds in datasets:
                 ds["unlocked"] = (ds["name"], cid) in _UNLOCK_CACHE
         datasets, _acl_hidden = _rag_acl_filter_datasets(datasets)
+        _annotate_acl_granted(datasets)
         return {"datasets": datasets, **({"acl_hidden": _acl_hidden} if _acl_hidden else {})}
     try:
         page = await loop.run_in_executor(
@@ -1453,6 +1949,7 @@ async def api_list_datasets(
         for ds in datasets:
             ds["unlocked"] = (ds["name"], cid) in _UNLOCK_CACHE
     datasets, _acl_hidden = _rag_acl_filter_datasets(datasets)
+    _annotate_acl_granted(datasets)
     return {
         "datasets": datasets,
         "next_cursor": page["next_cursor"],
@@ -1826,6 +2323,105 @@ async def api_upload_status(
 # -- Search ------------------------------------------------------------------
 
 
+# Weighted-RRF bounds (feature: weighted RRF) — same discipline as the MCP
+# surface: weights are rank-space tilts (0.0–10.0, 3 decimals), k is the
+# ranking constant (default 2 when unpinned).  Out-of-range values clamp
+# rather than reject, and the response's ``rrf`` block reports exactly what
+# was applied.
+_RRF_WEIGHT_MAX = 10.0
+
+
+def _rrf_default_meta_from_env() -> "dict[str, Any] | None":
+    """Parse ``RAG_RRF_DEFAULT`` (``"dense,sparse[,k]"``) to a meta payload.
+
+    Returns ``None`` when unset/empty/disabled — no per-dataset default is
+    stamped and new datasets inherit the global 1.0/1.0 code default (the
+    deployment-level knob is opt-in; disabled-by-default is part of the
+    ruling).  A payload that clamps to pure defaults also returns ``None``
+    (nothing worth stamping).  Malformed values degrade to the disabled
+    default with a loud log — a bad chart value must never block dataset
+    creation.
+    """
+    raw = RAG_RRF_DEFAULT
+    if not raw:
+        return None
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        return None
+    try:
+        dense = float(parts[0])
+        sparse = float(parts[1]) if len(parts) > 1 else 1.0
+        k = int(parts[2]) if len(parts) > 2 else None
+    except (TypeError, ValueError):
+        logger.warning(
+            "RAG_RRF_DEFAULT=%r is not 'dense,sparse[,k]' — per-dataset RRF defaults stay disabled",
+            raw,
+        )
+        return None
+    from multimodal_rag.dataset_manager import DatasetManager
+
+    try:
+        payload: dict[str, Any] = {"dense_weight": dense, "sparse_weight": sparse}
+        if k is not None:
+            payload["k"] = k
+        return DatasetManager._sanitize_rrf_meta(payload)
+    except ValueError as exc:
+        logger.warning("RAG_RRF_DEFAULT=%r rejected (%s) — per-dataset RRF defaults stay disabled", raw, exc)
+        return None
+
+
+def _clamp_rrf_weight(value: Any, name: str) -> float:
+    """Clamp a search weight to ``[0.0, 10.0]``, rounded to 3 decimals."""
+    try:
+        w = float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"Field '{name}' must be a number")
+    if math.isnan(w) or math.isinf(w):
+        raise HTTPException(400, f"Field '{name}' must be a finite number")
+    return round(min(max(w, 0.0), _RRF_WEIGHT_MAX), 3)
+
+
+def _rrf_params_from_request(dense_weight: Any = None, sparse_weight: Any = None, k: Any = None) -> "RrfParams | None":
+    """Build the weighted-RRF override from raw request params, or ``None``.
+
+    ``None`` (no override present) keeps the default fusion request
+    byte-identical.  Present-but-unset values (``1.0``/``1.0`` with no k)
+    are clamped and returned anyway — the response's ``rrf`` block then
+    echoes the effective parameters while the executed request stays
+    rank-arithmetic-identical to the default.
+    """
+    from multimodal_rag.vector_store import RrfParams
+
+    if dense_weight is None and sparse_weight is None and k is None:
+        return None
+    k_val: int | None = None
+    if k is not None:
+        try:
+            k_val = int(k)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Field 'k' must be an integer")
+        k_val = max(1, min(k_val, 1000))
+    return RrfParams(
+        dense_weight=_clamp_rrf_weight(dense_weight, "dense_weight") if dense_weight is not None else 1.0,
+        sparse_weight=_clamp_rrf_weight(sparse_weight, "sparse_weight") if sparse_weight is not None else 1.0,
+        k=k_val,
+    )
+
+
+def _rrf_response_block(rrf: "RrfParams", results: list[dict[str, Any]]) -> dict[str, Any]:
+    """The response-level ``rrf`` block: agree with the first-entry block.
+
+    The first entry's ``rrf`` block (folded by ``DatasetManager.search``
+    from the per-doc stamps before they are popped) is the source of truth
+    for what was actually applied — the REST layer must not re-derive it
+    from a private state that ``dm.search`` has already consumed.  When no
+    entry carries the folded block (e.g. an empty result list), ``applied``
+    is ``false`` — never label a request as applied without evidence.
+    """
+    applied = bool(results and isinstance(results[0].get("rrf"), dict) and results[0]["rrf"].get("applied") is True)
+    return {"dense": rrf.dense_weight, "sparse": rrf.sparse_weight, "k": rrf.k, "applied": applied}
+
+
 def _search_filters_from_params(
     file_types: str = "",
     severities: str = "",
@@ -1871,6 +2467,9 @@ async def api_search(
     top_k: int = Query(10, ge=1, le=100),
     use_reranker: bool = Query(False),
     reranker_top_k: int = Query(3, ge=1, le=50),
+    dense_weight: float | None = Query(None, description="Weighted-RRF dense-lane weight (0.0–10.0, rank-space tilt)"),
+    sparse_weight: float | None = Query(None, description="Weighted-RRF sparse/BM25-lane weight (0.0–10.0)"),
+    k: int | None = Query(None, description="Weighted-RRF ranking constant (default 2; 1–1000)"),
     file_types: str = Query(
         "",
         description="Comma-separated file-type filter (pdf,image,video,audio,text,json,table,code,office,html,xml,yaml,notebook,ebook,log,unknown)",
@@ -1890,11 +2489,20 @@ async def api_search(
     Optional metadata filters (AND-combined, applied in Qdrant before
     ranking): ``file_types``, ``severities``, ``source_prefix``,
     ``date_from``/``date_to``.
+
+    Optional weighted-RRF override (feature: weighted RRF): ``dense_weight``
+    / ``sparse_weight`` (0.0–10.0, rank-space tilts — NOT score multipliers)
+    and ``k`` (ranking constant, default 2).  Omitted params keep the
+    default fusion request; any override applies only to the hybrid lane
+    and is reported back in the response's ``rrf`` block
+    (``{dense, sparse, k, applied}``) — ``applied=false`` on dense-degraded
+    searches rather than labelling dense results with weights.
     """
     dm = await get_manager_async()
     try:
         await _require_dataset_password(dm, name, x_dataset_password, request)
         filters = _search_filters_from_params(file_types, severities, source_prefix, date_from, date_to)
+        rrf = _rrf_params_from_request(dense_weight, sparse_weight, k)
         loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(
             sync_pool,
@@ -1906,9 +2514,13 @@ async def api_search(
                 use_reranker=use_reranker,
                 reranker_top_k=reranker_top_k,
                 filters=filters,
+                rrf=rrf,
             ),
         )
-        return {"query": q, "filters": filters, "results": results}
+        payload: dict[str, Any] = {"query": q, "filters": filters, "results": results}
+        if rrf is not None:
+            payload["rrf"] = _rrf_response_block(rrf, results)
+        return payload
     except FileNotFoundError:
         raise HTTPException(404, f"Dataset '{name}' not found")
 
@@ -1958,6 +2570,14 @@ async def api_search_multimodal(
             }
         }
 
+    An optional weighted-RRF override (feature: weighted RRF) re-tilts the
+    hybrid fusion: ``dense_weight`` / ``sparse_weight`` (0.0–10.0, rank-space
+    tilts — NOT score multipliers) and ``k`` (ranking constant, default 2).
+    Omitted fields keep the default fusion request.  Any override applies
+    only to the hybrid lane and is reported back in the response's ``rrf``
+    block (``{dense, sparse, k, applied}``) — ``applied=false`` on
+    dense-degraded searches rather than labelling dense results with weights.
+
     Returns ranked results with content and similarity scores.
     """
     query = body.get("query")
@@ -1967,6 +2587,7 @@ async def api_search_multimodal(
     top_k = body.get("top_k", 10)
     use_reranker = body.get("use_reranker", False)
     reranker_top_k = body.get("reranker_top_k", 3)
+    rrf = _rrf_params_from_request(body.get("dense_weight"), body.get("sparse_weight"), body.get("k"))
 
     # Query-time SSRF guard: remote media URLs in the query are fetched
     # server-side by the embedder, so apply the same host policy as ingest
@@ -2006,9 +2627,13 @@ async def api_search_multimodal(
                 use_reranker=use_reranker,
                 reranker_top_k=reranker_top_k,
                 filters=raw_filters,
+                rrf=rrf,
             ),
         )
-        return {"query": query, "filters": raw_filters, "results": results}
+        payload: dict[str, Any] = {"query": query, "filters": raw_filters, "results": results}
+        if rrf is not None:
+            payload["rrf"] = _rrf_response_block(rrf, results)
+        return payload
     except FileNotFoundError:
         raise HTTPException(404, f"Dataset '{name}' not found")
 
@@ -2058,12 +2683,13 @@ async def _federated_rest_search(
     use ``POST /api/datasets/{name}/unlock`` first).
     """
     loop = asyncio.get_running_loop()
-    # D15: a registry-key identity's ACL restricts the fan-out (skipped with
-    # a note, exactly like a password lock). None = no enforcement.
+    # D15/D16: a registry-key identity's ACL ∪ self-selections restricts the
+    # fan-out (skipped with a note, exactly like a password lock).
+    # None = no enforcement.
     identity = _clients_registry.current_identity() if _clients_registry.registry_configured() else None
     allowed = None
     if identity is not None and not identity.is_admin:
-        allowed = lambda name: _clients_registry.dataset_allowed(identity, name)
+        allowed = lambda name: _access_store.dataset_allowed(identity, name)
     try:
         targets, skipped, errors = await loop.run_in_executor(
             sync_pool, partial(resolve_federated_targets, dm, datasets, is_unlocked, allowed)
@@ -3675,6 +4301,33 @@ async def api_repair_preprocessed(
     return await loop.run_in_executor(sync_pool, dm.repair_preprocessed_media, name, dry_run)
 
 
+@app.post("/api/admin/datasets/{name}/contextual-preview")
+async def api_contextual_preview(
+    name: str,
+    request: Request,
+    x_dataset_password: str | None = Header(None, alias="X-Dataset-Password"),
+) -> dict[str, Any]:
+    """Cost preview for enabling contextual retrieval on *name*.
+
+    Returns a LABELED ESTIMATE: the live Qdrant point count (doubled for
+    hybrid-capable collections — real-text chunks get text-only twins that
+    carry the same context line) × one context call's token math (shared
+    cached preamble + chunk input + ~80 output tokens) + the configured VLM
+    model name.  Read-only, no side effects; surfaces as the confirm line
+    next to the contextual checkbox in the dashboard before the flag flips.
+
+    Password-protected datasets require the ``X-Dataset-Password`` header
+    (it reveals per-dataset content scale).
+    """
+    dm = await get_manager_async()
+    await _require_dataset_password(dm, name, x_dataset_password, request)
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(sync_pool, dm.contextualize_preview, name)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Dataset '{name}' not found")
+
+
 @app.post("/api/admin/datasets/import")
 async def api_import_dataset(request: Request) -> dict[str, Any]:
     """Restore a dataset from a ``GET /api/datasets/{name}/export`` backup.
@@ -3821,6 +4474,17 @@ async def api_import_dataset(request: Request) -> dict[str, Any]:
 # HTML frontend
 # ---------------------------------------------------------------------------
 
+def _load_html(template: str) -> str | None:
+    """Load one template file from ``templates/`` (None when missing)."""
+    path = Path(__file__).parent / "templates" / template
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
 _HTML_INDEX: str | None = None
 
 
@@ -3828,27 +4492,46 @@ _HTML_INDEX: str | None = None
 async def index():
     global _HTML_INDEX
     if _HTML_INDEX is None:
-        html_path = Path(__file__).parent / "templates" / "index.html"
-        if html_path.exists():
-            _HTML_INDEX = html_path.read_text(encoding="utf-8")
-        else:
-            _HTML_INDEX = "<html><body><h1>Frontend not found</h1></body></html>"
+        _HTML_INDEX = _load_html("index.html") or "<html><body><h1>Frontend not found</h1></body></html>"
     # Server-injected page configuration via meta tags: the OCR-fallback
     # default (RAG_OCR_DEFAULT, chart values rag.ocr) pre-checks the create
-    # form's "OCR fallback" box; the API key (when auth is on) lets the
-    # browser keep working — the page is public by design and IS the auth
-    # boundary for browser users; direct/scripted callers still send
-    # X-RAG-Api-Key themselves.
-    html = _HTML_INDEX
+    # form's "OCR fallback" box; the weighted-RRF create default
+    # (RAG_RRF_DEFAULT, chart values rag.rrfDefault) pre-fills the create
+    # form's weight placeholders (absent → the page's own 1.0/1.0 defaults
+    # show); the API key (when auth is on) lets the browser keep working —
+    # the page is public by design and IS the auth boundary for browser
+    # users; direct/scripted callers still send X-RAG-Api-Key themselves.
+    page = _HTML_INDEX
     if RAG_OCR_DEFAULT:
-        html = html.replace("</head>", '<meta name="rag-ocr-default" content="true"></head>', 1)
+        page = page.replace("</head>", '<meta name="rag-ocr-default" content="true"></head>', 1)
+    if RAG_CONTEXTUAL_DEFAULT:
+        # Contextual-retrieval create default (RAG_CONTEXTUAL_DEFAULT, chart
+        # values rag.contextual): pre-checks the create form's "Contextual
+        # retrieval" box.  Injected ONLY when enabled, so a disabled
+        # deployment renders the byte-identical pre-feature page.
+        page = page.replace("</head>", '<meta name="rag-contextual-default" content="true"></head>', 1)
+    rrf_default_meta = _rrf_default_meta_from_env()
+    if rrf_default_meta is not None:
+        # "dense,sparse[,k]" — exactly the RAG_RRF_DEFAULT syntax the page's
+        # placeholders mirror; attribute-escaped so a hand-edited env can
+        # never break out of the meta tag.
+        content = ",".join(
+            str(rrf_default_meta.get(key))
+            for key in ("dense_weight", "sparse_weight", "k")
+            if rrf_default_meta.get(key) is not None
+        )
+        page = page.replace(
+            "</head>",
+            f'<meta name="rag-rrf-default" content="{html.escape(content, quote=True)}"></head>',
+            1,
+        )
     if _RAG_API_KEY:
-        html = html.replace(
+        page = page.replace(
             "</head>",
             f'<meta name="rag-api-key" content="{_RAG_API_KEY}"></head>',
             1,
         )
-    return html
+    return page
 
 
 @app.get("/favicon.png")
@@ -3864,6 +4547,32 @@ async def favicon():
 @app.get("/manage", response_class=HTMLResponse)
 async def manage():
     return await index()
+
+
+@app.get("/access", response_class=HTMLResponse)
+async def access():
+    """Per-user access page (the key-holder's counterpart to the operator UI).
+
+    Served public like ``/`` and ``/manage`` — the page IS its own auth
+    boundary: the user pastes their OWN API key into the page, which is then
+    sent as ``X-RAG-Api-Key`` on every API call the page makes.  The server
+    deliberately injects NO key meta tag here (unlike ``/``, which embeds the
+    deployment key for its operator context): under D15 the page is used with
+    per-user registry keys, and injecting any deployment key would leak
+    admin credentials onto a public page.  See ``documentation/API.md``
+    § "The /access page".
+    """
+    page = _load_html("access.html")
+    if not page:
+        return await index()
+    # The unlock endpoint's configured bounds, so the page's TTL selector
+    # can match the server (and carry the deployment's no-expiry knob).
+    page = page.replace(
+        "</head>",
+        f'<meta name="rag-unlock-ttl-max" content="{_unlock_ttl_max()}"></head>',
+        1,
+    )
+    return page
 
 
 # ---------------------------------------------------------------------------

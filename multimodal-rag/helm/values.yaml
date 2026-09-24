@@ -1,7 +1,7 @@
 replicaCount: 1
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v4.0.7
+  tag: v4.4.1
   pullPolicy: IfNotPresent
 deployment:
   name: rag-mcp-server
@@ -61,6 +61,29 @@ rag:
   captionWithVlm: true
   remote: false
   dedupThreshold: 0.995
+  # Ingest-time contextual retrieval (feature: contextual retrieval).
+  # false = new datasets stamp contextual:false and ingest exactly as
+  # before (zero behaviour change).  true = NEW datasets are created with
+  # the flag on (an explicit "contextual" in the POST /api/datasets body
+  # always wins; existing datasets are untouched — PATCH or Recreate them).
+  # Cost: one small LLM call per real-text chunk at ingest — review
+  # POST /api/admin/datasets/{name}/contextual-preview before enabling.
+  contextual: false
+  # Weighted-RRF per-dataset create-time defaults (RAG_RRF_DEFAULT).
+  # enabled: false = no default stamped; new datasets inherit the global
+  # 1.0/1.0 (rank order unchanged).  When enabled, NEW datasets are stamped
+  # dense/sparse[/k] at create time (existing datasets untouched; a body
+  # "rrf" object on POST /api/datasets always wins).
+  rrfDefault:
+    enabled: false
+    dense: 1.0
+    sparse: 1.0
+    k: 2
+  # Unlock TTL bound (RAG_UNLOCK_MAX_TTL): 60..N seconds for explicit unlock
+  # TTLs (default 86400 = the historical 24h cap).  The special value 0 opts
+  # the deployment into NO-EXPIRY unlocks (ttl=0 lasts until an explicit
+  # lock — the /access page's "No expiry (0)" option becomes meaningful).
+  unlockMaxTtl: 86400
 qdrant:
   image:
     repository: qdrant/qdrant
@@ -76,10 +99,11 @@ mcp:
   # fleet pattern: K8S-MCP). When existingSecret is set, the chart wires
   # RAG_API_KEYS from that Secret's key and every /mcp request needs a valid
   # key (X-API-Key or Bearer). Leave empty for gateway-fronted deployments —
-  # the server then runs open (with a loud startup warning). Comma-separated
-  # keys all authenticate: that is the rotation mechanism — append the new
-  # key, move clients over, drop the old one, no downtime. The fleet-universal
-  # MCP_API_KEYS env is honored too (either var authenticates).
+  # the server then runs open (with a loud startup warning; the REST side is
+  # still D20 fail-closed). Comma-separated keys all authenticate: that is
+  # the rotation mechanism — append the new key, move clients over, drop the
+  # old one, no downtime. The fleet-universal MCP_API_KEYS env is honored too
+  # (either var authenticates).
   apiKey:
     existingSecret: ""
     existingSecretKey: api-keys
@@ -121,7 +145,13 @@ resources:
     limits:
       memory: 32Gi
       cpu: '8'
+# Extra env vars for BOTH containers (API + MCP) — the pass-through for the
+# env-only knobs: MEMORY_DATASET (the D20 anonymous grant / memory fallback),
+# RAG_MEMORY_PASSWORD, RAG_WEBHOOK_URL / RAG_WEBHOOK_SECRET / RAG_WEBHOOK_TIMEOUT,
+# INGEST_ALLOW_S3_BUCKETS, HTTPS_PROXY/NO_PROXY (hosted-trial egress), etc.
 extraEnv: {}
+#  extraEnv:
+#    MEMORY_DATASET: "team-memory"
 security:
   # REST API-key (RAG_API_KEY) + media-token HMAC secret (MEDIA_TOKEN_SECRET,
   # 64 hex): the chart ships NO key material (P0-7, 2026-09 — the previously
@@ -154,6 +184,22 @@ security:
   pwMaxFailures: 10
   pwFailWindow: 300
   trustProxyIdentity: true
+  # Self-service dataset selection + per-identity access store (decision D16,
+  # env RAG_ACCESS_STORE).  true (chart default, ratified 2026-09-24) =
+  # registry-key users manage their own dataset set on the /access page
+  # (checkboxes; protected datasets demand their password once, saved per
+  # identity under /data/access — the shared PVC).  Effective access =
+  # operator ACL ∪ selections.  Requires mcp.apiKeyClients (per-user keys)
+  # to be useful.  false = operator-managed ACLs only (RAG_DATASET_ACLS).
+  accessStore: true
+  # Comma-separated dataset names that can never be self-selected (D16
+  # ceiling protection, env RAG_ACCESS_DENY_SELECT).  Empty = everything
+  # selectable (with proof).  Read per request; rotation without restart.
+  accessDenySelect: ''
+  # Deployment-wide fallback memory dataset (env RAG_MEMORY_DEFAULT) — used
+  # when a caller has no personal ★ binding and no client headers/env.
+  # Empty = unset (the pre-existing MEMORY_DATASET env remains the fallback).
+  memoryDefault: ''
   # Gate the /metrics exposition behind an API key (env RAG_METRICS_AUTH).
   # false (default) = public in-cluster exposition, unchanged behaviour.
   # true = every scrape must present X-RAG-Api-Key / X-API-Key / a Bearer key
@@ -177,6 +223,28 @@ backups:
   schedule: 0 3 * * *
   bucket: ''
   retentionDays: 0
+# Watched S3 sources (opt-in reconciler CronJob): on each tick the job POSTs
+# every source's prefixes to POST /api/datasets/{name}/batch-urls with
+# sync=true (ingest new/changed objects, prune deleted ones; unchanged objects
+# are skipped via the per-dataset ETag/Size state).  Disabled by default —
+# deployments without S3 render nothing.  Validation (helm template):
+#   * every prefix must be an s3:// directory URL (single-object s3://file
+#     URLs and http(s) URLs are rejected — sync reconciles prefixes only)
+#   * every source needs a dataset name and at least one prefix
+# A `type:` field is reserved for forward compatibility (SharePoint stays a
+# follow-up per decision 2026-09); unknown types are rejected in v1.
+watchedSources:
+  enabled: false
+  schedule: '*/30 * * * *'
+  sources: []
+  # sources:
+  #   - dataset: reports
+  #     prefixes:
+  #       - s3://mm-rag-drop/reports/
+  #   - dataset: logs
+  #     prefixes:
+  #       - s3://mm-rag-drop/logs/
+  #       - s3://mm-rag-drop/trace-exports/
 ezua:
   enabled: true
   virtualService:

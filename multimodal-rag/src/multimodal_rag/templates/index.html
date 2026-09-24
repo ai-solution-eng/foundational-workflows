@@ -302,6 +302,7 @@
     </div>
     <a href="/" style="color:var(--text-muted);font-size:.85rem;text-decoration:none">Datasets</a>
     <a href="/manage" style="color:var(--text-muted);font-size:.85rem;text-decoration:none">Manage</a>
+    <a href="/access" style="color:var(--text-muted);font-size:.85rem;text-decoration:none">Access</a>
   </div>
 </div>
 
@@ -404,6 +405,23 @@
       <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400;margin-left:16px" title="OCR fallback: scanned pages (images, no text layer) are OCR'd via tesseract at ingest. Text pages are never OCR'd - costs nothing unless a page needs it.">
         OCR fallback <input type="checkbox" id="ds-ocr">
       </label>
+      <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400;margin-left:16px" title="Contextual retrieval: at ingest, one small LLM call per text chunk writes 1-2 sentences of document-level context, prepended before embedding (better chunk retrieval for large documents). Affects NEW ingests only - Recreate the dataset to re-contextualize existing files. Watch the cost preview when enabling on a large dataset.">
+        Contextual retrieval <input type="checkbox" id="ds-contextual">
+      </label>
+      <span id="ds-contextual-cost" style="display:none;font-size:.8rem;color:var(--text-muted);margin-left:8px"></span>
+    </div>
+    <div class="form-group" style="margin-top:10px">
+      <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400" title="Weighted-RRF defaults for this dataset (hybrid text search only). Rank-space tilt, NOT a score multiplier: a higher weight makes that lane's rank positions count more (trust the order, not the magnitude). Applies only when a search carries no explicit override; multimodal (vector-only) queries ignore weights. Leave blank for the global default.">
+        RRF weights (optional) — dense / sparse / k
+      </label>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <input type="number" id="ds-rrf-dense" step="0.001" min="0" max="10" placeholder="dense 1.0" style="width:110px">
+        <span style="color:var(--text-muted)">/</span>
+        <input type="number" id="ds-rrf-sparse" step="0.001" min="0" max="10" placeholder="sparse 1.0" style="width:110px">
+        <span style="color:var(--text-muted)">/</span>
+        <input type="number" id="ds-rrf-k" step="1" min="1" max="1000" placeholder="k default" style="width:100px">
+        <span style="font-size:.8rem;color:var(--text-muted)" title="Rank-space tilt, NOT a score multiplier: a higher weight makes that lane's rank positions count more (trust the order, not the magnitude). Applies only when a search carries no explicit override; multimodal (vector-only) queries ignore weights.">ⓘ</span>
+      </div>
     </div>
     <div class="form-group" style="margin-top:10px">
       <label for="ds-password">Password (optional — protects dataset access)</label>
@@ -540,7 +558,20 @@
       <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-weight:400;font-size:.85rem" title="Transcribe video audio tracks via ASR for NEW uploads to this dataset.">Caption with ASR <input type="checkbox" id="edit-caption-asr"></label>
       <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-weight:400;font-size:.85rem;margin-left:8px" title="VLM-describe images/videos at ingest for NEW uploads. Enables VLM-skip at retrieval.">Caption with VLM <input type="checkbox" id="edit-caption-vlm"></label>
       <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-weight:400;font-size:.85rem;margin-left:8px" title="OCR fallback via tesseract for scanned pages (images, no text layer) for NEW uploads to this dataset.">OCR fallback <input type="checkbox" id="edit-ocr"></label>
+      <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-weight:400;font-size:.85rem;margin-left:8px" title="Contextual retrieval (ingest-time document context per chunk) for NEW uploads to this dataset. Affects new ingests only - Recreate to re-contextualize existing files.">Contextual <input type="checkbox" id="edit-contextual"></label>
       <button class="btn btn-primary btn-sm" onclick="saveDatasetSettings()" title="Apply captioning/OCR settings now — affects future ingests/retrievals">Save Flags</button>
+    </div>
+    <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:.85rem">
+      <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-weight:400" title="Weighted-RRF defaults for this dataset's hybrid text searches. Rank-space tilt, NOT a score multiplier: a higher weight makes that lane's rank positions count more (trust the order, not the magnitude). Applied only when a search carries no explicit override; multimodal (vector-only) queries ignore weights. Blank = global default (1.0/1.0).">
+        RRF weights — dense / sparse / k
+      </label>
+      <input type="number" id="edit-rrf-dense" step="0.001" min="0" max="10" placeholder="dense 1.0" style="width:105px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem">
+      <span style="color:var(--text-muted)">/</span>
+      <input type="number" id="edit-rrf-sparse" step="0.001" min="0" max="10" placeholder="sparse 1.0" style="width:105px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem">
+      <span style="color:var(--text-muted)">/</span>
+      <input type="number" id="edit-rrf-k" step="1" min="1" max="1000" placeholder="k default" style="width:95px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem">
+      <span style="font-size:.8rem;color:var(--text-muted)" title="Rank-space tilt, NOT a score multiplier: a higher weight makes that lane's rank positions count more (trust the order, not the magnitude). Applied only when a search carries no explicit override; multimodal (vector-only) queries ignore weights. Blank = global default (1.0/1.0).">ⓘ</span>
+      <button class="btn btn-primary btn-sm" onclick="saveRrfDefaults()" title="Apply weighted-RRF defaults now — affects this dataset's hybrid text searches immediately (query-time only, no re-ingest)">Save RRF</button>
     </div>
     <div id="doc-list" style="margin-top:12px"></div>
   </div>
@@ -649,10 +680,23 @@ async function createDataset() {
   const keepOriginals = document.getElementById('ds-keep-originals').checked;
   const dsOcr = document.getElementById('ds-ocr');
   const ocr = dsOcr ? dsOcr.checked : false;
+  const dsContextual = document.getElementById('ds-contextual');
+  const contextual = dsContextual ? dsContextual.checked : false;
   const pw = document.getElementById('ds-password').value.trim();
+  // Optional weighted-RRF defaults: blank fields → omit (server falls back
+  // to the deployment default, else the global 1.0/1.0).  The inputs'
+  // min/max steer the user, but the server clamps authoritatively.
+  const rrf = {};
+  const denseEl = document.getElementById('ds-rrf-dense');
+  const sparseEl = document.getElementById('ds-rrf-sparse');
+  const kEl = document.getElementById('ds-rrf-k');
+  if (denseEl && denseEl.value.trim() !== '') rrf.dense_weight = parseFloat(denseEl.value);
+  if (sparseEl && sparseEl.value.trim() !== '') rrf.sparse_weight = parseFloat(sparseEl.value);
+  if (kEl && kEl.value.trim() !== '') rrf.k = parseInt(kEl.value, 10);
   input.disabled = true;
   try {
-    const body = { name, caption_with_asr: captionWithAsr, caption_with_vlm: captionWithVlm, keep_originals: keepOriginals, ocr: ocr };
+    const body = { name, caption_with_asr: captionWithAsr, caption_with_vlm: captionWithVlm, keep_originals: keepOriginals, ocr: ocr, contextual: contextual };
+    if (Object.keys(rrf).length) body.rrf = rrf;
     if (desc) body.description = desc;
     if (pw) body.password = pw;
     await api('POST', '/api/datasets', body);
@@ -660,6 +704,7 @@ async function createDataset() {
     input.value = '';
     document.getElementById('ds-desc').value = '';
     document.getElementById('ds-password').value = '';
+    for (const el of [denseEl, sparseEl, kEl]) { if (el) el.value = ''; }
     await listDatasets();
     selectDataset(name);
   } catch (e) {
@@ -743,6 +788,21 @@ async function selectDataset(name) {
   if (cVlm) cVlm.checked = !!d.caption_with_vlm;
   const cOcr = document.getElementById('edit-ocr');
   if (cOcr) cOcr.checked = !!d.ocr;
+  const cContextual = document.getElementById('edit-contextual');
+  if (cContextual) cContextual.checked = !!d.contextual;
+  // Cost-preview confirm line: when the create form's contextual box is
+  // checked, re-fetch the estimate for THIS dataset's scale so the operator
+  // sees the cost before creating the next contextual dataset.
+  if (typeof window._refreshContextualPreview === 'function') window._refreshContextualPreview(name);
+  // Weighted-RRF defaults: show the stored per-dataset values; blank when
+  // the dataset has none (placeholder then shows the global default).
+  const storedRrf = (d.rrf && typeof d.rrf === 'object') ? d.rrf : {};
+  const eDense = document.getElementById('edit-rrf-dense');
+  const eSparse = document.getElementById('edit-rrf-sparse');
+  const eK = document.getElementById('edit-rrf-k');
+  if (eDense) eDense.value = storedRrf.dense_weight !== undefined && storedRrf.dense_weight !== null ? storedRrf.dense_weight : '';
+  if (eSparse) eSparse.value = storedRrf.sparse_weight !== undefined && storedRrf.sparse_weight !== null ? storedRrf.sparse_weight : '';
+  if (eK) eK.value = storedRrf.k !== undefined && storedRrf.k !== null ? storedRrf.k : '';
   document.getElementById('doc-list').innerHTML = '';
 
   // If dataset is password-protected and we don't have a password yet, prompt
@@ -1649,11 +1709,13 @@ async function saveDatasetSettings() {
   const cVlm = document.getElementById('edit-caption-vlm');
   if (!cAsr || !cVlm) return;
   const cOcr = document.getElementById('edit-ocr');
+  const cContextual = document.getElementById('edit-contextual');
   const body = {
     caption_with_asr: cAsr.checked,
     caption_with_vlm: cVlm.checked,
     ocr: cOcr ? cOcr.checked : undefined,
   };
+  if (cContextual) body.contextual = cContextual.checked;
   try {
     await api('PATCH', '/api/datasets/' + selectedDataset, body, undefined, passwordHeader());
     toast('Dataset flags applied (affects new content)');
@@ -1663,7 +1725,33 @@ async function saveDatasetSettings() {
       d.caption_with_asr = cAsr.checked;
       d.caption_with_vlm = cVlm.checked;
       if (cOcr) d.ocr = cOcr.checked;
+      if (cContextual) d.contextual = cContextual.checked;
     }
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+// Weighted-RRF defaults (PATCH /api/datasets/{name} {"rrf": …}): query-time
+// only — the change affects this dataset's hybrid text searches immediately,
+// no re-ingest.  All three fields blank → the stored default is REMOVED
+// (the dataset falls back to the global 1.0/1.0).  The server clamps
+// authoritatively; a rejected value surfaces the error message.
+async function saveRrfDefaults() {
+  if (!selectedDataset) return;
+  const eDense = document.getElementById('edit-rrf-dense');
+  const eSparse = document.getElementById('edit-rrf-sparse');
+  const eK = document.getElementById('edit-rrf-k');
+  if (!eDense || !eSparse || !eK) return;
+  const rrf = {};
+  if (eDense.value.trim() !== '') rrf.dense_weight = parseFloat(eDense.value);
+  if (eSparse.value.trim() !== '') rrf.sparse_weight = parseFloat(eSparse.value);
+  if (eK.value.trim() !== '') rrf.k = parseInt(eK.value, 10);
+  try {
+    await api('PATCH', '/api/datasets/' + selectedDataset, { rrf: rrf }, undefined, passwordHeader());
+    toast(Object.keys(rrf).length ? 'RRF defaults applied (query-time)' : 'RRF defaults cleared');
+    const d = datasets.find(x => x.name === selectedDataset);
+    if (d) d.rrf = Object.keys(rrf).length ? rrf : undefined;
   } catch (e) {
     toast(e.message, 'error');
   }
@@ -2183,6 +2271,73 @@ async function initCaptionCheckboxes() {
     var m = document.querySelector('meta[name="rag-ocr-default"]');
     var box = document.getElementById('ds-ocr');
     if (m && box && (m.content || '').toLowerCase() === 'true') box.checked = true;
+  })();
+</script>
+<script>
+  // Deployment-level contextual-retrieval create default
+  // (RAG_CONTEXTUAL_DEFAULT, chart values rag.contextual): pre-checks the
+  // create form's "Contextual retrieval" box.  Absent meta (knob disabled —
+  // the default) leaves the box unchecked: zero behaviour change.  When the
+  // checkbox flips to checked, the cost preview endpoint (labeled estimate:
+  // live point count × one context call's token math) is fetched once and
+  // shown as the confirm line next to the checkbox, so the per-chunk LLM
+  // cost is visible BEFORE the flag lands on the dataset.
+  (function () {
+    var m = document.querySelector('meta[name="rag-contextual-default"]');
+    var box = document.getElementById('ds-contextual');
+    if (!box) return;
+    if (m && (m.content || '').toLowerCase() === 'true') box.checked = true;
+    var costEl = document.getElementById('ds-contextual-cost');
+    var fetchedFor = null;  // dataset-name-less create form: fetch once per page load
+    function fmtInt(n) { return (n || 0).toLocaleString(); }
+    function show(preview) {
+      if (!costEl) return;
+      var model = preview.model || 'the configured VLM';
+      costEl.textContent = '≈ ' + fmtInt(preview.estimated_chunk_count) + ' LLM call(s) · ≈ '
+        + fmtInt(preview.estimated_total_tokens) + ' tokens via ' + model + ' (estimate; new ingests only — Recreate re-contextualizes existing files)';
+      costEl.style.display = 'inline';
+    }
+    async function refresh(name) {
+      if (!costEl) return;
+      try {
+        var preview = await api('POST', '/api/admin/datasets/' + encodeURIComponent(name) + '/contextual-preview', undefined, 15000);
+        show(preview);
+      } catch (e) {
+        costEl.style.display = 'none';
+      }
+    }
+    // Create form: no dataset exists yet, so the preview reflects the
+    // deployment's existing datasets only when one is selected in the
+    // detail pane; the create form shows the cost of the LAST fetched
+    // preview (refreshed on checkbox change when a dataset is selected).
+    box.addEventListener('change', function () {
+      if (!box.checked) { if (costEl) costEl.style.display = 'none'; return; }
+      var name = selectedDataset || fetchedFor;
+      if (name) refresh(name);
+    });
+    // Expose for selectDataset(): when a dataset is picked and the create
+    // box is checked, refresh the confirm line with that dataset's scale.
+    window._refreshContextualPreview = function (name) {
+      fetchedFor = name;
+      if (box.checked) refresh(name);
+    };
+  })();
+</script>
+<script>
+  // Deployment-level weighted-RRF create default (RAG_RRF_DEFAULT, chart
+  // values rag.rrfDefault): pre-fills the create form's weight inputs so
+  // the operator sees what NEW datasets will be stamped with.  Absent meta
+  // (knob disabled — the default) leaves the inputs blank with the global
+  // 1.0/1.0 placeholders.  Content is "dense,sparse[,k]".
+  (function () {
+    var m = document.querySelector('meta[name="rag-rrf-default"]');
+    if (!m || !m.content) return;
+    var parts = m.content.split(',');
+    var map = { 'ds-rrf-dense': parts[0], 'ds-rrf-sparse': parts[1], 'ds-rrf-k': parts[2] };
+    Object.keys(map).forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el && el.value.trim() === '' && map[id] !== undefined && map[id] !== '') el.value = map[id];
+    });
   })();
 </script>
 </body>

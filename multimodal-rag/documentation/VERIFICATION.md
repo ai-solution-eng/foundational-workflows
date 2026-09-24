@@ -99,4 +99,4 @@ not the magnitude — and don't debug the embedder because a memory recall "scor
 | Model swap had no effect | Hot reload disabled (`CONFIG_DIR` unset) | Charts mount `-config`/`-model-keys` — check the deployment's volumes; otherwise re-apply to roll |
 | Ingest warnings "media dropped" | Neither the embedder nor VLM/ASR supports the modality | Configure a VLM/ASR endpoint, or accept the drop (warning is surfaced to the UI) |
 
-Memory-specific symptoms (opencode plugin not writing, OWUI recall empty, dataset/password errors) have their own table in [memory/README.md](memory/README.md) § Troubleshooting.
+Memory-specific symptoms (opencode plugin not writing, OWUI recall empty, dataset/password errors) have their own table in [MEMORY.md](MEMORY.md) § Troubleshooting.

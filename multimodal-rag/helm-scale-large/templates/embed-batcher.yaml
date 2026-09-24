@@ -97,6 +97,11 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app: {{ .Values.deployment.name }}-embed-batcher
+    # EZUA app-catalog discovery requires the vendor labels on every
+    # Service — an unlabeled Service flips the imported app's card to
+    # "Unknown" (the embed-batcher Service was the one unlabeled resource).
+    hpe-ezua/app: {{ .Chart.Name }}
+    hpe-ezua/type: vendor-service
 spec:
   type: ClusterIP
   selector:

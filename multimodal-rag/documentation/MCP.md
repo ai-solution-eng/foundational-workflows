@@ -29,6 +29,10 @@ The MCP container shares the `/data` PVC with the API server, so `file://` paths
 
 > **Multi-user keys → dataset ACLs (decision D15 — opt-in).** Setting `RAG_API_KEY_CLIENTS="name:key;name:key"` mints per-user keys accepted on **both** the MCP and REST surfaces, and `RAG_DATASET_ACLS="name:ds1,ds2;name2:*"` binds each name to its datasets (`*` = all). Access is **fail-closed** (a registry key with no ACL entry sees no datasets), while the plain deployment keys (`RAG_API_KEY` + `MCP_API_KEYS` / `RAG_API_KEYS`) keep full admin access. Default (registry unset): single-key behaviour, unchanged. See [API.md](API.md) § 1 for the REST side.
 
+> **Self-service dataset selection (decision D16 — opt-in via `RAG_ACCESS_STORE=1`).** With the access store enabled, registry-key users grow their own dataset set: `select_dataset(dataset_name, password?)` adds a dataset to the key's set (protected datasets demand the correct password, which is then saved server-side — every tool afterwards works with **no** `password` argument), `deselect_dataset` removes it, and `set_memory_dataset` binds the key's ★ memory dataset so `add_memory` / `search_memory` need neither `dataset_name` nor `password`. Effective access = operator ACL ∪ selections (the ACL is a floor; `RAG_ACCESS_DENY_SELECT` datasets refuse selection outright). `list_datasets` shows only the key's EFFECTIVE datasets (operator grants ∪ selections) — access isolation: a listing never shows names the key cannot use (ratified 2026-09-24, reversing the earlier discovery-mode flip). See [API.md](API.md) § 1 for the REST endpoints and the `/access` page.
+
+> **Unlock TTL bounds (`RAG_UNLOCK_MAX_TTL`, default `86400`).** `unlock_dataset(ttl=…)` is clamped to 60..86400 seconds by default — the deployment may set `RAG_UNLOCK_MAX_TTL` to a different cap. The special value `0` opts the deployment into **no-expiry unlocks**: `ttl=0` caches the unlock without a deadline (until the MCP process restarts — the in-memory cache also evicts under its bounded-entry guard). Read per request (rotation without restart). The same knob bounds the REST `POST /api/datasets/{name}/unlock` (where `ttl=0` lasts until an explicit `/lock`); the `/access` page ([API.md](API.md) § 1) surfaces the opt-in as its "No expiry (0)" TTL option.
+
 If the cluster ingress uses `oauth2-proxy` (EZUA), include a bearer token in the `Authorization` header:
 
 ```json
@@ -37,12 +41,15 @@ If the cluster ingress uses `oauth2-proxy` (EZUA), include a bearer token in the
 
 ---
 
-## 2. Available tools (16)
+## 2. Available tools (19)
 
 | Tool | Purpose | Needs `dataset_name`? | Needs `password`? |
 |------|---------|----------------------|-------------------|
-| `list_datasets()` | List all datasets with metadata | — | — |
-| `unlock_dataset(dataset_name, password, ttl)` | Verify a dataset password; cached per-process (default 30 min) — pass `password=` per call on multi-replica deployments | yes | yes |
+| `list_datasets()` | List the caller's datasets with metadata — only the key's EFFECTIVE datasets (operator grants ∪ selections; access isolation) | — | — |
+| `unlock_dataset(dataset_name, password, ttl)` | Verify a dataset password; cached per-process (default 30 min; `ttl` bounded by `RAG_UNLOCK_MAX_TTL`, `0` = no expiry when the deployment opts in) — pass `password=` per call on multi-replica deployments, or select the dataset once instead (below) | yes | yes |
+| `select_dataset(dataset_name, password?)` | **D16** (opt-in): add a dataset to YOUR key's set — protected ones require the correct password, saved server-side so no tool needs `password=` afterwards | yes | if protected |
+| `deselect_dataset(dataset_name)` | **D16**: remove one of YOUR selections (and its saved password); operator-ACL grants untouched | yes | — |
+| `set_memory_dataset(dataset_name?)` | **D16**: bind your ★ memory dataset (omit the arg to clear) — `add_memory`/`search_memory` then need no `dataset_name`/`password` | no | — |
 | `search_dataset(dataset_name, query, image?, video?, audio?, top_k?, use_reranker?, reranker_top_k?, base_llm_modalities?, password?, media_base_url?, file_types?, severities?, source_prefix?, date_from?, date_to?)` | Full multimodal retrieval with post-processing; optional metadata filters (`file_types`, `severities`, `source_prefix`, `date_from`/`date_to`) applied server-side before ranking | yes | if protected |
 | `get_dataset_files(dataset_name, file_path?, limit?, offset?, password?)` | List or retrieve files in a dataset | yes | if protected |
 | `get_dataset_info(dataset_name, password?)` | Dataset metadata | yes | if protected |
@@ -102,7 +109,7 @@ If the calling LLM doesn't support a modality (set via `base_llm_modalities`), r
 }
 ```
 
-All 16 tools are exposed on every connection. The client (or its `tools` config) can disable specific tools it doesn't want the model to see.
+All 19 tools are exposed on every connection. The client (or its `tools` config) can disable specific tools it doesn't want the model to see.
 
 ### 3.2 opencode (two-connection pattern for memory isolation)
 
