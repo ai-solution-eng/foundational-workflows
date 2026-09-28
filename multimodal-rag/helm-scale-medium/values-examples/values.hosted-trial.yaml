@@ -31,7 +31,7 @@ replicaCount: 2
 image:
   # Packaged with the chart — leave as-is unless you built your own image.
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v4.4.1
+  tag: v4.5.2
   pullPolicy: IfNotPresent
 
 deployment:
@@ -221,8 +221,10 @@ service:
 # SITE: tune to the namespace quota
 resources:
   app:
+    # HPA-calibrated: the HPA CPU target reads utilization against the
+    # request — 1.5 cpu puts the 70% target at ~1.05 cores sustained.
     requests:
-      memory: 2.5Gi
+      memory: 4Gi
       cpu: '1.5'
     limits:
       memory: 8Gi

@@ -143,6 +143,23 @@ Existing inline users: unaffected — precedence 2 keeps their values working ve
 Existing deployed clusters: upgrading does not change their Secret (precedence 3 reuses
 the released values).
 
+### Model / S3 / Redis keys — SECRET-FIRST, sticky (2026-09)
+
+`modelSecrets.*ApiKey`, `s3.accessKeyId`/`secretAccessKey` and `redis.password` follow the
+**opposite flow** of the REST keys: the value already stored in `<release>-model-keys`
+WINS on every upgrade; the values entries only SEED (first install, or after the Secret is
+deleted). Nothing is auto-generated. Practical consequences:
+
+- **Rotate in place (no rollout):** `kubectl -n <ns> edit secret <release>-model-keys` —
+  the `/etc/rag/secrets` mount refreshes (~1s) and the containers' `CONFIG_DIR` watcher
+  rebuilds the models (~15s). The next upgrade preserves your edit (stored value wins).
+- **Reseed from values:** delete the Secret first, then upgrade
+  (`kubectl -n <ns> delete secret <release>-model-keys && helm upgrade …`). Pods inside
+  the delete→upgrade window may show `CreateContainerConfigError` until the upgrade
+  recreates the Secret.
+- **Values edits to already-seeded keys are inert** — the stored value always wins. This
+  is deliberate: an upgrade can never clobber a key rotated out-of-band.
+
 ---
 
 ## 4 · Rolling a deployment after changing key *provisioning* (not rotating values)

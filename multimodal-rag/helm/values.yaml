@@ -1,7 +1,7 @@
 replicaCount: 1
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v4.4.1
+  tag: v4.5.2
   pullPolicy: IfNotPresent
 deployment:
   name: rag-mcp-server
@@ -46,6 +46,14 @@ models:
     name: CohereLabs/cohere-transcribe-03-2026
     url: ''
     extra: {}
+# Model-serving API keys, S3/MinIO credentials and the Redis password are
+# SECRET-FIRST and STICKY (2026-09): the value already stored in the
+# `<deployment.name>-model-keys` Secret wins on every upgrade; these entries
+# SEED the keys on first install (or after the Secret is deleted). A values
+# edit to an already-seeded key is INERT — to reseed from values, delete the
+# Secret first, then upgrade. Out-of-band `kubectl edit secret` rotations are
+# preserved and hot-reload live via the /etc/rag/secrets mount + CONFIG_DIR
+# watcher (no rollout). No material is ever auto-generated here.
 modelSecrets:
   embedderApiKey: ''
   rerankerApiKey: ''

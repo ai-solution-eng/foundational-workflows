@@ -4,7 +4,7 @@ End-to-end multimodal retrieval-augmented generation: ingest documents in 17+ fo
 
 [Video Demonstration](https://storage.googleapis.com/ai-solution-engineering-videos/public/MultimodalRag.mkv) with chapters and subtitles. Highlights models, dataset ingestion, open webui integration, and the opencode longterm memory implementation.
 
-<div align="center"><img src="./documentation/rag_system_flow-1.png" width="700" alt="RAG system flow: dataset building (left) feeding a shared vector store, queried by query-time retrieval (right), with dynamic batching annotations throughout"></div>
+<div align="center"><img src="./documentation/rag_system_flow-1.png" width="700" alt="RAG system flow: dataset building (top) feeding a shared vector store, queried by the query-time retrieval flow (bottom, left to right), with dynamic batching annotations"></div>
 
 ---
 
@@ -87,7 +87,7 @@ To deploy on PCAI:
      --from-literal=RAG_API_KEY="$(openssl rand -hex 16)" \
      --from-literal=MEDIA_TOKEN_SECRET="$(openssl rand -hex 32)"
    ```
-   — or leave the `security` block empty and let the chart auto-generate both keys into `<deployment.name>-model-keys` on first install (retrieve the API key with `kubectl -n <ns> get secret <deployment.name>-model-keys -o jsonpath='{.data.RAG_API_KEY}' | base64 -d`). Inline `security.apiKey` / `security.mediaTokenSecret` still work as back-compat. Model API tokens go to `modelSecrets.*ApiKey` (values → the model-keys Secret). Precedence chain and the optional rotation runbook: `helm/ROTATION.md`.
+   — or leave the `security` block empty and let the chart auto-generate both keys into `<deployment.name>-model-keys` on first install (retrieve the API key with `kubectl -n <ns> get secret <deployment.name>-model-keys -o jsonpath='{.data.RAG_API_KEY}' | base64 -d`). Inline `security.apiKey` / `security.mediaTokenSecret` still work as back-compat. Model API tokens go to `modelSecrets.*ApiKey` (values → the model-keys Secret on first install; afterwards the stored value wins on every upgrade — values edits to seeded keys are inert, delete the Secret to reseed). Precedence chain and the optional rotation runbook: `helm/ROTATION.md`.
 
 The image does not bundle any ML models — it connects to remote model endpoints (embedder, reranker, VLM, ASR) configured at runtime via the chart's values. See `documentation/DEPLOYMENT.md` for details.
 

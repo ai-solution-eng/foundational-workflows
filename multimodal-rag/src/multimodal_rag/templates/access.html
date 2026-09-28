@@ -583,7 +583,7 @@ async function loadDatasets() {
   // Throws on failure — callers decide between auth-rejected and toast.
   const container = document.getElementById('dataset-list');
   container.innerHTML = '<div style="text-align:center;padding:20px"><span class="spinner"></span></div>';
-  const body = await api('GET', '/api/datasets');
+  const body = await api('GET', '/api/datasets?catalog=1');  // 2026-10: world + public-available + excluded
   datasets = Array.isArray(body && body.datasets) ? body.datasets : [];
   const hidden = Number(body && body.acl_hidden) || 0;
   const note = document.getElementById('acl-note');
@@ -624,7 +624,11 @@ function renderRow(d) {
   const open = openUnlockRow === name;
   const selEntry = selections[name] || null;
   const aclGranted = d.acl_granted === true;
-  const isSelected = !!selEntry || aclGranted;
+  const excluded = d.excluded === true;
+  // 2026-10: the user's checkbox set is authoritative — an excluded
+  // dataset renders UNCHECKED even when the operator grant stands
+  // underneath (re-selecting is then password-free).
+  const isSelected = (!!selEntry || aclGranted) && !excluded;
   const pwSaved = !!(selEntry && selEntry.has_password);
 
   // Lock state per spec: unlocked → 🔓 unlocked, locked → 🔒 locked,
@@ -635,7 +639,8 @@ function renderRow(d) {
   const selState = accessStoreOn && isSelected
     ? (aclGranted && !selEntry ? ' · ✓ granted' : ' · ✓ selected' + (hasPw ? (pwSaved ? ' 🔑' : '') : ''))
     : '';
-  const meta = `${count} document${count === 1 ? '' : 's'}${lockState ? ' · ' + lockState : ''}${selState}`;
+  const exclState = excluded ? ' · 🚫 excluded (re-select to include)' : '';
+  const meta = `${count} document${count === 1 ? '' : 's'}${lockState ? ' · ' + lockState : ''}${selState}${exclState}`;
 
   // D16 checkbox column (access store on): PRE-CHECKED when the dataset is
   // already reachable (operator/admin grant or self-selection) — a user
@@ -645,7 +650,7 @@ function renderRow(d) {
   if (accessStoreOn) {
     const checked = isSelected ? ' checked' : '';
     const title = isSelected
-      ? (aclGranted ? 'Granted to your key (click to add the dataset password for password-free reads/memory)'
+      ? (aclGranted ? 'Included in your key\u2019s datasets (uncheck to exclude — your checked set is authoritative)'
                     : 'Selected by you (click to remove)')
       : (hasPw ? 'Select (will ask for the dataset password)' : 'Select for your key');
     checkbox = `<input type="checkbox" class="sel-check" data-name="${escHtml(name)}"${checked} onchange="onSelectToggle(this)" title="${title}" aria-label="Select ${escHtml(name)}">`;
@@ -843,15 +848,12 @@ function onSelectToggle(box) {
   const aclGranted = !!(row && row.acl_granted);
   const wasChecked = !!selections[name];
   if (!box.checked) {
-    if (aclGranted && !wasChecked) {
-      // Operator/admin grant — not removable from this page (the checkbox
-      // reflects the grant). Revert and say so.
-      box.checked = true;
-      toast(`'${name}' is granted to your key by the admin — the grant is managed in User keys (or the env).`, 'error');
-      return;
-    }
-    if (!wasChecked) return;  // nothing stored — pure UI state
-    if (!confirm(`Remove '${name}' from your key's datasets? The saved password is dropped too.`)) {
+    // 2026-10: unchecking ALWAYS works — for a self-selection it removes
+    // the selection (and saved password); for an operator-granted or
+    // public dataset it records an EXCLUSION that hides it until
+    // re-selected. The user's checked set is their world.
+    if (!wasChecked && pwSaved) return;  // nothing to remove
+    if (pwSaved && !confirm(`Remove '${name}' from your key's datasets? The saved password is dropped too.`)) {
       box.checked = true;
       return;
     }
@@ -923,7 +925,7 @@ async function submitSelect(event, form) {
 async function deselectDataset(name) {
   try {
     const res = await api('POST', `/api/datasets/${encodeURIComponent(name)}/deselect`);
-    toast(res.message || `Dataset '${name}' deselected`);
+    toast(res.message || `Dataset '${name}' removed from your datasets (re-select any time)`);
     if (serverMemory === name) serverMemory = '';
     await refreshDatasets();
   } catch (e) {

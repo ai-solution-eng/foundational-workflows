@@ -5,8 +5,10 @@ registry-key user (from ``RAG_API_KEY_CLIENTS``) selects datasets on the
 ``/access`` page — public datasets freely, password-protected ones only with
 the correct password as proof — and the selection persists per identity so
 BOTH surfaces (MCP tools and the REST API) honor it.  Effective access is
-``operator ACL ∪ self-selections`` (the ACL is a guaranteed FLOOR; selections
-can only widen, never narrow, and can never reach the admin surface).
+``(operator ACL ∪ self-selections) − exclusions`` — 2026-10 revision (fleet-
+owner ruling): the user's checked set IS their world, so a deselect records
+an EXCLUSION that hides even an operator-granted (or public) dataset;
+re-selecting clears it.  Admin identities are never affected.
 
 Storage: one JSON file per identity under ``{DATA_PATH}/access/<identity>.json``
 (the shared RWX PVC — the same store the upload history and dataset metadata
@@ -146,8 +148,11 @@ def _load(identity: str) -> dict:
         doc = {}
     doc.setdefault("datasets", {})
     doc.setdefault("memory_dataset", "")
+    doc.setdefault("excluded", [])
     if not isinstance(doc.get("datasets"), dict):
         doc["datasets"] = {}
+    if not isinstance(doc.get("excluded"), list):
+        doc["excluded"] = []
     with _mtime_lock:
         _mtime_cache[key] = (stamp[0], stamp[1], doc)
     return doc
@@ -184,8 +189,11 @@ def _mutate(identity: str, fn: Callable[[dict], bool]) -> dict:
             doc = {}
         doc.setdefault("datasets", {})
         doc.setdefault("memory_dataset", "")
+        doc.setdefault("excluded", [])
         if not isinstance(doc.get("datasets"), dict):
             doc["datasets"] = {}
+        if not isinstance(doc.get("excluded"), list):
+            doc["excluded"] = []
         if not fn(doc):
             return doc
         tmp = path.with_suffix(".json.tmp")
@@ -219,6 +227,21 @@ def selections_for(identity: Any | None) -> frozenset:
     return frozenset(str(k) for k in _load(identity.client_id).get("datasets", {}))
 
 
+def exclusions_for(identity: Any | None) -> frozenset:
+    """The identity's excluded dataset names (empty for admins/None/off).
+
+    An exclusion records "I do not want this dataset in my world" — it
+    hides even an operator-granted or public dataset until re-selected
+    (the 2026-10 ruling: the user's checkbox set is authoritative).
+    """
+    if identity is None or not store_enabled():
+        return frozenset()
+    if getattr(identity, "is_admin", False):
+        return frozenset()
+    exc = _load(identity.client_id).get("excluded", [])
+    return frozenset(str(x) for x in exc if x)
+
+
 def selection_entry(identity: Any | None, dataset_name: str) -> dict | None:
     """The identity's stored entry for *dataset_name*, or None."""
     if identity is None or not store_enabled() or getattr(identity, "is_admin", False):
@@ -242,18 +265,26 @@ def selection_password(identity: Any | None, dataset_name: str) -> str | None:
 
 
 def dataset_allowed(identity: Any | None, dataset_name: str) -> bool:
-    """D16-effective access: operator ACL ∪ self-selections.
+    """D16-effective access: (operator ACL ∪ self-selections) − exclusions.
 
     Semantics preserved exactly when the store is off / identity is None or
-    admin (byte-identical default).  For a registry client: the operator ACL
-    is a FLOOR — a selection widens access (it was made with proof), the
-    denylist can never be selected in the first place.
+    admin (byte-identical default).  For a registry client:
+
+      * the operator ACL and self-selections are the inclusion sources (the
+        denylist can never be SELECTED in the first place);
+      * the 2026-10 revision: a user may EXCLUDE any dataset — including an
+        operator-granted or public one — by deselecting it; the exclusion
+        hides the dataset until re-selected;
+      * public datasets are NOT auto-granted: they are password-free
+        self-selections (availability, not inclusion).
     """
     from multimodal_rag.utils.clients_registry import dataset_allowed as operator_allows
 
-    if operator_allows(identity, dataset_name):
-        return True
-    return dataset_name in selections_for(identity)
+    if identity is None:
+        return operator_allows(identity, dataset_name)
+    if operator_allows(identity, dataset_name) or dataset_name in selections_for(identity):
+        return dataset_name not in exclusions_for(identity)
+    return False
 
 
 def filter_dataset_names(identity: Any | None, names) -> tuple[list, int]:
@@ -295,6 +326,12 @@ def select_dataset(identity: Any | None, dataset_name: str, password: str | None
     stored_source = {"v": "self"}
 
     def _apply(doc: dict) -> bool:
+        # Re-selecting clears any exclusion (the user brought it back).
+        exc = doc.get("excluded")
+        cleared = False
+        if isinstance(exc, list) and dataset_name in exc:
+            exc.remove(dataset_name)
+            cleared = True
         entry = {"dataset": dataset_name, "password": password or "", "selected_at": selected_at}
         if already:
             if password:
@@ -313,8 +350,8 @@ def select_dataset(identity: Any | None, dataset_name: str, password: str | None
             # No proof offered: keep the store minimal (the ACL already
             # grants; shadowing it with an empty entry would break nothing
             # but carries no information).
-            stored_source["v"] = "acl"
-            return False
+            stored_source["v"] = "reincluded" if cleared else "acl"
+            return cleared  # False unless an exclusion was just cleared
         entry["source"] = "self"
         doc["datasets"][dataset_name] = entry
         return True
@@ -329,26 +366,34 @@ def select_dataset(identity: Any | None, dataset_name: str, password: str | None
 
 
 def deselect_dataset(identity: Any | None, dataset_name: str) -> bool:
-    """Remove the identity's self-selection (and its saved password).
+    """Remove the dataset from the identity's world (and its saved password).
 
-    Returns True when a stored selection was removed.  An operator-ACL grant
-    is NOT touched (deselecting what the operator granted is meaningless —
-    access comes from the ACL itself).
+    2026-10 semantics: the user's checked set is authoritative.  A stored
+    selection is deleted; when the dataset would remain reachable via the
+    operator ACL (or is public), an EXCLUSION is recorded so the dataset
+    disappears from listings/search until re-selected.  Returns True when
+    the store changed.
     """
     if identity is None or getattr(identity, "is_admin", False) or not store_enabled():
         return False
 
-    removed = {"v": False}
+    changed = {"v": False}
 
     def _apply(doc: dict) -> bool:
+        hit = False
         if dataset_name in doc["datasets"]:
             del doc["datasets"][dataset_name]
-            removed["v"] = True
-            return True
-        return False
+            changed["v"] = True
+            hit = True
+        exc = doc.setdefault("excluded", [])
+        if dataset_name not in exc:
+            exc.append(dataset_name)
+            changed["v"] = True
+            hit = True
+        return hit
 
     _mutate(identity.client_id, _apply)
-    return removed["v"]
+    return changed["v"]
 
 
 def memory_dataset_for(identity: Any | None, fallback: str | None = None) -> str | None:

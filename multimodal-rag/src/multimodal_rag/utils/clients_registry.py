@@ -31,9 +31,12 @@ stdlib-only and dependency-free, and it never logs or returns key material.
 """
 
 import hmac
+import json
 import os
 import re
+import threading
 from contextvars import ContextVar
+from pathlib import Path
 from typing import NamedTuple
 
 from multimodal_rag.utils.mcp_auth import configured_keys
@@ -301,12 +304,66 @@ def current_identity() -> "Identity | None":
     return _identity_ctx.get()
 
 
+# ---------------------------------------------------------------------------
+# Public datasets (2026-10, revised): a per-dataset meta.json flag making
+# the dataset AVAILABLE for password-free self-selection by every minted
+# key — deliberately NOT an automatic grant (a user's checkbox set is
+# their world; public datasets are opt-in). Admin-only toggle (the REST
+# surface is /api/admin/datasets/{name}/public); a password-protected
+# dataset can never carry the flag (enforced at write AND read time).
+# Read per call with an mtime/size-checked cache (the admin_registry
+# pattern): a toggle takes effect on the next request from any replica
+# (meta.json lives on the shared RWX PVC) without a per-request NFS read
+# on the hot path.  Missing/corrupt meta -> private (fail-closed).
+# ---------------------------------------------------------------------------
+
+_PUBLIC_META_CACHE: dict[str, tuple[int, int, bool]] = {}
+_public_meta_lock = threading.Lock()
+
+def is_public_dataset(dataset_name: str) -> bool:
+    """True when *dataset_name* is stamped "public" in its meta.json.
+
+    Defense in depth: a meta that ALSO carries a password_hash is never
+    public, regardless of the flag - a hand-edited meta cannot publish a
+    password-gated dataset.
+    """
+    path = Path(os.environ.get("DATA_PATH", "/data")) / "datasets" / dataset_name / "meta.json"
+    try:
+        st = path.stat()
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    key = str(path)
+    if stamp is not None:
+        with _public_meta_lock:
+            cached = _PUBLIC_META_CACHE.get(key)
+            if cached and (cached[0], cached[1]) == stamp:
+                return cached[2]
+        is_public = False
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+            is_public = bool(
+                isinstance(meta, dict) and meta.get("public") and not meta.get("password_hash")
+            )
+        except (json.JSONDecodeError, OSError):
+            is_public = False
+        with _public_meta_lock:
+            _PUBLIC_META_CACHE[key] = (stamp[0], stamp[1], is_public)
+        return is_public
+    with _public_meta_lock:
+        _PUBLIC_META_CACHE.pop(key, None)
+    return False
+
 def dataset_allowed(identity: "Identity | None", dataset_name: str) -> bool:
     """May *identity* touch *dataset_name*?
 
     ``identity is None`` → D15 inactive → allowed (default UX byte-identical).
     Admins → allowed.  Clients → dataset in their ACL, or ``*``.  Everything
     else → denied (fail-closed; an empty ACL grants nothing).
+
+    NOTE (2026-10): the public-dataset flag is NOT a grant — it is
+    availability (password-free self-selection, enforced in access_store),
+    so it deliberately does not appear here.
     """
     if identity is None or identity.is_admin:
         return True

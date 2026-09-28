@@ -27,7 +27,7 @@ replicaCount: 4
 image:
   # Packaged with the chart — leave as-is unless you built your own image.
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v4.4.1
+  tag: v4.5.2
   pullPolicy: IfNotPresent
 
 deployment:
@@ -228,13 +228,16 @@ service:
     type: ClusterIP
 
 # -- Resources ---------------------------------------------------------------------------------------------
-# SITE: tune to the namespace quota (SE-G2 deployment ran the reduced shape
-# below: 2.5Gi/1.5 app, 10Gi/3 qdrant requests)
+# SITE: tune to the namespace quota. App requests are HPA-calibrated (the HPA
+# CPU target reads utilization against the request — see the chart's
+# values.yaml); 2 cpu puts the 70% target at ~1.4 cores of sustained
+# per-container CPU. Qdrant stays burst-to-limit (deliberately NOT the HPA
+# signal).
 resources:
   app:
     requests:
-      memory: 2.5Gi
-      cpu: '1.5'
+      memory: 4Gi
+      cpu: 2
     limits:
       memory: 8Gi
       cpu: '3'

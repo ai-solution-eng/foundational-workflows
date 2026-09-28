@@ -573,6 +573,13 @@
       <span style="font-size:.8rem;color:var(--text-muted)" title="Rank-space tilt, NOT a score multiplier: a higher weight makes that lane's rank positions count more (trust the order, not the magnitude). Applied only when a search carries no explicit override; multimodal (vector-only) queries ignore weights. Blank = global default (1.0/1.0).">ⓘ</span>
       <button class="btn btn-primary btn-sm" onclick="saveRrfDefaults()" title="Apply weighted-RRF defaults now — affects this dataset's hybrid text searches immediately (query-time only, no re-ingest)">Save RRF</button>
     </div>
+    <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:.85rem">
+      <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-weight:400" title="Public: every minted API key (registry client) can list, read and search this dataset without an explicit grant. Admin-only. Password-protected datasets cannot be made public — remove the password first.">
+        Public (all API keys) <input type="checkbox" id="edit-public-flag">
+      </label>
+      <button class="btn btn-primary btn-sm" onclick="savePublicFlag()" title="Apply the public flag now — takes effect on the next request from any replica (query-time only, no re-ingest)">Save Public</button>
+      <span id="public-note" style="font-size:.8rem;color:var(--text-muted)"></span>
+    </div>
     <div id="doc-list" style="margin-top:12px"></div>
   </div>
 
@@ -756,7 +763,7 @@ function renderDatasetList() {
     <div class="dataset-item ${selectedDataset === d.name ? 'selected' : ''}"
          data-name="${escHtml(d.name)}" onclick="selectDataset(this.dataset.name)" style="cursor:pointer">
       <div class="dataset-info">
-        <div class="dataset-name">${d.has_password ? (datasetPasswords[d.name] ? '🔓 ' : '🔒 ') : ''}${escHtml(d.name)}</div>
+        <div class="dataset-name">${d.has_password ? (datasetPasswords[d.name] ? '🔓 ' : '🔒 ') : ''}${d.public ? '🌐 ' : ''}${escHtml(d.name)}</div>
         <div class="dataset-meta">${d.document_count || 0} docs · ${d.created ? new Date(d.created).toLocaleDateString() : ''}</div>
       </div>
     </div>
@@ -790,6 +797,11 @@ async function selectDataset(name) {
   if (cOcr) cOcr.checked = !!d.ocr;
   const cContextual = document.getElementById('edit-contextual');
   if (cContextual) cContextual.checked = !!d.contextual;
+  // Public flag (feature: public-to-all-keys) + the protected-dataset note.
+  const cPublic = document.getElementById('edit-public-flag');
+  if (cPublic) cPublic.checked = !!d.public;
+  const pNote = document.getElementById('public-note');
+  if (pNote) pNote.textContent = d.has_password ? 'Password-protected: remove the password first to publish.' : '';
   // Cost-preview confirm line: when the create form's contextual box is
   // checked, re-fetch the estimate for THIS dataset's scale so the operator
   // sees the cost before creating the next contextual dataset.
@@ -1775,6 +1787,23 @@ async function saveDescription() {
   }
 }
 
+async function savePublicFlag() {
+  if (!selectedDataset) return;
+  const cb = document.getElementById('edit-public-flag');
+  if (!cb) return;
+  const want = cb.checked;
+  try {
+    const res = await api('POST', `/api/admin/datasets/${selectedDataset}/public`, { public: want });
+    toast(want ? 'Dataset is now public (all minted API keys)' : 'Dataset is private again');
+    const d = datasets.find(x => x.name === selectedDataset);
+    if (d) d.public = !!res.public;
+    renderDatasetList();
+  } catch (e) {
+    toast(e.message, 'error');
+    cb.checked = !want; // revert the checkbox on refusal (e.g. password-protected)
+  }
+}
+
 // -----------------------------------------------------------------------
 // Tabs
 // -----------------------------------------------------------------------
@@ -2106,7 +2135,7 @@ async function loadManageStats() {
               return `<li style="margin:2px 0;color:var(--text-muted)">${k}: ${parts.join(', ')}</li>`;
             }).join('');
             return `<li style="margin:8px 0">
-              <strong>${d.has_password ? (datasetPasswords[d.name] ? '🔓 ' : '🔒 ') : ''}${escHtml(d.name)}</strong>
+              <strong>${d.has_password ? (datasetPasswords[d.name] ? '🔓 ' : '🔒 ') : ''}${d.public ? '🌐 ' : ''}${escHtml(d.name)}</strong>
               <span style="color:var(--text-muted);margin-left:8px">${d.documents} doc${d.documents !== 1 ? 's' : ''}, ${formatBytes(d.file_bytes)}</span>
               ${subs ? '<ol style="list-style:lower-alpha;margin:2px 0 0 20px;padding:0">' + subs + '</ol>' : ''}
             </li>`;

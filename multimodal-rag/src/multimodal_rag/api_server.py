@@ -906,6 +906,12 @@ def _rag_acl_path_denial(path: str, method: str, identity) -> "str | None":
     if name is not None:
         if method == "POST" and path.endswith("/select"):
             return None  # D16: the select endpoint enforces its own proof
+        if method == "POST" and path.endswith("/deselect"):
+            # 2026-10: unchecking always works — the deselect only removes
+            # from the caller's own store (selection delete / exclusion
+            # record); it can never widen access, so it is fail-soft here
+            # (re-deselecting an already-excluded dataset must not 403).
+            return None
         if not _access_store.dataset_allowed(identity, name):
             return _clients_registry.DatasetAccessDenied(
                 f"Dataset '{name}' is not permitted for this API key (dataset ACLs are configured — D15)."
@@ -1655,6 +1661,12 @@ async def api_select_dataset(name: str, request: Request, body: dict[str, Any] =
             "message": f"Dataset '{name}' is already granted to your key by the operator ACL — nothing to add.",
             "source": "acl",
         }
+    if entry.get("source") == "reincluded":
+        return {
+            "status": "ok",
+            "message": f"Dataset '{name}' re-included in your datasets.",
+            "source": "reincluded",
+        }
     if entry.get("source") == "acl+pw":
         # ACL-granted, but the caller proved the password anyway: saved as a
         # password-only sidecar (the memory-binding case — the ★ binding can
@@ -1678,7 +1690,7 @@ async def api_deselect_dataset(name: str, request: Request):
     identity = _require_select_identity()
     removed = _access_store.deselect_dataset(identity, name)
     if removed:
-        return {"status": "ok", "message": f"Dataset '{name}' deselected (saved password removed)."}
+        return {"status": "ok", "message": f"Dataset '{name}' removed from your datasets (saved password dropped; re-select any time)."}
     return {"status": "ok", "message": f"No self-selection for '{name}' on your key — nothing removed."}
 
 
@@ -1868,22 +1880,42 @@ async def api_media_token(name: str, request: Request):
     return {"token": _sign_media_token(name, "*"), "ttl_seconds": _MEDIA_TOKEN_TTL}
 
 
-def _rag_acl_filter_datasets(datasets: list) -> tuple:
-    """D15/D16: drop datasets the caller's identity cannot use.
+def _rag_acl_filter_datasets(datasets: list, catalog: bool = False) -> tuple:
+    """D15/D16: drop datasets outside the caller's dataset world.
 
     Returns ``(visible, hidden_count)``.  The visible set is the caller's
-    EFFECTIVE access: operator ACL ∪ self-selections (the D16 union) —
+    EFFECTIVE access: (operator ACL ∪ self-selections) − exclusions —
     access isolation is the design (the ratified 2026-09-24 ruling REVERSED
     the earlier discovery-mode flip: a listing never shows names the key
     cannot use).  Admin identities see everything; the anonymous identity
     (unconfigured deployment, D20) sees only its memory-dataset grant, so
     the filter runs whenever an identity is bound — not only when the
     registry is configured.
+
+    *catalog* (the /access page's view, 2026-10) widens the visible set to
+    the selection CATALOG: world ∪ public-available ∪ excluded — public
+    datasets are advertised so a user can opt in, and excluded datasets
+    stay visible (stamped ``excluded: true``) so a user can re-include
+    them.  API listings (MCP/REST without the flag) keep the world-only
+    filter: an unselected public dataset never force-enters a key's world.
     """
     identity = _clients_registry.current_identity()
     if identity is None or identity.is_admin:
         return datasets, 0
-    visible = [d for d in datasets if _access_store.dataset_allowed(identity, str(d.get("name", "")))]
+    if not catalog:
+        visible = [d for d in datasets if _access_store.dataset_allowed(identity, str(d.get("name", "")))]
+        return visible, len(datasets) - len(visible)
+    excluded = _access_store.exclusions_for(identity)
+    visible = []
+    for d in datasets:
+        name = str(d.get("name", ""))
+        if (_access_store.dataset_allowed(identity, name)
+                or _clients_registry.is_public_dataset(name)
+                or name in excluded):
+            if name in excluded:
+                d = dict(d)
+                d["excluded"] = True
+            visible.append(d)
     return visible, len(datasets) - len(visible)
 
 
@@ -1909,7 +1941,16 @@ def _annotate_acl_granted(datasets: list) -> None:
     if identity is None or identity.is_admin:
         return
     for ds in datasets:
-        if _access_store.dataset_allowed(identity, str(ds.get("name", ""))):
+        name = str(ds.get("name", ""))
+        if ds.get("excluded") is True:
+            # Catalog view: the dataset is excluded by the user.  Report
+            # whether the operator grant still stands underneath
+            # (re-inclusion is then password-free) - but never pre-check
+            # the row.
+            if _clients_registry.dataset_allowed(identity, name):
+                ds["acl_granted"] = True
+            continue
+        if _access_store.dataset_allowed(identity, name):
             ds["acl_granted"] = True
 
 
@@ -1918,6 +1959,7 @@ async def api_list_datasets(
     request: Request,
     cursor: str = Query("", description="Opaque continuation token from a previous page's next_cursor"),
     limit: int = Query(0, ge=0, le=10000, description="Page size; 0 = no pagination (full list, default)"),
+    catalog: bool = Query(False, description="/access page view: world + public-available + excluded (stamped excluded:true)"),
 ):
     """List all datasets with metadata.
 
@@ -1934,7 +1976,7 @@ async def api_list_datasets(
         with _UNLOCK_CACHE_LOCK:
             for ds in datasets:
                 ds["unlocked"] = (ds["name"], cid) in _UNLOCK_CACHE
-        datasets, _acl_hidden = _rag_acl_filter_datasets(datasets)
+        datasets, _acl_hidden = _rag_acl_filter_datasets(datasets, catalog=catalog)
         _annotate_acl_granted(datasets)
         return {"datasets": datasets, **({"acl_hidden": _acl_hidden} if _acl_hidden else {})}
     try:
@@ -1948,7 +1990,7 @@ async def api_list_datasets(
     with _UNLOCK_CACHE_LOCK:
         for ds in datasets:
             ds["unlocked"] = (ds["name"], cid) in _UNLOCK_CACHE
-    datasets, _acl_hidden = _rag_acl_filter_datasets(datasets)
+    datasets, _acl_hidden = _rag_acl_filter_datasets(datasets, catalog=catalog)
     _annotate_acl_granted(datasets)
     return {
         "datasets": datasets,
@@ -1995,6 +2037,9 @@ async def api_update_dataset(
         return {"status": "ok", "updated": name}
     except FileNotFoundError:
         raise HTTPException(404, f"Dataset '{name}' not found")
+    except ValueError as exc:
+        # Includes the admin-only 'public' key rejection (fail loud, not 500).
+        raise HTTPException(400, str(exc))
 
 
 @app.delete("/api/datasets/{name}")
@@ -4167,6 +4212,33 @@ async def api_clear_upload_history(dataset: str | None = Query(None)) -> dict[st
             _save_upload_history(remaining)
         return {"status": "ok", "removed": removed}
 
+
+@app.post("/api/admin/datasets/{name}/public")
+async def api_admin_set_dataset_public(
+    name: str,
+    request: Request,
+    body: dict[str, Any] = Body(...),
+):
+    """Set a dataset's "public" flag (feature: public-to-all-keys).
+
+    ADMIN-ONLY: the middleware 403s registry-client keys on /api/admin/*
+    and the D20 anonymous identity alike - only deployment keys reach this
+    handler.  Body: {"public": true|false}.  A password-protected dataset
+    is refused with 409 (remove the password first if publication is
+    really intended).  Takes effect on the next request from any replica
+    (query-time only - no re-ingest, no restart).
+    """
+    enabled = bool(body.get("public"))
+    dm = await get_manager_async()
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(sync_pool, dm.set_public, name, enabled)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Dataset '{name}' not found")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    logger.info("Dataset '%s' public flag set to %s (admin)", name, result["public"])
+    return {"status": "ok", **result}
 
 @app.post("/api/admin/datasets/{name}/migrate-tier-schema")
 async def api_migrate_tier_schema(

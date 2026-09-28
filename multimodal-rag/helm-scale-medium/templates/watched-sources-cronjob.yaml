@@ -77,6 +77,11 @@ spec:
       ttlSecondsAfterFinished: 3600
       template:
         metadata:
+          # Deliberately NO hpe-ezua vendor labels on cron pods: the platform's
+          # scheduler-stamping vendor policy makes labeled pods undeletable on
+          # pod update (immutable schedulerName; G2 2026-09-24 incident). The
+          # app-catalog status comes from the long-running pods — see the
+          # pod-template comment in templates/deployment.yaml.
           labels:
             app: {{ .Values.deployment.appName }}
         spec:

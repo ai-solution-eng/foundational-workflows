@@ -4,7 +4,9 @@ The ratified model: any authenticated key SEES all dataset names (discovery),
 SELECTS the ones it wants — public datasets freely, protected ones only with
 the correct password, which is then saved per identity so both surfaces work
 without passwords — and effective access is operator ACL ∪ selections (the
-ACL is a floor).  OFF by default (``RAG_ACCESS_STORE``): every test here
+ACL grants form the base; 2026-10 revision: the user's checked set is
+authoritative — deselect EXCLUDES even operator-granted or public datasets
+until re-selected).  OFF by default (``RAG_ACCESS_STORE``): every test here
 exercises the knob explicitly, and the default-without-env behaviour is
 pinned byte-identical.
 
@@ -533,9 +535,57 @@ def test_acl_pw_sidecar_removed_by_deselect(monkeypatch):
     acc.select_dataset(ident, "andrew-memory", password="mempw")
     assert acc.deselect_dataset(ident, "andrew-memory") is True
     assert acc.selection_password(ident, "andrew-memory") is None
-    # The ACL grant itself survives the deselect (floor).
-    assert acc.dataset_allowed(ident, "andrew-memory")
+    # 2026-10: the deselect EXCLUDES the ACL-granted dataset (the user's
+    # checked set is authoritative) — hidden until re-selected.
+    assert acc.dataset_allowed(ident, "andrew-memory") is False
+    assert "andrew-memory" in acc.exclusions_for(ident)
+    # Re-selecting re-includes it (the grant still stands underneath).
+    entry = acc.select_dataset(ident, "andrew-memory")
+    assert entry["source"] == "reincluded"
+    assert acc.dataset_allowed(ident, "andrew-memory") is True
 
+
+def test_deselect_excludes_operator_grant(monkeypatch):
+    """2026-10 ruling: a user may exclude ANY dataset — even an operator-
+    granted one.  The grant stands underneath; the exclusion hides it."""
+    monkeypatch.setenv(acc.STORE_ENV, "1")
+    ident = _client("alice", {"acl-ds"})
+    assert acc.dataset_allowed(ident, "acl-ds") is True
+    assert acc.deselect_dataset(ident, "acl-ds") is True
+    assert acc.dataset_allowed(ident, "acl-ds") is False
+    assert "acl-ds" in acc.exclusions_for(ident)
+
+
+def test_reselect_clears_exclusion(monkeypatch):
+    monkeypatch.setenv(acc.STORE_ENV, "1")
+    ident = _client("alice", {"acl-ds"})
+    acc.deselect_dataset(ident, "acl-ds")
+    entry = acc.select_dataset(ident, "acl-ds")
+    assert entry["source"] == "reincluded"
+    assert acc.dataset_allowed(ident, "acl-ds") is True
+    assert acc.exclusions_for(ident) == frozenset()
+
+
+def test_public_available_then_excluded_then_reincluded(monkeypatch):
+    """The full public lifecycle: available (not granted) -> selected ->
+    excluded (gone from the world) -> re-selected (back, password-free)."""
+    monkeypatch.setenv(acc.STORE_ENV, "1")
+    ident = _client("alice")
+    assert acc.dataset_allowed(ident, "public-ds") is False   # availability only
+    acc.select_dataset(ident, "public-ds")
+    assert acc.dataset_allowed(ident, "public-ds") is True
+    acc.deselect_dataset(ident, "public-ds")
+    assert acc.dataset_allowed(ident, "public-ds") is False
+    entry = acc.select_dataset(ident, "public-ds")            # password-free again
+    assert entry["password"] == ""
+    assert acc.dataset_allowed(ident, "public-ds") is True
+
+
+def test_exclusions_inert_without_store(monkeypatch):
+    ident = _client("alice", {"acl-ds"})
+    assert acc.exclusions_for(ident) == frozenset()
+    assert acc.deselect_dataset(ident, "acl-ds") is False
+    assert acc.dataset_allowed(ident, "acl-ds") is True  # operator behaviour intact
 
 def test_verify_and_select_passes_password_for_acl_granted(monkeypatch):
     """The REST/MCP shared proof flow feeds the password through for

@@ -2700,7 +2700,9 @@ try:
         a password-protected dataset needs its CORRECT password (verified
         server-side, then saved so every other tool works without any
         password argument).  The selection persists for this API key until
-        you call ``deselect_dataset``.  Operator-ACL grants cannot be
+        you call ``deselect_dataset``.  Excluding a dataset (deselect) is always
+    allowed — your checked set is authoritative (2026-10): even operator-ACL
+    grants can be excluded, and re-selecting re-includes
         revoked here, and denylisted datasets (RAG_ACCESS_DENY_SELECT) are
         refused outright.
 
@@ -2757,11 +2759,12 @@ try:
     async def deselect_dataset(
         dataset_name: str,
     ) -> str:
-        """Remove a dataset from YOUR key's self-selected set (D16).
+        """Remove a dataset from YOUR key's datasets (D16, revised).
 
-        Only removes selections YOU made (password-proof ones); an
-        operator-ACL grant is untouched.  The saved password is dropped with
-        the selection.
+        Unchecking always works: your checked set is authoritative
+        (2026-10).  A self-selection is removed (saved password dropped);
+        an operator-granted or public dataset is EXCLUDED — hidden from
+        your listings and searches until you select it again.
 
         Parameters
         ----------
@@ -2775,7 +2778,7 @@ try:
                 raise ToolError("deselect_dataset applies to per-user API keys (registry keys).")
             removed = _access.deselect_dataset(ident, dataset_name)
             if removed:
-                return f"Dataset '{dataset_name}' deselected (saved password removed)."
+                return f"Dataset '{dataset_name}' removed from your datasets (re-select any time)."
             return f"No self-selection for '{dataset_name}' on your key — nothing removed."
 
         return await _offload(_impl)

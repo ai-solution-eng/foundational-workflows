@@ -391,8 +391,12 @@ Secrets/values must exist — everything else is optional tuning:
    first install into `<deployment.name>-model-keys`; or set
    `security.apiKey` / `security.mediaTokenSecret` inline — back-compat.
    Precedence and the optional rotation runbook: `helm/ROTATION.md`.)
-2. **Model API keys** — `modelSecrets.*ApiKey` in values (rendered into the
-   `<name>-model-keys` Secret); paste the platform JWT per MLIS endpoint.
+2. **Model API keys** — `modelSecrets.*ApiKey` in values (seeded into the
+   `<name>-model-keys` Secret on first install); paste the platform JWT per MLIS endpoint.
+   SECRET-FIRST afterwards: the stored value wins on every upgrade, so a values edit to an
+   already-seeded key is inert — rotate with `kubectl edit secret` (hot-reloads live, see
+   §8) or delete the Secret and upgrade to reseed from values. The same sticky rule covers
+   `s3.accessKeyId`/`secretAccessKey` and `redis.password`.
 3. **MCP keys (optional)** — `mcp.apiKey.existingSecret: mcp-fleet-apikeys` +
    `kubectl -n <ns> create secret generic mcp-fleet-apikeys
    --from-literal='api-keys=<key1>,<key2>'`. The chart never creates or inlines
@@ -471,7 +475,7 @@ When `ezua.enabled=true` (default), the chart also creates:
 
 - **VirtualService** — routes `ezua.virtualService.endpoint` through `ezua.virtualService.istioGateway` (default `istio-system/ezaf-gateway`), with three timeout tiers: batch uploads/SSE and `/mcp` get `ezua.virtualService.longTimeout` (3600s), everything else `ezua.virtualService.timeout` (300s). The endpoint is **required** — with it unset the chart render fails with `Valid .Values.ezua.virtualService.endpoint is required !`, and the endpoint value is also what builds `MEDIA_BASE_URL` (PVC-path → HTTPS media URLs in MCP search results)
 - **AuthorizationPolicy** (`ezua.authorizationPolicy.enabled`, default `true`) — enforces OAuth2 authentication at the Istio ingress gateway, via provider `ezua.authorizationPolicy.providerName` (`oauth2-proxy`) in `ezua.authorizationPolicy.namespace` (`istio-system`). Set `enabled: false` where the gateway already applies SSO centrally (SE G2)
-- **Kyverno ClusterPolicy** — auto-labels **Deployments and Services** in the release namespace with `hpe-ezua/type: vendor-service` and `hpe-ezua/app: rag-mcp-server` (required for the EZUA ingress to discover the service). **Pods are deliberately NOT matched** (fixed 2026-09-24): the EzAF platform ships its own admission policy that rewrites the scheduler on every pod carrying that `hpe-ezua/type` label, which made cron pods with orphaned finalizers undeletable — this chart version permanently immunizes the release against that interaction.
+- **Kyverno ClusterPolicy** — auto-labels **Deployments and Services** in the release namespace with `hpe-ezua/type: vendor-service` and `hpe-ezua/app: rag-mcp-server` (required for the EZUA ingress to discover the service). **The policy still matches only Deployment/Service objects** (fixed 2026-09-24): the EzAF platform ships its own admission policy that rewrites the scheduler on every pod carrying that `hpe-ezua/type` label, which made cron pods with orphaned finalizers undeletable — this chart version permanently immunizes the release against that interaction. Separately (2026-10), the **pod templates of the long-running workloads** (API Deployment, Qdrant, Redis, embed-batcher) render the same vendor labels themselves: the app-catalog card's *status* is derived from labeled pods, and an app whose pods carry no `hpe-ezua` labels shows "Unknown" in the catalog. **Cron-job pods stay unlabeled** — labeled pods are scheduler-stamped at every admission and become undeletable on pod update.
 
 ---
 
@@ -525,6 +529,8 @@ In PCAI, upgrading is just editing the values and applying again. To bump the im
 
 To change specific settings (e.g. storage or model endpoints), edit the corresponding keys in `values.yaml` and re-apply; the rest of the values are kept. API keys sourced from the release Secret are reused across upgrades (never rotated underneath a running deployment); the optional, operator-initiated rotation procedure — and the warning that rotated keys invalidate every issued media token — is `helm/ROTATION.md`.
 
+Model/S3/Redis keys in the same Secret are **sticky in the other direction** (2026-09): the stored value wins, values only seed. To rotate a model JWT or S3 credential, `kubectl -n <ns> edit secret <deployment.name>-model-keys` — the kubelet refreshes the `/etc/rag/secrets` mount within ~1s and both containers' `CONFIG_DIR` watcher rebuilds the affected models within ~15s, **no rollout needed**. To rotate *from values* instead, delete the Secret first, then upgrade (pods inside the delete→upgrade window may show `CreateContainerConfigError` until the upgrade recreates it).
+
 ---
 
 ## 9. Troubleshooting
@@ -538,5 +544,6 @@ To change specific settings (e.g. storage or model endpoints), edit the correspo
 | Qdrant OOMKilled | Vector count exceeds memory | Increase `resources.qdrant.limits.memory` |
 | Watched-sources cron pod stuck with an orphaned finalizer (old chart) | The pre-fix vendor-label policy matched Pod kind and the platform scheduler-mutation policy rejected every pod update | Deploy this chart version (policy matches Deployment/Service only); one-time cleanup for already-stuck pods: strip the finalizer AND the `hpe-ezua/type` label in one patch (see the CHANGELOG 2026-09-24 entry) |
 | 404 at VirtualService endpoint | Kyverno labels not applied | Confirm the Deployment/Service carry the `hpe-ezua` labels (PCAI discovery reads Deployments/Services, not Pods) |
+| App card shows **Unknown** in the EzUA catalog | No pod carries the `hpe-ezua` labels — the catalog derives card *status* from labeled pods (object labels alone are not enough) | Deploy this chart version (long-running pod templates carry the labels); verify with `kubectl get pods -n <ns> --show-labels | grep vendor-service`. Cron pods are unlabeled by design — that is not the cause |
 | 401 at VirtualService endpoint | OAuth2 token missing/expired | Check `oauth2-proxy` logs in `istio-system` |
 | Endpoint shows `rag-mcp-server.<domain>` unresolved | Domain value not set | Set `ezua.virtualService.endpoint` in values.yaml |

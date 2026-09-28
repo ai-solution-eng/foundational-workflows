@@ -2,7 +2,7 @@
 
 ## Overview
 
-<div align="center"><img src="./rag_system_flow-1.png" width="700" alt="Data pipeline: dataset building (left) feeding a shared vector store, queried at query time (right)"></div>
+<div align="center"><img src="./rag_system_flow-1.png" width="700" alt="Data pipeline: dataset building (top) feeding a shared vector store, queried at query time (bottom, left to right)"></div>
 
 <div align="center"><img src="./deployment_flow-1.png" width="900" alt="Deployment architecture: clients, edge, release pods, data, and MLIS model endpoints"></div>
 
@@ -595,7 +595,7 @@ Exposes **19 MCP tools** (`mcp_server.py`):
 | `list_datasets()` | Returns formatted text of the caller's datasets (with `[asr]` / `[vlm]` / `[password]` / `[unlocked]` markers) — ACL-filtered to the key's EFFECTIVE datasets (D15/D16: operator grants ∪ selections; a listing never surfaces names the key cannot use) |
 | `unlock_dataset()` | Verify a dataset password and cache the unlock per-process (default TTL 30 min, bounded by `RAG_UNLOCK_MAX_TTL`; the MCP cache is not Redis-backed — pass `password=` per call on multi-replica deployments, or `select_dataset` once instead) |
 | `select_dataset()` | **D16** (opt-in, access store on): add a dataset to YOUR key's set — protected ones demand the correct password, saved server-side so no later tool call needs `password=` |
-| `deselect_dataset()` | **D16**: remove one of YOUR selections (and its saved password); operator-ACL grants are untouched |
+| `deselect_dataset()` | **D16 (2026-10 revision)**: remove a dataset from YOUR world — a self-selection is deleted (saved password dropped); an operator-granted or public dataset is EXCLUDED (hidden until re-selected). Your checked set is authoritative |
 | `set_memory_dataset()` | **D16**: bind the key's ★ memory dataset server-side — `add_memory` / `search_memory` then need neither `dataset_name` nor `password` |
 | `search_dataset()` | Multimodal search (`dataset_name`, `query`, `image`/`video`/`audio`, `top_k`, `use_reranker`, `reranker_top_k`, `password`, `media_base_url`, plus the metadata-filter params `file_types`/`severities`/`source_prefix`/`date_from`/`date_to`). Instantiates a `Postprocessor` for modality conversion based on `base_llm_modalities`. |
 | `search_datasets()` | **Federated search** across datasets (`datasets` list or `"all"`) — per-dataset `top_k`, concurrent fan-out, dataset-labelled merged results, single optional rerank over the pool, dataset-qualified dedup. Password-protected datasets that are not unlocked are skipped with a note; there is deliberately **no `password` parameter** (passwords stay out of tool signatures). |

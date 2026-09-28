@@ -1968,6 +1968,50 @@ class DatasetManager:
             meta.pop("password_hash", None)
         self._write_meta(name, meta)
 
+    def set_public(self, name: str, public: bool) -> dict[str, Any]:
+        """Set the dataset's "public" flag (feature: public-to-all-keys).
+
+        A public dataset is readable by every AUTHENTICATED registry-client
+        key (D15/D16/D17 identities) without an explicit grant - list, read
+        and search. Guardrails:
+
+          * ADMIN-ONLY operation: the REST surface is
+            POST /api/admin/datasets/{name}/public (the middleware 403s
+            client keys on /api/admin/*) - this method trusts its caller
+            to have resolved an admin identity.
+          * A password-protected dataset can NEVER be made public: the flag
+            would silently publish password-gated content to every minted
+            key. ValueError - remove the password first
+            (set_password(name, None)) if publication is really intended.
+            The read side (clients_registry.is_public_dataset) enforces
+            the same rule, so even a hand-edited meta.json cannot publish a
+            protected dataset.
+
+        The flag is unstamped (key removed) when *public* is false, so
+        datasets created before the feature - and recreated datasets - are
+        private by default. Query-time only: no RAG rebuild, no re-ingest;
+        effective on the next request from any replica (meta.json is
+        re-read per check, mtime-cached).
+        """
+        with self._get_meta_lock(name):
+            meta = self._read_meta(name)
+            if not meta:
+                raise FileNotFoundError(f"Dataset '{name}' not found")
+            if public and meta.get("password_hash"):
+                raise ValueError(
+                    "Refusing to make a password-protected dataset public - "
+                    "remove the password first if you really mean to publish it."
+                )
+            if public:
+                meta["public"] = True
+            else:
+                meta.pop("public", None)
+            self._write_meta(name, meta)
+            return {
+                "name": name,
+                "public": "public" in meta,
+                "has_password": "password_hash" in meta,
+            }
     @staticmethod
     def _strip_password(meta: dict[str, Any]) -> dict[str, Any]:
         """Return a copy of *meta* with the password hash removed and a
@@ -2543,7 +2587,15 @@ class DatasetManager:
             if "contextual" in updates:
                 meta["contextual"] = bool(updates["contextual"])
                 caption_changed = True
-            # Weighted-RRF defaults (feature: weighted RRF, dataset-defaults
+            # The public flag (feature: public-to-all-keys) NEVER rides the
+            # generic PATCH: this endpoint is reachable by registry clients,
+            # and a client must never be able to publish a dataset
+            # (capabilities travel with the credential - D15). The single
+            # admin surface is POST /api/admin/datasets/{name}/public.
+            if "public" in updates:
+                raise ValueError(
+                    "The 'public' flag is admin-only: POST /api/admin/datasets/{name}/public"
+                )            # Weighted-RRF defaults (feature: weighted RRF, dataset-defaults
             # slice): PATCH ``{"rrf": {"dense_weight": …, "sparse_weight": …,
             # "k": …}}`` with any subset of keys.  Clamped/validated like the
             # create-time surface; an empty object or a payload that reduces

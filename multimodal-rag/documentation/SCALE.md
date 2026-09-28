@@ -6,7 +6,7 @@ A medium variant, `helm-scale-medium/`, reuses the scale-chart architecture (gun
 
 ## 1. Multiple API replicas + load balancing
 
-`values.yaml` — `replicaCount: 4`
+`values.yaml` — `replicaCount: 4` (when `autoscaling.enabled`, §12, an HPA owns this count instead and the Deployment ships without `spec.replicas`)
 
 The Deployment runs 4 pods (vs 1 in the base chart). Traffic is distributed across them by:
 
@@ -137,9 +137,9 @@ below); documented once there and repeated here so coverage is explicit:
 |---|---|---|---|
 | `deployment.appName` | `rag-mcp-server` | `rag-mcp-server` | `app` label on every rendered resource |
 | `image.pullPolicy` | `IfNotPresent` | `IfNotPresent` | Pull policy for the app image (all containers + CronJobs) |
-| `resources.app.requests.memory` / `requests.cpu` | 4Gi / 2 | 2.5Gi / 1.5 | Per-container requests (×2 containers per pod) |
+| `resources.app.requests.memory` / `requests.cpu` | 4Gi / 2 | 4Gi / 1.5 | Per-container requests (×2 containers per pod) — HPA-calibrated: utilization is computed against the request, so the request sets where the 70 % target fires (§12) |
 | `resources.app.limits.memory` / `limits.cpu` | 8Gi / 4 | 8Gi / 3 | Per-container limits |
-| `resources.qdrant.requests.memory` / `requests.cpu` | 16Gi / 4 | 10Gi / 3 | Per-replica Qdrant requests |
+| `resources.qdrant.requests.memory` / `requests.cpu` | 4Gi / 1 | 4Gi / 1 | Per-replica Qdrant requests — burst-to-limit; a pod whose working set far exceeds its request is a node-pressure eviction candidate |
 | `resources.qdrant.limits.memory` / `limits.cpu` | 32Gi / 8 | 20Gi / 6 | Per-replica Qdrant limits |
 | `resources.redis.requests.memory` / `resources.redis.requests.cpu` | 256Mi / 100m | 256Mi / 100m | Redis pod requests |
 | `resources.redis.limits.memory` / `resources.redis.limits.cpu` | 512Mi / 500m | 512Mi / 500m | Redis pod limits |
@@ -148,11 +148,57 @@ below); documented once there and repeated here so coverage is explicit:
 | `redis.image.repository` / `redis.image.tag` | `redis` / `7-alpine` | same | Redis server image |
 | `redis.image.pullPolicy` | `IfNotPresent` | `IfNotPresent` | Redis image pull policy |
 
+## 12. Opt-in autoscaling (HPA) and HPA-calibrated requests
+
+Both scale charts ship an opt-in HorizontalPodAutoscaler for the API Deployment:
+
+```yaml
+# values.yaml (scale charts; default off — the default render is unchanged)
+autoscaling:
+  enabled: false
+  minReplicas: 2        # HA floor — 1 replica is not high availability
+  maxReplicas: 6        # medium (large: 8) — cap to your namespace quota
+  targetCPUUtilizationPercentage: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # bursty RAG traffic → avoid flapping
+```
+
+When `autoscaling.enabled`, `templates/hpa.yaml` renders an autoscaling/v2 HPA targeting the API Deployment, and the Deployment renders **without `spec.replicas`** — the HPA owns the replica count, so a subsequent `helm upgrade` can no longer reset it (the classic helm/HPA fight; `replicaCount` is inert while enabled). The defaults preserve today's behavior exactly: disabled renders the HPA nothing and pins `spec.replicas: {{ .Values.replicaCount }}`.
+
+What the HPA deliberately does **not** scale:
+
+- **Qdrant StatefulSet** — shard topology and per-replica PVCs (`volumeClaimTemplates`) are not HPA-elastic; scale `qdrant.replicas` deliberately.
+- **Embed-batcher** — a singleton by design (`replicas: 1`); more replicas would split the batch pool again (§8b). More API replicas means more queries through the same batcher — if `maxReplicas` goes high, consider raising `resources.embedBatcher`.
+- **Base chart** — no autoscaling block at all: its in-process unlock cache is not multi-replica safe. Only the scale charts (Redis unlock cache, deferred count sync, shared RWX data PVC) are replicas-safe by construction (§4, §5, §10).
+
+Scheduling shape is the other half of the contract — the app containers' **requests are HPA-calibrated** (2026-10):
+
+| Resource | Requests (default) | Limits (unchanged) |
+|---|---|---|
+| App container (×2/pod) | 4Gi / 2 cpu (large) · 4Gi / 1.5 cpu (medium) | 8Gi / 4 cpu (large) · 8Gi / 3 cpu (medium) |
+| Qdrant replica | 4Gi / 1 (burst-to-limit) | 20Gi / 6 cpu (medium) · 32Gi / 8 cpu (large) |
+
+**Why the app request is NOT burst-to-limit:** the HPA's Resource-metric CPU target computes average utilization **against the request** — the request is the autoscaler's sensitivity dial, not just a scheduling reservation. An earlier all-burst-to-limit attempt (1Gi/500m app requests) made the benchmarked N=100–250 shape (7-day G2 peak: 2.37 cores on `rag-api-server`) read **474 %+ utilization**, so any real traffic slammed the HPA straight to `maxReplicas` while idle pods read ~3 % (meaningless resolution at both ends). The restored app requests put the 70 % target at **~1.4 cores (large) / ~1.05 cores (medium)** of sustained per-container CPU: interactive load (0.2–0.5 core, 10–25 % utilization) never triggers scale-up, sustained heavy load does. Memory requests cover the measured busy peak (~3.1 Gi) so a busy pod is not a node-pressure eviction candidate. Qdrant **stays burst-to-limit** — it is deliberately NOT the HPA signal (excluded from autoscaling, shard topology), and its measured CPU is ~60 m, so returning idle headroom there remains correct; its long-standing caveat stands: a Qdrant pod whose working set far exceeds its request is an eviction candidate as collections approach the memory limits.
+
+Prerequisites and operations:
+
+- **metrics-server** must be installed on the cluster for the Resource metric (or a prometheus-adapter + ServiceMonitor for the custom-metric path below).
+- Prefer bounding by quota first: at the large chart's default shape (8Gi limit per app container, ×2 containers), `maxReplicas: 8` still reserves real capacity when busy — set `maxReplicas` to what your quota actually fits.
+- Once the ServiceMonitor is on (`metrics.serviceMonitor`) and a prometheus-adapter exists, a pods metric on `rag_http_requests_total` (per-pod rate, AverageValue target) scales on true request demand instead of CPU — the API is partly I/O-bound on the embedder, so request-rate is the more faithful signal.
+- An HPA pairing nicely with this: add a PodDisruptionBudget (`minAvailable: 1`) so node drains respect the HA floor (not shipped by the charts yet).
+
+## 13. EzUA app-catalog status (vendor labels on pod templates)
+
+The EzUA app catalog derives a card's status from **labeled pods**. This chart's Service/Deployment objects were always labeled (the cluster's vendor-label policy plus the embed-batcher Service fix), but its pod templates were not — making it the only unlabeled-pod app on the G2 cluster and the only "Unknown" card in the catalog (2026-10). All long-running workloads' pod templates (API Deployment, Qdrant StatefulSet, Redis, embed-batcher) now render `hpe-ezua/type: vendor-service` + `hpe-ezua/app: <chart>`, matching what every Ready app's pods carry.
+
+Deliberate exception: **cron-job pods stay unlabeled**. The platform's `assign-custom-scheduler-for-ezua-user-vendor-pods` Kyverno policy stamps `schedulerName` on labeled pods at every admission, and pod updates (the Job controller's finalizer removal) then reject the immutable-field change — labeled cron pods become undeletable (G2 2026-09-24 incident). Catalog status is unaffected: it reads the long-running pods. Both bars are render-pinned in `tests/full_pipeline/test_vendor_pod_labels_render.py` (labels present on long-running pod templates; absent from selectors — immutable field — and from all CronJob pod specs).
+
 ## Summary table
 
 | Dimension | Base chart (`helm/`) | Medium chart (`helm-scale-medium/`) | Large chart (`helm-scale-large/`) |
 |---|---|---|---|
-| API replicas | 1 | 2 | 4 |
+| API replicas | 1 | 2 (HPA-managed when `autoscaling.enabled`, §12) | 4 (HPA-managed when `autoscaling.enabled`, §12) |
 | Server | `uvicorn` (1 event loop) | `gunicorn` + 2 `UvicornWorker`s | `gunicorn` + 4 `UvicornWorker`s |
 | Qdrant | 1 instance (HTTP) | 2-node cluster (gRPC, sharded) | 3-node cluster (gRPC, sharded) |
 | Qdrant client timeout | 30s | 30s | 30s |
@@ -181,11 +227,11 @@ Each API pod runs **two** containers (`rag-api-server` + `rag-mcp-server`), so p
 | Component | Chart | Replicas | Per-unit req | Per-unit lim | Storage |
 |---|---|---|---|---|---|
 | **App** (2 ctr/pod) | `helm/` | 1 | 4 Gi / 4 cpu | 16 Gi / 8 cpu | — |
-| | `helm-scale-medium/` | 2 | 5 Gi / 3 cpu | 16 Gi / 6 cpu | — |
+| | `helm-scale-medium/` | 2 | 8 Gi / 3 cpu | 16 Gi / 6 cpu | — |
 | | `helm-scale-large/` | 4 | 8 Gi / 4 cpu | 16 Gi / 8 cpu | — |
 | **Qdrant** | `helm/` | 1 | 16 Gi / 4 cpu | 32 Gi / 8 cpu | 50 Gi |
-| | `helm-scale-medium/` | 2 | 10 Gi / 3 cpu | 20 Gi / 6 cpu | 25 Gi × 2 |
-| | `helm-scale-large/` | 3 | 16 Gi / 4 cpu | 32 Gi / 8 cpu | 100 Gi × 3 |
+| | `helm-scale-medium/` | 2 | 4 Gi / 1 cpu | 20 Gi / 6 cpu | 25 Gi × 2 |
+| | `helm-scale-large/` | 3 | 4 Gi / 1 cpu | 32 Gi / 8 cpu | 100 Gi × 3 |
 | **Redis** | `helm/` | — | — | — | — |
 | | `helm-scale-medium/` | 1 | 256 Mi / 100 m | 512 Mi / 500 m | — |
 | | `helm-scale-large/` | 1 | 256 Mi / 100 m | 512 Mi / 500 m | — |
@@ -194,15 +240,15 @@ Each API pod runs **two** containers (`rag-api-server` + `rag-mcp-server`), so p
 
 | | `helm/` (base) | `helm-scale-medium/` | `helm-scale-large/` |
 |---|---|---|---|
-| **Req memory** | 20 Gi | 30.25 Gi (+51 %) | 104.25 Gi (+421 %) |
-| **Req CPU** | 8.0 | 12.1 (+51 %) | 36.1 (+351 %) |
-| **Lim memory** | 48 Gi | 72.5 Gi (+51 %) | 176.5 Gi (+268 %) |
-| **Lim CPU** | 16.0 | 24.5 (+53 %) | 64.5 (+303 %) |
+| **Req memory** | 20 Gi | 24.25 Gi (+21 %) | 44.75 Gi (+124 %) |
+| **Req CPU** | 8.0 | 8.1 (+1 %) | 19.6 (+145 %) |
+| **Lim memory** | 48 Gi | 72.5 Gi (+51 %) | 161.5 Gi (+236 %) |
+| **Lim CPU** | 16.0 | 24.5 (+53 %) | 58.5 (+266 %) |
 | **PVC total** | 100 Gi | 100 Gi (+0 %) | 400 Gi (+300 %) |
 
-> The totals are the **`values.yaml` defaults** (large = 4 API replicas × 4 workers). The actual SE-G2 scale-large deployment ran a reduced shape (2.5Gi/1.5 app, 10Gi/3 qdrant requests — see `helm-scale-large/values-examples/values.g2.yaml`); size to your own namespace quota.
+> The totals are the **`values.yaml` defaults** (large = 4 API replicas × 4 workers), recomputed from the per-component table after the HPA-calibration change (§12, 2026-10 — supersedes the burst-to-limit totals). Limits are unchanged by that change; the app **requests** went back up (500m/1Gi → 1.5/2 cpu, 4Gi) because the HPA reads utilization against them.
 
-Percentages are relative to the base chart. The medium variant is tuned so that **total requests are ~50 % above the base chart** while **total PVC stays at 100 Gi** — the data PVC is unchanged at 50 Gi (no resize needed on upgrade) and the two Qdrant PVCs are 25 Gi each (replacing the base chart's single 50 Gi Qdrant PVC).
+Percentages are relative to the base chart. Requests are deliberately calibrated to the HPA (§12), not minimized: at these levels the 70 % CPU target fires only on sustained real demand — at the cost of reserving more scheduling headroom per replica than a burst-to-limit shape would, which is the trade-off you accept when you run an HPA. **Total PVC stays at 100 Gi (medium)** — the data PVC is unchanged at 50 Gi (no resize needed on upgrade) and the two Qdrant PVCs are 25 Gi each (replacing the base chart's single 50 Gi Qdrant PVC).
 
 ### PVC layout
 

@@ -1,7 +1,26 @@
 replicaCount: 4
+# -- Autoscaling (opt-in) -------------------------------------------------------
+# When autoscaling.enabled, a HorizontalPodAutoscaler (templates/hpa.yaml) owns
+# the API Deployment's replica count and `replicaCount` above is inert
+# (spec.replicas is omitted from the Deployment so `helm upgrade` cannot reset
+# the autoscaler's count). The HPA scales ONLY the API Deployment — never the
+# Qdrant StatefulSet (shard topology + per-replica PVCs) or the embed-batcher
+# singleton. Requires metrics-server in the cluster for resource metrics.
+# minReplicas doubles as the HA floor: Redis (unlock cache), count-sync deferral
+# and the shared RWX data PVC make extra replicas safe, but 1 replica is not
+# high availability.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 8
+  targetCPUUtilizationPercentage: 70
+  # Stabilization window so bursty RAG traffic does not flap scale-down.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v4.4.1
+  tag: v4.5.2
   pullPolicy: IfNotPresent
 deployment:
   name: rag-mcp-server
@@ -57,6 +76,12 @@ models:
     name: CohereLabs/cohere-transcribe-03-2026
     url: ''
     extra: {}
+# SECRET-FIRST + STICKY (2026-09): the value already stored in the
+# `<deployment.name>-model-keys` Secret wins on every upgrade; these entries
+# SEED the keys on first install (or after the Secret is deleted). A values
+# edit to an already-seeded key is INERT — delete the Secret first, then
+# upgrade, to reseed from values. No material is ever auto-generated here.
+# (Out-of-band kubectl edits hot-reload live via /etc/rag/secrets + watcher.)
 modelSecrets:
   embedderApiKey: ''
   rerankerApiKey: ''
@@ -155,6 +180,16 @@ service:
     type: ClusterIP
 resources:
   app:
+    # HPA-calibrated requests (see the autoscaling block above): the HPA's CPU
+    # target reads utilization against the REQUEST, so the app request is the
+    # scaling sensitivity dial — a 2-cpu request makes the 70% target fire at
+    # ~1.4 cores of sustained per-container CPU (the 7-day G2 peak under the
+    # benchmarked N=250 shape was 2.37 cores on rag-api-server; interactive
+    # load idles at 0.2-0.5) — real demand scales, idle demand doesn't. Too
+    # low (the 500m burst-to-limit attempt) read 474%+ under load and slammed
+    # the HPA to maxReplicas; too high over-reserves idle pods. Memory is the
+    # scheduling floor (7-day peak 3.1Gi; below 4Gi a busy pod becomes a
+    # node-pressure eviction candidate). Limits unchanged.
     requests:
       memory: 4Gi
       cpu: 2
@@ -162,9 +197,14 @@ resources:
       memory: 8Gi
       cpu: 4
   qdrant:
+    # Burst-to-limit requests (see the app block above): Qdrant returns
+    # idle headroom between scale-outs. Caveat: a Qdrant pod whose working
+    # set grows far past its request is a prime node-pressure eviction
+    # candidate — keep an eye on headroom when collections approach the
+    # PVC/memory limits. Limits are unchanged.
     requests:
-      memory: 16Gi
-      cpu: '4'
+      memory: 4Gi
+      cpu: '1'
     limits:
       memory: 32Gi
       cpu: '8'
