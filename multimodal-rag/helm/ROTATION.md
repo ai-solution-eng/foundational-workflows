@@ -120,7 +120,7 @@ rotation, which was explicitly not wanted**:
 > still listed here as the working credentials.
 | `helm-scale-large/local/values.omnilife.yaml` (ex-omnilife.yaml, restored 2026-09-18) (88-104, 215-216) | `modelSecrets` JWTs, `s3.accessKeyId`/`s3.secretAccessKey` (MinIO), `security.apiKey`/`mediaTokenSecret` | JWTs, `iZEud…Cbu6`, `MYSwK…Qw81`, `Y4GlF…5M5g`, `ed735…06be` |
 | `helm-scale-large/local/migrate-my-memory.py` (31) | `API_KEY` (G2 REST key baked into the helper script) | `_55_V…PoPd` |
-| `MultimodalRAG/.g2_cluster.yaml` (100-103, 243; repo root) | `modelSecrets.*ApiKey` JWTs + `security.mediaTokenSecret` | JWTs (`eyJhbG…`), `5787d…a7dd` |
+| ~~`MultimodalRAG/.g2_cluster.yaml`~~ (DELETED 2026-09-30 — legacy parallel site-values copy superseded by `helm-scale-large/local/values.g2.yaml`, which sources keys from the `rag-platform-keys` Secret and holds no literals) | was: `modelSecrets.*ApiKey` JWTs + `security.mediaTokenSecret` | JWTs (`eyJhbG…`), `5787d…a7dd` — the media-token literal lived ONLY here; if a rotation ever requires it, mint a FRESH `MEDIA_TOKEN_SECRET` (rolling media-token invalidation) instead of hunting for the old value |
 | SearXNG site file (recorded for A3/wave boundary) | `secretKey` | see §2 "Other app" |
 
 Only a now-false comment in `se_g2.yaml` (since merged into `values.g2.yaml` and deleted; see 2026-09-18 cleanup) ("the charts ship the same default key") was

@@ -1798,6 +1798,7 @@ class DatasetManager:
         ocr: bool = False,
         rrf: "dict[str, Any] | None" = None,
         contextual: bool = False,
+        created_by: "str | None" = None,
     ) -> dict[str, Any]:
         """Create a new dataset.
 
@@ -1851,6 +1852,13 @@ class DatasetManager:
             on an existing dataset does NOT re-contextualize stored content
             (content-hash dedup would skip the re-embed anyway); run Recreate
             to re-contextualize existing files.
+        created_by:
+            D23 dataset ownership: the CREATOR identity name stamped into
+            meta.json at create time.  ``None`` stores nothing (the dataset
+            is then "pre-D23" — deletable by admins only, never toggleable
+            public by a non-admin).  The REST surface passes the request's
+            resolved identity: a registry/JWT/SSO name, ``"admin"`` (admins
+            act as the deployment), or ``"anonymous"``.
         """
         self._validate_name(name)
         dataset_dir = self.datasets_path / name
@@ -1878,6 +1886,11 @@ class DatasetManager:
         rrf_meta = self._sanitize_rrf_meta(rrf)
         if rrf_meta is not None:
             meta["rrf"] = rrf_meta
+        # D23 ownership: the creator's identity name — the delete/public
+        # surfaces read it back.  Empty/None stores nothing (pre-D23 shape).
+        creator = str(created_by or "").strip()
+        if creator:
+            meta["created_by"] = creator
         if password:
             meta["password_hash"] = _hash_password(password)
         self._write_meta(name, meta)
@@ -5418,6 +5431,21 @@ class DatasetManager:
             return json.loads(p.read_text())
         except Exception:
             return None
+
+    def read_created_by(self, name: str) -> "str | None":
+        """The dataset's ``created_by`` stamp (D23 ownership), or None.
+
+        None covers every "no provable creator" case: missing dataset,
+        corrupt/unreadable meta, and pre-D23 metas that never carried the
+        stamp — the callers (owner-or-admin delete, creator public toggle)
+        all treat None as admin-only, so a corrupt read can never widen
+        a non-admin's powers (fail-closed by construction).
+        """
+        meta = self._read_meta(name)
+        if not meta:
+            return None
+        creator = str(meta.get("created_by") or "").strip()
+        return creator or None
 
     def _write_meta(self, name: str, meta: dict[str, Any]) -> None:
         p = self._meta_path(name)

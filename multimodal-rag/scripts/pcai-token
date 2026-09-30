@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# pcai-token — print your current PCAI UA bearer JWT without opening a notebook.
+#
+# The rotating token notebooks read from /etc/secrets/ezua/.auth_token is
+# backed by a Kubernetes Secret (conventionally `access-token`, key
+# `AUTH_TOKEN`) in YOUR project namespace; this script pulls the CURRENT
+# value straight from the API server (same rotation source), so it is always
+# fresh. No notebook required.
+#
+# Usage:
+#   pcai-token                 print the token (stdout only — pipe-safe)
+#   pcai-token --info          token + expiry/identity summary (stderr stays clean)
+#   pcai-token whoami          prove it: GET /api/oidc-session on the RAG service
+#   pcai-token --help
+#
+# Configuration — per-user, set once in your shell profile (fish example):
+#   set -gx PCAI_KUBECONFIG ~/SSH/G2/g2_kubeconfig.yaml   # if not ~/.kube/config
+#   set -gx PCAI_PROXY socks5://127.0.0.1:1080            # or "" on the VPN
+#   set -gx PCAI_RAG_URL https://rag-mcp-server.<your-domain>
+#
+# Nothing else is user-specific: the namespace is derived FROM THE TOKEN'S OWN
+# claims (the `namespace` claim names the user's project namespace), with an
+# optional PCAI_NAMESPACE override for callers who want to target a different
+# namespace than their identity's.  The kubeconfig defaults to
+# $KUBECONFIG / ~/.kube/config — the machine's ordinary cluster access.
+#
+#   PCAI_KUBECONFIG  kubeconfig path (default: $KUBECONFIG, then ~/.kube/config)
+#   PCAI_PROXY       proxy for the cluster API (default: unset = direct;
+#                    set to socks5://... / http://... when your network needs it)
+#   PCAI_NAMESPACE   override the target namespace (default: from token claims)
+#   PCAI_RAG_URL     RAG service base URL for `whoami` (deployment-specific)
+#   PCAI_TOKEN_FILE  read the token from a local file instead of the cluster
+#
+# Install:  install -m 0755 scripts/pcai-token ~/.local/bin/pcai-token
+#
+# The token is printed to stdout and nowhere else; --info/whoami metadata goes
+# to stderr so `RAG_TOKEN=$(pcai-token)` stays clean.
+#
+# The chicken-and-egg, handled: the token's claims name the namespace, but the
+# token lives IN the namespace's Secret.  Resolution order:
+#   1. PCAI_NAMESPACE env (explicit override — always wins)
+#   2. ~/.kube/config current-context namespace (set by `kubectl config set-context --namespace=...`)
+#   3. PCAI_NAMESPACE_DISCOVERY="namespace1 namespace2 ..." — probe each for
+#      the token Secret (one list call, first hit wins)
+#   4. If the kubeconfig identity can LIST namespaces: any namespace whose
+#      name starts with `project-user-` and matches the kubeconfig user slug
+#      (the PCAI convention) — attempted LAST because it needs RBAC.
+set -euo pipefail
+
+PROG="pcai-token"
+
+usage() {
+  sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+}
+
+case "${1:-}" in
+  -h|--help|help) usage ;;
+esac
+
+# --- locate a kubeconfig -----------------------------------------------------
+KC=""
+for cand in "${PCAI_KUBECONFIG:-}" "${KUBECONFIG:-}" "$HOME/.kube/config"; do
+  if [ -n "$cand" ] && [ -f "$cand" ]; then KC="$cand"; break; fi
+done
+if [ -z "$KC" ] && [ -z "${PCAI_TOKEN_FILE:-}" ]; then
+  echo "$PROG: no kubeconfig found (tried \$PCAI_KUBECONFIG, \$KUBECONFIG, ~/.kube/config)" >&2
+  exit 1
+fi
+KC_ARGS=()
+[ -n "$KC" ] && KC_ARGS=(--kubeconfig "$KC")
+
+# --- kubeconfig current-context namespace (standard kubectl convention) -----
+CTX_NS=""
+if [ -n "$KC" ]; then
+  CTX_NS="$(kubectl "${KC_ARGS[@]}" config view --minify -o jsonpath='{..namespace}' 2>/dev/null || true)"
+fi
+
+# --- proxy (transport to the cluster API) ------------------------------------
+# '-' (not ':-'): an EMPTY PCAI_PROXY="" disables the proxy explicitly; only
+# an UNSET variable means direct.  Assign first so set -u is safe.
+PCAI_PROXY="${PCAI_PROXY-}"
+if [ -n "$PCAI_PROXY" ]; then
+  export https_proxy="$PCAI_PROXY" HTTPS_PROXY="$PCAI_PROXY"
+fi
+
+# --- candidate namespaces, best first ----------------------------------------
+NS_CANDIDATES=()
+[ -n "${PCAI_NAMESPACE:-}" ] && NS_CANDIDATES+=("$PCAI_NAMESPACE")
+[ -n "$CTX_NS" ] && NS_CANDIDATES+=("$CTX_NS")
+# PCAI_NAMESPACE_DISCOVERY: a space-separated list the user (or a team
+# profile script) can seed — e.g. from `kubectl get ns -o name` piped
+# through grep project-user.
+for c in ${PCAI_NAMESPACE_DISCOVERY:-}; do NS_CANDIDATES+=("$c"); done
+# de-dup, keep order
+if [ ${#NS_CANDIDATES[@]} -gt 1 ]; then
+  mapfile -t NS_CANDIDATES < <(printf '%s\n' "${NS_CANDIDATES[@]}" | awk '!seen[$0]++')
+fi
+
+if [ ${#NS_CANDIDATES[@]} -eq 0 ]; then
+  echo "$PROG: no namespace candidate found." >&2
+  echo "  Set PCAI_NAMESPACE, or the kubeconfig context namespace, or" >&2
+  echo "  PCAI_NAMESPACE_DISCOVERY='ns1 ns2 ...' (probed for the token Secret)." >&2
+  exit 1
+fi
+
+# --- token sources -----------------------------------------------------------
+fetch_token_from_ns() {
+  # $1 = namespace; prints the token on stdout, returns non-zero on miss.
+  local ns="$1"
+  local tok
+  # Fast path: the PCAI token Secret convention — `access-token` / AUTH_TOKEN
+  # (the notebook projection /etc/secrets/ezua/.auth_token maps to it).
+  tok="$(kubectl "${KC_ARGS[@]}" -n "$ns" get secret access-token \
+    -o jsonpath='{.data.AUTH_TOKEN}' 2>/dev/null | base64 --decode 2>/dev/null || true)"
+  tok="${tok//[[:space:]]/}"
+  if [ -n "$tok" ] && [ "$(printf '%s' "$tok" | awk -F. '{print NF}')" -eq 3 ]; then
+    printf '%s' "$tok"
+    return 0
+  fi
+  # Fallback: scan the namespace's Secrets for any auth-token-ish key that
+  # carries a JWT.  The JSON goes through a TEMP FILE, never argv: a full
+  # Secret dump exceeds the kernel per-argument limit (MAX_ARG_STRLEN) —
+  # "Argument list too long".
+  local jf
+  jf="$(mktemp "${TMPDIR:-/tmp}/pcai-token-secrets.XXXXXX")"
+  kubectl "${KC_ARGS[@]}" -n "$ns" get secrets -o json > "$jf" 2>/dev/null || { rm -f "$jf"; return 1; }
+  tok="$(python3 - "$jf" "$ns" <<'PYEOF'
+import base64, json, sys
+
+with open(sys.argv[1]) as fh:
+    doc = json.load(fh)
+hits = []  # (priority, secret_name, token)
+for s in doc.get("items", []):
+    name = s.get("metadata", {}).get("name", "")
+    for key, val in (s.get("data") or {}).items():
+        kl = key.lower().lstrip(".")
+        if kl in ("auth_token", "authtoken", "access-token", "access_token") or kl.endswith("auth_token"):
+            try:
+                tok = base64.b64decode(val).decode("utf-8").strip()
+            except Exception:
+                continue
+            if len(tok.split(".")) == 3:  # JWT shape only
+                hits.append((0 if ("ezua" in name.lower() or "token" in name.lower()) else 1, name, tok))
+if not hits:
+    sys.exit(1)
+hits.sort()
+if len({h[2] for h in hits}) > 1:
+    sys.stderr.write(f"pcai-token: WARNING multiple distinct tokens in ns '{sys.argv[2]}' ({', '.join(h[1] for h in hits)}); using '{hits[0][1]}'\n")
+print(hits[0][2])
+PYEOF
+)" || { rm -f "$jf"; return 1; }
+  rm -f "$jf"
+  [ -n "$tok" ] && printf '%s' "$tok"
+}
+
+# --- try candidates until one yields a JWT -----------------------------------
+if [ -n "${PCAI_TOKEN_FILE:-}" ]; then
+  TOKEN="$(cat "$PCAI_TOKEN_FILE")"
+else
+  TOKEN=""
+  MISSES=""
+  for ns in "${NS_CANDIDATES[@]}"; do
+    if TOKEN="$(fetch_token_from_ns "$ns")" && [ -n "$TOKEN" ]; then
+      NS="$ns"
+      break
+    fi
+    MISSES="$MISSES $ns"
+  done
+  if [ -z "$TOKEN" ]; then
+    echo "$PROG: no token found in any candidate namespace ($MISSES)." >&2
+    echo "  The token Secret is conventionally 'access-token' (key AUTH_TOKEN)." >&2
+    echo "  Point PCAI_NAMESPACE at the right namespace, or seed" >&2
+    echo "  PCAI_NAMESPACE_DISCOVERY with the namespace list." >&2
+    exit 1
+  fi
+  # The token's own claims name the user's project namespace — if we found
+  # the token somewhere ELSE (context default, discovery list), RE-TARGET the
+  # token's home namespace so per-namespace tools behave naturally.
+  CLAIM_NS="$(python3 - "$TOKEN" <<'PYEOF'
+import base64, json, sys
+parts = sys.argv[1].split(".")
+pad = parts[1] + "=" * (-len(parts[1]) % 4)
+print(json.loads(base64.urlsafe_b64decode(pad)).get("namespace", ""))
+PYEOF
+)" || CLAIM_NS=""
+  if [ -n "$CLAIM_NS" ] && [ "$CLAIM_NS" != "$NS" ] && [ -z "${PCAI_NAMESPACE:-}" ]; then
+    # Re-fetch from the token's home namespace (same rotation source the
+    # user's notebooks mount) — fall back silently to what we have.
+    HOME_TOK="$(fetch_token_from_ns "$CLAIM_NS" || true)"
+    if [ -n "$HOME_TOK" ]; then TOKEN="$HOME_TOK"; NS="$CLAIM_NS"; fi
+  fi
+fi
+NS="${NS:-${PCAI_NAMESPACE:-unknown}}"
+
+# --- validate + summarize ----------------------------------------------------
+INFO="$(python3 - "$TOKEN" <<'PYEOF'
+import base64, json, sys, time
+
+tok = sys.argv[1].strip()
+parts = tok.split(".")
+if len(parts) != 3:
+    sys.stderr.write("pcai-token: value is not a JWT\n"); sys.exit(1)
+pad = parts[1] + "=" * (-len(parts[1]) % 4)
+claims = json.loads(base64.urlsafe_b64decode(pad))
+exp, now = int(claims.get("exp", 0)), int(time.time())
+left = exp - now
+user = claims.get("preferred_username") or claims.get("sub") or "?"
+if left <= 0:
+    sys.stderr.write(f"pcai-token: EXPIRED {abs(left)//3600}h {(abs(left)%3600)//60}m ago ({user})\n")
+    sys.exit(2)
+print(f"identity={user} expires_in={left//86400}d{(left%86400)//3600}h ns={claims.get('namespace', '?')}")
+PYEOF
+)" || { [ $? -eq 2 ] && exit 2 || exit 1; }
+
+case "${1:-token}" in
+  --info)
+    echo "source=kubectl ns=$NS" >&2
+    echo "$INFO" >&2
+    echo "$TOKEN"
+    ;;
+  whoami)
+    RAG_URL="${PCAI_RAG_URL:?pcai-token: set PCAI_RAG_URL (the deployment base URL) to use whoami}"
+    echo "GET $RAG_URL/api/oidc-session" >&2
+    echo "$INFO" >&2
+    exec curl -sk -H "Authorization: Bearer $TOKEN" "$RAG_URL/api/oidc-session"
+    ;;
+  token|"")
+    echo "$INFO" >&2
+    echo "$TOKEN"
+    ;;
+  *)
+    echo "$PROG: unknown command '$1' (try --help)" >&2
+    exit 1
+    ;;
+esac

@@ -31,6 +31,23 @@ The MCP container shares the `/data` PVC with the API server, so `file://` paths
 
 > **Self-service dataset selection (decision D16 — opt-in via `RAG_ACCESS_STORE=1`).** With the access store enabled, registry-key users grow their own dataset set: `select_dataset(dataset_name, password?)` adds a dataset to the key's set (protected datasets demand the correct password, which is then saved server-side — every tool afterwards works with **no** `password` argument), `deselect_dataset` removes it, and `set_memory_dataset` binds the key's ★ memory dataset so `add_memory` / `search_memory` need neither `dataset_name` nor `password`. Effective access = operator ACL ∪ selections (the ACL is a floor; `RAG_ACCESS_DENY_SELECT` datasets refuse selection outright). `list_datasets` shows only the key's EFFECTIVE datasets (operator grants ∪ selections) — access isolation: a listing never shows names the key cannot use (ratified 2026-09-24, reversing the earlier discovery-mode flip). See [API.md](API.md) § 1 for the REST endpoints and the `/access` page.
 
+> **OIDC JWT as a second credential (decision D21 — opt-in via `RAG_OIDC_ENABLED=true`).** When the deployment enables OIDC, a JWT-only MCP client sends its Keycloak/UA-realm token as the bearer — the server verifies it (RS256 against the realm JWKS; `iss` / `aud` / `exp`) and resolves it to the **same per-user registry identity** as the user's minted API key (join key = `preferred_username`, fallback `sub`). A JWT-only user starts with **zero datasets (fail-closed)** and self-selects via the D16 tools above — no API key is needed at all. Note the tokens rotate (15-day validity on G2): the client should re-read the notebook secret per session, not bake a token into the config.
+
+> **Dataset ownership on delete (decision D23).** The D23 ownership rule applies to the MCP delete tools identically: deleting a dataset (or its documents) requires the dataset's `created_by` identity or an admin — same owner-or-admin rule as the REST DELETE endpoint, enforced on both surfaces; pre-D23 datasets (no recorded creator) are admin-only. See API.md § 1 and § 4.3.
+
+```jsonc
+{
+  "mcpServers": {
+    "multimodal-rag": {
+      "url": "https://rag-mcp-server.<YOUR-DOMAIN>/mcp",
+      "headers": {
+        "Authorization": "Bearer {env:RAG_INGRESS_TOKEN}"
+      }
+    }
+  }
+}
+```
+
 > **Unlock TTL bounds (`RAG_UNLOCK_MAX_TTL`, default `86400`).** `unlock_dataset(ttl=…)` is clamped to 60..86400 seconds by default — the deployment may set `RAG_UNLOCK_MAX_TTL` to a different cap. The special value `0` opts the deployment into **no-expiry unlocks**: `ttl=0` caches the unlock without a deadline (until the MCP process restarts — the in-memory cache also evicts under its bounded-entry guard). Read per request (rotation without restart). The same knob bounds the REST `POST /api/datasets/{name}/unlock` (where `ttl=0` lasts until an explicit `/lock`); the `/access` page ([API.md](API.md) § 1) surfaces the opt-in as its "No expiry (0)" TTL option.
 
 If the cluster ingress uses `oauth2-proxy` (EZUA), include a bearer token in the `Authorization` header:

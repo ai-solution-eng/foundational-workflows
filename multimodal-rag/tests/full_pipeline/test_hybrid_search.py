@@ -1360,6 +1360,7 @@ def test_rest_create_dataset_body_rrf_flows_and_validates():
             ocr: bool,
             rrf: Any = None,
             contextual: bool = False,
+            created_by: str | None = None,  # D23 ownership stamp (passed through)
         ) -> dict[str, Any]:
             DatasetManager._validate_name(name)
             self.seen.append({"name": name, "rrf": rrf})

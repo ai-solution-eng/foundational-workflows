@@ -141,9 +141,23 @@ def test_grant_update_applies_without_restart(tmp_path):
     assert cr.dataset_allowed(ident2, "anything-else")  # '*' grant
 
 
-def test_grant_unknown_client_404s(tmp_path):
+def test_grant_unknown_client_auto_mints_observed_user(tmp_path):
+    """D23 (lead fix): granting an UNKNOWN name auto-mints an empty-key
+    entry (the observed-JWT-user flow — granting IS minting) instead of
+    404ing.  The entry carries NO key material (authenticates nothing until
+    explicitly minted) and env-authoritative names still refuse."""
+    res = ar.grant_datasets("ghost-observed", ["ds1", "ds2"])
+    assert res["datasets"] == ["ds1", "ds2"]
+    entry = ar._load()["clients"]["ghost-observed"]
+    assert entry["key"] == "", "auto-mint must NOT fabricate key material"
+    assert entry["datasets"] == ["ds1", "ds2"]
+    assert all(k for k in ar.overlay_clients())  # no empty keys in the key map
+
+
+def test_grant_env_authoritative_name_still_refuses(tmp_path, monkeypatch):
+    monkeypatch.setenv("RAG_API_KEY_CLIENTS", "envuser:envkey")
     with pytest.raises(KeyError):
-        ar.grant_datasets("ghost", ["ds"])
+        ar.grant_datasets("envuser", ["ds"])
 
 
 def test_corrupt_overlay_degrades_to_env_only(tmp_path, monkeypatch):
@@ -397,3 +411,23 @@ def test_delegation_precedence_via_rest_middleware(monkeypatch, tmp_path):
     names = [d["name"] for d in r.json()["datasets"]]
     assert names == ["andrew-memory"], names  # andrew's view, NOT the admin's
     assert r.json()["acl_hidden"] == 1
+
+
+def test_patch_flag_only_bodies_accepted(tmp_path):
+    """D21 lead fix: the PATCH /api/admin/clients/{name} route validates
+    'datasets' ONLY when present — flag-only bodies (the SPA's Block and
+    OIDC-bind buttons) must be accepted, not 400ed with the datasets
+    message.  Regression was runtime-verified on G2 (OIDC… button)."""
+    # unit-level: the handler contract is exercised via the REST layer in
+    # test_oidc_identity.py; here we pin the ADMIN REGISTRY primitive the
+    # handler leans on — set_client_flags auto-mints unknown names:
+    os.environ["DATA_PATH"] = str(tmp_path)
+    os.environ["RAG_ACCESS_STORE"] = "1"
+    flags = ar.set_client_flags("jwt-only-user", oidc="jwt-only-user")
+    assert flags["oidc"] == "jwt-only-user"
+    entry = ar._load()["clients"]["jwt-only-user"]
+    assert entry["datasets"] == []
+    assert entry["key"], "set_client_flags auto-mint generates a usable key"
+    # and a flag-only body shape would now pass the handler validation:
+    body = {"oidc": "someone"}
+    assert body.get("datasets") is None and body.get("oidc") is not None

@@ -13,6 +13,18 @@ file on the shared PVC:
       }
     }
 
+D21 — OIDC sign-in fields (optional, per client entry):
+
+* ``"oidc": "<alias>"`` — binds this client to the JWT identity whose
+  ``RAG_OIDC_IDENTITY_CLAIM`` (or ``sub``) resolves to ``<alias>``: the
+  verified token then adopts the CLIENT's name and datasets (both
+  credentials, one identity — same client_id).  A JWT whose name matches a
+  client's name by convention needs no alias.  Must satisfy the registry
+  name rules when present.
+* ``"blocked": true`` — the identity (by name or alias) resolves to NOTHING:
+  a minted key stops authenticating and a matching JWT 401s downstream.
+  Env-registry names cannot be blocked (env has no place to say it).
+
 Resolution (the union is computed by ``clients_registry.resolve_presented``
 via :func:`overlay_clients` / :func:`overlay_acls` — both re-read per call):
 
@@ -52,6 +64,7 @@ import os
 import re
 import secrets
 import threading
+import time
 from pathlib import Path
 
 from multimodal_rag.utils import access_store as _base
@@ -97,6 +110,26 @@ def _validate_name(name: str) -> str:
             "(must start alphanumeric)"
         )
     return name
+
+
+def valid_name(name: str) -> bool:
+    """True when *name* satisfies the registry name rules (D21: the JWT
+    identity claim must yield a name of exactly this shape — shared rules,
+    not a parallel vocabulary)."""
+    try:
+        return bool(_NAME_RE.match(str(name).strip()))
+    except Exception:
+        return False
+
+
+def _validate_oidc_alias(alias: str) -> str:
+    alias = str(alias).strip()
+    if not valid_name(alias):
+        raise ValueError(
+            "the 'oidc' alias must be 1-64 chars of letters, digits, '.', '_' or '-' "
+            "(must start alphanumeric) — it names the JWT identity it binds"
+        )
+    return alias
 
 
 def _load() -> dict:
@@ -179,12 +212,20 @@ def overlay_clients() -> dict:
     Merged into the env registry by callers — on key conflicts with the env
     registry the ENV key wins (callers apply env first; a duplicate key with
     a different name is resolved by the env registry taking precedence).
+
+    D21 (lead fix, 2026-10): a ``"blocked": true`` entry is FILTERED OUT —
+    the docstring has always promised a blocked client's minted key stops
+    authenticating, but the key previously survived the merge and kept its
+    identity + datasets (runtime-verified gap; the JWT path was correctly
+    blocked).  Fail-closed wins: block means BOTH credentials die.
     """
     if not admin_file_enabled():
         return {}
     clients: dict[str, str] = {}
     for name, entry in _load().get("clients", {}).items():
         if isinstance(entry, dict) and entry.get("key"):
+            if entry.get("blocked") is True:
+                continue
             clients[str(entry["key"])] = str(name)
     return clients
 
@@ -202,6 +243,21 @@ def overlay_acls() -> dict:
             else:
                 acls[str(name)] = frozenset()
     return acls
+
+
+def overlay_entries() -> dict:
+    """``{name: entry}`` — the overlay client entries verbatim (D21).
+
+    The resolver's view of the D21 fields (``oidc`` alias, ``blocked`` flag):
+    it matches by alias BEFORE falling back to plain name-convention
+    matching, and treats ``blocked: true`` as a resolve-to-nothing.  Empty
+    when the overlay is disabled.  Entries are returned as loaded (a
+    hand-edited file's odd fields stay inert — only the documented fields
+    are ever written by mint/patch).
+    """
+    if not admin_file_enabled():
+        return {}
+    return {str(name): e for name, e in _load().get("clients", {}).items() if isinstance(e, dict)}
 
 
 # ---------------------------------------------------------------------------
@@ -237,12 +293,61 @@ def mint_client(name: str, datasets: list | None = None, key: str | None = None)
     def _apply(doc: dict) -> bool:
         existing = doc["clients"].get(name)
         rotated = bool(existing and existing.get("key") != new_key)
-        doc["clients"][name] = {"key": new_key, "datasets": ds}
+        entry = {"key": new_key, "datasets": ds}
+        if isinstance(existing, dict):
+            # Rotation must not silently drop the D21 OIDC binding/block —
+            # key rotation is about the KEY, not the identity's JWT wiring.
+            if "oidc" in existing:
+                entry["oidc"] = existing["oidc"]
+            if "blocked" in existing:
+                entry["blocked"] = existing["blocked"]
+        doc["clients"][name] = entry
         result["rotated"] = rotated
         return True
 
     _mutate(_apply)
     return {"name": name, "key": new_key, "datasets": ds, "rotated": result.get("rotated", False)}
+
+
+def set_client_flags(name: str, *, oidc: str | None = None, blocked: bool | None = None) -> dict:
+    """Set (or clear) the D21 fields on an overlay client.
+
+    Pass ``oidc=""`` to CLEAR the alias, ``blocked=False`` to UNBLOCK.
+    ``None`` leaves the field untouched.  The key and dataset grants are
+    untouched.  Used by the REST PATCH handler (extend-grant shape) — no new
+    route; a JWT-only blocked name that was never minted gets a minted entry
+    with an empty grant so the block survives anywhere ``blocked`` can live.
+    """
+    if not admin_file_enabled():
+        raise _base.SelectionDenied("The admin key registry is not enabled on this deployment.")
+    name = _validate_name(name)
+    alias: str | None = None
+    if oidc is not None:
+        alias = _validate_oidc_alias(oidc) if str(oidc).strip() else ""
+
+    def _apply(doc: dict) -> bool:
+        entry = doc["clients"].get(name)
+        if not isinstance(entry, dict):
+            # Mint an empty-grant entry so a JWT-only name can be blocked /
+            # alias-bound without hand-crafting a key first.
+            entry = {"key": generate_key(), "datasets": []}
+            doc["clients"][name] = entry
+        if alias is not None:
+            if alias:
+                entry["oidc"] = alias
+            else:
+                entry.pop("oidc", None)
+        if blocked is not None:
+            entry["blocked"] = bool(blocked)
+        return True
+
+    _mutate(_apply)
+    doc = _load().get("clients", {}).get(name, {})
+    return {
+        "name": name,
+        "oidc": doc.get("oidc") or None,
+        "blocked": bool(doc.get("blocked")),
+    }
 
 
 def revoke_client(name: str) -> bool:
@@ -267,7 +372,19 @@ def revoke_client(name: str) -> bool:
 
 
 def grant_datasets(name: str, datasets: list) -> dict:
-    """Replace an overlay client's dataset grant (the checkbox set)."""
+    """Replace an overlay client's dataset grant (the checkbox set).
+
+    D23 (lead fix, 2026-10): an UNKNOWN name is AUTO-MINTED (empty key,
+    the saved grants as its ACL) instead of 404ing — observed JWT-only
+    identities (D21 ``observed.json`` rows) are users: granting them IS
+    minting them, and the admin panel offers Grants… on observed rows.
+    The auto-mint is fail-closed by construction: no key material exists
+    until the operator explicitly mints/rotates one (the empty-key entry
+    authenticates NOTHING), and ``set_client_flags`` already used this
+    exact pattern for Block/OIDC-bind on observed rows.  ENV-authoritative
+    names still refuse here (the overlay cannot shadow the env registry —
+    delete the env entry to manage the name from the page).
+    """
     if not admin_file_enabled():
         raise _base.SelectionDenied("The admin key registry is not enabled on this deployment.")
     name = _validate_name(name)
@@ -278,7 +395,12 @@ def grant_datasets(name: str, datasets: list) -> dict:
     def _apply(doc: dict) -> bool:
         entry = doc["clients"].get(name)
         if not isinstance(entry, dict):
-            raise KeyError(name)
+            if name in os.environ.get("RAG_API_KEY_CLIENTS", ""):
+                # Env-authoritative name: the overlay must not shadow it.
+                raise KeyError(name)
+            entry = {"key": "", "datasets": ds, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            doc["clients"][name] = entry
+            return True
         entry["datasets"] = ds
         return True
 
@@ -295,7 +417,16 @@ def _validate_dataset_token(d: str) -> None:
 
 
 def list_clients() -> list:
-    """The overlay registry for the admin UI — key material MASKED."""
+    """The overlay registry for the admin UI — key material MASKED.
+
+    D21: entries carry their ``oidc`` alias / ``blocked`` flag when set, and
+    OBSERVED JWT-only identities (authenticated with a valid token but never
+    minted an entry — ``{DATA_PATH}/access/observed.json``) appear as
+    separate rows ``{"name", "source": "observed", "key": null,
+    "datasets": [], "last_seen": …}`` so the /access page can mint or block
+    them.  A name that already exists in the overlay or env registry is not
+    repeated as observed (its row carries the information instead).
+    """
     from multimodal_rag.utils.clients_registry import CLIENTS_ENV, dataset_acls, parse_clients
 
     env_clients = parse_clients(os.environ.get(CLIENTS_ENV, ""))
@@ -307,15 +438,18 @@ def list_clients() -> list:
             continue
         key = str(entry.get("key") or "")
         env_name = env_clients.get(key)
-        out.append(
-            {
-                "name": name,
-                "key_masked": (key[:6] + "…" + key[-2:]) if len(key) > 10 else "…",
-                "datasets": list(entry.get("datasets") or []),
-                "source": "env+overlay" if env_name == name else "overlay",
-                "created": entry.get("created"),
-            }
-        )
+        row = {
+            "name": name,
+            "key_masked": (key[:6] + "…" + key[-2:]) if len(key) > 10 else "…",
+            "datasets": list(entry.get("datasets") or []),
+            "source": "env+overlay" if env_name == name else "overlay",
+            "created": entry.get("created"),
+        }
+        if entry.get("oidc"):
+            row["oidc"] = str(entry["oidc"])
+        if entry.get("blocked"):
+            row["blocked"] = True
+        out.append(row)
     # Env-only clients are listed too (visible, not editable here — the env
     # is authoritative for them).
     for key, env_name in env_clients.items():
@@ -331,6 +465,27 @@ def list_clients() -> list:
                 "created": None,
             }
         )
+    # D21: JWT-only users — observed at least once, never minted/granted.
+    try:
+        from multimodal_rag.utils.oidc_identity import observed_identities
+
+        known = {row["name"] for row in out}
+        for obs in observed_identities():
+            if obs.get("name") in known:
+                continue
+            out.append(
+                {
+                    "name": obs.get("name"),
+                    "key": None,
+                    "key_masked": None,
+                    "datasets": [],
+                    "source": "observed",
+                    "created": None,
+                    "last_seen": obs.get("last_seen"),
+                }
+            )
+    except Exception:  # telemetry sidecar broken → the registry still lists
+        pass
     return sorted(out, key=lambda c: c["name"])
 
 

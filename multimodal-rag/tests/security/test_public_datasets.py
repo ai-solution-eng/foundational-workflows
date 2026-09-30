@@ -32,6 +32,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 import multimodal_rag.api_server as api
+from multimodal_rag.utils import access_store as acc
 from multimodal_rag.utils import clients_registry as cr
 
 
@@ -165,10 +166,20 @@ def rest(monkeypatch):
             self.public_flags[name] = public
             return {"name": name, "public": public, "has_password": False}
 
+        def get_dataset(self, name, check_embedder=True):
+            if name not in ("reports", "notes"):
+                raise FileNotFoundError("Dataset not found: " + name)
+            return {"name": name}
+
+        def has_password(self, name):
+            return False
+
+        def verify_password(self, name, pw):
+            return False
+
         def update_dataset(self, name, updates):
             if "public" in updates:
                 raise ValueError("The 'public' flag is admin-only: POST /api/admin/datasets/{name}/public")
-            return None
 
     dm = _FakeDM()
 
@@ -200,21 +211,94 @@ def test_client_key_cannot_reach_admin_toggle(rest):
 
 
 def test_generic_patch_rejects_public_key(rest):
-    """HARD BAR: a client cannot publish via the generic metadata PATCH."""
+    """HARD BAR: a client cannot publish via the generic metadata PATCH.
+
+    2026-10 posture: the middleware denies a registry client BEFORE the
+    handler — alice has no grant on ``reports``, and the D15 fail-closed
+    path filter 403s any dataset-scoped route outside her world (the deny
+    message says nothing about 'public', which is correct: the ACL layer
+    must not advertise WHY a dataset is interesting).  The admin-only
+    ``public``-key rejection (400, ValueError → HTTPException) sits one
+    layer deeper and is pinned separately below via the deployment key.
+    """
     client, _ = rest
     r = client.patch("/api/datasets/reports", json={"public": True},
                      headers={"X-RAG-Api-Key": "alice-key"})
+    assert r.status_code == 403
+    assert "not permitted for this API key" in r.json()["detail"]
+
+
+def test_generic_patch_public_key_rejected_at_handler(rest):
+    """Second layer: a caller who CAN reach the handler (the deployment key
+    binds the admin identity) still cannot set ``public`` through the
+    generic PATCH — the admin-only ValueError maps to 400 with the
+    designated admin route named."""
+    client, _ = rest
+    r = client.patch("/api/datasets/notes", json={"public": True},
+                     headers={"X-RAG-Api-Key": "deployment-key"})
     assert r.status_code == 400
     assert "admin-only" in r.json()["detail"]
 
 
-def test_public_dataset_flows_to_client_listing(rest):
-    """End-to-end: alice has no grant on reports; the flag alone admits it."""
+def test_public_dataset_catalog_visibility_and_self_selection(rest, tmp_path, monkeypatch):
+    """End-to-end, 2026-10 semantics (see module docstring): public is
+    AVAILABILITY, not inclusion.
+
+    * The plain listing keeps the D15 world-only filter — an unselected
+      public dataset never force-enters a key's world (the ratified
+      2026-09-24 ruling: a listing never shows names the key cannot use;
+      the 2026-10 revision made public datasets opt-in like any other).
+    * The /access catalog view (``?catalog=true``) ADVERTISES the public
+      dataset (world ∪ public-available ∪ excluded) so the user can opt in,
+      stamped ``public: true``.
+    * A password-free self-selection (POST .../select) brings it INTO the
+      world; deselecting EXCLUDES it again (hidden everywhere, but the
+      catalog keeps it visible stamped ``excluded: true`` so the user can
+      re-include).
+
+    The flag is written to a real meta.json under tmp DATA_PATH because
+    ``is_public_dataset`` (the middleware's defense-in-depth read) reads
+    DISK, not the manager's in-memory rows — in production both read the
+    same meta, so the fixture mirrors that.
+    """
+    (tmp_path / "datasets" / "reports").mkdir(parents=True)
+    (tmp_path / "datasets" / "reports" / "meta.json").write_text(
+        json.dumps({"name": "reports", "public": True})
+    )
+    (tmp_path / "datasets" / "notes").mkdir(parents=True)
+    (tmp_path / "datasets" / "notes" / "meta.json").write_text(json.dumps({"name": "notes"}))
+    monkeypatch.setenv("DATA_PATH", str(tmp_path))
+    monkeypatch.setenv(acc.STORE_ENV, "1")
+    cr._PUBLIC_META_CACHE.clear()
+
     client, _ = rest
-    r = client.get("/api/datasets", headers={"X-RAG-Api-Key": "alice-key"})
+    H = {"X-RAG-Api-Key": "alice-key"}
+
+    # Before selection: plain listing is world-only (alice's ACL names
+    # 'private-reports', which the manager does not list here → empty);
+    # the catalog advertises exactly the public dataset.
+    names = [d["name"] for d in client.get("/api/datasets", headers=H).json()["datasets"]]
+    assert names == []
+    cat = client.get("/api/datasets", params={"catalog": "true"}, headers=H).json()["datasets"]
+    assert [d["name"] for d in cat] == ["reports"]
+    assert cat[0]["public"] is True
+
+    # Password-free self-selection admits it (availability → inclusion).
+    r = client.post("/api/datasets/reports/select", headers=H)
     assert r.status_code == 200
-    names = [d["name"] for d in r.json()["datasets"]]
-    assert names == ["reports"]  # public reports visible; private notes hidden
+    names = [d["name"] for d in client.get("/api/datasets", headers=H).json()["datasets"]]
+    assert names == ["reports"]
+    assert "notes" not in names  # private stays hidden throughout
+
+    # Deselect → exclusion hides it everywhere...
+    r = client.post("/api/datasets/reports/deselect", headers=H)
+    assert r.status_code == 200
+    names = [d["name"] for d in client.get("/api/datasets", headers=H).json()["datasets"]]
+    assert names == []
+    # ...but the catalog keeps advertising it, stamped excluded, for re-inclusion.
+    cat = client.get("/api/datasets", params={"catalog": "true"}, headers=H).json()["datasets"]
+    by_name = {d["name"]: d for d in cat}
+    assert by_name["reports"]["excluded"] is True
 
 
 def test_anonymous_rest_denied_public_listing(rest):

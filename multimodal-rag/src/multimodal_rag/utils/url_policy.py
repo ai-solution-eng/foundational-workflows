@@ -165,6 +165,20 @@ def _check_media_url_policy(url: str) -> None:
     from urllib.parse import urlparse
 
     host = urlparse(url).hostname or ""
+    # The server's OWN media host (MEDIA_BASE_URL) is trusted: search
+    # results mint self-referential media URLs on it by design (HMAC-token
+    # protected), so refusing to fetch them back breaks describe_media /
+    # transcribe_audio and client previews for exactly the URLs this server
+    # issued.  Read per call (env convention); everything else keeps the
+    # strict private/SSRF rules.
+    own_media_host = (os.environ.get("MEDIA_BASE_URL", "") or "").strip()
+    if own_media_host:
+        own_media_host = (urlparse(own_media_host).hostname or "").strip().lower()
+    else:
+        own_media_host = ""
+    own_media_host = (own_media_host or "").strip().lower()
+    if own_media_host and host == own_media_host:
+        return
     if _INGEST_ALLOW_HOSTS:
         if not _host_matches_allowlist(host):
             raise ValueError(

@@ -6,6 +6,16 @@
 <link rel="icon" type="image/png" href="/favicon.png">
 <title>Multimodal RAG — Access</title>
 <script>
+  // D23 bookmark compatibility: /access is now the SPA's Access TAB.
+  // The SPA shell lives at / (index.html) with tabs #datasets/#access/
+  // #admin/#stats — anyone landing on the legacy /access URL is sent
+  // straight to /#access before anything renders. The server may still
+  // serve this file (older deployments); the redirect is unconditional.
+  // (The /manage URL is NOT redirected: it keeps its meaning as the
+  // operator manage view inside the SPA shell — see the D23 report.)
+  location.replace('/#access');
+</script>
+<script>
   (function() {
     var t = localStorage.getItem('theme') || 'light';
     if (t === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
@@ -334,6 +344,19 @@
     <div class="error-text" id="login-error"></div>
     <button type="submit" class="btn btn-primary" id="connect-btn">Connect</button>
   </form>
+  <div id="sso-section" style="display:none;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+      <div style="flex:1;height:1px;background:var(--border)"></div>
+      <span class="muted" style="font-size:.75rem">or</span>
+      <div style="flex:1;height:1px;background:var(--border)"></div>
+    </div>
+    <a class="btn btn-outline" id="sso-login-btn" href="/oauth/login" style="display:block;text-align:center;text-decoration:none">
+      Sign in with SSO
+    </a>
+    <p class="muted" style="margin:8px 0 0;font-size:.75rem" id="sso-hint">
+      Uses your platform single sign-on (HPE SSO). The session stays in an HttpOnly cookie — page scripts never see the token.
+    </p>
+  </div>
 </div>
 
 <!-- Access view: the datasets this key can see -->
@@ -640,7 +663,11 @@ function renderRow(d) {
     ? (aclGranted && !selEntry ? ' · ✓ granted' : ' · ✓ selected' + (hasPw ? (pwSaved ? ' 🔑' : '') : ''))
     : '';
   const exclState = excluded ? ' · 🚫 excluded (re-select to include)' : '';
-  const meta = `${count} document${count === 1 ? '' : 's'}${lockState ? ' · ' + lockState : ''}${selState}${exclState}`;
+  // D16 public/global marker (2026-10): an admin-flagged GLOBAL dataset —
+  // every user may self-select it WITHOUT a password.  Distinct from a
+  // merely password-less dataset (which only its ACL grants reach).
+  const publicState = d.public === true ? ' · 🌐 global (password-free selection for everyone)' : '';
+  const meta = `${count} document${count === 1 ? '' : 's'}${lockState ? ' · ' + lockState : ''}${selState}${publicState}${exclState}`;
 
   // D16 checkbox column (access store on): PRE-CHECKED when the dataset is
   // already reachable (operator/admin grant or self-selection) — a user
@@ -1265,6 +1292,25 @@ async function revokeClient(btn) {
       }
     });
 })();
+
+// D22: show the "Sign in with SSO" section only when the flow is served
+// (an inert deployment 404s /oauth/login — the button would be a dead end).
+// The link itself is plain navigation: /oauth/login redirects to the realm,
+// the callback lands back here with the session cookie planted.
+fetch('/api/oidc-session', { credentials: 'same-origin' })
+  .then(function (r) { return r.ok ? r.json() : null; })
+  .then(function (s) {
+    if (s && s.oidc && s.oidc.enabled) {
+      var sec = document.getElementById('sso-section');
+      if (sec) sec.style.display = 'block';
+      // Already signed in via SSO? Surface it on the sign-in card.
+      if (s.authenticated && s.source === 'sso-cookie') {
+        var hint = document.getElementById('sso-hint');
+        if (hint) hint.textContent = 'Currently signed in via SSO as ' + s.identity + '.';
+      }
+    }
+  })
+  .catch(function () { /* SSO probe failed — keep the section hidden */ });
 </script>
 </body>
 </html>

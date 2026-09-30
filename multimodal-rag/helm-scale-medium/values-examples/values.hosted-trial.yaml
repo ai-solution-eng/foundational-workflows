@@ -31,7 +31,7 @@ replicaCount: 2
 image:
   # Packaged with the chart — leave as-is unless you built your own image.
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v4.5.2
+  tag: v5.2.3
   pullPolicy: IfNotPresent
 
 deployment:
@@ -298,6 +298,33 @@ security:
   # enabling, also set metrics.serviceMonitorBearerSecret so the scraper
   # presents the key as its bearer token.)
   metricsAuth: false
+  # OIDC JWT as a second credential for the same per-user registry identity
+  # (D21) — COMMENTED / off here.  The oauth2-proxy AuthorizationPolicy at
+  # the edge is COMPLEMENTARY, not a replacement: edge auth gates ingress to
+  # the cluster, D21 binds the app-level identity — a verified realm JWT as
+  # `Authorization: Bearer <jwt>` resolves to the SAME registry identity as
+  # the user's minted key (join key = preferred_username, fallback sub).
+  # issuer is REQUIRED when enabled — the Keycloak realm URL pattern:
+  #   https://keycloak.<your-domain>/realms/UA
+  # audience is the token's azp claim.  JWT identities are never admin; a
+  # JWT-only user starts with zero datasets and self-selects on /access
+  # (accessStore).  See README § Security hardening (D21).
+  # oidc:
+  #   enabled: true
+  #   issuer: "https://keycloak.<your-domain>/realms/UA"
+  #   audience: ua
+  #   identityClaim: preferred_username
+  #   jwksUrl: ''
+  #   jwksRefreshSeconds: 3600
+  #   observedTtl: 86400
+  #   fetchTimeoutSeconds: 3
+  #   clockSkewSeconds: 60
+  # D23 identity gate on the served pages — COMMENTED / off here.  When
+  # uncommented (ssoGate: true), the HTML pages (/, /manage, /access) demand
+  # an authenticated identity (SSO cookie / Bearer JWT / API key) and
+  # anonymous visitors get the 401 sign-in page.  Meaningful only together
+  # with the oidc block below (or configured API keys).
+  # ssoGate: true
 
 # -- Metrics (optional) -----------------------------------------------------------------------------------------------
 metrics:

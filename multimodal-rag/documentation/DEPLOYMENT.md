@@ -181,6 +181,8 @@ in `values.yaml` (both examples in `helm/values-examples/` set them too):
 | `security.accessStore` | `true` | **D16** — the `/access` checkbox model: registry keys select their own datasets (protected ones with the password, saved per identity under `/data/access`) and bind their ★ memory dataset. Effective access = operator ACL ∪ selections. |
 | `security.accessDenySelect` / `security.memoryDefault` | `""` / `""` | **D16** ceiling/fallback: datasets that can never be self-selected; the deployment-wide fallback memory dataset. Render only when non-empty. |
 | `rag.unlockMaxTtl` | `86400` | Bound for explicit unlock TTLs on both surfaces; `0` opts into no-expiry unlocks (the `/access` page's "No expiry (0)" option). |
+| `security.oidc.*` | `enabled: false` | **D21** — OIDC JWT as a second credential for the same per-user registry identity. `enabled` (default `false`) / `issuer` (REQUIRED when enabled — the Keycloak realm URL, e.g. `https://keycloak.<your-domain>/realms/UA`) / `audience` (`ua`) / `identityClaim` (`preferred_username`) / `jwksUrl` (empty = `<issuer>/protocol/openid-connect/certs`) / `jwksRefreshSeconds` (`3600`) / `observedTtl` (`86400`) / `fetchTimeoutSeconds` (`3`) / `clockSkewSeconds` (`60`). Rendered ONLY when enabled (default render byte-identical); see the OIDC subsection in § 5b. |
+| `security.ssoGate` | `false` | **D23** — the identity-gated unified frontend. `true` = the served HTML pages (`/`, `/manage`, `/access`) require an authenticated identity (SSO cookie / Bearer JWT / API key); anonymous visitors get the minimal 401 "Sign in required" page (a `/oauth/login` link when SSO is enabled). Probes/health, the `/oauth/*` flow and media bytes stay exempt. `false` (default) = byte-identical public pages. Meaningful only with `oidc.enabled` or API keys configured (an empty deployment gates to nothing). Read per request — flip without a restart. Rendered ONLY when `true`; see the Identity-gated frontend subsection in § 5b. |
 
 With the access store on, an ADMIN key additionally gets the **User keys** panel on
 `/access` (**D17**): mint per-user keys, set dataset grants, rotate, revoke — against a
@@ -412,6 +414,61 @@ deployment's memory dataset (`MEMORY_DATASET` env, when set — dataset paths an
 normal full-access behaviour — every chart-managed deployment already does.
 `MEMORY_DATASET` (and `RAG_MEMORY_PASSWORD`) are settable via `extraEnv` in
 values — e.g. `extraEnv: {MEMORY_DATASET: "team-memory"}`.
+
+### OIDC identity (D21, 2026-10)
+
+`security.oidc.*` turns a verified Keycloak/UA-realm JWT into a **second credential**
+for the same per-user registry identity as the user's minted API key: a
+`Authorization: Bearer <jwt>` on `/api/*` or `/mcp` (RS256 against the realm JWKS;
+`iss` / `aud`-as-`azp` / `exp` validated; JWKS URL = `security.oidc.jwksUrl` or
+`<issuer>/protocol/openid-connect/certs` — no OIDC discovery in v1) resolves via the
+`identityClaim` (`preferred_username`, fallback `sub`) or an explicit `"oidc":
+"<alias>"` overlay entry. Key semantics: API keys are unchanged and remain sufficient
+alone; JWT-only sign-in works (fail-closed zero-dataset identity → self-select via the
+D16 access store, chart default `security.accessStore: true`); JWT identities are
+**never admin** (realm `groups` are not RAG grants); operator ACL grants apply to key
+and JWT alike; key and JWT rotation/revocation are independent; a `"blocked": true`
+overlay entry kills the JWT path; D19 delegation precedence is unchanged (through the
+LLM gateway an explicit `X-API-Key` still outranks a co-forwarded `Authorization:
+Bearer`); observed JWT-only users appear in `GET /api/admin/clients` as
+`{"source": "observed"}` entries. Issuer is **REQUIRED** when enabled (the app logs a
+loud startup warning without it) and every knob is read per request — no restart.
+Chart wiring renders the `RAG_OIDC_*` envs into BOTH containers only when
+`oidc.enabled: true` (the default render is byte-identical).
+
+**G2 note:** the ezaf-gateway applies SSO centrally at the edge
+(`ezua.authorizationPolicy.enabled: false` on this site), so app-level OIDC is the
+identity source — edge SSO proves who you are at the door, D21 binds that identity to
+the registry. On hosted trials the oauth2-proxy AuthorizationPolicy is complementary,
+not competing: edge auth gates ingress, D21 binds app identity. Full semantics: README
+§ Security hardening (D21 subsection), MCP.md (JWT-only client config), API.md § 1.
+
+### Identity-gated frontend (D23, 2026-10)
+
+`security.ssoGate: true` (`RAG_SSO_GATE`, read per request — no restart to flip)
+folds the three HTML pages into ONE identity-gated shell: the homepage re-glasses
+into a four-tab app — **Datasets** (the identity-scoped upload/search workspace),
+**Access** (the D15/D16 dataset checkboxes, unlock/TTL panel and ★ memory binding),
+**Admin** (the operator dashboard, rendered only for `is_admin` identities), and
+**Stats** (a read-only dashboard for everyone). `/manage` and `/access` redirect
+into their tabs; anonymous visitors get a minimal 401 "Sign in required" page
+(with a `/oauth/login` link when browser SSO is configured). Sign-in: SSO button
+first, API-key paste fallback; the embedded admin key is used only in the
+key-unconfigured legacy mode.
+
+Ownership (RATIFIED 2026-10): dataset creation stamps `created_by` in the
+dataset's `meta.json` (the identity name; an admin-key creator stamps `admin`).
+DELETE is **owner-or-admin** — enforced identically on REST and MCP. Datasets
+created before D23 have no owner recorded: admins delete them, and only admins
+can make them global (no ownership is ever backfilled). A creator may toggle
+their own dataset public (available to every identity); non-creators are denied.
+Listings gain `created_by` + `owned_by_me`; `GET /api/stats` is a read-only,
+identity-filtered summary (`datasets.total` / `visible_to_you` / `documents` /
+`storage_bytes`, `models[]`, `jobs`, `generated_at`) — a user sees exactly their
+visible world, an admin sees the deployment; it never mutates anything. Enable
+the gate ONLY with `security.oidc.enabled` or API keys configured — an empty
+deployment gates to nothing. Full semantics incl. the 8 ratified points: README
+§ Security hardening (D23 subsection), API.md § 1.
 
 ---
 

@@ -60,7 +60,12 @@ def mcp_auth_warn_if_open() -> bool:
     """Loud one-time startup warning when no API keys are configured."""
     from multimodal_rag.utils.mcp_auth import warn_if_open
 
-    return warn_if_open("multimodal-rag-mcp", AUTH_ENV_NAMES)
+    warn_if_open("multimodal-rag-mcp", AUTH_ENV_NAMES)
+    # D21: RAG_OIDC_ENABLED without RAG_OIDC_ISSUER leaves the resolver
+    # inert (every JWT 401s, fail-closed) — say so once, loudly.
+    from multimodal_rag.utils import oidc_identity
+
+    return oidc_identity.warn_if_misconfigured("multimodal-rag-mcp")
 
 
 # ---------------------------------------------------------------------------
@@ -790,6 +795,9 @@ class _RagClientAuthMiddleware(ApiKeyAuthMiddleware):
         # Authorization Bearer (a gateway's own platform/admin token), so a
         # per-key override to a registry identity is honored even when the
         # gateway also authenticates itself as admin.
+        # D21: JWT-shaped candidates resolve inside resolve_presented via the
+        # oidc_identity pipeline (same registry identity as the user's key,
+        # never admin) — the MCP surface needs no separate OIDC step.
         pairs = presented_keys_with_source(scope)
         identity = _clients.resolve_presented(
             [k for k, _ in pairs], [via for _, via in pairs]

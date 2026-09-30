@@ -20,7 +20,7 @@ autoscaling:
       stabilizationWindowSeconds: 300
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v4.5.2
+  tag: v5.2.3
   pullPolicy: IfNotPresent
 deployment:
   name: rag-mcp-server
@@ -275,6 +275,76 @@ security:
   # (RAG_API_KEY plus the MCP key set MCP_API_KEYS / RAG_API_KEYS are all
   # accepted).
   metricsAuth: false
+  # OIDC JWT as a SECOND credential for the same per-user registry identity
+  # (decision D21, 2026-10; env RAG_OIDC_*).  false (default) = disabled —
+  # the default render is byte-identical to the pre-D21 chart.  When true, a
+  # verified JWT (RS256 against the realm JWKS; iss / aud(azp) / exp
+  # validated) presented as `Authorization: Bearer <jwt>` resolves to the
+  # SAME per-user registry identity as that user's minted API key (join key
+  # = the identity claim, default `preferred_username`, fallback `sub`; an
+  # overlay client entry may pin an explicit `"oidc": "<alias>"`).
+  # Semantics (unchanged by D21): API keys stay sufficient alone and valid
+  # indefinitely (rotation via the /access mint panel); JWT-only sign-in
+  # WORKS — the user gets a valid registry identity with ZERO datasets
+  # (fail-closed) and self-selects datasets via RAG_ACCESS_STORE (public
+  # ones password-free, protected ones with their password, saved per
+  # identity; ★ memory binding included).  JWT identities are NEVER admin —
+  # not even when the realm token carries groups ["admin"] (a UA-realm role,
+  # not a RAG grant).  Operator ACL grants apply to key and JWT alike (same
+  # name); revoking/rotating one never affects the other; a `"blocked":
+  # true` overlay entry kills the JWT path (401) while the key entry
+  # semantics stay as today.  Issuer is REQUIRED when enabled (the app logs
+  # a loud startup warning without it) — recommend the Keycloak realm URL
+  # pattern https://keycloak.<your-domain>/realms/UA.  Audience is the
+  # token's azp claim ("ua" on PCAI G2).
+  oidc:
+    enabled: false
+    issuer: ''
+    audience: ua
+    # Claim carrying the registry identity name (fallback: `sub`).
+    identityClaim: preferred_username
+    # Optional explicit JWKS URL; empty = <issuer>/protocol/openid-connect/certs
+    # (the Keycloak/UA-realm location; no OIDC discovery in v1).
+    jwksUrl: ''
+    jwksRefreshSeconds: 3600
+    observedTtl: 86400
+    fetchTimeoutSeconds: 3
+    clockSkewSeconds: 60
+    # --- Browser SSO (decision D22, 2026-10 — the Open WebUI pattern): -----
+    # the app is an OIDC CLIENT: /oauth/login redirects to the realm,
+    # /oauth/oidc/callback exchanges the code and plants an HttpOnly session
+    # cookie (never visible to page JS).  Sessions resolve through the SAME
+    # D21 registry identity.  Requires `oidc.enabled` (the D21 resolver
+    # verifies the tokens) AND the client secret AND the callback URL
+    # registered in the client's redirect URIs (scripts/configure-oidc-rag.sh
+    # — the OWUI configure_oidc.sh pattern).  clientSecret is KEY MATERIAL:
+    # prefer clientExistingSecret.
+    sso:
+      enabled: false
+      clientId: ua
+      clientSecret: ''
+      # Secret carrying the client secret (key clientSecretKey) — preferred.
+      clientExistingSecret: ''
+      clientExistingSecretKey: clientSecret
+      # Callback URL registered in the client: https://<endpoint>/oauth/oidc/callback
+      redirectUri: ''
+      # In-cluster discovery URL (plain HTTP — sidesteps the platform-CA TLS
+      # gap; the external issuer above stays CLAIM-COMPARED only).
+      providerUrl: ''
+      scopes: 'openid profile email'
+      cookieName: pcai-sso
+      cookieMaxAgeSeconds: 43200
+      cookieSecure: true
+  # Identity gate on the served HTML pages (decision D23, 2026-10; env
+  # RAG_SSO_GATE, read per request — flip without a restart).  false (default)
+  # = byte-identical public-pages behaviour.  true = /, /manage and /access
+  # require an authenticated identity (SSO session cookie / Bearer JWT /
+  # API key); anonymous visitors get a minimal 401 "Sign in required" page
+  # (with a link to /oauth/login when SSO is enabled).  Probes/health, the
+  # oauth flow itself and media bytes stay exempt.  Enabling ONLY makes sense
+  # when security.oidc.enabled or API keys are configured — an empty
+  # deployment gates to nothing.
+  ssoGate: false
 metrics:
   serviceMonitor: false
   interval: 30s

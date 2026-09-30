@@ -318,9 +318,12 @@ def test_mcp_select_tool_end_to_end(monkeypatch):
         # Wrong password → refused, and nothing selected.
         with pytest.raises(Exception, match="Incorrect password"):
             asyncio.run(mcp.select_dataset(dataset_name="protected-ds", password="bad"))
-        # Deselect round-trip.
+        # Deselect round-trip.  (2026-10 wording: the deselection records an
+        # exclusion too — the assertion pins the contract "removed from your
+        # world", not any single phrasing of it.)
         out = asyncio.run(mcp.deselect_dataset(dataset_name="protected-ds"))
-        assert "deselected" in out
+        assert "removed" in out
+        assert "protected-ds" in out
         assert not acc.dataset_allowed(ident, "protected-ds")
     finally:
         cr.reset_current_identity(token)

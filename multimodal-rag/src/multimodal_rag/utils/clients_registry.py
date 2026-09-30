@@ -186,13 +186,25 @@ def registry_configured() -> bool:
     Read per request: configuring either source enables enforcement without
     a restart; leaving both unset keeps the single-key behaviour
     byte-identical.
+
+    D21: a fully configured OIDC resolver (``RAG_OIDC_ENABLED`` +
+    ``RAG_OIDC_ISSUER``) counts as configured too — a JWT-only deployment
+    must resolve identities (the D20 anonymous branch must NOT engage there),
+    and once this returns True JWTs resolve through oidc_identity below.
     """
     if bool(os.environ.get(CLIENTS_ENV, "").strip()):
         return True
     try:
         from multimodal_rag.utils import admin_registry
 
-        return admin_registry.admin_file_enabled()
+        if admin_registry.admin_file_enabled():
+            return True
+    except Exception:
+        pass
+    try:
+        from multimodal_rag.utils import oidc_identity
+
+        return oidc_identity.oidc_enabled()
     except Exception:
         return False
 
@@ -245,6 +257,19 @@ def resolve_presented(presented: list, presenters: "list | None" = None) -> "Ide
 
     Without *presenters* (legacy callers, single-header requests) the
     historical admin-first order applies unchanged.
+
+    D21 — OIDC JWTs as a second credential for the same registry identity:
+    a candidate that is JWT-shaped (three base64url segments) may resolve
+    through ``oidc_identity.resolve_jwt`` — to the SAME registry identity as
+    that user's minted key (same name, same ACLs, same ``client_id``), or to
+    a zero-dataset identity for an unknown-but-valid user.  Routing is
+    shape-based, never a registry lookup: an opaque key is never parsed as a
+    JWT, and a JWT is never compared against key material.  A JWT can only
+    ever yield a ``kind="client"`` identity — never admin.  In delegation
+    mode only the X-API-Key candidate takes the JWT path (Authorization is
+    transport auth, D19 — its Bearer JWT stays transport-only there).  The
+    D22 SSO cookie candidate carries source ``"cookie"`` — it participates
+    ONLY in the fall-through paths below (never delegation, never admin).
     """
     presented = [k for k in (presented or []) if k]
     if not presented:
@@ -255,11 +280,53 @@ def resolve_presented(presented: list, presenters: "list | None" = None) -> "Ide
             # Delegation mode: the X-API-Key candidate IS the caller's
             # chosen identity — resolve on it alone (never escalate to
             # admin from the co-forwarded Authorization token).
-            return _resolve_registry_only(xkey) or _admin_identity_for(xkey)
+            return (
+                _resolve_registry_only(xkey)
+                or _resolve_jwt_candidates(xkey)
+                or _admin_identity_for(xkey)
+            )
     admins = admin_keys()
     if admins and _match(presented, admins):
         return Identity(kind="admin", name=None, datasets=None)
-    return _resolve_registry_only(presented)
+    # D24 (the Clearwing/DSH pattern): a "proxy-identity" candidate is the
+    # ENFORCING proxy's injected identity NAME (not a secret) — it resolves
+    # DIRECTLY to the registry identity by name (the caller cannot choose
+    # it; the gateway overwrites the header per request behind the
+    # AuthorizationPolicy).  LOWEST precedence: any resolvable explicit
+    # credential above wins; a proxy-identity name that matches no
+    # registry/ACL entry yields a zero-dataset identity (fail-closed) so an
+    # edge-authenticated user lands in the SAME registry world as
+    # everyone else.  Never admin.
+    if presenters is not None and "proxy-identity" in presenters:
+        proxied = [k for k, via in zip(presented, presenters) if via == "proxy-identity"]
+        for name in proxied:
+            candidate = str(name).strip()
+            if not candidate:
+                continue
+            acls = dataset_acls().get(candidate, frozenset())
+            return Identity(kind="client", name=candidate, datasets=frozenset(acls))
+    return _resolve_registry_only(presented) or _resolve_jwt_candidates(presented)
+
+
+def _resolve_jwt_candidates(candidates: list) -> "Identity | None":
+    """D21: resolve the FIRST JWT-shaped candidate via oidc_identity.
+
+    Opaque keys (the normal case) fail the cheap shape pre-check and cost
+    nothing here.  ``None`` on every miss — the caller decides (401).
+    """
+    try:
+        from multimodal_rag.utils import oidc_identity
+    except Exception:
+        return None
+    if not oidc_identity.oidc_enabled():
+        return None
+    for candidate in candidates:
+        if not oidc_identity.is_jwt_format(candidate):
+            continue
+        ident = oidc_identity.resolve_jwt(candidate)
+        if ident is not None:
+            return ident
+    return None
 
 
 def _admin_identity_for(candidates: list) -> "Identity | None":
@@ -320,6 +387,15 @@ def current_identity() -> "Identity | None":
 _PUBLIC_META_CACHE: dict[str, tuple[int, int, bool]] = {}
 _public_meta_lock = threading.Lock()
 
+# D23: the same meta.json files carry the creator stamp ("created_by") the
+# ownership surfaces enforce on.  Listings annotate every row with it (plus
+# "owned_by_me" for the caller), so the reads ride a second mtime/size-
+# checked cache — one NFS read per dataset per stamp change, never per
+# request.  Missing/corrupt meta / no stamp -> None (pre-D23: no provable
+# creator; the delete/public gates treat that as admin-only).
+_CREATED_BY_CACHE: dict[str, tuple[int, int, "str | None"]] = {}
+_created_by_lock = threading.Lock()
+
 def is_public_dataset(dataset_name: str) -> bool:
     """True when *dataset_name* is stamped "public" in its meta.json.
 
@@ -353,6 +429,41 @@ def is_public_dataset(dataset_name: str) -> bool:
     with _public_meta_lock:
         _PUBLIC_META_CACHE.pop(key, None)
     return False
+
+
+def created_by_dataset(dataset_name: str) -> "str | None":
+    """The dataset's ``created_by`` stamp (D23), mtime/size-cached.
+
+    Mirrors :func:`is_public_dataset`'s read discipline (stat → stamp
+    compare → read → cache).  ``None`` for a missing/unreadable meta AND
+    for a meta without the stamp (pre-D23) — callers treat None as "no
+    provable creator" (admin-only manage, never non-admin public).
+    """
+    path = Path(os.environ.get("DATA_PATH", "/data")) / "datasets" / dataset_name / "meta.json"
+    try:
+        st = path.stat()
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    key = str(path)
+    if stamp is not None:
+        with _created_by_lock:
+            cached = _CREATED_BY_CACHE.get(key)
+            if cached and (cached[0], cached[1]) == stamp:
+                return cached[2]
+        creator: str | None = None
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(meta, dict):
+                creator = str(meta.get("created_by") or "").strip() or None
+        except (json.JSONDecodeError, OSError):
+            creator = None
+        with _created_by_lock:
+            _CREATED_BY_CACHE[key] = (stamp[0], stamp[1], creator)
+        return creator
+    with _created_by_lock:
+        _CREATED_BY_CACHE.pop(key, None)
+    return None
 
 def dataset_allowed(identity: "Identity | None", dataset_name: str) -> bool:
     """May *identity* touch *dataset_name*?

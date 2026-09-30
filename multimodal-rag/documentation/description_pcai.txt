@@ -1,0 +1,1 @@
+RAG implementation with 17 input modalities, including image and video. Supports LLM long term memory with full session opencode, DSH, and OWUI implementations. SSO support now enabled.

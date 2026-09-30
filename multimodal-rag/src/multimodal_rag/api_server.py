@@ -788,6 +788,11 @@ async def _lifespan(app: FastAPI):
             "reach this server — set RAG_API_KEY (helm: security.apiKey) or "
             "restrict access at the ingress."
         )
+    # D21: an OIDC resolver switched on without an issuer is inert (fail
+    # closed — every JWT 401s); scream about it once at startup.
+    from multimodal_rag.utils import oidc_identity
+
+    oidc_identity.warn_if_misconfigured("the REST API server")
     await _eager_init()
     yield
 
@@ -830,6 +835,13 @@ _RAG_API_KEY = os.environ.get("RAG_API_KEY", "")
 # or bypass the brute-force throttle.
 _TRUST_PROXY_IDENTITY = os.environ.get("RAG_TRUST_PROXY_IDENTITY", "").lower() in ("1", "true", "yes")
 
+
+def _trust_proxy_identity() -> bool:
+    """RAG_TRUST_PROXY_IDENTITY, read PER REQUEST (the house convention —
+    a config change needs no restart; D24 reads this for the proxy-identity
+    credential candidate, so the flag must not be frozen at import)."""
+    return os.environ.get("RAG_TRUST_PROXY_IDENTITY", "").strip().lower() in ("1", "true", "yes")
+
 # Periodic embedder liveness monitor.  The embedder is the only required
 # model; it is probed once per minute in the background and the result is
 # surfaced in /api/admin/health.  Health/readiness probes deliberately do
@@ -847,7 +859,7 @@ _model_health: dict[str, Any] = {
     }
 }
 
-_PUBLIC_PATHS = frozenset({"/healthz", "/readyz", "/favicon.png", "/", "/manage", "/access"})
+_PUBLIC_PATHS = frozenset({"/healthz", "/readyz", "/favicon.png", "/", "/manage", "/access", "/oauth/login", "/oauth/oidc/callback", "/oauth/logout", "/oauth/logged-out"})
 
 # Routes that must stay reachable without the API key, matched by the
 # endpoint function name so future prefix-based routes are NOT silently
@@ -865,6 +877,11 @@ _PUBLIC_ENDPOINT_NAMES = frozenset(
         "access",  # per-user key page (self-authenticating; no key injected)
         "api_serve_file",  # dataset media (password/token protected)
         "api_staging_serve",  # staged media (short-lived ids)
+        "api_oidc_session",  # D21 whoami: identity preview only, never a grant
+        "api_stats",  # D23 read-only stats: identity-filtered, no secrets —
+        # reachable pre-signin so the SPA stats tab works (the identity
+        # filtering scopes everything it reports; anonymous callers get the
+        # empty-world shape).
     }
 )
 
@@ -877,6 +894,79 @@ def _is_public_path(path: str, endpoint: Any = None) -> bool:
         if name in _PUBLIC_ENDPOINT_NAMES:
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# D23 HTML auth gate — RAG_SSO_GATE
+# ---------------------------------------------------------------------------
+
+# A minimal inline sign-in page (a tiny CONSTANT string, deliberately NOT a
+# template — templates/ is not touched by D23).  Rendered instead of the
+# requested page when RAG_SSO_GATE is on and the request presents no
+# credential at all.  No key material is ever embedded; when SSO is enabled
+# it links the browser into /oauth/login.
+_SSO_GATE_401_PAGE = (
+    "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+    "<title>Sign in required</title>"
+    "<style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;"
+    "justify-content:center;height:100vh;margin:0;background:#f6f7f9;color:#1f2937}"
+    "main{text-align:center}a{color:#2563eb}</style></head><body><main>"
+    "<h1>Sign in required</h1>"
+    "<p>This deployment requires an authenticated session to view this page.</p>"
+    "{sso_link}"
+    "<p style=\"margin-top:1.5em\"><a href=\"/\">Retry</a></p>"
+    "</main></body></html>"
+)
+
+
+def _sso_gate_required() -> bool:
+    """True when RAG_SSO_GATE gates the HTML pages (read per request —
+    flipping the env needs no restart).  Default off = the pages stay
+    public, byte-for-byte today's behaviour."""
+    return os.environ.get("RAG_SSO_GATE", "").strip().lower() in ("1", "true", "yes")
+
+
+def _html_gate_response(request: "Request | None") -> "Response | None":
+    """The 401 response for a gated HTML page, or None when the caller may
+    through (D23, RAG_SSO_GATE).
+
+    The gate fires only when the request presents NO credential of any kind
+    (no API key header, no forwarded JWT envelope, no SSO cookie — the
+    ``_presented_pairs`` collection is exactly what the auth middleware and
+    the whoami read).  A request that carries a credential keeps today's
+    page-serving behaviour: the embedded-key / SSO / whoami logic in the
+    handlers still governs WHAT the page shows (the gate is a sign-in
+    requirement, not a resolution — an invalid credential falls back to the
+    normal page, byte-identically, because the handlers already render the
+    signed-out view for it).  Health/probe/oauth routes and media serving
+    are exempt by construction (they never call this helper).
+    """
+    if not _sso_gate_required():
+        return None
+    if request is None:
+        # Direct callers (tests, the /manage fallback) have no request
+        # context: no credential can be presented — the gate applies.
+        return _sso_gate_401_response()
+    if _presented_pairs(request):
+        return None
+    return _sso_gate_401_response()
+
+
+def _sso_gate_401_response() -> Response:
+    """The minimal inline "Sign in required" page (401, HTML).  The link to
+    /oauth/login appears only when the SSO flow is configured; otherwise the
+    page just tells the caller to authenticate (an API-key deployment's
+    browser flow pastes the key into the page — which the gate itself now
+    requires a session for, so the honest message is the point)."""
+    try:
+        from multimodal_rag.utils import oidc_sso
+
+        sso_link = (
+            '<p><a href="/oauth/login">Sign in with SSO</a></p>' if oidc_sso.sso_enabled() else ""
+        )
+    except Exception:
+        sso_link = ""
+    return HTMLResponse(_SSO_GATE_401_PAGE.replace("{sso_link}", sso_link), status_code=401)
 
 
 def _rag_acl_path_denial(path: str, method: str, identity) -> "str | None":
@@ -917,6 +1007,64 @@ def _rag_acl_path_denial(path: str, method: str, identity) -> "str | None":
                 f"Dataset '{name}' is not permitted for this API key (dataset ACLs are configured — D15)."
             ).args[0]
     return None
+
+
+def _presented_pairs(request: Request) -> "list[tuple[str, str]]":
+    """The (key, header-source) candidates one REST request presents.
+
+    Shared by the auth middleware, the ``/api/oidc-session`` whoami and the
+    index renderer — one definition so a new envelope (D21 added the
+    auth-proxy's forwarded access token; D22 added the SSO cookie; D24 adds
+    the enforcing proxy's identity headers) engages everywhere at once.
+    """
+    presented: list[tuple[str, str]] = []
+    for header, via in (
+        ("X-RAG-Api-Key", "x-api-key"),
+        ("X-API-Key", "x-api-key"),
+        ("Authorization", "authorization"),
+        ("X-Auth-Request-Access-Token", "forwarded"),
+    ):
+        val = request.headers.get(header) or ""
+        if via == "authorization":
+            if val.startswith("Bearer ") and val[len("Bearer "):].strip():
+                presented.append((val[len("Bearer "):].strip(), via))
+        elif via == "forwarded":
+            val = val.strip()
+            if val[:7].lower() == "bearer ":
+                val = val[7:].strip()
+            if val:
+                presented.append((val, via))
+        elif val.strip():
+            presented.append((val.strip(), via))
+    # D22: the SSO session cookie is the LAST envelope — an explicit key or
+    # header always outranks a browser session, and an absent/invalid cookie
+    # costs nothing.
+    try:
+        from multimodal_rag.utils import oidc_sso
+
+        cookie_token = request.cookies.get(oidc_sso.cookie_name())
+        if cookie_token:
+            presented.append((cookie_token, "cookie"))
+    except Exception:
+        pass
+    # D24 (the Clearwing/DSH pattern): when an ENFORCING auth proxy is
+    # confirmed (RAG_TRUST_PROXY_IDENTITY), the proxy-injected identity
+    # headers ARE the credential — the gateway authenticated the user at the
+    # edge (oauth2-proxy AuthorizationPolicy) and overwrites these headers on
+    # EVERY request; the app cannot be reached with attacker-set values.
+    # Candidate source "proxy-identity": the identity NAME (not a token) —
+    # resolve_presented maps it straight to the registry identity
+    # (fail-closed, never admin, lowest precedence).  Absent headers (a
+    # direct/non-proxied caller) contribute nothing — fail closed.
+    if _trust_proxy_identity():
+        proxied_user = (
+            request.headers.get("X-Auth-Request-Preferred-Username")
+            or request.headers.get("X-Auth-Request-User")
+            or ""
+        ).strip()
+        if proxied_user:
+            presented.append((proxied_user, "proxy-identity"))
+    return presented
 
 
 @app.middleware("http")
@@ -977,14 +1125,11 @@ async def _api_key_auth(request: Request, call_next):
     # (a gateway's own platform/admin auth).  Collect (key, header-source)
     # pairs so resolve_presented can honor the caller's DELEGATED identity
     # instead of escalating to admin via the forwarded token.
-    presented: list[tuple[str, str]] = []
-    for header, via in (("X-RAG-Api-Key", "x-api-key"), ("X-API-Key", "x-api-key"), ("Authorization", "authorization")):
-        val = request.headers.get(header) or ""
-        if via == "authorization":
-            if val.startswith("Bearer ") and val[len("Bearer "):].strip():
-                presented.append((val[len("Bearer "):].strip(), via))
-        elif val.strip():
-            presented.append((val.strip(), via))
+    # D21: X-Auth-Request-Access-Token (the auth-proxy's forwarded OIDC
+    # access token) is collected as source "forwarded" — an envelope only;
+    # the JWT inside is fully verified before it resolves anything, and it
+    # can never outrank an explicit X-API-Key candidate.
+    presented = _presented_pairs(request)
     key = presented[0][0] if presented else ""
     import secrets
 
@@ -1002,6 +1147,11 @@ async def _api_key_auth(request: Request, call_next):
             if reset_handle is not None:
                 _clients_registry.reset_current_identity(reset_handle)
     if registry_on:
+        # D21: JWT-shaped candidates resolve inside resolve_presented via the
+        # oidc_identity pipeline (same registry identity as the user's key,
+        # never admin; opaque keys cost only a shape pre-check).  The
+        # deployment-key fast path above can never match a JWT, so OIDC
+        # engages entirely through this call — no separate middleware step.
         identity = _clients_registry.resolve_presented(
             [k for k, _ in presented], [via for _, via in presented]
         )
@@ -1390,6 +1540,14 @@ async def api_create_dataset(body: dict[str, Any] = Body(...)):
     (``"my dataset"`` → ``"my_dataset"``) — the common hand-typo, and the
     one invalid character a user can type without noticing.  Any other
     name the validator rejects comes back as HTTP 400, not 500.
+
+    D23 dataset ownership: the dataset's meta.json is stamped
+    ``created_by`` with the CURRENT request identity — a registry / JWT /
+    SSO identity stamps its name, an admin identity stamps ``admin``
+    (admins act as the deployment), and the D20 anonymous identity stamps
+    ``anonymous``.  The stamp is what DELETE (owner-or-admin) and the
+    creator's public toggle read back; datasets created before D23 carry
+    no stamp and stay admin-managed (never backfilled).
     """
     name = body.get("name", "").strip()
     if not name:
@@ -1449,6 +1607,7 @@ async def api_create_dataset(body: dict[str, Any] = Body(...)):
                 ocr,
                 rrf=rrf_meta,
                 contextual=bool(contextual),
+                created_by=_creator_name_for_request(),
             ),
         )
         return {"status": "ok", "dataset": meta}
@@ -1746,6 +1905,73 @@ def _require_admin_file() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# D23 dataset ownership — creator stamp + owner-or-admin enforcement
+# ---------------------------------------------------------------------------
+
+
+def _creator_name_for_request() -> str:
+    """The identity name to stamp as ``created_by`` at dataset CREATE (D23).
+
+    The CURRENT request identity (the middleware bound it): a registry /
+    JWT / SSO identity stamps its name, an ADMIN identity stamps ``admin``
+    (admins act as the deployment — every dataset made with a deployment
+    key is the deployment's), and a bound-but-nameless/anonymous identity
+    (the D20 unconfigured fallback) stamps ``anonymous``.  No identity at
+    all also reads ``anonymous`` — the stamp records what happened, the
+    enforcement matrix (owner-or-admin) does the gating.
+    """
+    identity = _clients_registry.current_identity()
+    if identity is not None:
+        if identity.is_admin:
+            return "admin"
+        name = str(getattr(identity, "name", "") or "").strip()
+        # The D20 fallback name is a SENTINEL, not a user: a dataset created
+        # unauthenticated is nobody's — "anonymous" (a name the registry's
+        # own regex can never mint, so it can never collide with a real key
+        # identity).
+        if name and name != "__anonymous__":
+            return name
+    return "anonymous"
+
+
+def _identity_may_manage_dataset(dm: DatasetManager, name: str) -> None:
+    """D23 ownership gate for destructive dataset surfaces (delete, the
+    creator's public toggle): 403 unless the caller is the creator or an
+    admin.
+
+    Rules (fleet decision D23):
+      * an ADMIN identity always passes (deployment keys, MCP keyset keys);
+      * otherwise the caller's identity NAME must equal the dataset's
+        ``created_by`` stamp (meta.json, written at create time);
+      * a dataset with NO stamp — pre-D23, or one whose meta is missing /
+        unreadable — is ADMIN-ONLY: no backfill, no proof of creation, and
+        a corrupt read must never widen a non-admin's powers (fail-closed).
+    The password gate on those surfaces stays layered ON TOP of this (the
+    check runs first so the 403 does not leak whether a password exists).
+    """
+    identity = _clients_registry.current_identity()
+    if identity is not None and identity.is_admin:
+        return
+    caller = str(getattr(identity, "name", "") or "").strip()
+    creator = ""
+    try:
+        creator = str(dm.read_created_by(name) or "").strip()
+    except Exception:
+        creator = ""  # unreadable meta → no provable creator → admin-only
+    if creator and caller and caller == creator:
+        return
+    if not creator:
+        raise HTTPException(
+            403,
+            f"Dataset '{name}' predates dataset ownership (no creator recorded) — only an admin can manage it.",
+        )
+    raise HTTPException(
+        403,
+        f"Dataset '{name}' is owned by '{creator}' — only its creator or an admin can delete it.",
+    )
+
+
 @app.get("/api/admin/clients")
 async def api_admin_list_clients():
     """List the per-user registry (env ∪ overlay) — key material masked.
@@ -1815,24 +2041,72 @@ async def api_admin_grant_client(name: str, request: Request, body: dict[str, An
         {"datasets": ["reports", "notes"]}   # ["*"] = everything, [] = none
 
     The key itself is untouched.  Applies on the next request (no restart).
+
+    D21 (optional extra fields on the same PATCH — no new route):
+    ``"oidc": "<alias>"`` binds the client to a JWT identity (empty string
+    clears the binding) and ``"blocked": true/false`` blocks/unblocks the
+    identity (key AND JWT — nothing resolves for it).  Both are ignored when
+    absent, so the grant-only body keeps its exact behaviour.
     """
     _require_admin_file()
     _require_admin_identity()
     datasets = body.get("datasets")
-    if not isinstance(datasets, list):
+    oidc_field = body.get("oidc")
+    blocked_field = body.get("blocked")
+    # D21 flag-only PATCHes (the SPA's Block and OIDC-bind buttons) carry NO
+    # datasets field — grant validation applies only when datasets is
+    # actually present.  A body with none of the three fields is still a
+    # 400 (nothing to do).
+    if datasets is None and oidc_field is None and blocked_field is None:
+        raise HTTPException(400, "Provide 'datasets' (a list), 'oidc' (a string), or 'blocked' (a bool)")
+    if datasets is not None and not isinstance(datasets, list):
         raise HTTPException(400, "Field 'datasets' must be a list of dataset names")
+    if oidc_field is not None and (not isinstance(oidc_field, str)):
+        raise HTTPException(400, "Field 'oidc' must be a string (an alias, or '' to clear)")
+    if blocked_field is not None and not isinstance(blocked_field, bool):
+        raise HTTPException(400, "Field 'blocked' must be a boolean")
     loop = asyncio.get_running_loop()
     try:
-        result = await loop.run_in_executor(
-            sync_pool, lambda: _admin_registry.grant_datasets(name, datasets)
-        )
+        result = None
+        if datasets is not None:
+            result = await loop.run_in_executor(
+                sync_pool, lambda: _admin_registry.grant_datasets(name, datasets)
+            )
+        if oidc_field is not None or blocked_field is not None:
+            # set_client_flags AUTO-MINTS an empty-grant entry for unknown
+            # names (the observed-JWT-user flow) — so a flag-only PATCH on an
+            # observed row works without a prior mint (Block and OIDC-bind).
+            flags = await loop.run_in_executor(
+                sync_pool,
+                lambda: _admin_registry.set_client_flags(
+                    name,
+                    oidc=None if oidc_field is None else oidc_field,
+                    blocked=None if blocked_field is None else blocked_field,
+                ),
+            )
+        else:
+            flags = None
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     except KeyError:
         raise HTTPException(404, f"Client '{name}' not found in the admin registry")
-    logger.info("Admin updated grants for '%s' → %s", name, result["datasets"])
-    return {"status": "ok", "name": name, "datasets": result["datasets"],
-            "message": f"Grants for '{name}' updated: {', '.join(result['datasets']) or '(none)'}."}
+    result_datasets = result["datasets"] if result is not None else None
+    if result is not None:
+        logger.info("Admin updated grants for '%s' → %s", name, result["datasets"])
+    message = (
+        f"Grants for '{name}' updated: {', '.join(result_datasets) or '(none)'}."
+        if result is not None
+        else f"Flags for '{name}' updated."
+    )
+    if flags is not None:
+        detail = []
+        if "oidc" in flags:
+            detail.append(f"oidc={flags['oidc'] or '(cleared)'}")
+        detail.append(f"blocked={flags['blocked']}")
+        message += f" D21 flags: {', '.join(detail)}."
+    return {"status": "ok", "name": name,
+            "datasets": result_datasets if result_datasets is not None else (flags or {}).get("datasets", []),
+            "message": message}
 
 
 @app.delete("/api/admin/clients/{name}")
@@ -1919,6 +2193,40 @@ def _rag_acl_filter_datasets(datasets: list, catalog: bool = False) -> tuple:
     return visible, len(datasets) - len(visible)
 
 
+def _annotate_public(datasets: list) -> None:
+    """Stamp ``public: true`` on datasets carrying the admin-set public flag
+    (meta.json ``public`` — feature: public-to-all-keys), plus the D23
+    ownership stamps (``created_by`` and ``owned_by_me``) on every row.
+
+    The /access page renders a 🌐 badge from the first; the UI renders owner
+    info from ``created_by`` (and the "mine" affordance from
+    ``owned_by_me`` — true ONLY when the current identity's name equals the
+    stamp; admins/anonymous/pre-D23 rows never claim ownership).  Both meta
+    reads are mtime-cached (``is_public_dataset`` / ``created_by_dataset``),
+    so this costs no per-request NFS round trip beyond the first.  Stamped
+    on every listing surface (catalog and plain) — an admin marking a
+    dataset global is deployment-wide information, and the creator stamp is
+    how owners recognize their own rows.
+    """
+    identity = _clients_registry.current_identity()
+    caller_name = str(getattr(identity, "name", "") or "").strip() if identity is not None else ""
+    for ds in datasets:
+        try:
+            if _clients_registry.is_public_dataset(str(ds.get("name", ""))):
+                ds["public"] = True
+        except Exception:  # never let a meta read break a listing
+            pass
+        # D23 ownership stamps (best-effort per row — same never-break rule).
+        try:
+            creator = _clients_registry.created_by_dataset(str(ds.get("name", "")))
+            if creator:
+                ds["created_by"] = creator
+                if caller_name and caller_name == creator:
+                    ds["owned_by_me"] = True
+        except Exception:
+            continue
+
+
 def _annotate_acl_granted(datasets: list) -> None:
     """Stamp ``acl_granted: true`` on datasets the caller's identity can
     already reach via the OPERATOR ACL (env registry or the D17 admin
@@ -1977,6 +2285,7 @@ async def api_list_datasets(
             for ds in datasets:
                 ds["unlocked"] = (ds["name"], cid) in _UNLOCK_CACHE
         datasets, _acl_hidden = _rag_acl_filter_datasets(datasets, catalog=catalog)
+        _annotate_public(datasets)
         _annotate_acl_granted(datasets)
         return {"datasets": datasets, **({"acl_hidden": _acl_hidden} if _acl_hidden else {})}
     try:
@@ -1991,11 +2300,267 @@ async def api_list_datasets(
         for ds in datasets:
             ds["unlocked"] = (ds["name"], cid) in _UNLOCK_CACHE
     datasets, _acl_hidden = _rag_acl_filter_datasets(datasets, catalog=catalog)
+    _annotate_public(datasets)
     _annotate_acl_granted(datasets)
     return {
         "datasets": datasets,
         "next_cursor": page["next_cursor"],
         **({"acl_hidden": _acl_hidden} if _acl_hidden else {}),
+    }
+
+
+# ---------------------------------------------------------------------------
+# D23 read-only stats — GET /api/stats
+# ---------------------------------------------------------------------------
+
+# Last-known model health for /api/stats: the ONLY data source is state that
+# already exists (the periodic embedder liveness monitor's ``_model_health``
+# snapshot + which optional models are CONFIGURED — no synchronous HTTP
+# probe per stats request, ever).  A tiny TTL cache smooths the one
+# DatasetManager read so a poll-happy tab still cannot fan out manager
+# construction.
+_STATS_MODEL_TTL = 10.0
+_stats_models_cache: dict[str, Any] = {"ts": 0.0, "models": []}
+
+
+def _stats_model_rows() -> "list[dict[str, Any]]":
+    """The ``models`` rows for /api/stats — last-known state only.
+
+    One row per role with ``{name, url, healthy}``: ``healthy`` is True only
+    when the role's liveness state is known-good (the embedder's periodic
+    monitor; optional roles count as healthy merely when configured — their
+    liveness is only ever checked on-demand by /api/admin/connections, and
+    /api/stats deliberately never makes those calls).  Never raises.
+    """
+    now = time.monotonic()
+    if now - _stats_models_cache["ts"] < _STATS_MODEL_TTL and _stats_models_cache["models"]:
+        return _stats_models_cache["models"]
+
+    def _collect() -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        embedder = _model_health.get("embedder") or {}
+        try:
+            dm = get_manager()
+        except Exception:
+            dm = None
+        for role, model in (
+            ("embedder", getattr(dm, "embedder", None)),
+            ("reranker", getattr(dm, "reranker", None)),
+            ("vlm", getattr(dm, "vlm", None)),
+            ("asr", getattr(dm, "asr", None)),
+        ):
+            if model is None:
+                continue
+            healthy = bool(
+                role != "embedder" or (embedder.get("status") == "healthy")
+            )
+            rows.append(
+                {
+                    "name": str(getattr(model, "model_name", "") or ""),
+                    "url": str(getattr(model, "url_remote", "") or "").rstrip("/"),
+                    "healthy": healthy,
+                }
+            )
+        return rows
+
+    try:
+        rows = _collect()
+    except Exception:
+        rows = []
+    _stats_models_cache["ts"] = now
+    _stats_models_cache["models"] = rows
+    return rows
+
+
+@app.get("/api/stats")
+async def api_stats(request: Request = None) -> dict[str, Any]:
+    """Read-only deployment stats for the SPA's stats tab (D23) —
+    identity-aware and deliberately cheap.
+
+    Shape (public-schema JSON): ``{"datasets": {"total", "visible_to_you",
+    "documents", "storage_bytes"}, "models": [{name, url, healthy}],
+    "jobs": {"active_uploads", "recent_failures"}, "memory": {"dataset"},
+    "generated_at"}``.
+
+    Identity filtering mirrors the listing: the dataset counts come from the
+    SAME ``_rag_acl_filter_datasets`` logic, so ``visible_to_you`` is exactly
+    the caller's world (the D16 union — operator ACL ∪ self-selections −
+    exclusions); an ADMIN identity sees deployment-wide numbers
+    (``total == visible_to_you``); an unauthenticated caller (identity
+    ``None``) gets the same shape with ``visible_to_you`` 0 and no model
+    health — never an error.  ``storage_bytes`` sums the visible datasets'
+    ``files/`` directories (one stat per file — the same walk
+    /api/admin/storage does).
+
+    ZERO write operations, and no per-request model probes: the meta counts
+    ride ``list_datasets`` (mtime/counter-cached), model health is the
+    periodic monitor's last-known snapshot behind a short TTL — the endpoint
+    is safe to poll.
+    """
+    # api_stats is PUBLIC (the SPA stats tab works pre-signin), so the auth
+    # middleware never binds the request identity for it — resolve it HERE,
+    # exactly the way the middleware would have: the presented (key,
+    # source) pairs through resolve_presented (admin keys, registry keys,
+    # JWT envelopes, the D22 cookie).  No credential → identity None → the
+    # empty-world anonymous shape below.
+    identity = _clients_registry.current_identity()
+    if identity is None and request is not None:
+        presented = _presented_pairs(request)
+        if presented:
+            try:
+                identity = _clients_registry.resolve_presented(
+                    [k for k, _ in presented], [via for _, via in presented]
+                )
+            except Exception:
+                identity = None  # fail closed to the anonymous shape
+    token = None
+    if identity is not None:
+        # Bind so the executor-side filter (and any helper) reads the same
+        # identity the middleware would have bound.
+        token = _clients_registry.set_current_identity(identity)
+    try:
+        return await _stats_body(identity)
+    finally:
+        if token is not None:
+            _clients_registry.reset_current_identity(token)
+
+
+async def _stats_body(identity) -> dict[str, Any]:
+    """The /api/stats payload for *identity* (already resolved or None)."""
+    try:
+        dm = await get_manager_async()
+    except Exception:
+        dm = None  # a not-yet-initialised manager reads as an empty world
+
+    def _collect(dm: "DatasetManager | None") -> tuple[int, int, int, int]:
+        """(total, visible, documents, storage_bytes) over the caller's world."""
+        if dm is None:
+            return 0, 0, 0, 0
+        datasets = dm.list_datasets()
+        total = len(datasets)
+        visible, _hidden = _rag_acl_filter_datasets(datasets)
+        documents = 0
+        storage_bytes = 0
+        for ds in visible:
+            documents += int(ds.get("document_count", 0) or 0)
+            files_dir = dm._dataset_dir(str(ds.get("name", ""))) / "files"
+            if files_dir.is_dir():
+                for f in files_dir.rglob("*"):
+                    try:
+                        if f.is_file() and not f.name.startswith("."):
+                            storage_bytes += f.stat().st_size
+                    except OSError:
+                        continue
+        return total, len(visible), documents, storage_bytes
+
+    total = visible = documents = storage_bytes = 0
+    if identity is None:
+        # Unauthenticated: the shape stays identical, the caller's world is
+        # empty by definition (never probe anything on their behalf).
+        visible = 0
+    else:
+        # _submit_with_context, NOT bare run_in_executor: _collect reads the
+        # caller's identity (via _rag_acl_filter_datasets) and a pool worker
+        # starts with EMPTY contextvars — the same trap the ingest-warning
+        # collector hit (see _submit_with_context).
+        total, visible, documents, storage_bytes = await _submit_with_context(sync_pool, _collect, dm)
+
+    active_uploads = 0
+    recent_failures = 0
+    try:
+        with _upload_jobs._lock:
+            for job in _upload_jobs._jobs.values():
+                if job.get("status") == "uploading":
+                    active_uploads += 1
+                elif job.get("status") == "error" and job.get("completed_at") and time.time() - float(
+                    job["completed_at"]
+                ) < 3600:
+                    recent_failures += 1
+    except Exception:
+        logger.debug("Suppressed exception", exc_info=True)
+
+    memory_binding: str | None = None
+    try:
+        memory_binding = _access_store.memory_dataset_for(identity, None)
+    except Exception:
+        memory_binding = None
+
+    if identity is None:
+        # No identity: model health is deliberately withheld (all-unknown)
+        # rather than probed for an anonymous caller.
+        models: list[dict[str, Any]] = []
+    else:
+        models = await _submit_with_context(sync_pool, _stats_model_rows)
+
+    # PVC capacity (the old /manage page's headline info — restored into the
+    # identity-agnostic storage section of /api/stats): one shutil.statvfs
+    # on the shared data PVC, plus the Qdrant PVC summary when the manager
+    # exposes one.  Read-only; both are the same numbers /api/admin/health
+    # and /api/admin/storage report — non-admins simply never had a page
+    # that showed them.
+    storage_pvc: dict[str, Any] | None = None
+    qdrant_pvc: dict[str, Any] | None = None
+    if dm is not None:
+        try:
+            import shutil as _shutil
+
+            usage = _shutil.disk_usage(str(dm.base_path))
+            storage_pvc = {
+                "total_bytes": usage.total,
+                "used_bytes": usage.used,
+                "free_bytes": usage.free,
+                "used_percent": round(usage.used / usage.total * 100, 1),
+            }
+        except Exception:
+            storage_pvc = None
+        try:
+            # The Qdrant PVC is a SEPARATE RWO volume per replica — none
+            # mounted on the API pod (mountReadOnly is off on multi-replica
+            # charts: a replica's RWO PVC cannot bind to API pods on other
+            # nodes).  Used bytes come from QDRANT'S OWN TELEMETRY via the
+            # same helpers /api/admin/health uses (cluster API for peers,
+            # per-peer telemetry for segment sizes, TTL-cached); capacity is
+            # the configured per-replica PVC size.
+            if QDRANT_STORAGE_PATH and Path(QDRANT_STORAGE_PATH).exists():
+                # single-node deployment with a read-only mount: exact usage
+                q_usage = _shutil.disk_usage(QDRANT_STORAGE_PATH)
+                qdrant_pvc = {
+                    "total_bytes": q_usage.total,
+                    "used_bytes": q_usage.used,
+                    "free_bytes": q_usage.free,
+                    "used_percent": round(q_usage.used / q_usage.total * 100, 1),
+                }
+            else:
+                qd_total = _parse_size_bytes(os.environ.get("QDRANT_PVC_SIZE", ""))
+                replicas = _qdrant_cluster_replicas()
+                usage = _qdrant_replica_usage(replicas, os.environ.get("QDRANT_HOST", ""), os.environ.get("QDRANT_PORT", "6333"))
+                qd_used = sum(usage.values())
+                if qd_total and qd_used:
+                    qdrant_pvc = {
+                        "total_bytes": qd_total,
+                        "used_bytes": qd_used,
+                        "free_bytes": max(qd_total - qd_used, 0),
+                        "used_percent": round(qd_used / qd_total * 100, 1),
+                        "replicas": dict(usage),
+                    }
+                elif usage:
+                    qdrant_pvc = {"used_bytes": qd_used, "replicas": dict(usage)}
+        except Exception:
+            qdrant_pvc = None
+
+    return {
+        "datasets": {
+            "total": total,
+            "visible_to_you": visible,
+            "documents": documents,
+            "storage_bytes": storage_bytes,
+        },
+        "storage_pvc": storage_pvc,
+        "qdrant_pvc": qdrant_pvc,
+        "models": models,
+        "jobs": {"active_uploads": active_uploads, "recent_failures": recent_failures},
+        "memory": {"dataset": memory_binding},
+        "generated_at": datetime.datetime.now(datetime.UTC).isoformat(),
     }
 
 
@@ -2050,11 +2615,22 @@ async def api_delete_dataset(
 ):
     """Delete a dataset and its Qdrant collection.
 
-    Password-protected datasets require the ``X-Dataset-Password`` header
-    (or a cached unlock) — deleting must not be easier than reading.
+    D23 dataset ownership — owner-or-admin: only the identity whose name
+    equals the dataset's ``created_by`` stamp, or an ADMIN identity, may
+    delete.  Everyone else gets 403
+    (``Dataset '<name>' is owned by '<created_by>' — only its creator or an
+    admin can delete it.``).  A dataset whose meta carries NO ``created_by``
+    (pre-D23) is deletable by ADMINS ONLY — never backfilled, no provable
+    creator.  The ownership check runs BEFORE the password gate so a
+    non-owner learns nothing about the dataset's protection state.
+
+    Password-protected datasets still require the ``X-Dataset-Password``
+    header (or a cached unlock) — deleting must not be easier than reading;
+    ownership is an ADDITIONAL check layered in front of it.
     """
     try:
         dm = await get_manager_async()
+        _identity_may_manage_dataset(dm, name)
         await _require_dataset_password(dm, name, x_dataset_password, request)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(sync_pool, dm.delete_dataset, name)
@@ -3767,6 +4343,52 @@ _QDRANT_TELEMETRY_CACHE: dict[str, Any] = {"ts": 0.0, "usage": {}}
 _QDRANT_TELEMETRY_TTL = 60.0
 
 
+def _qdrant_cluster_replicas() -> "list[dict[str, Any]]":
+    """Per-replica shard placement from Qdrant's /cluster API (the same
+    discovery /api/admin/health performs inline), ordered by pod ordinal.
+    Best-effort: [] on any failure (cluster disabled, unreachable)."""
+    import httpx2
+
+    qhost = os.environ.get("QDRANT_HOST", "")
+    qport = os.environ.get("QDRANT_PORT", "6333")
+    if not qhost:
+        return []
+    try:
+        with httpx2.Client(timeout=5.0) as client:
+            resp = client.get(f"http://{qhost}:{qport}/cluster")
+            if resp.status_code != 200:
+                return []
+            result = resp.json().get("result") or {}
+            if result.get("status") != "enabled":
+                return []
+            peers = result.get("peers") or {}
+            peer_shards: dict[str, int] = {}
+            for cinfo in (result.get("collections") or {}).values() if isinstance(result.get("collections"), dict) else []:
+                if not isinstance(cinfo, dict):
+                    continue
+                for sh in cinfo.get("shards") or []:
+                    if not isinstance(sh, dict):
+                        continue
+                    pid = sh.get("peer_id")
+                    if pid is not None:
+                        key = str(pid)
+                        peer_shards[key] = peer_shards.get(key, 0) + 1
+            replicas: list[dict[str, Any]] = []
+            for pid in sorted(peers.keys(), key=lambda p: str(p)):
+                ps = peer_shards.get(str(pid), 0)
+                peer = peers[pid] or {}
+                uri = peer.get("uri", "") if isinstance(peer, dict) else ""
+                label = _peer_host_label(uri)
+                if not label or label == uri:
+                    label = f"peer-{pid}"
+                replicas.append({"host": label, "shards": ps, "uri": uri})
+            replicas.sort(key=lambda r: int(m.group(1)) if (m := re.search(r"(\d+)$", r["host"])) else -1)
+            return replicas
+    except Exception:
+        logger.debug("Suppressed exception", exc_info=True)
+        return []
+
+
 def _qdrant_replica_usage(
     replicas: list[dict[str, Any]],
     qhost: str,
@@ -4227,6 +4849,12 @@ async def api_admin_set_dataset_public(
     is refused with 409 (remove the password first if publication is
     really intended).  Takes effect on the next request from any replica
     (query-time only - no re-ingest, no restart).
+
+    D23: a NON-admin identity can publish/unpublish ONLY a dataset it
+    created (``created_by`` == its identity name) — via the parallel
+    creator route ``POST /api/datasets/{name}/public`` (this /api/admin
+    route is unreachable for client keys by construction).  A pre-D23
+    dataset (no stamp) can never be made public by a non-admin.
     """
     enabled = bool(body.get("public"))
     dm = await get_manager_async()
@@ -4238,6 +4866,39 @@ async def api_admin_set_dataset_public(
     except ValueError as exc:
         raise HTTPException(409, str(exc))
     logger.info("Dataset '%s' public flag set to %s (admin)", name, result["public"])
+    return {"status": "ok", **result}
+
+
+@app.post("/api/datasets/{name}/public")
+async def api_set_dataset_public_creator(
+    name: str,
+    request: Request,
+    body: dict[str, Any] = Body(...),
+):
+    """Set a dataset's "public" flag — the D23 CREATOR path.
+
+    A NON-admin identity may publish/unpublish ONLY a dataset it created
+    (meta.json ``created_by`` == the caller's identity name; admins are not
+    expected here — their surface is /api/admin/datasets/{name}/public, and
+    an admin reaching this route is allowed with the same effect).
+    Non-creators (including the D20 anonymous identity and pre-D23 datasets
+    with no stamp) are 403ed by the ownership gate — no provable creator,
+    no self-service publication.  Body: {"public": true|false}.  The
+    password-protected-never-public rule is enforced underneath
+    (``set_public`` → 409).  Takes effect on the next request from any
+    replica (query-time only).
+    """
+    dm = await get_manager_async()
+    _identity_may_manage_dataset(dm, name)
+    enabled = bool(body.get("public"))
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(sync_pool, dm.set_public, name, enabled)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Dataset '{name}' not found")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    logger.info("Dataset '%s' public flag set to %s (creator)", name, result["public"])
     return {"status": "ok", **result}
 
 @app.post("/api/admin/datasets/{name}/migrate-tier-schema")
@@ -4546,6 +5207,296 @@ async def api_import_dataset(request: Request) -> dict[str, Any]:
 # HTML frontend
 # ---------------------------------------------------------------------------
 
+def _whoami_flags() -> dict:
+    """The D23 ``flags`` object for an AUTHENTICATED whoami (snake_case).
+
+    * ``can_create_datasets`` — matches the middleware's POST /api/datasets
+      rule (``_rag_acl_path_denial``): the registry is NOT configured, or
+      the identity carries the ``*`` grant, or it is an admin.
+    * ``sso_enabled`` — the D22 browser SSO flow is fully configured.
+    * ``memory_dataset`` — the caller's effective ★ binding or null (the
+      same fail-soft resolution the MCP memory tools use).
+    """
+    identity = _clients_registry.current_identity()
+    can_create = False
+    if identity is None:
+        # No identity bound: creation is governed by the D15 config — the
+        # middleware's rule denies only when the registry is configured
+        # without the ``*`` grant; with nothing configured there is no
+        # registry gate (the D20 fail-closed branch binds an identity, so
+        # None here means a genuinely legacy surface — creation allowed).
+        can_create = not _clients_registry.registry_configured()
+    elif identity.is_admin:
+        can_create = True
+    else:
+        can_create = "*" in (identity.datasets or frozenset())
+    memory = None
+    try:
+        memory = _access_store.memory_dataset_for(identity, None)
+    except Exception:
+        memory = None
+    try:
+        from multimodal_rag.utils import oidc_sso
+
+        sso_on = bool(oidc_sso.sso_enabled())
+    except Exception:
+        sso_on = False
+    return {
+        "can_create_datasets": bool(can_create),
+        "sso_enabled": sso_on,
+        "memory_dataset": memory,
+    }
+
+
+def _oidc_session_payload(presented: "list[tuple[str, str]]") -> dict:
+    """The D21/D22/D23 whoami body for *presented* (key, source) pairs.
+
+    Never a grant: it previews the identity the presented credential WOULD
+    resolve to (the auth middleware re-resolves on every protected call).
+    Resolution order mirrors the middleware: an explicit opaque key wins
+    (source: key — and an admin key NEVER leaks its status here, the payload
+    stays anonymous-shaped), then JWT envelopes in collection order
+    (Authorization Bearer, then the auth-proxy's forwarded access token,
+    then the D22 SSO session cookie).  When OIDC is disabled the JWT path is
+    inert, so the payload is the anonymous shape regardless.
+
+    D23 additions to the AUTHENTICATED shape only: ``is_admin`` (true only
+    for cookie/JWT identities that resolve as admin — which the resolver
+    never yields for JWTs, so in practice always false here; an OPAQUE admin
+    key keeps the anonymity rule and never reaches this branch) and
+    ``flags`` (``can_create_datasets`` / ``sso_enabled`` /
+    ``memory_dataset``).  The anonymous shape ``{"authenticated": false}``
+    stays EXACTLY that — the SPA treats missing keys as false.
+    """
+    from multimodal_rag.utils import oidc_identity
+
+    if not oidc_identity.oidc_enabled():
+        return {"authenticated": False}
+    # An explicit opaque key means the page's own credential governs — the
+    # whoami stays anonymous-shaped (an admin key must never leak that it
+    # is one, and the page already has its own key by definition).  The D22
+    # SSO cookie is a JWT envelope, not an opaque key — it does NOT trigger
+    # this bail-out.
+    if any(
+        via not in ("forwarded", "cookie") and not oidc_identity.is_jwt_format(candidate)
+        for candidate, via in presented
+    ):
+        return {"authenticated": False}
+    for candidate, via in presented:
+        if not oidc_identity.is_jwt_format(candidate):
+            continue
+        ident = oidc_identity.resolve_jwt(candidate)
+        if ident is None:
+            continue  # invalid/expired/blocked — try the next envelope
+        # D23: the whoami never binds the request's contextvar (it is a
+        # preview, not a resolution), so the flags are computed against the
+        # resolved identity directly.
+        token = _clients_registry.set_current_identity(ident)
+        try:
+            flags = _whoami_flags()
+        finally:
+            _clients_registry.reset_current_identity(token)
+        return {
+            "authenticated": True,
+            "identity": ident.name,
+            "source": "sso-cookie" if via == "cookie" else "oidc",
+            "datasets": sorted(ident.datasets or ()),
+            "is_admin": bool(ident.is_admin),
+            "flags": flags,
+            "oidc": oidc_identity.oidc_status(),
+        }
+    return {"authenticated": False}
+
+
+@app.get("/api/oidc-session")
+async def api_oidc_session(request: Request):
+    """D21 browser whoami — WHICH identity would this request resolve to?
+
+    Public by design (it leaks nothing: the response is an identity-name
+    preview plus the caller's own ACL datasets — exactly what the caller
+    can already see via any authenticated listing; failure and absence both
+    return the same anonymous shape, so it is not an oracle either).  The
+    browser homepage calls this WITHOUT its embedded key first: when the
+    auth proxy forwards the OIDC access token (or the session presents a
+    Bearer JWT), the page renders the user's identity instead of
+    embedding/using the admin key.
+    """
+    return _oidc_session_payload(_presented_pairs(request))
+
+
+# ---------------------------------------------------------------------------
+# Browser SSO — the OIDC authorization-code flow (D22, the OWUI pattern)
+# ---------------------------------------------------------------------------
+
+
+def _sso_cookie_headers(token: str, max_age: int, secure: bool) -> list[tuple[str, str]]:
+    """Set-Cookie for the SSO session: HttpOnly (page JS never sees the
+    token), SameSite=Lax (CSRF-hard default; the OIDC round trip is
+    top-level navigation so Lax works), Secure on https deployments."""
+    from multimodal_rag.utils import oidc_sso
+
+    parts = [
+        f"{oidc_sso.cookie_name()}={token}",
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Lax",
+        f"Max-Age={max_age}",
+    ]
+    if secure:
+        parts.append("Secure")
+    return [("set-cookie", "; ".join(parts))]
+
+
+def _sso_state_cookie_headers(state: str, secure: bool) -> list[tuple[str, str]]:
+    """Set-Cookie for the login-attempt CSRF state (short-lived, HttpOnly,
+    SameSite=Lax — read back at the callback and cleared immediately)."""
+    from multimodal_rag.utils import oidc_sso
+
+    parts = [
+        f"{oidc_sso.state_cookie_name()}={state}",
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Lax",
+        f"Max-Age={600}",
+    ]
+    if secure:
+        parts.append("Secure")
+    return [("set-cookie", "; ".join(parts))]
+
+
+def _sso_clear_cookie_headers() -> list[tuple[str, str]]:
+    from multimodal_rag.utils import oidc_sso
+
+    return [
+        ("set-cookie", f"{oidc_sso.cookie_name()}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+        ("set-cookie", f"{oidc_sso.state_cookie_name()}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+    ]
+
+
+@app.get("/oauth/login")
+async def oauth_login(next: str = "/"):
+    """Start the SSO round trip: redirect the browser to the realm's
+    authorization endpoint with a CSRF ``state`` planted in a short-lived
+    cookie.  404 when SSO is inert (the route does not exist then)."""
+    from starlette.responses import RedirectResponse
+
+    from multimodal_rag.utils import oidc_sso
+
+    if not oidc_sso.sso_enabled():
+        raise HTTPException(404, "SSO is not enabled on this deployment")
+    url = oidc_sso.build_authorization_url(oidc_sso.new_state())
+    if not url:
+        raise HTTPException(503, "OIDC provider discovery unavailable — try again shortly")
+    # The state cookie value is "<state>|<safe-next>" — the callback splits
+    # it back (never trusting the query string for the redirect target).
+    state = url.split("state=")[-1]
+    target = oidc_sso.safe_next_path(next)
+    resp = RedirectResponse(url, status_code=302)
+    secure = oidc_sso.cookie_secure()
+    parts = [
+        f"{oidc_sso.state_cookie_name()}={state}|{target}",
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Lax",
+        "Max-Age=600",
+    ]
+    if secure:
+        parts.append("Secure")
+    resp.headers.append("set-cookie", "; ".join(parts))
+    return resp
+
+
+@app.get("/oauth/oidc/callback")
+async def oauth_callback(request: Request, code: str = "", state: str = ""):
+    """Finish the SSO round trip: exchange the code, verify the token with
+    the D21 machinery, plant the session cookie, redirect to the ``next``
+    path that rode INSIDE the state cookie (never the query string — an
+    open redirect would launder the auth code).
+
+    Every failure redirects to the homepage WITHOUT a cookie (fail closed,
+    no error detail leaked)."""
+    from starlette.responses import RedirectResponse
+
+    from multimodal_rag.utils import oidc_sso
+
+    if not oidc_sso.sso_enabled():
+        raise HTTPException(404, "SSO is not enabled on this deployment")
+    if not code or not state:
+        return RedirectResponse("/?sso=error", status_code=302)
+    # Split the state cookie: <nonce>|<safe-next>.
+    raw_state = request.cookies.get(oidc_sso.state_cookie_name(), "")
+    cookie_state, _, cookie_target = raw_state.partition("|")
+    if not oidc_sso.state_matches(cookie_state, state):
+        logger.warning("OIDC SSO callback: state mismatch (CSRF check failed)")
+        return RedirectResponse("/?sso=error", status_code=302)
+    token_response = oidc_sso.exchange_code(code)
+    if not token_response:
+        return RedirectResponse("/?sso=error", status_code=302)
+    token = str(token_response.get("access_token") or "")
+    if not token:
+        return RedirectResponse("/?sso=error", status_code=302)
+    # Verify with the D21 machinery — the same pipeline every credential
+    # goes through (RS256/JWKS, iss/aud/exp).  An unverifiable token never
+    # becomes a session.
+    ident = _clients_registry.resolve_presented([token])
+    if ident is None:
+        logger.warning("OIDC SSO callback: token did not resolve to an identity (verification failed)")
+        return RedirectResponse("/?sso=error", status_code=302)
+    target = oidc_sso.safe_next_path(cookie_target or "/")
+    resp = RedirectResponse(target, status_code=302)
+    for header in _sso_cookie_headers(
+        token,
+        oidc_sso.cookie_max_age_for(token),
+        oidc_sso.cookie_secure(),
+    ):
+        resp.headers.append(*header)
+    # Clear the state cookie (its one job is done).
+    resp.headers.append(
+        "set-cookie",
+        f"{oidc_sso.state_cookie_name()}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+    )
+    logger.info("SSO sign-in: identity '%s' session established", ident.name)
+    return resp
+
+
+@app.get("/oauth/logged-out")
+async def oauth_logged_out():
+    """The post-sign-out landing page (D24): confirms BOTH sessions were
+    ended (the gateway's oauth2-proxy session via /oauth2/sign_out, and the
+    app-side D22 cookie via /oauth/logout) and offers the way back in.
+    Public by construction — it renders for whoever lands here, including
+    an edge-re-authenticated visitor (in which case the banner explains
+    the SSO re-auth behavior honestly)."""
+    return HTMLResponse(
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+        "<title>Signed out — Multimodal RAG</title>"
+        "<style>body{font-family:system-ui,sans-serif;background:#0b0f14;color:#e8e8e8;"
+        "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}"
+        ".card{background:#11161d;border:1px solid #232a33;border-radius:8px;padding:32px 40px;"
+        "max-width:420px;text-align:center}a{color:#2eb872}</style></head><body>"
+        "<div class='card'><h2>Signed out</h2>"
+        "<p style='font-size:.9rem;line-height:1.5'>Your app session and the gateway"
+        " session were ended. Note: with platform single sign-on, clicking"
+        " <b>Sign in with SSO</b> may sign you straight back in without a password —"
+        " that is your identity provider's session, which ends when you sign out"
+        " of the platform (or close all SSO apps).</p>"
+        "<p style='margin-top:20px'><a href='/'>← Back to Multimodal RAG</a></p>"
+        "</div></body></html>",
+        status_code=200,
+    )
+
+
+@app.get("/oauth/logout")
+async def oauth_logout():
+    """Clear the SSO session cookies and land on the homepage."""
+    from starlette.responses import RedirectResponse
+
+    resp = RedirectResponse("/", status_code=302)
+    for header in _sso_clear_cookie_headers():
+        resp.headers.append(*header)
+    return resp
+
+
 def _load_html(template: str) -> str | None:
     """Load one template file from ``templates/`` (None when missing)."""
     path = Path(__file__).parent / "templates" / template
@@ -4561,8 +5512,15 @@ _HTML_INDEX: str | None = None
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index(request: Request = None):  # direct callers (the /manage fallback, tests) pass no request
     global _HTML_INDEX
+    # D23 auth gate (RAG_SSO_GATE): an unauthenticated request with no
+    # credential of any kind gets the minimal sign-in page instead — health,
+    # probes, oauth routes and media serving are exempt (they never enter
+    # this handler).  Env off (the default) = byte-identical public pages.
+    gate = _html_gate_response(request)
+    if gate is not None:
+        return gate
     if _HTML_INDEX is None:
         _HTML_INDEX = _load_html("index.html") or "<html><body><h1>Frontend not found</h1></body></html>"
     # Server-injected page configuration via meta tags: the OCR-fallback
@@ -4597,7 +5555,15 @@ async def index():
             f'<meta name="rag-rrf-default" content="{html.escape(content, quote=True)}"></head>',
             1,
         )
-    if _RAG_API_KEY:
+    # D21: when the request itself presents a resolvable JWT (browser SSO —
+    # the auth proxy forwards the access token), DO NOT embed the admin key:
+    # the page's auth header would outrank the forwarded JWT and escalate
+    # every SSO visitor to admin.  The page probes /api/oidc-session first;
+    # in SSO mode it sends no key and the forwarded JWT resolves per request.
+    # A direct call (request=None — the /manage fallback, tests) has no SSO
+    # context: presented is empty, the meta is embedded, history preserved.
+    presented = _presented_pairs(request) if request is not None else []
+    if _RAG_API_KEY and not _oidc_session_payload(presented).get("authenticated", False):
         page = page.replace(
             "</head>",
             f'<meta name="rag-api-key" content="{_RAG_API_KEY}"></head>',
@@ -4617,12 +5583,15 @@ async def favicon():
 
 
 @app.get("/manage", response_class=HTMLResponse)
-async def manage():
-    return await index()
+async def manage(request: Request = None):
+    """The management page — the same render as ``/`` (including the D23
+    RAG_SSO_GATE gate: the request is forwarded so an unauthenticated
+    gated deployment gets the sign-in page here too)."""
+    return await index(request)
 
 
 @app.get("/access", response_class=HTMLResponse)
-async def access():
+async def access(request: Request = None):
     """Per-user access page (the key-holder's counterpart to the operator UI).
 
     Served public like ``/`` and ``/manage`` — the page IS its own auth
@@ -4633,7 +5602,13 @@ async def access():
     per-user registry keys, and injecting any deployment key would leak
     admin credentials onto a public page.  See ``documentation/API.md``
     § "The /access page".
+
+    D23 auth gate (RAG_SSO_GATE): an unauthenticated request with no
+    credential gets the minimal sign-in page instead of the access UI.
     """
+    gate = _html_gate_response(request)
+    if gate is not None:
+        return gate
     page = _load_html("access.html")
     if not page:
         return await index()

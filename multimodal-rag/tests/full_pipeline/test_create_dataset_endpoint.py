@@ -40,6 +40,7 @@ class _StubManager:
         ocr: bool,
         rrf: dict[str, Any] | None = None,
         contextual: bool = False,
+        created_by: str | None = None,  # D23 ownership stamp (passed through)
     ) -> dict[str, Any]:
         DatasetManager._validate_name(name)  # the real validator
         self.seen.append((name, description, password, ocr))

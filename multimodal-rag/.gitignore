@@ -35,7 +35,10 @@ helm*/local/*
 .vscode/
 .idea/
 
-# Local cluster credentials (never commit)
+# Local cluster credentials (never commit). NOTE: the legacy root
+# .g2_cluster.yaml was deleted 2026-09-30 — site values live in
+# helm-scale-large/local/values.g2.yaml (gitignored via local/) —
+# the pattern below remains as a guard against re-creating it.
 .g2_cluster.yaml
 
 # Packaged charts / sync-conflict duplicates

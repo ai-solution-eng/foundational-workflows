@@ -131,6 +131,90 @@ spec:
                   name: {{ .Values.security.existingSecret }}
                   key: {{ .Values.security.existingSecretMediaTokenKey }}
             {{- end }}
+            {{- if .Values.security.oidc.enabled }}
+            # D21 (opt-in) OIDC JWT as a second credential for the same
+            # per-user registry identity — rendered ONLY when enabled
+            # (default render byte-identical). The registry serves BOTH
+            # containers (REST + MCP must resolve the same identities).
+            # ENABLED WITHOUT AN ISSUER still renders RAG_OIDC_ENABLED (the
+            # app logs a loud startup warning and fails closed) — the env is
+            # never silently dropped.
+            - name: RAG_OIDC_ENABLED
+              value: "true"
+            - name: RAG_OIDC_ISSUER
+              value: {{ .Values.security.oidc.issuer | quote }}
+            - name: RAG_OIDC_AUDIENCE
+              value: {{ .Values.security.oidc.audience | quote }}
+            - name: RAG_OIDC_IDENTITY_CLAIM
+              value: {{ .Values.security.oidc.identityClaim | quote }}
+            {{- if .Values.security.oidc.jwksUrl }}
+            - name: RAG_OIDC_JWKS_URL
+              value: {{ .Values.security.oidc.jwksUrl | quote }}
+            {{- end }}
+            - name: RAG_OIDC_JWKS_REFRESH_SECONDS
+              value: {{ .Values.security.oidc.jwksRefreshSeconds | quote }}
+            - name: RAG_OIDC_OBSERVED_TTL
+              value: {{ .Values.security.oidc.observedTtl | quote }}
+            - name: RAG_OIDC_FETCH_TIMEOUT_SECONDS
+              value: {{ .Values.security.oidc.fetchTimeoutSeconds | quote }}
+            - name: RAG_OIDC_CLOCK_SKEW_SECONDS
+              value: {{ .Values.security.oidc.clockSkewSeconds | quote }}
+            {{- end }}
+            {{- if .Values.security.oidc.sso.enabled }}
+            # D22 browser SSO (the OWUI pattern): /oauth/* flow + the session
+            # cookie envelope.  Rendered ONLY when sso.enabled — the default
+            # render is byte-identical.  clientSecret prefers the existing
+            # Secret; an inline value is back-compat.
+            - name: RAG_OIDC_SSO_ENABLED
+              value: "true"
+            - name: RAG_OIDC_SSO_CLIENT_ID
+              value: {{ .Values.security.oidc.sso.clientId | quote }}
+            {{- if .Values.security.oidc.sso.clientExistingSecret }}
+            - name: RAG_OIDC_SSO_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.security.oidc.sso.clientExistingSecret }}
+                  key: {{ .Values.security.oidc.sso.clientExistingSecretKey }}
+            {{- else }}
+            - name: RAG_OIDC_SSO_CLIENT_SECRET
+              value: {{ .Values.security.oidc.sso.clientSecret | quote }}
+            {{- end }}
+            {{- if .Values.security.oidc.sso.redirectUri }}
+            - name: RAG_OIDC_SSO_REDIRECT_URI
+              value: {{ .Values.security.oidc.sso.redirectUri | quote }}
+            {{- end }}
+            {{- if .Values.security.oidc.sso.providerUrl }}
+            - name: RAG_OIDC_SSO_PROVIDER_URL
+              value: {{ .Values.security.oidc.sso.providerUrl | quote }}
+            {{- end }}
+            - name: RAG_OIDC_SSO_SCOPES
+              value: {{ .Values.security.oidc.sso.scopes | quote }}
+            - name: RAG_OIDC_SSO_COOKIE_NAME
+              value: {{ .Values.security.oidc.sso.cookieName | quote }}
+            - name: RAG_OIDC_SSO_COOKIE_MAX_AGE
+              value: {{ .Values.security.oidc.sso.cookieMaxAgeSeconds | quote }}
+            - name: RAG_OIDC_SSO_COOKIE_SECURE
+              value: {{ .Values.security.oidc.sso.cookieSecure | quote }}
+            {{- end }}
+            {{- if .Values.security.ssoGate }}
+            # D23 identity gate on the served HTML pages (/, /manage, /access
+            # require an authenticated identity; anonymous visitors get the
+            # minimal 401 sign-in page).  Rendered ONLY when ssoGate — the
+            # default render is byte-identical.  Read per request: flipping
+            # the value needs no restart.  Empty deployments gate to nothing
+            # (enable ONLY with oidc.enabled or API keys configured).
+            - name: RAG_SSO_GATE
+              value: "true"
+            {{- end }}
+            {{- if .Values.security.oidc.platformCa.configMapName }}
+            # Platform private-CA bundle (e.g. the ezaf-root-ca ConfigMap) —
+            # trusted by the D21/D22 OIDC fetches (REMOTE_CA_BUNDLE) so the
+            # EXTERNAL https issuer/provider URLs work from inside the pod
+            # (the ezaf-gateway path passes GETs AND POSTs, unlike the mesh
+            # path to the Istio-injected Keycloak pod).
+            - name: REMOTE_CA_BUNDLE
+              value: /etc/platform-ca/ca-certificates.crt
+            {{- end }}
             {{- range $key, $val := .Values.extraEnv }}
             - name: {{ $key }}
               value: {{ $val | quote }}
@@ -147,6 +231,11 @@ spec:
             - name: rag-model-keys
               mountPath: /etc/rag/secrets
               readOnly: true
+            {{- if .Values.security.oidc.platformCa.configMapName }}
+            - name: platform-ca
+              mountPath: /etc/platform-ca
+              readOnly: true
+            {{- end }}
             - name: tmp
               mountPath: /tmp
             - name: gunicorn-ctl
@@ -267,6 +356,90 @@ spec:
               value: {{ .Values.mcp.datasetAcls | quote }}
             {{- end }}
             {{- end }}
+            {{- if .Values.security.oidc.enabled }}
+            # D21 (opt-in) OIDC JWT as a second credential for the same
+            # per-user registry identity — rendered ONLY when enabled
+            # (default render byte-identical). The registry serves BOTH
+            # containers (REST + MCP must resolve the same identities).
+            # ENABLED WITHOUT AN ISSUER still renders RAG_OIDC_ENABLED (the
+            # app logs a loud startup warning and fails closed) — the env is
+            # never silently dropped.
+            - name: RAG_OIDC_ENABLED
+              value: "true"
+            - name: RAG_OIDC_ISSUER
+              value: {{ .Values.security.oidc.issuer | quote }}
+            - name: RAG_OIDC_AUDIENCE
+              value: {{ .Values.security.oidc.audience | quote }}
+            - name: RAG_OIDC_IDENTITY_CLAIM
+              value: {{ .Values.security.oidc.identityClaim | quote }}
+            {{- if .Values.security.oidc.jwksUrl }}
+            - name: RAG_OIDC_JWKS_URL
+              value: {{ .Values.security.oidc.jwksUrl | quote }}
+            {{- end }}
+            - name: RAG_OIDC_JWKS_REFRESH_SECONDS
+              value: {{ .Values.security.oidc.jwksRefreshSeconds | quote }}
+            - name: RAG_OIDC_OBSERVED_TTL
+              value: {{ .Values.security.oidc.observedTtl | quote }}
+            - name: RAG_OIDC_FETCH_TIMEOUT_SECONDS
+              value: {{ .Values.security.oidc.fetchTimeoutSeconds | quote }}
+            - name: RAG_OIDC_CLOCK_SKEW_SECONDS
+              value: {{ .Values.security.oidc.clockSkewSeconds | quote }}
+            {{- end }}
+            {{- if .Values.security.oidc.sso.enabled }}
+            # D22 browser SSO (the OWUI pattern): /oauth/* flow + the session
+            # cookie envelope.  Rendered ONLY when sso.enabled — the default
+            # render is byte-identical.  clientSecret prefers the existing
+            # Secret; an inline value is back-compat.
+            - name: RAG_OIDC_SSO_ENABLED
+              value: "true"
+            - name: RAG_OIDC_SSO_CLIENT_ID
+              value: {{ .Values.security.oidc.sso.clientId | quote }}
+            {{- if .Values.security.oidc.sso.clientExistingSecret }}
+            - name: RAG_OIDC_SSO_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.security.oidc.sso.clientExistingSecret }}
+                  key: {{ .Values.security.oidc.sso.clientExistingSecretKey }}
+            {{- else }}
+            - name: RAG_OIDC_SSO_CLIENT_SECRET
+              value: {{ .Values.security.oidc.sso.clientSecret | quote }}
+            {{- end }}
+            {{- if .Values.security.oidc.sso.redirectUri }}
+            - name: RAG_OIDC_SSO_REDIRECT_URI
+              value: {{ .Values.security.oidc.sso.redirectUri | quote }}
+            {{- end }}
+            {{- if .Values.security.oidc.sso.providerUrl }}
+            - name: RAG_OIDC_SSO_PROVIDER_URL
+              value: {{ .Values.security.oidc.sso.providerUrl | quote }}
+            {{- end }}
+            - name: RAG_OIDC_SSO_SCOPES
+              value: {{ .Values.security.oidc.sso.scopes | quote }}
+            - name: RAG_OIDC_SSO_COOKIE_NAME
+              value: {{ .Values.security.oidc.sso.cookieName | quote }}
+            - name: RAG_OIDC_SSO_COOKIE_MAX_AGE
+              value: {{ .Values.security.oidc.sso.cookieMaxAgeSeconds | quote }}
+            - name: RAG_OIDC_SSO_COOKIE_SECURE
+              value: {{ .Values.security.oidc.sso.cookieSecure | quote }}
+            {{- end }}
+            {{- if .Values.security.ssoGate }}
+            # D23 identity gate on the served HTML pages (/, /manage, /access
+            # require an authenticated identity; anonymous visitors get the
+            # minimal 401 sign-in page).  Rendered ONLY when ssoGate — the
+            # default render is byte-identical.  Read per request: flipping
+            # the value needs no restart.  Empty deployments gate to nothing
+            # (enable ONLY with oidc.enabled or API keys configured).
+            - name: RAG_SSO_GATE
+              value: "true"
+            {{- end }}
+            {{- if .Values.security.oidc.platformCa.configMapName }}
+            # Platform private-CA bundle (e.g. the ezaf-root-ca ConfigMap) —
+            # trusted by the D21/D22 OIDC fetches (REMOTE_CA_BUNDLE) so the
+            # EXTERNAL https issuer/provider URLs work from inside the pod
+            # (the ezaf-gateway path passes GETs AND POSTs, unlike the mesh
+            # path to the Istio-injected Keycloak pod).
+            - name: REMOTE_CA_BUNDLE
+              value: /etc/platform-ca/ca-certificates.crt
+            {{- end }}
             {{- range $key, $val := .Values.extraEnv }}
             - name: {{ $key }}
               value: {{ $val | quote }}
@@ -283,6 +456,11 @@ spec:
             - name: rag-model-keys
               mountPath: /etc/rag/secrets
               readOnly: true
+            {{- if .Values.security.oidc.platformCa.configMapName }}
+            - name: platform-ca
+              mountPath: /etc/platform-ca
+              readOnly: true
+            {{- end }}
             {{- if .Values.persistence.qdrant.mountReadOnly }}
             - name: qdrant-data
               mountPath: /qdrant-storage
@@ -332,3 +510,11 @@ spec:
           emptyDir: {}
         - name: gunicorn-ctl
           emptyDir: {}
+        {{- if .Values.security.oidc.platformCa.configMapName }}
+        - name: platform-ca
+          configMap:
+            name: {{ .Values.security.oidc.platformCa.configMapName }}
+            items:
+              - key: {{ .Values.security.oidc.platformCa.configMapKey | default "ca-certificates.crt" }}
+                path: ca-certificates.crt
+        {{- end }}

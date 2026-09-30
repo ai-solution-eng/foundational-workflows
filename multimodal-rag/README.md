@@ -129,6 +129,8 @@ The charts ship auth **on by default** (`security.apiKey` / `mediaTokenSecret` a
 | `RAG_API_KEY_CLIENTS` (+ `RAG_DATASET_ACLS`) | **Decision D15 — multi-user API keys → dataset ACLs (explicitly OPT-IN; enabling changes the auth model).** `RAG_API_KEY_CLIENTS="name:key;name:key"` (parsed like `K8S_MCP_CLIENTS`; keys must not contain `:` or `;`) mints per-user keys accepted by BOTH the REST and MCP surfaces; `RAG_DATASET_ACLS="name:ds1,ds2;name2:*"` binds each name to its datasets (`*` = all). A registry key matching NO ACL entry gets **NO datasets (fail-closed)**; dataset access (list/read/search/unlock/manage) is enforced per identity on both surfaces, per-key unlock caches and password-throttle buckets ride the D10 per-identity machinery (`key:<name>`), federated search restricts its fan-out to granted datasets, and ACL'd keys cannot reach `/api/admin/*` nor create datasets (unless granted `*`). The plain deployment keys — `RAG_API_KEY` plus the MCP key set (`MCP_API_KEYS` / `RAG_API_KEYS`) — keep FULL (admin) access. **Default (registry unset): today's single-key behaviour, byte-identical.** Env re-read per request (rotation without restart). Chart wiring: `mcp.apiKeyClients` / `mcp.datasetAcls` — rendered ONLY when set; the values are key material, pass them from a Secret pipeline. | unset (single-key, unchanged) |
 | `RAG_ACCESS_STORE` (+ `RAG_ACCESS_DENY_SELECT` / `RAG_MEMORY_DEFAULT`) | **Decision D16 — self-service dataset selection + per-identity access store (OPT-IN; requires D15 registry keys to be useful).** `RAG_ACCESS_STORE=1` enables the /access page's checkbox model: registry keys SELECT their own datasets — public ones freely, protected ones only with the correct password, which is then saved per identity (`{DATA_PATH}/access/<name>.json`, 0600, shared PVC) so every REST/MCP call works password-free; `list_datasets` shows only a key's EFFECTIVE datasets (grants ∪ selections — access isolation, no name discovery). Effective access = operator ACL ∪ selections (the ACL is a floor). `RAG_ACCESS_DENY_SELECT="ds1,ds2"` datasets refuse self-selection outright; `RAG_MEMORY_DEFAULT` is the deployment-wide fallback memory dataset (resolution order: arg → header → the caller's ★ binding → this → `MEMORY_DATASET`). MCP tools: `select_dataset` / `deselect_dataset` / `set_memory_dataset`. **Default (off): byte-identical D15 behaviour** — ACL'd names only, fail-closed, selection endpoints 409. Env re-read per request. Chart wiring: `security.accessStore` (chart default `true` — the base-chart render always carries the key; set `false` to opt out) / `security.accessDenySelect` / `security.memoryDefault` — the latter two rendered ONLY when set. | chart default: on (`accessStore: true`); raw env default off |
 | `RAG_UNLOCK_MAX_TTL` | Upper bound for explicit unlock TTLs on BOTH surfaces (REST `POST /unlock`, MCP `unlock_dataset(ttl=…)`; default 86400 = the historical 24 h cap). The special value `0` opts the deployment into **no-expiry unlocks** (`ttl=0` lasts until an explicit `POST /lock` on REST / until process restart on MCP) — the /access page's "No expiry (0)" option becomes meaningful only then. Read per request (rotation without restart). Chart wiring: `rag.unlockMaxTtl` (always rendered; the chart default equals the built-in default, so behaviour is unchanged). | `86400` |
+| `RAG_OIDC_ENABLED` (+ `RAG_OIDC_ISSUER` / `RAG_OIDC_AUDIENCE` / `RAG_OIDC_IDENTITY_CLAIM` / `RAG_OIDC_JWKS_URL` / `RAG_OIDC_JWKS_REFRESH_SECONDS` / `RAG_OIDC_OBSERVED_TTL` / `RAG_OIDC_FETCH_TIMEOUT_SECONDS` / `RAG_OIDC_CLOCK_SKEW_SECONDS`) | **Decision D21 — OIDC JWT as a SECOND credential for the same per-user registry identity (opt-in).** With `RAG_OIDC_ENABLED=true`, a verified `Authorization: Bearer <jwt>` (RS256 against the realm JWKS; `iss` / `aud`-as-`azp` / `exp` validated, `RAG_OIDC_CLOCK_SKEW_SECONDS` tolerance) resolves to the SAME identity as that user's minted API key — join key = the `RAG_OIDC_IDENTITY_CLAIM` (default `preferred_username`, fallback `sub`), or an explicit `"oidc": "<alias>"` field on the user's overlay client entry in `{DATA_PATH}/access/clients.json`. No OIDC discovery in v1: the JWKS URL is `RAG_OIDC_JWKS_URL` or `<issuer>/protocol/openid-connect/certs` (the Keycloak/UA-realm location), cached and refreshed every `RAG_OIDC_JWKS_REFRESH_SECONDS`; `RAG_OIDC_FETCH_TIMEOUT_SECONDS` bounds the fetch; observed JWT-only users are remembered for `RAG_OIDC_OBSERVED_TTL` and appear in `GET /api/admin/clients` as `{"source": "observed"}` entries so admins can grant them before they ask. **Issuer is REQUIRED when enabled** (loud startup warning without it). All vars are read per request — flip without restart. Chart wiring: `security.oidc.*` — rendered ONLY when `enabled: true` (default render byte-identical). See the D21 subsection below for the full semantics. | disabled (`RAG_OIDC_ENABLED` unset) |
+| `RAG_SSO_GATE` | **Decision D23 — the identity-gated unified frontend (opt-in).** When `true`, the served HTML pages (`/`, `/manage`, `/access`) require an authenticated identity (an SSO session cookie, a Bearer JWT, or an API key); anonymous visitors get a minimal 401 "Sign in required" page — with a link to `/oauth/login` when browser SSO (D22) is enabled. Health probes, the `/oauth/*` flow itself and media bytes stay exempt. When disabled (default), public-pages behavior is byte-identical to today. Enabling ONLY makes sense when `security.oidc.enabled` (or API keys) are configured — an empty deployment gates to nothing. Read per request: flip the value, no restart. Chart wiring: `security.ssoGate` — rendered ONLY when `true` (default render byte-identical). See the D23 subsection below for the full semantics (dataset ownership, the four-tab shell, `/api/stats`). | disabled — public pages |
 
 Some defaults have deliberately shifted from permissive to strict since v1.9 (`MEDIA_TOKEN_SECRET` now required, private-host ingest blocking on, media path allowlist fail-closed). `helm/`, `helm-scale-large/` and `helm-scale-medium/` ship a `security:` values block wired to these flags. In PCAI you set them in `values.yaml` (the *Helm Values* editor) — the charts ship no key material, so point at a Secret you own (see Quick start step 3) or let the chart auto-generate:
 
@@ -250,3 +252,169 @@ user's dataset grants (`*` = all), rotate, or revoke — against
 registry = `RAG_API_KEY_CLIENTS` env ∪ overlay (env authoritative on conflicts; grants
 union per name), and everything applies on the next request — no restart. Registry keys
 can never reach the panel (the D15 admin-surface gate denies `/api/admin/*` to them).
+
+### OIDC JWT as a second credential (D21 — opt-in)
+
+A verified Keycloak/UA-realm JWT presented as `Authorization: Bearer <jwt>` resolves to
+the **SAME per-user registry identity** as that user's minted API key — the join key is
+the token's `preferred_username` claim (`RAG_OIDC_IDENTITY_CLAIM`, fallback `sub`), or an
+explicit `"oidc": "<alias>"` field on the user's overlay client entry in
+`{DATA_PATH}/access/clients.json`. Verification is RS256 against the realm JWKS with
+`iss` / `aud` (the `azp` claim, default `"ua"` on PCAI G2) / `exp` all validated; no OIDC
+discovery in v1 — the JWKS URL is `RAG_OIDC_JWKS_URL` or
+`<issuer>/protocol/openid-connect/certs`. The semantics, exactly:
+
+- **API keys are unchanged** — sufficient alone, valid indefinitely, rotation stays on
+  the /access mint panel. The JWT is a second door to the same room, not a replacement.
+- **JWT-only sign-in WORKS**: the user gets a valid registry identity with **zero
+  datasets (fail-closed)** and can then self-select public datasets password-free,
+  select password-protected ones with their password (saved per identity — the D16
+  model, chart default `RAG_ACCESS_STORE=1`), and bind their ★ memory dataset.
+- **JWT identities are NEVER admin** — not even when the realm token carries
+  `groups: ["admin"]` (a UA-realm role, not a RAG grant).
+- **Operator ACL grants apply to key and JWT alike** (same name, same grants).
+- **Revoking/rotating a user's key never affects their JWT path, and vice versa** — the
+  two credentials are independent; only the identity they resolve to is shared.
+- **A `"blocked": true` overlay entry kills the JWT path (401)** while the key entry
+  semantics stay as today.
+- **D19 delegation precedence is unchanged**: through the LLM gateway, an explicit
+  `X-API-Key` still outranks a co-forwarded `Authorization: Bearer` — a JWT is honored
+  as the delegated identity only when it arrives via `X-API-Key` in that mode.
+- **Observed JWT-only users appear in `GET /api/admin/clients` as `{"source":
+  "observed"}` entries** so admins can grant them without waiting for them to ask.
+
+Chart wiring: `security.oidc.*` in all three charts — rendered ONLY when
+`oidc.enabled: true` (the default render is byte-identical). `issuer` is REQUIRED when
+enabled (recommend the Keycloak realm URL pattern
+`https://keycloak.<your-domain>/realms/UA`; the app warns loudly without it), `audience`
+is the token's azp claim, and all `RAG_OIDC_*` envs are read per request — no restart to
+flip. Values examples ship a commented-out `oidc` block (g2 and hosted-trial profiles).
+
+**Browser SSO (automatic homepage sign-in).** When the ingress auth proxy forwards the
+OIDC access token upstream (oauth2-proxy `pass_access_token` / `set_authorization_header`
+— platform-side configuration), every browser request arrives with the JWT in the
+`X-Auth-Request-Access-Token` envelope, which the REST and MCP middlewares accept as a
+presented credential (D21: an ENVELOPE, not a trust grant — the JWT inside is fully
+signature-verified, so a forged header gains nothing, and the envelope can never outrank
+an explicit `X-API-Key`). The homepage then signs users in automatically: the served page
+carries a "Signed in as `<identity>`" banner, and — critically — the embedded admin-key
+meta tag is **suppressed for requests that themselves present a resolvable JWT** (the
+page's auth header would otherwise outrank the forwarded JWT and escalate every SSO
+visitor to admin; visitors without a JWT get today's embedded-key page unchanged). The
+browser queries `GET /api/oidc-session` (public whoami: `{authenticated, identity,
+source: "oidc" | "sso-cookie", datasets[]}`, identical anonymous shape on every failure mode — not an
+oracle). If the gateway does not forward access tokens, MCP/REST clients keep the D21
+`Authorization: Bearer` path, and the browser keeps the embedded-key mode — no breakage,
+just no banner.
+
+**Browser SSO, self-contained (D22 — the app is an OIDC client, the Open WebUI pattern).**
+No gateway configuration needed at all: the app itself runs the OIDC authorization-code
+flow. `GET /oauth/login` redirects to the realm's authorization endpoint with a CSRF
+`state` cookie; `GET /oauth/oidc/callback` exchanges the code (form POST to the token
+endpoint), verifies the access token with the SAME D21 machinery (RS256/JWKS,
+iss/aud/exp — no new trust), and plants an **HttpOnly `SameSite=Lax` session cookie**
+carrying the token — page scripts never see it. The cookie is one more presented
+credential envelope (lowest priority: an explicit key always wins), so SSO sessions
+resolve through the identical fail-closed registry machinery — same identity as the
+user's minted key, zero datasets by default, never admin. `GET /oauth/logout` clears it.
+Setup (once per deployment, the `configure_oidc.sh` recipe): run
+`scripts/configure-oidc-rag.sh` — it registers `https://<endpoint>/oauth/oidc/callback`
+in the `ua` client's redirect URIs (idempotent — no duplicates) and prints the ready-to-
+paste `security.oidc.sso` values block (client secret is KEY MATERIAL: put it in a
+Secret, `clientExistingSecret`). Chart wiring: `security.oidc.sso.*` in all three
+charts, rendered ONLY when `sso.enabled: true` (default render byte-identical); the
+provider URL points at the in-cluster Keycloak (plain HTTP — the external issuer stays
+claim-compared only, sidestepping the platform-CA TLS gap). The `/access` page shows a
+"Sign in with SSO" button whenever the flow is served (it probes the whoami first — an
+inert deployment keeps the key-only card). Inert by default: without the flag + secret +
+D21 issuer, every `/oauth/*` route 404s and no cookie is ever accepted.
+
+### The identity-gated unified frontend (D23)
+
+D23 is the capstone that turns the accumulation of D15–D22 into a single coherent
+product: when `RAG_SSO_GATE` is enabled, the three HTML pages fuse into ONE
+identity-gated shell — the homepage (`/`) re-glasses into a four-tab app, `/manage`
+and `/access` redirect into its tabs, and everything you see is scoped to who you
+are. Unauthenticated visitors get a minimal 401 "Sign in required" page (with a
+"Sign in with SSO" link when D22 is configured) instead of the old open pages.
+
+**The tab map** — four tabs render from the public whoami
+(`GET /api/oidc-session` → `{authenticated, identity, is_admin, flags, …}`):
+
+- **Datasets** — the existing homepage workspace (upload, search, ingest),
+  identity-scoped: a user sees only their own datasets plus the globals.
+- **Access** — the `/access` page absorbed: per-identity dataset checkboxes
+  (D15/D16), the unlock/TTL panel, and the ★ memory-dataset binding.
+- **Admin** — the `/manage` operator dashboard absorbed; renders ONLY when the
+  whoami says `is_admin: true`.
+- **Stats** — a read-only dashboard for EVERYONE (see `/api/stats` below): the
+  caller's own dataset/document/storage numbers, model-endpoint health, and job
+  queue state — filtered exactly like the listings, so it leaks nothing.
+
+**Sign-in flow** — the SSO button comes first (it probes the whoami; an inert
+D22 deployment simply never shows it), the API-key paste is the fallback for
+key-only deployments, and the embedded admin key is used ONLY in the
+key-unconfigured legacy mode (the D20 fail-closed posture otherwise binds
+anonymous visitors to a memory-dataset-only identity). One sign-in serves all
+four tabs; credentials never cross tabs.
+
+**The 8 ratified semantics** (decision D23, 2026-10 — the contract the backend,
+frontend, charts and docs all implement):
+
+1. **The gate comes first — SSO + admin keys.** `RAG_SSO_GATE=true` demands an
+   authenticated identity for `/`, `/manage`, `/access`; the accepted credentials
+   are the D22 session cookie, a verified D21 Bearer JWT, and an API key.
+2. **Admin mints named keys** — the D17 User keys panel (mint per-user keys with
+   dataset grants, rotate, revoke) stays THE onboarding path; the admin panel
+   lands in the Admin tab, unchanged in behavior.
+3. **Users see only their datasets, including globals** — listings stay
+   identity-filtered (D15/D16: grants ∪ self-selections), and datasets a creator
+   published global appear in everyone's world without an admin action.
+4. **A per-user homepage with memory ★ + TTL unlocks** — each signed-in user gets
+   their own workspace; the ★ memory binding and per-identity unlock TTLs (D16)
+   work unchanged inside the shell.
+5. **Admin full power** — the admin identity sees ALL datasets, manages users
+   (mint/grant/rotate/revoke), and can delete anything.
+6. **Creator-owned delete** — a dataset stamps `created_by` at create time
+   (identity name; admin-key creators stamp `admin`); DELETE is owner-or-admin.
+   Datasets created before D23 have no owner recorded — admins delete them; no
+   ownership is backfilled.
+7. **Creator publish-global** — the creator of a dataset may toggle it public
+   (visible to every identity, per the availability semantics); non-creators are
+   denied. Pre-D23 datasets (no `created_by`) can only be made global by an admin.
+8. **The Stats tab is read-only for everyone** — `GET /api/stats` never mutates;
+   a user sees their own footprint, an admin sees the deployment's.
+
+**The stats endpoint** — `GET /api/stats` is a read-only, identity-filtered
+summary: `{"datasets": {"total", "visible_to_you", "documents",
+"storage_bytes"}, "models": [...], "jobs": {"active_uploads",
+"recent_failures"}, "generated_at"}`. A user's numbers cover exactly their
+visible world (own + global); an admin's cover the deployment. Listing rows gain
+`created_by` and `owned_by_me` so the UI (and scripts) can render ownership
+without guessing, and the whoami's `flags` object carries
+`can_create_datasets` / `sso_enabled` / `memory_dataset` (the caller's ★ binding
+or null) so the shell renders itself without a second probe.
+
+Chart wiring: `security.ssoGate` in all three charts (see the `RAG_SSO_GATE` row
+above) — rendered ONLY when `true`, default render byte-identical; values
+examples ship a commented `ssoGate: true` line in both profiles.
+
+## Enabling the network zone
+
+The chart ships an optional ingress NetworkPolicy (`networkPolicy.enabled`,
+default **false** — the default render is byte-identical to the baseline).
+When on, only the allowlisted callers reach the service: the authorized client
+namespaces (plus same-namespace pods, the node IPs in `probeCidrs` for kubelet
+probes, and the edge-gateway pods — the browser path stays open by default via
+`allowEzafGatewayIngress: true`, so the VirtualService keeps working).
+Six steps: (1) `kubectl get ns` to find your callers' namespaces; (2) append
+any extra caller namespaces to `networkPolicy.authorizedClients.namespaces`
+(keep `monitoring` — Prometheus scrapes `/metrics` on the same port, and an
+unlisted scrape namespace dies **silently**); (3) put your cluster's pod CIDR
+into `networkPolicy.probeExceptCidrs` (or real node IPs in `probeCidrs`);
+(4) leave `ezua.virtualService.enabled: true` — the browser path is a feature
+here, not a break-glass; (5) apply via the PCAI values editor (`helm upgrade`
+for operators); (6) verify — an allowed namespace gets HTTP 200 from
+`service:port/mcp`, any other namespace times out (browsers keep working via
+the gateway). See `values-examples/values-hardened-g2.yaml` for the full
+hardened profile.
