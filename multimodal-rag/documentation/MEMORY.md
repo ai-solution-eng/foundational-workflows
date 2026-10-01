@@ -17,7 +17,7 @@ stores memories via a separate distillation LLM. Raw transcripts are never store
 | **Write trigger** | Auto: `session-memory-logger` plugin writes a structured session history ~45s after the conversation goes quiet (flushed on exit) **and** the model calls `add_memory` for distilled notes | `outlet()` filter asks a distillation LLM after each reply |
 | **Recall trigger** | Model calls `search_memory` MCP tool (proactive, per `AGENTS.md`) | `inlet()` filter auto-searches at conversation start |
 | **Transport** | MCP (streamable-http, stateless) | REST API (direct HTTP from filter) |
-| **Dataset/password** | `{env:}` headers in `opencode.jsonc` | HMAC-derived from SSO `__user__` (or shared valve) |
+| **Dataset/password** | resolved server-side from the identity's ★ binding + saved selection (D16); legacy `{env:}` headers still supported | HMAC-derived from SSO `__user__` (or shared valve) |
 | **Provenance** | `source: "opencode:memory"` | `source: "openwebui:memory"` |
 
 Both paths land in the same Qdrant collection via `DatasetManager.add_documents`. Near-duplicates are auto-skipped at cosine ≥ `RAG_DEDUP_THRESHOLD` (default `0.995`).
@@ -30,22 +30,24 @@ Both paths land in the same Qdrant collection via `DatasetManager.add_documents`
 Create one password-protected dataset via the RAG HTML frontend (e.g. `andrew-memory`).
 
 > **The key-only path (D16 access store, chart default `security.accessStore: true`):** with
-> per-user registry keys (D15/D17) you can skip the env vars entirely — open the `/access`
-> page, paste YOUR API key, select your memory dataset once (entering its password once —
+> per-user identity auth (D21 JWT or D15/D17 registry keys) open the `/access`
+> page signed in as YOUR identity, select your memory dataset once (entering its password once —
 > it is saved server-side per identity), and ★ it. `add_memory` / `search_memory` then
-> resolve dataset + password from the ★ binding on every call. Resolution order: explicit
-> arg → request header → the caller's ★ binding → `RAG_MEMORY_DEFAULT` → `MEMORY_DATASET`.
+> resolve dataset + password from the ★ binding on every call — no env vars needed.
+> Resolution order: explicit arg → request header → the caller's ★ binding → `RAG_MEMORY_DEFAULT` → `MEMORY_DATASET`.
 
 ### Config
-Use the two-connection pattern in [`opencode.jsonc`](opencode.jsonc) — `rag-memory` (sends memory headers, exposes only `add_memory` / `search_memory`) and `rag-knowledge` (general dataset tools). See [MCP.md](MCP.md) § 3.2 for the full config.
+
+Use the single-connection config in [`opencode.jsonc`](opencode.jsonc) — one `rag` connection, bearer-authenticated (D21 JWT or a minted per-user key), all tools exposed, no secrets in headers. The memory dataset + password resolve server-side from the caller's ★ binding + saved selection. The legacy two-connection pattern (`rag-memory` with env headers / `rag-knowledge`) remains valid for key-unconfigured single-user deployments — see [MCP.md](MCP.md) § 3.2.
 
 ### Env vars (export before launching opencode)
 
 | Var | Required | Purpose |
 |---|---|---|
-| `RAG_MEMORY_DATASET` | yes | Your memory dataset name (e.g. `andrew-memory`) |
-| `RAG_MEMORY_PASSWORD` | yes | That dataset's password |
-| `RAG_INGRESS_TOKEN` | only via ingress | Platform bearer token — only if reaching the server through the oauth2-proxy ingress. Drop for a local `kubectl port-forward` (`http://localhost:8001/mcp`). |
+| `MM_RAG_BEARER_TOKEN` | yes (keyed/OIDC deployments) | The caller's credential — a Keycloak UA access token (D21) or minted registry key. Rotate per session; never bake the value in. Also read by the session-memory-logger plugin (`RAG_MEMORY_BEARER_TOKEN` overrides for the plugin alone). |
+| `RAG_MEMORY_DATASET` | optional | Pins the memory dataset via the `X-Memory-Dataset` header (overrides the ★ binding). Unset = resolve from the /access ★ binding → `RAG_MEMORY_DEFAULT` → `MEMORY_DATASET`. |
+| `RAG_MEMORY_PASSWORD` | optional | Only needed with `RAG_MEMORY_DATASET` on deployments where the identity has no saved selection. Prefer the ★ binding — no secret in env. |
+| `RAG_INGRESS_TOKEN` | only via an auth-proxy ingress | Platform bearer token — only if an oauth2-proxy-style ingress sits in front (G2's plain Istio VirtualService does not check it). |
 
 ### Agent behavior
 [`AGENTS.md`](AGENTS.md) tells the model:
@@ -81,8 +83,11 @@ Notes:
 
 ### Verify
 ```bash
-opencode mcp list     # both rag-memory and rag-knowledge should connect
+opencode mcp list     # the rag connection should connect
 ```
+
+Notes for the unified config:
+- The **session-memory-logger plugin** sends `Authorization: Bearer` from `MM_RAG_BEARER_TOKEN` (or `RAG_MEMORY_BEARER_TOKEN`) on its direct HTTP writes — export the same token opencode uses, or its writes 401 against any keyed/OIDC deployment (D20 fail-closed). The legacy `X-Memory-Dataset` / `X-Dataset-Password` env headers still ride along and remain the credential path for key-unconfigured deployments.
 
 ---
 

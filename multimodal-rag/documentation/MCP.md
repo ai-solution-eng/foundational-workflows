@@ -128,53 +128,34 @@ If the calling LLM doesn't support a modality (set via `base_llm_modalities`), r
 
 All 19 tools are exposed on every connection. The client (or its `tools` config) can disable specific tools it doesn't want the model to see.
 
-### 3.2 opencode (two-connection pattern for memory isolation)
+### 3.2 opencode (unified single connection, 2026-10)
 
-opencode connects **twice** to the same URL, splitting memory tools from knowledge tools so the memory password only rides requests to the memory connection:
+The historical two-connection pattern existed to keep the memory **password** out of knowledge-connection headers. Under D16/D21 that secret no longer rides any header — the per-identity **★ memory binding + saved selection** (from the /access page) resolves dataset and password server-side — so opencode connects **once** with one bearer:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "instructions": ["documentation/AGENTS.md"],
   "mcp": {
-    "rag-memory": {
+    "rag": {
       "type": "remote",
       "url": "https://rag-mcp-server.<YOUR-DOMAIN>/mcp",
       "headers": {
-        "Authorization": "Bearer {env:RAG_INGRESS_TOKEN}",
-        "X-Memory-Dataset": "{env:RAG_MEMORY_DATASET}",
-        "X-Dataset-Password": "{env:RAG_MEMORY_PASSWORD}"
-      }
-    },
-    "rag-knowledge": {
-      "type": "remote",
-      "url": "https://rag-mcp-server.<YOUR-DOMAIN>/mcp",
-      "headers": {
-        "Authorization": "Bearer {env:RAG_INGRESS_TOKEN}"
+        // Keycloak OIDC access token (D21) → the SAME per-user identity as
+        // your browser SSO; or a minted per-user registry key (D15/D17).
+        // Rotate per session — tokens have bounded validity on G2.
+        "Authorization": "Bearer {env:MM_RAG_BEARER_TOKEN}"
       }
     }
-  },
-  "tools": {
-    "rag-memory_search_dataset": false,
-    "rag-memory_search_datasets": false,
-    "rag-memory_list_datasets": false,
-    "rag-memory_get_dataset_files": false,
-    "rag-memory_get_dataset_info": false,
-    "rag-memory_unlock_dataset": false,
-    "rag-memory_dataset_add_documents": false,
-    "rag-memory_dataset_delete_documents": false,
-    "rag-memory_dataset_replace_document": false,
-    "rag-memory_describe_media": false,
-    "rag-memory_transcribe_audio": false,
-    "rag-knowledge_add_memory": false,
-    "rag-knowledge_search_memory": false
   }
 }
 ```
 
-The full template is at [`opencode.jsonc`](opencode.jsonc). The agent policy (when to recall / write) is in [`AGENTS.md`](AGENTS.md). See [MEMORY.md](MEMORY.md) § 3 for the complete opencode setup guide.
+The full template is at [`opencode.jsonc`](opencode.jsonc). The agent policy (when to recall / write) is in [`AGENTS.md`](AGENTS.md). See [MEMORY.md](MEMORY.md) § 2 for the one-time /access selection that replaces the env headers.
 
-> **Verify after connecting:** run `opencode mcp list` — both `rag-memory` and `rag-knowledge` should appear. Confirm the prefixed tool names match the `tools` globs above.
+> **Legacy (key-unconfigured single-user) deployments** — or if you prefer explicit headers — the two-connection pattern still works byte-for-byte: `rag-memory` with `X-Memory-Dataset: {env:RAG_MEMORY_DATASET}` + `X-Dataset-Password: {env:RAG_MEMORY_PASSWORD}` headers, `rag-knowledge` with the bearer only, and the `tools:` disable-list splitting the namespaces (memory tools off on rag-knowledge, dataset tools off on rag-memory). Keep `Authorization` OUT of rag-memory's env headers in that mode only if the deployment has no keys configured; with keys/OIDC configured the memory connection ALSO needs the bearer (an unauthenticated write 401s — D20 fail-closed).
+>
+> **Verify after connecting:** run `opencode mcp list` — the connection should appear and tool calls should resolve. A 401 means the bearer is stale/absent; an "No memory dataset specified" ToolError means the identity has no ★ binding and no header supplied.
 
 ### 3.3 Open WebUI
 
