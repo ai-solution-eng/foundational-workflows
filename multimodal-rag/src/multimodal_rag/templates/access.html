@@ -361,6 +361,18 @@
 
 <!-- Access view: the datasets this key can see -->
 <div id="access-view" style="display:none">
+  <!-- D25 SSO self-mint — shown/hidden entirely by probeSelfMint(); visible
+       only for non-admin SSO sessions whose whoami flags carry self_mint.
+       It always reflects the SSO identity's own key, never the pasted one. -->
+  <div class="card" id="selfmint-card" style="display:none">
+    <div class="card-header">
+      <h2 style="margin-bottom:0">Your API key</h2>
+    </div>
+    <p class="muted" id="selfmint-explainer" style="margin-bottom:12px;font-size:.85rem">
+      Mint a long-lived API key for your identity — use it in MCP clients (opencode, Open WebUI) or any REST caller. It carries exactly your access (grants + selections) and never expires.
+    </p>
+    <div id="selfmint-body"></div>
+  </div>
   <div class="card">
     <div class="card-header">
       <h2 style="margin-bottom:0">Your datasets</h2>
@@ -831,6 +843,141 @@ function signOut() {
   window.location.reload();   // back at /access with no key → login state
 }
 
+// =======================================================================
+// D25 SSO self-mint — the SSO identity's own long-lived API key, offered
+// on this page too.
+//
+// This page's governing credential is ALWAYS the pasted key (sent as
+// X-RAG-Api-Key), so the card is gated on a separate header-less whoami
+// probe: GET /api/oidc-session with NO key header returns authenticated
+// only when an SSO session (cookie / forwarded JWT envelope) exists. The
+// card shows when that SSO session carries flags.self_mint AND the user
+// is not an admin (probeAdmin governs — they have the admin panel). The
+// edge case "SSO cookie present AND pasted key governing" is accepted:
+// minting only ever touches the SSO identity's own key, never the pasted
+// one. A pasted-key-only browser (no SSO) never sees the card; the flag's
+// absence keeps pre-D25 deployments unchanged.
+//
+// D25 REST pair (SSO identity required; API-key callers get 403, knob off
+// 409 — the card hides silently on 409/403/404 rather than sticking):
+//   GET  /api/access/key      → {enabled, source, identity, has_key,
+//                                key_masked, datasets, created, oidc, blocked}
+//   POST /api/access/mint-key → {status, name, key (FULL, shown once),
+//                                rotated, created, message} — body
+//                                {"rotate": true} replaces an existing key.
+// =======================================================================
+
+let selfmintState = null;   // GET /api/access/key result, cached per identity
+
+function hideSelfMintCard() {
+  const card = document.getElementById('selfmint-card');
+  if (card) card.style.display = 'none';
+}
+
+async function fetchSelfMintState() {
+  if (selfmintState !== null) return selfmintState;
+  try {
+    selfmintState = await api('GET', '/api/access/key') || {};
+  } catch (e) {
+    if (e.status === 401) { handleAuthRejected(); selfmintState = { _off: true }; }
+    else selfmintState = { _off: true };       // 409/403/404/network → hidden
+  }
+  return selfmintState;
+}
+
+async function probeSelfMint() {
+  const card = document.getElementById('selfmint-card');
+  if (!card) return;
+  if (isAdmin) { hideSelfMintCard(); return; }
+  // SSO session present? The header-less whoami is the only signal this
+  // page has (its own api() always rides the pasted key).
+  let ssoOn = false;
+  try {
+    const r = await fetch('/api/oidc-session', { credentials: 'same-origin' });
+    if (r.ok) {
+      const s = await r.json();
+      ssoOn = !!(s && s.authenticated && s.flags && s.flags.self_mint === true);
+    }
+  } catch (e) { /* whoami unreachable — keep the card hidden */ }
+  if (!ssoOn) { hideSelfMintCard(); return; }
+  const st = await fetchSelfMintState();
+  if (st._off) { hideSelfMintCard(); return; }
+  card.style.display = 'block';
+  const body = document.getElementById('selfmint-body');
+  if (!body) return;
+  if (st.has_key) {
+    const created = st.created ? new Date(st.created).toLocaleDateString() : '';
+    body.innerHTML =
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">' +
+      '<span class="client-meta" style="font-family:\'SF Mono\',\'Fira Code\',monospace">' + escHtml(st.key_masked || '') + '</span>' +
+      (st.oidc ? ' <span class="src-tag" style="color:var(--accent);border-color:var(--accent)">oidc:' + escHtml(st.oidc) + '</span>' : '') +
+      (st.blocked ? ' <span class="src-tag" style="color:var(--red);border-color:var(--red)">blocked</span>' : '') +
+      (created ? ' <span class="muted">created ' + escHtml(created) + '</span>' : '') +
+      '</div>' +
+      '<div class="muted" style="margin-bottom:10px">Carries ' + (Array.isArray(st.datasets) ? st.datasets.length : 0) +
+      ' granted dataset(s) — minting again would not change the grants.</div>' +
+      '<button class="btn btn-outline btn-sm" onclick="selfmintRotate()">Rotate…</button>' +
+      '<div class="muted" style="margin-top:8px;font-size:.78rem">Rotation replaces this key — the previous one stops authenticating immediately.</div>';
+  } else {
+    body.innerHTML =
+      '<button class="btn btn-primary btn-sm" onclick="selfmintMint(false)">Mint my key</button>';
+  }
+}
+
+// POST /api/access/mint-key and swap the button row for the copy-once
+// reveal — the same .key-reveal presentation the admin mint uses.
+async function selfmintMint(rotate) {
+  try {
+    const res = await api('POST', '/api/access/mint-key', rotate ? { rotate: true } : {});
+    selfmintState = null;                       // has_key/masked/created changed
+    const body = document.getElementById('selfmint-body');
+    if (body) {
+      body.innerHTML =
+        '<div class="muted" style="margin-bottom:4px">' + escHtml(res.message || (rotate ? 'Key rotated.' : 'Key minted.')) +
+        ' Shown only once — copy it now:</div>' +
+        '<div class="key-reveal" id="selfmint-key">' + escHtml(res.key || '') + '</div>' +
+        '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">' +
+        '<button class="btn btn-outline btn-sm" onclick="copySelfMintKey()">Copy key</button>' +
+        '<button class="btn btn-outline btn-sm" onclick="selfmintUseHere()">Use in this browser</button>' +
+        '<button class="btn btn-outline btn-sm" onclick="selfmintDone()">Done — I saved it</button>' +
+        '</div>';
+    }
+    toast(res.message || (rotate ? 'Key rotated' : 'Key minted'));
+  } catch (e) {
+    if (e.status === 409 || e.status === 403 || e.status === 404) {
+      hideSelfMintCard();                       // not offered to this session
+      return;
+    }
+    if (e.status === 401) { handleAuthRejected(); return; }
+    toast(e.message || 'Mint failed', 'error');
+  }
+}
+
+function copySelfMintKey() {
+  const key = document.getElementById('selfmint-key');
+  if (!key) return;
+  navigator.clipboard.writeText(key.textContent)
+    .then(() => toast('Key copied to clipboard'))
+    .catch(() => toast('Copy failed — select the key manually', 'error'));
+}
+
+function selfmintUseHere() {
+  const key = document.getElementById('selfmint-key');
+  if (!key) return;
+  storeKey(key.textContent, false);   // this page's key model: reload governs
+  location.reload();
+}
+
+async function selfmintDone() {
+  selfmintState = null;             // has_key/masked/created may have changed
+  await probeSelfMint();            // collapses back to the has-key view
+}
+
+async function selfmintRotate() {
+  if (!confirm('Replace your API key? The previous key stops authenticating immediately.')) return;
+  await selfmintMint(true);
+}
+
 // -----------------------------------------------------------------------
 // Unlock / Lock
 // -----------------------------------------------------------------------
@@ -1110,6 +1257,7 @@ async function probeAdmin() {
     clients = [];
   }
   showView('access');
+  probeSelfMint();   // D25: non-admin SSO sessions get the self-mint card
 }
 
 function renderClients() {
@@ -1282,6 +1430,7 @@ async function revokeClient(btn) {
   showBoot();
   loadDatasets()
     .then(() => probeAdmin())
+    .then(() => probeSelfMint())   // D25: refresh the card with fresh state
     .catch((e) => {
       if (e.status === 401 || e.status === 403) {
         handleAuthRejected();

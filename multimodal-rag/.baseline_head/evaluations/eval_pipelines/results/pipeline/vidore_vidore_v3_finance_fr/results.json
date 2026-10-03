@@ -1,0 +1,58 @@
+{
+  "dataset": "vidore/vidore_v3_finance_fr",
+  "timestamp": "2026-06-29T17:31:26.131347",
+  "num_pdfs": 5,
+  "num_chunks": 2394,
+  "num_queries": 1920,
+  "num_qrels": 9204,
+  "metrics": {
+    "text_only": {
+      "ndcg_at_1": 0.0,
+      "recall_at_1": 0.0,
+      "map_at_1": 0.0,
+      "ndcg_at_3": 0.0,
+      "recall_at_3": 0.0,
+      "map_at_3": 0.0,
+      "ndcg_at_5": 0.1106268648502718,
+      "recall_at_5": 0.11554863716832672,
+      "map_at_5": 0.06346811118257197,
+      "ndcg_at_10": 0.13437641114540141,
+      "recall_at_10": 0.18877633847359404,
+      "map_at_10": 0.0775062729884623,
+      "ndcg_at_20": 0.16207825429412068,
+      "recall_at_20": 0.2717383102912644,
+      "map_at_20": 0.08701990951440676
+    },
+    "multimodal": {
+      "ndcg_at_1": 0.0,
+      "recall_at_1": 0.0,
+      "map_at_1": 0.0,
+      "ndcg_at_3": 0.0,
+      "recall_at_3": 0.0,
+      "map_at_3": 0.0,
+      "ndcg_at_5": 0.1115085247795135,
+      "recall_at_5": 0.11591506600697776,
+      "map_at_5": 0.06343828220453698,
+      "ndcg_at_10": 0.1266798690427341,
+      "recall_at_10": 0.16685278527706288,
+      "map_at_10": 0.07391317563089222,
+      "ndcg_at_20": 0.1557755168809241,
+      "recall_at_20": 0.2584235235287652,
+      "map_at_20": 0.0834294614628182
+    }
+  },
+  "info": {
+    "corpus_embed_text": {
+      "corpus_embed_time_s": 170.63,
+      "num_corpus": 2394
+    },
+    "query_embed": {
+      "query_embed_time_s": 73.86,
+      "num_query": 1920
+    },
+    "corpus_embed_multimodal": {
+      "corpus_embed_time_s": 498.59,
+      "num_corpus": 2394
+    }
+  }
+}

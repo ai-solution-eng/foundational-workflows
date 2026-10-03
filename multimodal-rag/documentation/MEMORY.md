@@ -34,7 +34,7 @@ Create one password-protected dataset via the RAG HTML frontend (e.g. `andrew-me
 > page signed in as YOUR identity, select your memory dataset once (entering its password once —
 > it is saved server-side per identity), and ★ it. `add_memory` / `search_memory` then
 > resolve dataset + password from the ★ binding on every call — no env vars needed.
-> Resolution order: explicit arg → request header → the caller's ★ binding → `RAG_MEMORY_DEFAULT` → `MEMORY_DATASET`.
+> Resolution order (audit 2026-10-02 hardening): request header → the caller's ★ binding → `RAG_MEMORY_DEFAULT` → `MEMORY_DATASET`. An explicit `dataset_name` ARGUMENT is honoured only when it AGREES with that resolution (or when no binding exists — the headerless single-user path); a disagreeing argument is refused, so a prompt-injected `dataset_name` can never redirect memory writes to another identity's store.
 
 ### Config
 

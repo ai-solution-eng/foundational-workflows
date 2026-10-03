@@ -6,14 +6,33 @@ metadata:
   labels:
     app: {{ .Values.deployment.appName }}
 spec:
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- else }}
+  # autoscaling.enabled: the HPA (templates/hpa.yaml) owns the replica count.
+  # spec.replicas is deliberately omitted so `helm upgrade` never overwrites
+  # the autoscaler's current replica count (reapplying `replicas` would reset
+  # it and fight the HPA on every deploy).
+  {{- end }}
   selector:
     matchLabels:
       app: {{ .Values.deployment.appName }}
   template:
     metadata:
+      # EzUA app-catalog labels on the POD TEMPLATE: the catalog derives a
+      # card's status from labeled pods — an app whose pods carry no
+      # hpe-ezua labels shows "Unknown" in the catalog (this chart was the
+      # only unlabeled-pod app on G2 and the only Unknown card, 2026-10).
+      # Long-running controllers only: cron-job pods stay UNLABELED — the
+      # platform's assign-custom-scheduler-for-ezua-user-vendor-pods policy
+      # stamps schedulerName on labeled pods at EVERY admission, and pod
+      # updates (Job finalizer removal) then reject the immutable-field
+      # change — the G2 2026-09-24 undeletable-cron-pod incident (see
+      # tests/full_pipeline/test_kyverno_vendor_labels_render.py).
       labels:
         app: {{ .Values.deployment.appName }}
+        hpe-ezua/type: vendor-service
+        hpe-ezua/app: {{ .Chart.Name }}
     spec:
       securityContext:
         runAsUser: 1000
@@ -186,6 +205,21 @@ spec:
             # (enable ONLY with oidc.enabled or API keys configured).
             - name: RAG_SSO_GATE
               value: "true"
+            {{- end }}
+            {{- if or .Values.mcp.apiKeyClients .Values.mcp.datasetAcls }}
+            # D15 (opt-in) multi-user API keys + dataset ACLs — rendered ONLY
+            # when set (default render byte-identical). The registry serves
+            # BOTH containers (REST + MCP must resolve the same identities).
+            # Values are key material: provide them from a Secret pipeline
+            # (--set-string), never commit real keys to values files.
+            {{- if .Values.mcp.apiKeyClients }}
+            - name: RAG_API_KEY_CLIENTS
+              value: {{ .Values.mcp.apiKeyClients | quote }}
+            {{- end }}
+            {{- if .Values.mcp.datasetAcls }}
+            - name: RAG_DATASET_ACLS
+              value: {{ .Values.mcp.datasetAcls | quote }}
+            {{- end }}
             {{- end }}
             {{- range $key, $val := .Values.extraEnv }}
             - name: {{ $key }}
@@ -382,6 +416,21 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.mcp.apiKey.existingSecret }}
                   key: {{ .Values.mcp.apiKey.existingSecretKey }}
+            {{- end }}
+            {{- if or .Values.mcp.apiKeyClients .Values.mcp.datasetAcls }}
+            # D15 (opt-in) multi-user API keys + dataset ACLs — rendered ONLY
+            # when set (default render byte-identical). The registry serves
+            # BOTH containers (REST + MCP must resolve the same identities).
+            # Values are key material: provide them from a Secret pipeline
+            # (--set-string), never commit real keys to values files.
+            {{- if .Values.mcp.apiKeyClients }}
+            - name: RAG_API_KEY_CLIENTS
+              value: {{ .Values.mcp.apiKeyClients | quote }}
+            {{- end }}
+            {{- if .Values.mcp.datasetAcls }}
+            - name: RAG_DATASET_ACLS
+              value: {{ .Values.mcp.datasetAcls | quote }}
+            {{- end }}
             {{- end }}
             {{- range $key, $val := .Values.extraEnv }}
             - name: {{ $key }}

@@ -405,29 +405,38 @@ def _bounded_cache_put(cache: dict, key: Any, value: Any, max_entries: int) -> N
 
 _MCP_PW_FAIL_WINDOW = float(os.environ.get("PW_FAIL_WINDOW", "300.0"))
 _MCP_PW_MAX_FAILURES = max(1, int(os.environ.get("PW_MAX_FAILURES", "10")))
-_mcp_pw_fail_buckets: dict[str, list[float]] = {}
+# Bucket key = (caller id, DATASET) — cross-validation finding 8, 2026-10-02:
+# a per-caller-only bucket lets a correct password on dataset B refund the
+# failures recorded against dataset A (the success-reset was global per cid),
+# handing back brute-force budget.  Per-(caller, dataset) buckets give each
+# dataset its own failure discipline; the 10k eviction bound is unchanged.
+_mcp_pw_fail_buckets: dict[tuple[str, str], list[float]] = {}
 _mcp_pw_fail_lock = threading.Lock()
 
 
-def _mcp_pw_failure_count(cid: str) -> int:
+def _mcp_pw_key(cid: str, dataset_name: str) -> tuple[str, str]:
+    return (cid, str(dataset_name))
+
+
+def _mcp_pw_failure_count(cid: str, dataset_name: str) -> int:
     now = time.monotonic()
     with _mcp_pw_fail_lock:
-        lst = _mcp_pw_fail_buckets.get(cid)
+        lst = _mcp_pw_fail_buckets.get(_mcp_pw_key(cid, dataset_name))
         if not lst:
             return 0
         lst[:] = [t for t in lst if now - t < _MCP_PW_FAIL_WINDOW]
         return len(lst)
 
 
-def _mcp_pw_check_throttle(cid: str) -> None:
-    if _mcp_pw_failure_count(cid) >= _MCP_PW_MAX_FAILURES:
+def _mcp_pw_check_throttle(cid: str, dataset_name: str) -> None:
+    if _mcp_pw_failure_count(cid, dataset_name) >= _MCP_PW_MAX_FAILURES:
         raise ToolError("Too many password attempts — try again later.")
 
 
-def _mcp_pw_record_failure(cid: str) -> None:
+def _mcp_pw_record_failure(cid: str, dataset_name: str) -> None:
     now = time.monotonic()
     with _mcp_pw_fail_lock:
-        lst = _mcp_pw_fail_buckets.setdefault(cid, [])
+        lst = _mcp_pw_fail_buckets.setdefault(_mcp_pw_key(cid, dataset_name), [])
         lst[:] = [t for t in lst if now - t < _MCP_PW_FAIL_WINDOW]
         lst.append(now)
         if len(_mcp_pw_fail_buckets) > 10_000:
@@ -435,9 +444,44 @@ def _mcp_pw_record_failure(cid: str) -> None:
                 _mcp_pw_fail_buckets.pop(k, None)
 
 
-def _mcp_pw_reset_failures(cid: str) -> None:
+def _mcp_pw_reset_failures(cid: str, dataset_name: str) -> None:
     with _mcp_pw_fail_lock:
-        _mcp_pw_fail_buckets.pop(cid, None)
+        _mcp_pw_fail_buckets.pop(_mcp_pw_key(cid, dataset_name), None)
+
+
+def _verify_password_throttled(
+    cid: str,
+    dm: "DatasetManager",
+    dataset_name: str,
+    password: str,
+) -> bool:
+    """Verify *password* under the caller's brute-force throttle (audit P1-7).
+
+    The single verification funnel for every tool that accepts a ``password``
+    argument and reaches the verifier through ``_check_unlocked_or_password``
+    — ``search_dataset``, ``get_dataset_files``, ``get_dataset_info``,
+    ``dataset_add_documents``, ``dataset_delete_documents`` and
+    ``dataset_replace_document``.  Before this funnel only ``unlock_dataset``
+    / ``select_dataset`` were throttled, so a caller could brute-force a
+    dataset password through any of those six tools: each attempt cost a
+    PBKDF2-600k verification (~0.2–0.5 s) and pinned one of the MCP pool's 64
+    threads.
+
+    Order: the bucket is checked BEFORE verification (an exhausted caller
+    gets the throttle refusal without paying for — or being able to time — a
+    verification), a wrong password records a failure, a correct one RESETS
+    the bucket (mirroring ``unlock_dataset``: a caller who eventually
+    supplies the right password is not left throttled).
+
+    Returns True/False; the caller owns the error text.  The caller must have
+    already established that *password* is truthy.
+    """
+    _mcp_pw_check_throttle(cid, dataset_name)
+    if dm.verify_password(dataset_name, password):
+        _mcp_pw_reset_failures(cid, dataset_name)
+        return True
+    _mcp_pw_record_failure(cid, dataset_name)
+    return False
 
 
 def _is_unlocked(dataset_name: str) -> str | None:
@@ -492,9 +536,14 @@ def _check_unlocked_or_password(
       1. If *password* is provided and correct, cache it and return it.
       2. If the dataset is in the unlock cache, return the cached password.
       3. Raise ToolError.
+
+    The provided-password branch runs through ``_verify_password_throttled``
+    (audit P1-7): a wrong password is counted in the caller's throttle bucket
+    and an exhausted bucket refuses before verification — this is the funnel
+    every password-accepting tool shares with ``unlock_dataset``.
     """
     if password:
-        if dm.verify_password(dataset_name, password):
+        if _verify_password_throttled(_unlock_client_id(), dm, dataset_name, password):
             _cache_unlock(dataset_name, password)
             return password
         raise ToolError(f"Incorrect password for dataset '{dataset_name}'.")
@@ -502,11 +551,12 @@ def _check_unlocked_or_password(
     if cached is not None:
         return cached
     if dm.has_password(dataset_name):
-        raise ToolError(
-            f"Dataset '{dataset_name}' is password protected. "
-            "Provide the correct 'password' parameter or use the "
-            "'unlock_dataset' tool to unlock it for your session."
-        )
+        # P2 password-oracle fix: the omitted-password case must be
+        # INDISTINGUISHABLE from the wrong-password case above — the old
+        # wording ("is password protected. Provide the correct 'password'
+        # parameter or use the 'unlock_dataset' tool…") told a caller which
+        # datasets are protected, i.e. it was an oracle over an unknown name.
+        raise ToolError(f"Incorrect password for dataset '{dataset_name}'.")
     return None
 
 
@@ -737,10 +787,24 @@ def _identity_dataset_allowed(dataset_name: str) -> bool:
     return _access.dataset_allowed(_current_key_identity(), dataset_name)
 
 
+_DATASET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")  # mirrors DatasetManager._validate_name
+
+
 def _require_dataset_acl(dataset_name: str) -> None:
     """Raise ToolError when the caller's key identity may not touch
     *dataset_name* (D15 + D16).  Denies without confirming existence, so the
-    error is not a dataset-existence oracle."""
+    error is not a dataset-existence oracle.
+
+    Also the common gate for every dataset tool, so it validates the NAME
+    first (P2): ``DatasetManager._dataset_dir`` joins the name onto the
+    datasets root with no check of its own, and the ACL gate (or the
+    no-identity passthrough) used to let ``"../<other>"`` reach it before any
+    existence check.  The rule mirrors ``DatasetManager._validate_name``
+    (start alphanumeric; then ``[A-Za-z0-9._-]`` only) without importing it,
+    and the refusal is generic — it never echoes the name, so it cannot be
+    used to probe what exists."""
+    if not _DATASET_NAME_RE.match(dataset_name or ""):
+        raise ToolError("Invalid dataset name.")
     ident = _current_key_identity()
     if ident is None:
         return
@@ -820,19 +884,69 @@ class _RagClientAuthMiddleware(ApiKeyAuthMiddleware):
             _clients.reset_current_identity(token)
 
 
+def _protected_streamable_path(path: str) -> bool:
+    """Protected-path predicate for the ``streamable-http`` transport.
+
+    That transport's only endpoint is the ``/mcp`` route (plus any
+    ``/mcp/...`` sub-path a client presents), so the historical predicate is
+    exactly right there.
+    """
+    return path.startswith("/mcp")
+
+
+def _protected_sse_path(path: str) -> bool:
+    """Protected-path predicate for the ``sse`` transport (audit P1-10).
+
+    The SSE transport serves ``/sse`` (the event stream) and the
+    ``/messages/`` MOUNT (where clients POST their protocol messages).  The
+    old shared predicate — ``p.startswith("/mcp")`` — matched NEITHER, so an
+    anonymous caller could open the SSE stream and POST messages through it
+    even with API keys configured.  Both route families are protected here.
+
+    ``/healthz`` and ``/readyz`` stay outside this set: they are added to the
+    transport app BEFORE the auth middleware wraps it and are matched before
+    route dispatch, so the probes remain reachable behind an enforcing gate.
+    """
+    return path == "/sse" or path.startswith(("/mcp", "/messages"))
+
+
 def _resolve_memory_dataset(dataset_name: str | None) -> str:
-    """Resolve the memory dataset name: explicit arg → request header → the
-    caller's saved ★ binding (D16 access store) → MEMORY_DATASET env."""
-    ds = dataset_name or _memory_dataset_ctx.get()
-    if not ds:
-        ds = _access.memory_dataset_for(_current_key_identity(), os.environ.get("MEMORY_DATASET"))
-    if not ds:
-        raise ToolError(
-            "No memory dataset specified. Provide 'dataset_name', send the "
-            "'X-Memory-Dataset' header from your MCP client, or mark a dataset "
-            "as your memory dataset on the /access page."
-        )
-    return ds
+    """Resolve the memory dataset name: the caller's binding → an explicit arg.
+
+    Resolution order:
+
+    1. The per-identity ``X-Memory-Dataset`` request header (transport-set by
+       the MCP client), then the caller's saved ★ binding (D16 access store),
+       then the ``MEMORY_DATASET`` env — i.e. every hardened, per-identity
+       source, exactly as before.
+    2. Only when NO binding resolves (no header, no ★, no env — e.g. a
+       headerless single-user deployment): an explicit ``dataset_name`` tool
+       argument, which is the long-standing working path for that case.
+
+    P2 fix: an explicit argument may no longer OVERRIDE a resolved binding.
+    It used to be checked first, so a prompt-injected ``dataset_name`` on
+    ``add_memory`` / ``search_memory`` / … retargeted the call at another
+    dataset than the one the client bound the connection to.  An explicit
+    argument that DISAGREES with the binding is refused; one that agrees is
+    accepted (it is redundant, not conflicting).
+    """
+    bound = _memory_dataset_ctx.get()
+    if not bound:
+        bound = _access.memory_dataset_for(_current_key_identity(), os.environ.get("MEMORY_DATASET"))
+    if bound:
+        if dataset_name and str(dataset_name) != bound:
+            raise ToolError(
+                "dataset_name does not match your memory binding — omit the "
+                "argument or update your binding."
+            )
+        return bound
+    if dataset_name:
+        return str(dataset_name)
+    raise ToolError(
+        "No memory dataset specified. Provide 'dataset_name', send the "
+        "'X-Memory-Dataset' header from your MCP client, or mark a dataset "
+        "as your memory dataset on the /access page."
+    )
 
 
 def _resolve_memory_password(password: str | None) -> str | None:
@@ -2272,6 +2386,82 @@ async def _arerank_federated(
     return out
 
 
+def _federated_concurrency() -> int:
+    """Max datasets retrieved CONCURRENTLY per federated fan-out (default 8).
+
+    Read per call (house convention: like ``_mcp_pool_size`` / ``_unlock_ttl_max``
+    / ``bm25.hybrid_search_enabled``) so the bound is tunable without a
+    restart; unset/garbage values fall back to the default.  Before this
+    bound, the fan-out launched one task per dataset — a caller naming 50
+    datasets put 50 retrievals in flight at once.
+    """
+    try:
+        return max(1, int(os.environ.get("RAG_FEDERATED_CONCURRENCY", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _federated_timeout_seconds() -> float:
+    """Per-dataset retrieval timeout (seconds) for one federated fan-out.
+
+    Read per call; ``0`` DISABLES the timeout (the retrieval is awaited
+    unwrapped).  Default 60s: one hung dataset must not pin the whole
+    federated call (Qdrant has no client timeout in the base chart — see
+    ``rag_system`` QDRANT_CLIENT_TIMEOUT — so nothing else bounds it).
+    """
+    try:
+        return max(0.0, float(os.environ.get("RAG_FEDERATED_TIMEOUT_SECONDS", "60")))
+    except (TypeError, ValueError):
+        return 60.0
+
+
+async def _afederated_bounded_call(sem: asyncio.Semaphore, coro_fn: Any, *args: Any) -> Any:
+    """Run ONE fan-out coroutine under the concurrency bound + per-dataset deadline.
+
+    Mirror of ``api_server._afederated_bounded_call`` (the D-mirror
+    convention: both federated twins bound their fan-out identically).  The
+    semaphore is held for the whole per-dataset retrieval and released on
+    every exit path (result, exception, cancellation); both env knobs are
+    read inside so they stay per-call.
+
+    The inner coroutine is wrapped in a TASK before the deadline is applied:
+    with a bare coroutine, an ``TimeoutError`` raised INSIDE the retrieval
+    (a Qdrant client timeout, whenever the client gets one) is
+    indistinguishable from the deadline and would be mis-reported as a
+    fan-out timeout.  With a task, a deadline that fires wins synchronously,
+    so the settled state tells the two apart: ``done and not cancelled``
+    means the inner error was already raised.
+    """
+
+    async def _run() -> Any:
+        async with sem:
+            timeout = _federated_timeout_seconds()
+            if timeout <= 0:
+                return await coro_fn(*args)  # 0 = disabled: no wrap, no cancel
+            task = asyncio.ensure_future(coro_fn(*args))
+            try:
+                return await asyncio.wait_for(task, timeout)
+            except TimeoutError as exc:
+                inner = task.exception() if (task.done() and not task.cancelled()) else None
+                if inner is not None:
+                    raise inner  # the inner timeout won the race; keep it as-is
+                raise TimeoutError(f"timed out after {timeout:g}s") from exc
+            finally:
+                # Slot-release ordering (cross-validation P1-3): cancel
+                # FIRE-AND-FORGET so `async with sem` releases the slot as
+                # soon as the deadline fires — a task that SUPPRESSES its
+                # cancellation (anyio-backed client internals can) would
+                # otherwise keep `_cancel_and_wait` (inside wait_for's
+                # unwinding) pinned in this frame and hold the slot for up
+                # to another full deadline.  The abandoned task keeps
+                # running to completion in the background (executor work
+                # cannot be un-run); it holds no semaphore resources.
+                if not task.done():
+                    task.cancel()
+
+    return await _run()
+
+
 async def _afederated_one_dataset(
     dm: "DatasetManager",
     name: str,
@@ -2391,7 +2581,10 @@ async def _afederated_search(
        :func:`_resolve_federated_targets` — locked datasets are skipped with
        a note, never a hard failure.
     2. Fan the retrieval out CONCURRENTLY (``asyncio.gather`` with
-       ``return_exceptions=True``); a failing dataset becomes an error note.
+       ``return_exceptions=True``), bounded per call by
+       ``RAG_FEDERATED_CONCURRENCY`` and timed per dataset by
+       ``RAG_FEDERATED_TIMEOUT_SECONDS``; a failing or timed-out dataset
+       becomes an error note.
     3. Merge the per-dataset pools into one dataset-labelled pool
        (:func:`multimodal_rag.rag_system.merge_federated_results` —
        dataset-qualified twin/text dedup + score sort).
@@ -2419,9 +2612,18 @@ async def _afederated_search(
             query_dict["audio"] = audio
 
     # -- Concurrent fan-out; per-dataset failures become error notes --
+    # BOUNDED (RAG_FEDERATED_CONCURRENCY, default 8) and TIMED
+    # (RAG_FEDERATED_TIMEOUT_SECONDS, default 60, 0=disabled) per dataset:
+    # without both, N targets meant N simultaneous retrievals and one hung
+    # dataset pinned the whole gather.  A deadline surfaces here as a
+    # ``TimeoutError("timed out after Ns")`` and takes the same
+    # per-dataset error-note path as any other failure.
+    sem = asyncio.Semaphore(_federated_concurrency())
     outcomes = await asyncio.gather(
         *[
-            _afederated_one_dataset(dm, name, query_dict, query, top_k, base_llm_modalities, filters)
+            _afederated_bounded_call(
+                sem, _afederated_one_dataset, dm, name, query_dict, query, top_k, base_llm_modalities, filters
+            )
             for name in targets
         ],
         return_exceptions=True,
@@ -2564,7 +2766,25 @@ try:
     from mcp.server.mcpserver.exceptions import ToolError
     from mcp.server.transport_security import TransportSecuritySettings
 
-    mcp = MCPServer("multimodal-rag")
+    mcp = MCPServer(
+        "multimodal-rag",
+        instructions=(
+            "Multimodal RAG over the user's datasets: documents, PDFs, office files, "
+            "images, videos, audio. When the user asks about the CONTENT of their "
+            "media — 'show me pictures of…', 'find photos where…', 'which video "
+            "shows…', 'what did they say in the recording…', 'find the slide about…' "
+            "— call search_datasets (unknown dataset: pass datasets='all') or "
+            "search_dataset (named dataset; call list_datasets first). Media is "
+            "found by MEANING: text queries match VLM captions and image↔text "
+            "embeddings; audio matches its speech transcript. Use describe_media / "
+            "transcribe_audio only for ONE file whose URL/path you already have. To "
+            "search WITH an example picture, pass image=. Password-protected "
+            "datasets: unlock_dataset (session TTL) or select_dataset (persists per "
+            "API key) once, then no password argument is needed. Durable facts and "
+            "preferences: add_memory / search_memory; set_memory_dataset binds the "
+            "memory store."
+        ),
+    )
     _mcp_transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
     @mcp.tool()
@@ -2572,7 +2792,22 @@ try:
         cursor: str | None = None,
         limit: int | None = None,
     ) -> str:
-        """List all available datasets with their metadata.
+        """List the datasets available to you, with document counts and access status —
+        ALWAYS call this FIRST when you don't know a dataset's exact name, before
+        ``search_dataset`` / ``search_datasets`` / ``get_dataset_files``.
+
+        The catalog typically mixes personal and shared/global datasets holding a
+        variety of media: PDFs and Office documents, images, video, audio, Markdown
+        notes, code, and tabular data — plus your stored memories. All of it is
+        indexed for MEANING-based search (see ``search_dataset``), so the same
+        natural-language question can surface a photo, a slide, or a meeting clip.
+
+        Each entry gives the exact name to pass to the other tools, its document
+        count, optional description, and status flags: ``[password]`` = protected
+        (unlock with ``unlock_dataset``, or prove the password once via
+        ``select_dataset``), ``[unlocked]`` = already usable this session,
+        ``[asr]``/``[vlm]`` = media in this dataset is transcribed/captioned at
+        ingest, so text queries find it well.
 
         Optional cursor pagination (additive): pass ``limit`` for a page
         size and feed the returned ``next_cursor`` back as ``cursor`` to
@@ -2673,7 +2908,6 @@ try:
             elif ttl < 60 or ttl > ttl_max:
                 raise ToolError(f"TTL must be between 60 and {ttl_max} seconds (or 0 for no expiry when enabled).")
             cid = _unlock_client_id()
-            _mcp_pw_check_throttle(cid)
             _require_dataset_acl(dataset_name)
             dm = get_manager()
             try:
@@ -2682,10 +2916,12 @@ try:
                 raise ToolError(f"Dataset '{dataset_name}' not found.")
             if not dm.has_password(dataset_name):
                 return f"Dataset '{dataset_name}' is not password protected — nothing to unlock."
-            if not dm.verify_password(dataset_name, password):
-                _mcp_pw_record_failure(cid)
+            # Throttled verification (audit P1-7 — the shared funnel): the
+            # bucket check runs AFTER the presence/protection checks so a
+            # wrong dataset name is not charged to the caller; the
+            # failure-record / success-reset pair lives in the funnel.
+            if not _verify_password_throttled(cid, dm, dataset_name, password):
                 raise ToolError(f"Incorrect password for dataset '{dataset_name}'.")
-            _mcp_pw_reset_failures(cid)
             _cache_unlock(dataset_name, password, ttl=ttl)
             if ttl == 0:
                 return f"Dataset '{dataset_name}' unlocked with no expiry (until the server restarts)."
@@ -2702,17 +2938,17 @@ try:
         dataset_name: str,
         password: str | None = None,
     ) -> str:
-        """Add a dataset to YOUR key's accessible set (self-service, D16).
+        """Add a dataset to YOUR key's accessible set so every other tool works
+        without a ``password`` argument (self-service access).
 
-        Mirrors the /access page's checkbox: a public dataset needs nothing;
-        a password-protected dataset needs its CORRECT password (verified
-        server-side, then saved so every other tool works without any
-        password argument).  The selection persists for this API key until
-        you call ``deselect_dataset``.  Excluding a dataset (deselect) is always
-    allowed — your checked set is authoritative (2026-10): even operator-ACL
-    grants can be excluded, and re-selecting re-includes
-        revoked here, and denylisted datasets (RAG_ACCESS_DENY_SELECT) are
-        refused outright.
+        A public dataset needs nothing; a password-protected dataset needs its
+        CORRECT password (verified server-side, then saved so every other tool
+        works without any password argument).  The selection persists for this
+        API key until you call ``deselect_dataset``.  Removing a dataset
+        (deselect) is always allowed — your selection set is authoritative:
+        even operator-ACL-granted datasets can be excluded, and re-selecting
+        re-includes one you previously deselected.  Denylisted datasets
+        (RAG_ACCESS_DENY_SELECT) are refused outright.
 
         Parameters
         ----------
@@ -2726,7 +2962,18 @@ try:
             ident = _current_key_identity()
             if ident is None or ident.is_admin:
                 raise ToolError("select_dataset applies to per-user API keys (registry keys) — admin keys see everything already.")
-            _mcp_pw_check_throttle(_unlock_client_id())
+            cid = _unlock_client_id()
+            # KEPT DELIBERATELY (audit P1-7 disposition): this explicit
+            # pre-check covers the NO-password path, which never reaches
+            # _verify_password_throttled — a public/ACL-granted selection
+            # does no password work, yet an identity whose bucket is
+            # exhausted must still be refused here (the previous behaviour:
+            # an exhausted caller cannot probe dataset existence through
+            # this tool).  The funnel cannot replace the check for that
+            # path, so it stays.  The failure-record / success-reset pair
+            # below rides the SAME bucket id, so select and unlock share one
+            # per-caller throttle.
+            _mcp_pw_check_throttle(cid, dataset_name)
             dm = get_manager()
             try:
                 dm.get_dataset(dataset_name)
@@ -2740,13 +2987,21 @@ try:
                     dm.has_password,
                     dm.verify_password,
                 )
+            except _access.SelectionDenied as exc:
+                # Audit 2026-10-02 P0-1 follow-up (cross-validation #1): a
+                # proof-gate refusal is a PermissionError, not a ValueError —
+                # unhandled it escaped the tool body as a generic SDK error
+                # ("Error executing tool", no message).  Surface the
+                # caller-safe refusal message as a ToolError; no throttle
+                # charge (no password proof was attempted).
+                raise ToolError(str(exc))
             except ValueError as exc:
                 # Wrong/missing password → count it in the caller's throttle
                 # bucket (same brute-force discipline as unlock_dataset).
                 if password:
-                    _mcp_pw_record_failure(_unlock_client_id())
+                    _mcp_pw_record_failure(cid, dataset_name)
                 raise ToolError(str(exc))
-            _mcp_pw_reset_failures(_unlock_client_id())
+            _mcp_pw_reset_failures(cid, dataset_name)
             # Selection IS the unlock for this identity: warm the session
             # cache so even store-less read paths see it immediately.
             if entry.get("password"):
@@ -2767,12 +3022,12 @@ try:
     async def deselect_dataset(
         dataset_name: str,
     ) -> str:
-        """Remove a dataset from YOUR key's datasets (D16, revised).
+        """Remove a dataset from YOUR key's accessible set.
 
-        Unchecking always works: your checked set is authoritative
-        (2026-10).  A self-selection is removed (saved password dropped);
-        an operator-granted or public dataset is EXCLUDED — hidden from
-        your listings and searches until you select it again.
+        Removing always works: your selection set is authoritative.  A
+        self-selection is removed (saved password dropped); an operator-granted
+        or public dataset is EXCLUDED — hidden from your listings and searches
+        until you ``select_dataset`` it again.
 
         Parameters
         ----------
@@ -2845,78 +3100,67 @@ try:
         sparse_weight: float | None = None,
         k: int | None = None,
     ) -> str:
-        """Search a multimodal RAG dataset and return formatted context.
+        """Search ONE multimodal RAG dataset for content by MEANING — call this whenever
+        the user asks what their photos, videos, audio or documents contain: "show me
+        pictures of the new product packaging", "find the slide about Q3 revenue",
+        "which video shows the assembly step?", "what was decided in the quarterly
+        review recording?".  Media is matched by what it shows or says: images/videos
+        are found by VLM captions AND direct image↔text embeddings (so plain text
+        queries find pictures), audio by its speech transcript, documents by their
+        text.  Pass ``image=`` with an example picture to find visually similar
+        media.  Call ``list_datasets`` first if you don't know the dataset name;
+        use ``search_datasets`` to sweep several at once.  Returns formatted
+        context with per-hit source URLs — not a file listing (that's
+        ``get_dataset_files``).
 
         Parameters
         ----------
         dataset_name:
-            Name of the dataset to search.
+            Name of the dataset to search (discover with ``list_datasets``).
         query:
-            Search query text.
-        image:
-            Image data URL (base64) or remote URL to search with.
-        video:
-            Video data URL (base64) or remote URL to search with.
-        audio:
-            Audio data URL (base64) or remote URL to search with.
+            Natural-language search text, e.g. "engineers inspecting a
+            turbine". May be empty when searching by media example alone.
+        image / video / audio:
+            Example media (base64 data URL or remote URL) to search BY
+            EXAMPLE ("find photos like this one"); combinable with ``query``.
         top_k:
             Number of results to retrieve (max 100).
         use_reranker:
-            Whether to re-rank results with the cross-encoder reranker.
+            Set True when the top hits look off-target: a cross-encoder
+            re-ranks the candidates and keeps ``reranker_top_k`` of them
+            (extra latency).
         reranker_top_k:
-            Number of results to keep after re-ranking.
+            Results kept after re-ranking (≤ top_k).
         base_llm_modalities:
             Modalities the calling LLM supports natively, e.g.
-            ``["text"]`` or ``["text", "image"]``.
-            Unsupported modalities are automatically converted:
-            image/video → VLM description → text,
-            audio → ASR transcription → text.
+            ``["text"]`` or ``["text", "image"]``.  Unsupported ones are
+            auto-converted (image/video → VLM description, audio → ASR text).
         password:
-            Optional if the dataset was previously unlocked with
-            ``unlock_dataset`` or selected with your key (``select_dataset``
-            / the /access page — the saved password resolves silently);
-            required otherwise.  When provided this also acts as an implicit
-            unlock for future calls.
+            Optional if already unlocked (``unlock_dataset`` /
+            ``select_dataset``); required otherwise.  Providing it also
+            unlocks for future calls.
         media_base_url:
-            External base URL of the API server (the value of
-            ``MEDIA_BASE_URL``). When set, ``file://`` PVC paths in results
-            are converted to ``{media_base_url}/api/datasets/{name}/files/
-            {path}`` HTTP URLs so the frontend can fetch media directly
-            without large inline base64 payloads.  Use the exact host seen in
-            the returned ``source`` URLs — never invent or substitute a
-            hostname (there is no valid ``rag-mcp-server.example.com``).
+            External base URL of the API server (``MEDIA_BASE_URL``); converts
+            ``file://`` result paths to fetchable HTTP URLs.  Use the exact
+            host seen in returned ``source`` URLs — never invent one.
         file_types:
-            Optional metadata filter: only results whose file type is one of
-            these (``pdf``, ``image``, ``video``, ``audio``, ``text``,
-            ``json``, ``table``, ``code``, ``office``, ``html``, ``xml``,
-            ``yaml``, ``notebook``, ``ebook``, ``log``).
+            Keep only these types (pdf, image, video, audio, text, json,
+            table, code, office, html, xml, yaml, notebook, ebook, log).
+            E.g. ``["image"]`` for "show me photos of …".
         severities:
-            Optional metadata filter for log corpora: only results whose
-            observed severities include one of these (``ERROR``, ``WARN``,
-            ``INFO``, ...).
+            Log-corpus filter: keep results with one of these observed
+            severities (ERROR, WARN, INFO, ...).
         source_prefix:
-            Optional metadata filter: only results whose stored source path
-            starts with this prefix (e.g. ``reports/2025/``).
+            Keep only results whose source path starts with this prefix.
         date_from / date_to:
-            Optional metadata filters (ISO-8601 datetimes) on a document's
-            ``timestamp_start`` — log entries and timestamped documents.
+            ISO-8601 bounds on a document's ``timestamp_start``.
         dense_weight / sparse_weight:
-            Optional weighted-RRF lane weights (default 1.0 / 1.0, clamped
-            0.0–10.0).  Rank-space tilts, NOT score multipliers: qdrant
-            scores each lane ``1/((pos+1)/w + k − 1)``, so a higher weight
-            makes that lane's rank positions count more — trust the order,
-            not the magnitude.  Text-only searches on a hybrid-capable
-            dataset fuse dense + BM25 lanes; multimodal (media-only) or
-            dense-degraded searches cannot fuse, and the response's
-            ``rrf.applied`` is then ``false``.  When BOTH weights are
-            omitted, the dataset's stored per-dataset defaults apply
-            (settable by the operator on the home page or via the create /
-            PATCH API) — an explicit weight here always wins, and the
-            response's ``rrf`` block reports the effective parameters.
+            Weighted-RRF lane tilts (default 1.0/1.0; rank-position tilts, not
+            score multipliers).  Raise ``dense_weight`` to favour semantic
+            over keyword (BM25) matches.  Omit both for the dataset's stored
+            defaults; media-only searches cannot fuse (``rrf.applied`` false).
         k:
-            Optional RRF ranking constant (default 2, clamped 1–1000).
-            Only sent when an override is present: the default request keeps
-            the fusion form exactly as before.
+            RRF ranking constant (default 2; only sent when overridden).
         """
 
         # Sync setup — cheap (cached singleton, meta.json read, cached RAG).
@@ -3042,52 +3286,47 @@ try:
         date_from: str | None = None,
         date_to: str | None = None,
     ) -> str:
-        """Search SEVERAL datasets at once with one query and merge the results.
-
-        Use this instead of ``search_dataset`` when you don't know which
-        dataset holds the answer, or when the answer may span datasets.
-        Every hit is labelled with its dataset; duplicate chunks that appear
-        in several datasets are kept per dataset (labelled), duplicates
-        within a dataset are collapsed.
+        """Search SEVERAL datasets with ONE query and merge the ranked results — the
+        default choice for content questions when you don't know which dataset holds
+        the answer ("find the photo that ran in the campaign", "where is the
+        slide about X?"), or when the answer may span datasets.  Same semantic
+        matching as ``search_dataset`` (photos/videos by what they show, audio by
+        what is said, documents by text).  Pass ``datasets="all"`` to sweep every
+        dataset readable without a password; name them explicitly once you know
+        them (``list_datasets``).  Every hit is labelled with its dataset;
+        cross-dataset duplicates are kept per dataset, within-dataset duplicates
+        collapse.
 
         Parameters
         ----------
         datasets:
-            List of dataset names — or the string ``"all"`` to search every
-            dataset that is readable WITHOUT a password (no password set, or
-            unlocked in this session via ``unlock_dataset``).
+            List of dataset names — or ``"all"`` for every dataset readable
+            WITHOUT a password (unlocked ones included).
         query:
-            Search query text.
+            Natural-language search text.
         image / video / audio:
-            Optional media (data URL or remote URL) to search with.
+            Optional example media (data URL or remote URL) to search by
+            example everywhere.
         top_k:
-            Number of results to retrieve PER DATASET (max 100).
+            Results PER DATASET (max 100); the merged pool is bounded by
+            len(datasets) × top_k.
         use_reranker:
-            Whether to re-rank the MERGED result pool with the cross-encoder
-            reranker (one pass over all datasets' candidates).
+            Re-rank the MERGED pool with the cross-encoder — recommended
+            here, where per-dataset ranks compete.
         reranker_top_k:
-            Number of results to keep after re-ranking (max 50).
+            Results kept after re-ranking (max 50).
         base_llm_modalities:
-            Modalities the calling LLM supports natively, e.g.
-            ``["text"]`` or ``["text", "image"]``.  Unsupported modalities
-            are automatically converted (image/video → VLM description →
-            text, audio → ASR transcription → text).
+            Native modalities of the calling LLM (unsupported media are
+            auto-converted: image/video → VLM text, audio → ASR text).
         file_types / severities / source_prefix / date_from / date_to:
-            Optional metadata filters applied to EVERY dataset (same
-            meanings as in ``search_dataset``).
+            Metadata filters applied to EVERY dataset (same meanings as in
+            ``search_dataset``).
 
-        Password-protected datasets that are not unlocked for this session
-        are SKIPPED and reported under ``skipped`` — this tool deliberately
-        accepts no ``password`` argument (unlock with ``unlock_dataset``
-        first, then call again).  A dataset that fails to search is reported
-        under ``errors`` and never fails the whole call; each remaining
-        dataset still contributes its results.
-
-        Weighted RRF: per-dataset defaults are deliberately IGNORED here by
-        ruling — one merged pool cannot honour differing per-dataset
-        weights, so every dataset is searched with the default fusion
-        request.  (Per-dataset defaults apply only to single-dataset
-        searches; there is deliberately no weight parameter on this tool.)
+        Locked datasets are SKIPPED and reported under ``skipped`` (this tool
+        deliberately takes no ``password`` argument — unlock first, then call
+        again); a failing dataset is reported under ``errors`` and never fails
+        the call.  No RRF weight tuning here by design — weights belong on
+        single-dataset ``search_dataset``.
         """
 
         # Clamp paging/ranking params to safe bounds (see _clamp_tool_limit).
@@ -3158,25 +3397,16 @@ try:
         dataset_name: str | None = None,
         password: str | None = None,
     ) -> str:
-        """Store a memory (a durable fact / decision / preference) for later recall.
+        """Store a memory (a durable fact / decision / preference) for later recall
+        via ``search_memory``.
 
-        Intended for LLM-curated long-term memory: the agent distils a
-        concise, self-contained record — NOT a raw transcript — and stores
-        it so future sessions can recall it via ``search_memory``.  The
-        memory dataset and password are normally supplied by the MCP client
-        via request headers, so the model does NOT need to pass
-        ``dataset_name`` / ``password``.
-
-        The stored text is split into documents of at most ``MEMORY_MAX_TOKENS``
-        tokens each (default 8192), mirroring dataset-side text splitting.
-        Splitting is context-aware: the body is packed from whole sections at
-        the session-history formats' own heading boundaries (``### User`` /
-        ``### Assistant`` / ``### Tool`` and ``## Transcript``), so a chunk
-        never breaks a section mid-body unless that one section alone exceeds
-        the budget.  The header (session/provenance block) is prepended to
-        **every** chunk, and the payload records ``chunk_index`` /
-        ``chunk_total`` / ``memory_chunks`` / ``memory_truncated`` so split
-        memories are identifiable and each chunk carries the session id.
+        Distil a concise, self-contained record — NOT a raw transcript.  The
+        memory dataset and password are normally supplied by the MCP client via
+        request headers, so the model does NOT need to pass ``dataset_name`` /
+        ``password``.  Long texts are split into whole sections (never mid-body)
+        up to ``MEMORY_MAX_TOKENS`` tokens per chunk; every chunk carries the
+        session id and split metadata, so they remain individually retrievable
+        and deletable.
 
         Parameters
         ----------
@@ -3186,39 +3416,21 @@ try:
             "User prefers tabs over spaces because of repo style" over
             "prefers tabs".
         image / video / audio:
-            Optional media attached to the memory (URLs or data URLs).
-            Rarely needed for coding memories; supported for completeness.
+            Optional media attached to the memory (URLs or data URLs).  Rarely
+            needed; supported for completeness.
         metadata:
             Optional structured provenance, e.g.
             ``{"kind": "decision", "tags": ["auth", "refactor"],
-            "session_id": "abc123"}``.  Stored alongside the memory in the
-            vector payload for later filtering.  The ``session_id`` field is
-            auto-populated from the ``X-Opencode-Session-ID`` request header
-            or ``OPENCODE_SESSION_ID`` env var when not provided explicitly.
-
-            When memories are created through the opencode
-            ``memory-provenance`` plugin, the following fields are injected
-            automatically (the plugin runs client-side, where the git repo
-            lives, so the remote server cannot derive them):
-              - ``git_before`` — HEAD commit at session start
-                (``{"sha", "short", "subject"}``)
-              - ``git_after``  — HEAD commit at memory-creation time
-              - ``git_branch`` — branch name
-              - ``git_repo``   — remote URL or repo root
-              - ``git_dirty``  — whether the working tree had uncommitted
-                changes
-              - ``git_diff_stat`` — one-line summary of uncommitted changes
-              - ``session_title``, ``session_created_at``, ``project_dir``
-            Explicit metadata keys always take precedence over auto-injected
-            ones.  ``search_memory`` surfaces these as a compact
-            ``[Provenance: ...]`` line above each result.
+            "session_id": "abc123"}``.  ``session_id`` auto-populates from the
+            request header / env when omitted; the opencode provenance plugin
+            injects git/session fields automatically (explicit keys win).
         dataset_name:
-            Memory dataset.  Optional — resolved from the
-            ``X-Memory-Dataset`` request header or ``MEMORY_DATASET`` env
-            var when omitted.  The model usually does NOT pass this.
+            Optional — resolved from the ``X-Memory-Dataset`` header or
+            ``MEMORY_DATASET`` env when omitted.  The model usually does NOT
+            pass this.
         password:
-            Password for the protected memory dataset.  Optional — resolved
-            from the ``X-Dataset-Password`` request header when omitted.
+            Optional — resolved from the ``X-Dataset-Password`` header when
+            omitted.
         """
 
         def _impl() -> str:
@@ -3654,34 +3866,32 @@ try:
         offset: int = 0,
         password: str | None = None,
     ) -> str:
-        """List files in a dataset or retrieve a specific file's content.
+        """Browse a dataset's files by NAME — paginated listing, or fetch one file's
+        content by path.  Use when you know or suspect a filename, or want to see
+        what was uploaded.  To find files by what is INSIDE them (semantic content
+        search), use ``search_dataset`` — this tool does not search content.
+        Text-like files return their content inline; binary files return metadata
+        plus a REST download URL instead of bytes.
 
         Parameters
         ----------
         dataset_name:
             Name of the dataset.
         file_path:
-            Relative path of a specific file to retrieve.
-            If omitted, lists files in the dataset (paginated).
-            For text-based files (txt, md, json, xml, yaml, log, html, code)
-            the content is returned inline.  Binary files (images, video,
-            audio, PDF, office docs, etc.) return metadata plus a URL to
-            the REST API endpoint for download.
+            Relative path of a specific file to retrieve.  If omitted, lists
+            files (paginated).  Text-based types (txt, md, json, xml, yaml,
+            log, html, code, notebook) return inline content; binary types
+            (images, video, audio, PDF, office) return a download URL.
         limit:
-            Maximum number of files to list (default 100, max 500).
-            Only applies when listing (``file_path`` is None).  Use
-            with ``offset`` for pagination.  Do NOT set a large limit
-            to list all files — datasets can contain tens of thousands
-            of files, which will produce a huge response and waste
-            context.  Use ``search_dataset`` to find specific files.
+            Max files per listing page (default 100, max 500; listing only).
+            Do NOT set a large limit to list everything — page with ``offset``
+            instead (the response reports ``has_more``).
         offset:
-            Number of files to skip for pagination (default 0).
+            Files to skip for pagination (default 0).
         password:
-            Optional if the dataset was previously unlocked with
-            ``unlock_dataset`` or selected with your key (``select_dataset``
-            / the /access page — the saved password resolves silently);
-            required otherwise.  When provided this also acts as an implicit
-            unlock for future calls.
+            Optional if already unlocked (``unlock_dataset`` /
+            ``select_dataset``); required otherwise.  Providing it also
+            unlocks for future calls.
         """
 
         def _impl() -> str:
@@ -4244,11 +4454,13 @@ try:
         query: str = "",
         media_type: str = "",
     ) -> str:
-        """Describe an image or video using the vision-language model (VLM).
-
-        Useful when the user wants a description of media **without**
-        searching a dataset — e.g. "what's in this image?" or "describe
-        this video".
+        """Describe ONE image or video with the vision-language model (VLM) — for
+        "what's in this picture?", "describe this video", or to answer a specific
+        question about a specific file whose URL/path you already have.  Use this
+        to LOOK at known media; to FIND unknown media inside a dataset by content,
+        use ``search_dataset`` / ``search_datasets`` instead.  For audio files use
+        ``transcribe_audio``.  Returns JSON: ``description``, ``media_url``,
+        ``media_type``, and a ``markdown`` embed snippet.
 
         Parameters
         ----------
@@ -4258,14 +4470,14 @@ try:
             ``data:`` base64 URLs.
         query:
             Optional question about the media — the VLM will answer it
-            instead of giving a generic description.
+            instead of giving a generic description (e.g. "what text is
+            on the sign?").
         media_type:
-            Optional expected modality hint: ``"image"`` or ``"video"``.
-            When empty (default) the tool detects the type automatically
-            from the URL/path (extension, Content-Type/magic bytes) and,
-            failing that, infers it from *query* wording (e.g. "describe
-            the image").  Pass this explicitly when you *know* the media
-            type and the URL/path is ambiguous.
+            Optional hint, ``"image"`` or ``"video"``.  Auto-detected from
+            the URL/path (then from *query* wording) when empty; pass it
+            explicitly for ambiguous URLs (e.g. extensionless) — otherwise
+            the call fails with a "could not determine image or video"
+            error.  Audio is not handled here.
         """
 
         def _impl() -> str:
@@ -4363,10 +4575,13 @@ try:
         audio_url: str,
         max_seconds: float = 60.0,
     ) -> str:
-        """Transcribe an audio file using the speech recognition model (ASR).
-
-        Useful when the user wants a transcription **without** searching a
-        dataset — e.g. "what's said in this recording?".
+        """Transcribe ONE audio file with the speech-recognition model (ASR) — for
+        "what did they say in this recording?", "transcribe this voicemail/meeting
+        clip".  Use this when you already have the audio's URL/path; to SEARCH a
+        dataset of recordings by content, use ``search_dataset`` /
+        ``search_datasets`` instead (speech transcripts are indexed there).  For
+        image/video files use ``describe_media``.  Returns JSON: ``transcript``
+        plus the source ``audio_url``.
 
         Parameters
         ----------
@@ -4375,9 +4590,9 @@ try:
             (staged uploads, dataset files), ``http(s)://`` URLs, and
             ``data:`` base64 URLs.
         max_seconds:
-            Maximum duration (in seconds) to transcribe.  Audio longer
-            than this is truncated from the start.  Default 60s to stay
-            within the ASR endpoint's payload cap.
+            Max duration to transcribe (default 60s — the ASR payload cap).
+            Local files are cut to their FIRST ``max_seconds``; remote/
+            ``data:`` URLs pass through as-is.  Local transcripts are cached.
         """
 
         def _impl() -> str:
@@ -4463,16 +4678,34 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 
-def _with_mcp_health(app: ASGIApp) -> ASGIApp:
-    """Attach ``/healthz`` (liveness) and ``/readyz`` (readiness) routes.
+def _memory_header_wrapped(app: ASGIApp) -> ASGIApp:
+    """Apply ``_MemoryHeaderMiddleware`` by WRAPPING (audit P1-10).
 
-    ``FastMCP`` returns the wrapped Starlette app, which supports adding
-    routes directly.  ``/healthz`` is pure process liveness (no model
-    checks — the embedder is always a remote vLLM/SGLang service, and
-    restarting this pod cannot bring it back).  ``/readyz`` is pure
-    readiness — it does not gate on the embedder either, for the same
-    reason (an embedder outage is a transient condition that a pod
-    restart cannot fix; it is surfaced via ``/api/admin/health``).
+    The middleware that binds the per-request memory headers / D10 identity
+    ContextVars is the INNER layer (closest to the routes); the auth gate is
+    wrapped AROUND the result.  Wrapping rather than ``app.add_middleware``
+    keeps the layering explicit and avoids Starlette's build-once semantics.
+    """
+    return _MemoryHeaderMiddleware(app)
+
+
+def _with_mcp_health(app: ASGIApp) -> ASGIApp:
+    """Attach ``/healthz`` (liveness) and ``/readyz`` (readiness) routes to
+    the Starlette transport app (``FastMCP`` returns one, and it supports
+    adding routes directly).
+
+    ``/healthz`` is pure process liveness (no model checks — the embedder is
+    always a remote vLLM/SGLang service, and restarting this pod cannot bring
+    it back).  ``/readyz`` is pure readiness — it does not gate on the
+    embedder either, for the same reason (an embedder outage is a transient
+    condition that a pod restart cannot fix; it is surfaced via
+    ``/api/admin/health``).
+
+    MUST be applied to the transport app itself, BEFORE the middleware
+    wrappers: the probes are then matched by the route table ahead of route
+    dispatch, so they stay reachable behind an enforcing auth gate.  A
+    middleware wrapper has no ``add_route``; calling this on one fails loudly
+    (AttributeError at startup) rather than silently dropping the probes.
     """
     from starlette.responses import JSONResponse
 
@@ -4539,11 +4772,34 @@ def main() -> None:
         mcp_auth_warn_if_open()
         logger.info("Starting MCP SSE server on %s:%s", args.host, args.port)
         app = mcp.sse_app(transport_security=_mcp_transport_security)
-        app.add_middleware(_MemoryHeaderMiddleware)
-        app.add_middleware(_RagClientAuthMiddleware, env_names=AUTH_ENV_NAMES, protected=lambda p: p.startswith("/mcp"))
+        # SECURITY (audit P1-10): the SSE transport's routes are ``/sse`` and
+        # the ``/messages/`` mount — NOT ``/mcp``, which only exists on the
+        # streamable-http transport.  The old predicate
+        # (``p.startswith("/mcp")``) therefore matched NEITHER route, so an
+        # anonymous request reached the SSE transport and full tool dispatch
+        # even with keys configured.  (``/mcp`` is kept in this predicate for
+        # completeness — it costs nothing and keeps a single spelling of the
+        # protected surface.)  The probes are attached to the transport app
+        # by ``_with_mcp_health`` below, i.e. BEFORE the wrappers, so they are
+        # matched ahead of route dispatch and stay public.
+        app = _with_mcp_health(app)
+        # Structural middleware (audit P1-10): the auth gate is applied by
+        # WRAPPING, not by ``app.add_middleware()`` after the app is built —
+        # adding middleware to an already-built Starlette app rebuilds the
+        # stack with first-request-only semantics (a later mutation can be
+        # silently ignored), and the wrapper sits outside the mount, so it
+        # also gates the ``/messages/`` MOUNT, which Starlette's
+        # ``add_middleware`` does not.  ``_MemoryHeaderMiddleware`` is the
+        # INNER layer (closest to the routes, exactly as before);
+        # ``_RagClientAuthMiddleware`` is the OUTERMOST wrapper.
+        app = _RagClientAuthMiddleware(
+            _memory_header_wrapped(app),
+            env_names=AUTH_ENV_NAMES,
+            protected=_protected_sse_path,
+        )
         _start_config_watcher()
         _start_model_health_thread()
-        uvicorn.run(_with_mcp_health(app), host=args.host, port=args.port)
+        uvicorn.run(app, host=args.host, port=args.port)
     elif args.transport == "streamable-http":
         mcp_auth_warn_if_open()
         logger.info("Starting MCP streamable-http server on %s:%s", args.host, args.port)
@@ -4559,11 +4815,15 @@ def main() -> None:
             stateless_http=True,
             transport_security=_mcp_transport_security,
         )
-        app.add_middleware(_MemoryHeaderMiddleware)
-        app.add_middleware(_RagClientAuthMiddleware, env_names=AUTH_ENV_NAMES, protected=lambda p: p.startswith("/mcp"))
+        app = _with_mcp_health(app)
+        app = _RagClientAuthMiddleware(
+            _memory_header_wrapped(app),
+            env_names=AUTH_ENV_NAMES,
+            protected=_protected_streamable_path,
+        )
         _start_config_watcher()
         _start_model_health_thread()
-        uvicorn.run(_with_mcp_health(app), host=args.host, port=args.port)
+        uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

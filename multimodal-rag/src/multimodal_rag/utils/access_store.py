@@ -475,19 +475,41 @@ def verify_and_select(
     """Verify the proof, then select.  Shared by the REST endpoint and (in
     tool form) the MCP ``select_dataset`` tool.
 
+    Proof is REQUIRED for every selection (audit 2026-10-02 — the P0 fix):
+    the correct password for a protected dataset, the dataset's public flag
+    (password-free self-selection is the feature), or an existing operator
+    ACL grant (re-select / the acl+pw sidecar path).  An unowned,
+    password-less, non-public dataset is NOT selectable — self-service must
+    never widen a key's world beyond what the operator made available.
     Order matters: the denylist/admin/store checks run BEFORE any password
-    work, a public dataset needs no password, and a WRONG password on a
-    protected dataset raises ``ValueError`` (the caller maps it to 403 with
-    its own throttle accounting — the caller owns its throttle buckets).
+    work (inside :func:`select_dataset`), a public dataset needs no
+    password, and a WRONG password on a protected dataset raises
+    ``ValueError`` (the caller maps it to 403 with its own throttle
+    accounting — the caller owns its throttle buckets).
     """
     # Existence + protection status are the caller's DatasetManager calls;
     # has_password/verify_password are passed in so this stays manager-free.
+    # The public flag and the operator ACL come from clients_registry — the
+    # same lazy-import pattern :func:`select_dataset` uses for
+    # ``operator_allows`` (registry-local, no manager needed here either).
+    from multimodal_rag.utils.clients_registry import (
+        dataset_allowed as operator_allows,
+    )
+    from multimodal_rag.utils.clients_registry import (
+        is_public_dataset,
+    )
+
     if has_password(dataset_name):
         if not password:
             raise ValueError(f"Dataset '{dataset_name}' is password protected — provide the password to select it.")
         if not verify_password(dataset_name, password):
             raise ValueError("Incorrect password")
         entry = select_dataset(identity, dataset_name, password=password)
-    else:
+        return entry
+    if is_public_dataset(dataset_name) or operator_allows(identity, dataset_name):
         entry = select_dataset(identity, dataset_name)
-    return entry
+        return entry
+    raise SelectionDenied(
+        f"Dataset '{dataset_name}' is not available for self-selection "
+        "(it is neither public nor granted to your key, and it carries no password proof)."
+    )

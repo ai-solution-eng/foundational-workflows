@@ -176,12 +176,12 @@ def test_mcp_throttle_is_per_identity():
     mcp._mcp_pw_fail_buckets.clear()
     try:
         for _ in range(mcp._MCP_PW_MAX_FAILURES):
-            mcp._mcp_pw_record_failure("attacker")
+            mcp._mcp_pw_record_failure("attacker", "ds")
         with pytest.raises(Exception, match="Too many password attempts"):
-            mcp._mcp_pw_check_throttle("attacker")
-        mcp._mcp_pw_check_throttle("victim")  # different identity: fresh bucket
+            mcp._mcp_pw_check_throttle("attacker", "ds")
+        mcp._mcp_pw_check_throttle("victim", "ds")  # different identity: fresh bucket
         # an identity cannot be rotated onto another's bucket
-        assert mcp._mcp_pw_failure_count("victim") == 0
+        assert mcp._mcp_pw_failure_count("victim", "ds") == 0
     finally:
         mcp._mcp_pw_fail_buckets.clear()
 
@@ -193,9 +193,9 @@ def test_mcp_throttle_shares_under_escape_hatch(monkeypatch):
     try:
         cid = mcp._unlock_client_id()  # "default" for every caller under the hatch
         for _ in range(mcp._MCP_PW_MAX_FAILURES):
-            mcp._mcp_pw_record_failure(cid)
+            mcp._mcp_pw_record_failure(cid, "ds")
         with pytest.raises(Exception, match="Too many password attempts"):
-            mcp._mcp_pw_check_throttle(cid)
+            mcp._mcp_pw_check_throttle(cid, "ds")
     finally:
         mcp._mcp_pw_fail_buckets.clear()
 

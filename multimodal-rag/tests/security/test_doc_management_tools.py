@@ -163,7 +163,10 @@ def test_add_documents_missing_dataset_is_the_rest_404_parity(dm):
 
 def test_add_documents_password_gate_parity(dm):
     dm.set_password("docs", "hunter2")
-    with pytest.raises(mcp.ToolError, match="password protected"):
+    # Audit 2026-10-02 P2: the omitted-password error is now WORD-IDENTICAL
+    # to the wrong-password error (the old "password protected" phrasing
+    # was an oracle for which datasets carry passwords).
+    with pytest.raises(mcp.ToolError, match="Incorrect password"):
         _call(mcp.dataset_add_documents, dataset_name="docs", texts=["x"])
     out = _payload(_call(mcp.dataset_add_documents, dataset_name="docs", texts=["x"], password="hunter2"))
     assert out["status"] == "ok"

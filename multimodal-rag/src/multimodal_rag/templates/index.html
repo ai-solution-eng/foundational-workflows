@@ -441,6 +441,17 @@
      unlock/TTL, ★ memory binding (promoted to the pane's first slot below
      the header). Handlers live in the access script below. -->
 <div id="view-access" class="app-view" style="display:none">
+  <!-- D25 SSO self-mint — shown/hidden entirely by renderSelfMintCard();
+       visible only in session mode when the whoami flags carry self_mint. -->
+  <div class="card" id="selfmint-card" style="display:none">
+    <div class="card-header">
+      <h2 style="margin-bottom:0">Your API key</h2>
+    </div>
+    <p class="muted" id="selfmint-explainer" style="margin-bottom:12px;font-size:.85rem">
+      Mint a long-lived API key for your identity — use it in MCP clients (opencode, Open WebUI) or any REST caller. It carries exactly your access (grants + selections) and never expires.
+    </p>
+    <div id="selfmint-body"></div>
+  </div>
   <div class="card">
     <div class="card-header">
       <h2 style="margin-bottom:0">Your datasets</h2>
@@ -803,46 +814,46 @@
         <tbody>
           <tr><td colspan="3" style="padding:6px 0 4px;font-weight:600;border-bottom:1px solid var(--border)">Ingest behavior</td></tr>
           <tr>
-            <td style="padding:6px 12px 6px 0;white-space:nowrap">Caption with ASR <input type="checkbox" id="edit-caption-asr" title="Transcribe video audio tracks via ASR for NEW uploads to this dataset."></td>
-            <td style="padding:6px 12px;color:var(--text);font-weight:500">ASR transcripts</td>
+            <td style="padding:6px 0;width:190px;white-space:nowrap"><label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="edit-caption-asr" title="Transcribe video audio tracks via ASR for NEW uploads to this dataset." style="margin:0;vertical-align:middle">Caption with ASR</label></td>
+            <td style="padding:6px 12px;width:150px;color:var(--text);font-weight:500">ASR transcripts</td>
             <td style="padding:6px 0;color:var(--text-muted);font-size:.78rem">video audio → text, for future uploads</td>
           </tr>
           <tr>
-            <td style="padding:6px 12px 6px 0;white-space:nowrap">Caption with VLM <input type="checkbox" id="edit-caption-vlm" title="VLM-describe images/videos at ingest for NEW uploads. Enables VLM-skip at retrieval."></td>
+            <td style="padding:6px 0;white-space:nowrap"><label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="edit-caption-vlm" title="VLM-describe images/videos at ingest for NEW uploads. Enables VLM-skip at retrieval." style="margin:0;vertical-align:middle">Caption with VLM</label></td>
             <td style="padding:6px 12px;color:var(--text);font-weight:500">VLM descriptions</td>
             <td style="padding:6px 0;color:var(--text-muted);font-size:.78rem">images/videos described at ingest</td>
           </tr>
           <tr>
-            <td style="padding:6px 12px 6px 0;white-space:nowrap">OCR fallback <input type="checkbox" id="edit-ocr" title="OCR fallback via tesseract for scanned pages (images, no text layer) for NEW uploads to this dataset."></td>
+            <td style="padding:6px 0;white-space:nowrap"><label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="edit-ocr" title="OCR fallback via tesseract for scanned pages (images, no text layer) for NEW uploads to this dataset." style="margin:0;vertical-align:middle">OCR fallback</label></td>
             <td style="padding:6px 12px;color:var(--text);font-weight:500">Text from images</td>
             <td style="padding:6px 0;color:var(--text-muted);font-size:.78rem">tesseract for scanned pages (no text layer)</td>
           </tr>
           <tr>
-            <td style="padding:6px 12px 6px 0;white-space:nowrap">Contextual retrieval <input type="checkbox" id="edit-contextual" title="Contextual retrieval (ingest-time document context per chunk) for NEW uploads to this dataset. Affects new ingests only - Recreate to re-contextualize existing files."></td>
+            <td style="padding:6px 0;white-space:nowrap"><label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="edit-contextual" title="Contextual retrieval (ingest-time document context per chunk) for NEW uploads to this dataset. Affects new ingests only - Recreate to re-contextualize existing files." style="margin:0;vertical-align:middle">Contextual retrieval</label></td>
             <td style="padding:6px 12px;color:var(--text);font-weight:500">Chunk context</td>
             <td style="padding:6px 0;color:var(--text-muted);font-size:.78rem">document context per chunk — Recreate applies retroactively</td>
           </tr>
 
           <tr><td colspan="3" style="padding:10px 0 4px;font-weight:600;border-bottom:1px solid var(--border)">Reciprocal Rank Fusion (RRF) <span style="font-weight:400;color:var(--text-muted);font-size:.72rem">— hybrid search defaults · query-time, immediate</span></td></tr>
           <tr>
-            <td style="padding:6px 12px 6px 0;white-space:nowrap">Dense weight <input type="number" id="edit-rrf-dense" step="0.001" min="0" max="10" placeholder="1.0" style="width:80px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem"></td>
+            <td style="padding:6px 0;white-space:nowrap"><label style="display:inline-flex;align-items:center;gap:8px"><span style="min-width:120px">Dense weight</span><input type="number" id="edit-rrf-dense" step="0.001" min="0" max="10" placeholder="1.0" style="width:80px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem"></label></td>
             <td style="padding:6px 12px;color:var(--text);font-weight:500">Vector lane tilt</td>
             <td style="padding:6px 0;color:var(--text-muted);font-size:.78rem">how much the vector lane's rank order counts · 0 = lean keyword-only</td>
           </tr>
           <tr>
-            <td style="padding:6px 12px 6px 0;white-space:nowrap">Sparse weight <input type="number" id="edit-rrf-sparse" step="0.001" min="0" max="10" placeholder="1.0" style="width:80px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem"></td>
+            <td style="padding:6px 0;white-space:nowrap"><label style="display:inline-flex;align-items:center;gap:8px"><span style="min-width:120px">Sparse weight</span><input type="number" id="edit-rrf-sparse" step="0.001" min="0" max="10" placeholder="1.0" style="width:80px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem"></label></td>
             <td style="padding:6px 12px;color:var(--text);font-weight:500">Keyword lane tilt</td>
             <td style="padding:6px 0;color:var(--text-muted);font-size:.78rem">BM25 lane · 0 = lean vector-only, 2+ = keyword-heavy</td>
           </tr>
           <tr>
-            <td style="padding:6px 12px 6px 0;white-space:nowrap">Ranking constant k <input type="number" id="edit-rrf-k" step="1" min="1" max="1000" placeholder="2" style="width:80px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem"></td>
+            <td style="padding:6px 0;white-space:nowrap"><label style="display:inline-flex;align-items:center;gap:8px"><span style="min-width:120px">Ranking constant k</span><input type="number" id="edit-rrf-k" step="1" min="1" max="1000" placeholder="2" style="width:80px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem"></label></td>
             <td style="padding:6px 12px;color:var(--text);font-weight:500">Top-rank sharpness</td>
             <td style="padding:6px 0;color:var(--text-muted);font-size:.78rem">Qdrant default 2 · lower flattens (deeper ranks count), higher concentrates on the top few</td>
           </tr>
 
           <tr><td colspan="3" style="padding:10px 0 4px;font-weight:600;border-bottom:1px solid var(--border)">Visibility</td></tr>
           <tr>
-            <td id="edit-public-row" style="padding:6px 12px 6px 0;white-space:nowrap">Public (all users) <input type="checkbox" id="edit-public-flag" title="Public (GLOBAL): every minted API key / SSO user can list, read and search this dataset without an explicit grant. Creator-or-admin only (D23). Password-protected datasets cannot be made public."></td>
+            <td id="edit-public-row" style="padding:6px 0;white-space:nowrap"><label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="edit-public-flag" title="Public (GLOBAL): every minted API key / SSO user can list, read and search this dataset without an explicit grant. Creator-or-admin only (D23). Password-protected datasets cannot be made public." style="margin:0;vertical-align:middle">Public (all users)</label></td>
             <td style="padding:6px 12px;color:var(--text);font-weight:500">Global</td>
             <td style="padding:6px 0;color:var(--text-muted);font-size:.78rem" id="public-note">listed for every user · self-selectable without a password</td>
           </tr>
@@ -3057,6 +3068,7 @@ async function applyIdentity(sess) {
     state.source = String(sess.source || 'oidc');
     state.isAdmin = sess.is_admin === true ||
       !!(sess.flags && (sess.flags.is_admin === true || sess.flags.isAdmin === true));
+    renderSelfMintCard();   // D25: first-paint correctness on the Access tab
     return;
   }
   // Anonymous whoami (an ADMIN key presented opaquely also yields this
@@ -3103,6 +3115,7 @@ async function enterWorkspace(initialTab, isManage) {
   probeStatsAvailability();
   ensureAccessLoaded();
   renderMemoryPanel();   // D23 addendum: memory front and center (or hidden)
+  renderSelfMintCard();   // D25: right on first paint (paste/embedded → hidden)
   switchAppTab(initialTab);
   document.getElementById('app-tabs').style.display = 'flex';
 }
@@ -3146,6 +3159,7 @@ function handleAuthRejected(message) {
   selectError = null;
   _accessLoaded = false;
   _memoryDone = {};
+  selfmintState = null;   // D25: next identity re-probes GET /api/access/key
   clients = [];
   showAdminTab(false);
   stopStatsPolling();
@@ -3222,6 +3236,7 @@ async function loadAccessDatasets() {
   }
   renderAccessList();
   renderAccessMemorySummary();
+  renderSelfMintCard();   // D25: right once accessStoreOn/selections are known
 }
 
 async function refreshDatasets() {
@@ -3435,6 +3450,150 @@ function findAccessRow(name) {
     if (item.dataset.name === name) return item;
   }
   return null;
+}
+
+// =======================================================================
+// D25 SSO self-mint — the identity's own long-lived API key, from the SPA.
+//
+// Backed by the D25 REST pair (both require an SSO-sourced identity; an
+// API-key caller gets 403 and the knob being off gets 409):
+//   GET  /api/access/key      → {enabled, source, identity, has_key,
+//                                key_masked, datasets, created, oidc, blocked}
+//   POST /api/access/mint-key → {status, name, key (FULL, shown once),
+//                                rotated, created, message} — body
+//                                {"rotate": true} replaces an existing key.
+//
+// The card renders ONLY when state.keyMode === 'session' AND the whoami
+// flags carry self_mint: paste mode means the user already holds a key in
+// this browser, embedded mode is the legacy-unconfigured fallback, and the
+// flag's absence keeps pre-D25 deployments byte-compatible (card stays
+// display:none forever). Any 409/403/404 from the pair hides the card
+// silently — the deployment is not offering self-mint to this session.
+// =======================================================================
+
+let selfmintState = null;   // GET /api/access/key result, cached per identity
+let selfmintBusy = false;   // one in-flight probe; clicks re-render instead
+
+function selfmintEligible() {
+  // D25 v2: the card rides the whoami SOURCE, not just the keyMode.  A G2
+  // edge-authenticated visitor resolves through the D24 proxy-identity
+  // path — its whoami source is 'proxy-identity', which the old literal
+  // keyMode==='session' check never matched, hiding the card from exactly
+  // the SSO users the feature is for.  Paste mode (a stored explicit key
+  // governs) still hides it: minting is not a power a key carries (D17),
+  // and the backend 403s key-only callers regardless.
+  if (!(state.flags && state.flags.self_mint === true)) return false;
+  if (state.keyMode === 'paste') return false;
+  return state.keyMode === 'session' || (state.identity || '') !== '';
+}
+
+function hideSelfMintCard() {
+  const card = document.getElementById('selfmint-card');
+  if (card) card.style.display = 'none';
+}
+
+async function fetchSelfMintState() {
+  if (selfmintState !== null || selfmintBusy) return selfmintState;
+  selfmintBusy = true;
+  try {
+    selfmintState = await api('GET', '/api/access/key') || {};
+  } catch (e) {
+    if (e.status === 409 || e.status === 403 || e.status === 404) {
+      selfmintState = { _off: true };          // not offered to this session
+    } else if (e.status === 401) {
+      handleAuthRejected('Your credentials were rejected by the server');
+      selfmintState = { _off: true };
+    } else {
+      toast(e.message, 'error');
+      selfmintState = { _off: true };          // never leave a stuck card
+    }
+  }
+  selfmintBusy = false;
+  return selfmintState;
+}
+
+async function renderSelfMintCard() {
+  const card = document.getElementById('selfmint-card');
+  if (!card) return;
+  if (!selfmintEligible()) { hideSelfMintCard(); return; }
+  const st = await fetchSelfMintState();
+  // st === null → another render's probe is still in flight; it re-renders
+  // the body when it lands, so this pass just keeps the card hidden.
+  if (!selfmintEligible() || !st || st._off) { hideSelfMintCard(); return; }
+  card.style.display = 'block';
+  const body = document.getElementById('selfmint-body');
+  if (!body) return;
+  if (st.has_key) {
+    const created = st.created ? new Date(st.created).toLocaleDateString() : '';
+    body.innerHTML =
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">' +
+      '<span class="client-meta" style="font-family:\'SF Mono\',\'Fira Code\',monospace">' + escHtml(st.key_masked || '') + '</span>' +
+      (st.oidc ? ' <span class="src-tag" style="color:var(--accent);border-color:var(--accent)">oidc:' + escHtml(st.oidc) + '</span>' : '') +
+      (st.blocked ? ' <span class="src-tag" style="color:var(--red);border-color:var(--red)">blocked</span>' : '') +
+      (created ? ' <span class="muted">created ' + escHtml(created) + '</span>' : '') +
+      '</div>' +
+      '<div class="muted" style="margin-bottom:10px">Carries ' + (Array.isArray(st.datasets) ? st.datasets.length : 0) +
+      ' granted dataset(s) — minting again would not change the grants.</div>' +
+      '<button class="btn btn-outline btn-sm" onclick="selfmintRotate()">Rotate…</button>' +
+      '<div class="muted" style="margin-top:8px;font-size:.78rem">Rotation replaces this key — the previous one stops authenticating immediately.</div>';
+  } else {
+    body.innerHTML =
+      '<button class="btn btn-primary btn-sm" onclick="selfmintMint(false)">Mint my key</button>';
+  }
+}
+
+// POST /api/access/mint-key and swap the button row for the copy-once
+// reveal — the same .key-reveal presentation the admin mint uses.
+async function selfmintMint(rotate) {
+  try {
+    const res = await api('POST', '/api/access/mint-key', rotate ? { rotate: true } : {});
+    selfmintState = null;                       // has_key/masked/created changed
+    const body = document.getElementById('selfmint-body');
+    if (body) {
+      body.innerHTML =
+        '<div class="muted" style="margin-bottom:4px">' + escHtml(res.message || (rotate ? 'Key rotated.' : 'Key minted.')) +
+        ' Shown only once — copy it now:</div>' +
+        '<div class="key-reveal" id="selfmint-key">' + escHtml(res.key || '') + '</div>' +
+        '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">' +
+        '<button class="btn btn-outline btn-sm" onclick="copySelfMintKey()">Copy key</button>' +
+        '<button class="btn btn-outline btn-sm" onclick="selfmintUseHere()">Use in this browser</button>' +
+        '<button class="btn btn-outline btn-sm" onclick="selfmintDone()">Done — I saved it</button>' +
+        '</div>';
+    }
+    toast(res.message || (rotate ? 'Key rotated' : 'Key minted'));
+  } catch (e) {
+    if (e.status === 409 || e.status === 403 || e.status === 404) {
+      hideSelfMintCard();                       // not offered to this session
+      return;
+    }
+    if (e.status === 401) { handleAuthRejected('Your credentials were rejected by the server'); return; }
+    toast(e.message || 'Mint failed', 'error');
+  }
+}
+
+function copySelfMintKey() {
+  const key = document.getElementById('selfmint-key');
+  if (!key) return;
+  navigator.clipboard.writeText(key.textContent)
+    .then(() => toast('Key copied to clipboard'))
+    .catch(() => toast('Copy failed — select the key manually', 'error'));
+}
+
+function selfmintUseHere() {
+  const key = document.getElementById('selfmint-key');
+  if (!key) return;
+  storeKey(key.textContent, false);   // paste mode governs after the reload
+  location.reload();
+}
+
+async function selfmintDone() {
+  selfmintState = null;             // has_key/masked/created may have changed
+  await renderSelfMintCard();       // collapses back to the has-key view
+}
+
+async function selfmintRotate() {
+  if (!confirm('Replace your API key? The previous key stops authenticating immediately.')) return;
+  await selfmintMint(true);
 }
 
 // -----------------------------------------------------------------------

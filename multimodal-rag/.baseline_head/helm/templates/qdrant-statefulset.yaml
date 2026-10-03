@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Values.deployment.name }}-qdrant
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.name }}-qdrant
+spec:
+  serviceName: {{ .Values.deployment.name }}-qdrant
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Values.deployment.name }}-qdrant
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.deployment.name }}-qdrant
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: qdrant
+          image: "{{ .Values.qdrant.image.repository }}:{{ .Values.qdrant.image.tag }}"
+          imagePullPolicy: {{ .Values.qdrant.image.pullPolicy }}
+          env:
+            {{- if .Values.qdrant.telemetryDisabled }}
+            # Qdrant phones home to telemetry.qdrant.io hourly; on clusters
+            # without open internet egress that fails ~24x/day per node and
+            # drowns the ERROR signal (721 entries in 9 days on SE-G2 —
+            # found by logsearch-mcp's first cross-namespace sweep).
+            - name: QDRANT__TELEMETRY_DISABLED
+              value: "true"
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - containerPort: {{ .Values.qdrant.grpcPort }}
+              name: grpc
+            - containerPort: {{ .Values.qdrant.httpPort }}
+              name: http
+          volumeMounts:
+            - name: data
+              mountPath: /qdrant/storage
+          resources: {{ toYaml .Values.resources.qdrant | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.qdrant.httpPort }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [{{ .Values.persistence.qdrant.accessMode }}]
+        {{- if .Values.persistence.qdrant.storageClass }}
+        storageClassName: {{ .Values.persistence.qdrant.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.qdrant.size }}

@@ -1,7 +1,7 @@
 replicaCount: 1
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v5.2.3
+  tag: v5.4.2
   pullPolicy: IfNotPresent
 deployment:
   name: rag-mcp-server
@@ -204,6 +204,22 @@ security:
   # ceiling protection, env RAG_ACCESS_DENY_SELECT).  Empty = everything
   # selectable (with proof).  Read per request; rotation without restart.
   accessDenySelect: ''
+  # SSO self-mint (decision D25, 2026-10; env RAG_ACCESS_SELF_MINT, read
+  # per request — flip without a restart).  false (default) = byte-identical
+  # behaviour (the mint endpoint 409s, the whoami flag reads false).  true =
+  # an SSO-authenticated identity (a verified D21 Bearer JWT, a D22 SSO
+  # session cookie, or a D24 trusted-proxy identity header) may mint — and
+  # deliberately rotate — a long-lived API key for ITS OWN registry identity
+  # from the Access page, no admin round-trip (D21 made JWT-only sign-in
+  # work; D25 closes the key loop).  Hard guarantees: the minted key carries
+  # EXACTLY the identity's existing access — self-mint never creates or
+  # widens dataset grants; an API-key-authenticated caller can never mint
+  # (the D17 invariant — a registry key is never a path to another key);
+  # env-authoritative and blocked names are refused; the key is shown
+  # exactly once.  Enabling ONLY makes sense when security.oidc.enabled (or
+  # trustProxyIdentity on G2) is on — there is no SSO identity to mint for
+  # otherwise.
+  accessSelfMint: false
   # Deployment-wide fallback memory dataset (env RAG_MEMORY_DEFAULT) — used
   # when a caller has no personal ★ binding and no client headers/env.
   # Empty = unset (the pre-existing MEMORY_DATASET env remains the fallback).

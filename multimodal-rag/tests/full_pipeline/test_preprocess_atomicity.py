@@ -375,6 +375,68 @@ def test_repair_reports_webm_stub_as_expected_failure():
         assert orig.exists()
 
 
+# ---------------------------------------------------------------------------
+# _store_file atomic copy (audit C4/P1)
+# ---------------------------------------------------------------------------
+
+
+def test_store_file_copy_is_atomic_and_retryable():
+    """A crash mid-copy must never expose a partial file at the final path.
+
+    ``_store_file`` used to run ``shutil.copy2(source, dest)`` straight onto
+    the final name, so a crash left a TRUNCATED file that the recreate
+    fallback re-embedded as garbage.  It now copies to a unique ``.part``
+    sibling and ``os.replace``s it into place.  Simulate the crash by
+    half-writing the destination then raising; assert no final-path file, no
+    ``.part`` litter, and that the next (healthy) call still works.
+    """
+    import shutil as _shutil
+
+    with tempfile.TemporaryDirectory() as td:
+        dm = _make_manager(Path(td))
+        files = dm.datasets_path / "ds" / "files"
+        src = Path(td) / "payload.bin"
+        payload = b"complete-contents-" * 4096  # 73_728 bytes
+        src.write_bytes(payload)
+
+        real_copy2 = _shutil.copy2
+        copied_to: list[str] = []
+
+        def _half_copy_then_crash(src_arg, dst_arg, *args, **kwargs):
+            Path(dst_arg).write_bytes(payload[: len(payload) // 2])  # torn write
+            copied_to.append(Path(dst_arg).name)
+            raise OSError("simulated crash mid-copy")
+
+        _shutil.copy2 = _half_copy_then_crash
+        try:
+            raised = False
+            try:
+                dm._store_file("ds", str(src))
+            except OSError:
+                raised = True
+            assert raised, "the simulated mid-copy crash must propagate"
+        finally:
+            _shutil.copy2 = real_copy2
+
+        assert copied_to, "the copy must go to the .part sibling"
+        assert all(n.endswith(".part") for n in copied_to), copied_to
+        # Dot-prefixed temp name: a SIGKILL cannot run the unlink cleanup, and
+        # every file listing filters on `startswith(".")` — a non-dot .part
+        # would surface as a phantom dataset file.
+        assert all(n.startswith(".") for n in copied_to), copied_to
+        visible = [p.name for p in files.iterdir() if p.is_file() and not p.name.startswith(".")]
+        assert visible == [], f"no final-path file may exist after a failed copy: {visible}"
+        assert not [p for p in files.iterdir() if p.name.endswith(".part")], ".part file leaked"
+
+        # The retry (no failure injected) must store a COMPLETE file, and the
+        # atomic rename must not leave a .part behind.
+        dest = dm._store_file("ds", str(src))
+        assert ".part" not in dest.name
+        assert dest.exists()
+        assert dest.read_bytes() == payload
+        assert not [p for p in files.iterdir() if p.name.endswith(".part")], ".part leaked on the success path"
+
+
 if __name__ == "__main__":
     import traceback
 

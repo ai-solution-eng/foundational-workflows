@@ -74,6 +74,12 @@ data:
   {{- if .Values.security.accessDenySelect }}
   RAG_ACCESS_DENY_SELECT: {{ .Values.security.accessDenySelect | quote }}
   {{- end }}
+  {{- if .Values.security.accessSelfMint }}
+  # D25 SSO self-mint (opt-in): SSO-authenticated identities (JWT / SSO
+  # cookie / trusted proxy headers) may mint their OWN long-lived API key
+  # from the Access page.  Read per request — flip without a restart.
+  RAG_ACCESS_SELF_MINT: "true"
+  {{- end }}
   {{- if .Values.security.memoryDefault }}
   # Deployment-wide fallback memory dataset (used when a caller has no
   # personal ★ binding and no client headers/env).

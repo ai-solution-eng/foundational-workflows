@@ -816,6 +816,7 @@ def test_whoami_authenticated_shape_with_flags(rest_client, jwks_server, monkeyp
         "can_create_datasets": False,  # named ACL, no '*'
         "sso_enabled": False,
         "memory_dataset": "ds1",
+        "self_mint": False,  # D25: the knob is off in this test's env
     }
     assert body["oidc"]["enabled"] is True
 

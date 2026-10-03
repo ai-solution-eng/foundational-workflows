@@ -1011,14 +1011,38 @@ def test_rest_index_suppresses_admin_key_meta_for_sso_visitor(rest_client, monke
     r = rest_client.get("/", headers={"X-Auth-Request-Access-Token": _mint(key, _claims(preferred="alice"))})
     assert r.status_code == 200
     assert 'meta name="rag-api-key"' not in r.text, "an SSO visitor must not receive the admin key"
-    # Same page, no JWT: meta present (embedded-key mode unchanged).
+    # D23 ratified semantics (audit 2026-10-02 P1-1): with the D15/D17
+    # registry configured, the embedded key NEVER appears — the page is
+    # public, so embedding the master key would hand full admin to any
+    # in-cluster caller.  The SPA prompts for the key client-side instead.
     r = rest_client.get("/")
-    assert 'meta name="rag-api-key"' in r.text and "deployment-admin-key" in r.text
-    # A FORGED token also suppresses nothing useful — verify it does NOT
-    # suppress (fail-closed meta retention: the page keeps its key mode).
+    assert 'meta name="rag-api-key"' not in r.text, (
+        "the admin key must not be embedded once D15/D17 key enforcement is active"
+    )
+    # A FORGED token also gets no key (registry mode suppresses regardless).
     forged = _mint(_generate_rsa("forged-kid"), _claims(preferred="alice"))
     r = rest_client.get("/", headers={"X-Auth-Request-Access-Token": forged})
-    assert 'meta name="rag-api-key"' in r.text
+    assert 'meta name="rag-api-key"' not in r.text
+
+
+def test_rest_index_embeds_key_only_in_legacy_mode(rest_client, monkeypatch, jwks_server):
+    """D23 ratified semantics (audit 2026-10-02 P1-1): the embedded admin
+    key exists ONLY in the key-unconfigured legacy mode — no D15 registry
+    (env ACLs or the admin overlay) configured.  Legacy: meta present.
+    Any registry configuration: suppressed (read per request, no restart)."""
+    _setup_key(jwks_server)  # issuer wired so the whoami probe is inert-clean
+    monkeypatch.setattr(api, "_RAG_API_KEY", "deployment-admin-key")
+    monkeypatch.setenv("RAG_OIDC_ISSUER", "")  # keep OIDC out of the picture
+    # Legacy mode: registry NOT configured → historical embedded-key page.
+    r = rest_client.get("/")
+    assert r.status_code == 200
+    assert 'meta name="rag-api-key"' in r.text and "deployment-admin-key" in r.text
+    # Flipping on the D15 registry (the env CLIENTS registry — the knob
+    # registry_configured() actually reads) removes the key from the public
+    # page — read per request, no restart.
+    monkeypatch.setenv(cr.CLIENTS_ENV, "alice:client-key-1")
+    r = rest_client.get("/")
+    assert 'meta name="rag-api-key"' not in r.text
 
 
 def test_rest_oidc_session_with_admin_key_stays_anonymous_shaped(rest_client, monkeypatch, jwks_server):
@@ -1320,3 +1344,39 @@ def test_oauth_logged_out_landing_page(rest_client):
     assert r.status_code == 200
     assert "Signed out" in r.text
     assert "Back to Multimodal RAG" in r.text
+
+
+def test_rest_index_embeds_no_key_in_d16_store_only_mode(rest_client, monkeypatch, jwks_server):
+    """Cross-validation 3-α: RAG_ACCESS_STORE=1 ALONE (D16 multi-user
+    self-service, no env registry / overlay / OIDC) is a configured
+    multi-user deployment — the embedded-key legacy fallback must NOT
+    engage (reproduced pre-fix: registry_configured() was False and the
+    master key was served on the public page)."""
+    _setup_key(jwks_server)
+    monkeypatch.setattr(api, "_RAG_API_KEY", "deployment-admin-key")
+    monkeypatch.setenv("RAG_OIDC_ISSUER", "")
+    monkeypatch.setenv(cr.CLIENTS_ENV, "")  # no env registry
+    monkeypatch.setenv("RAG_ACCESS_ADMIN_FILE", "")  # overlay follows the store
+    monkeypatch.setenv("RAG_ACCESS_STORE", "1")  # D16 only
+    r = rest_client.get("/")
+    assert r.status_code == 200
+    assert 'meta name="rag-api-key"' not in r.text, (
+        "a D16 store-only deployment is multi-user — the admin key must not be embedded"
+    )
+
+
+def test_rest_index_embeds_no_key_under_trust_proxy_identity(rest_client, monkeypatch, jwks_server):
+    """Cross-validation 3-β: RAG_TRUST_PROXY_IDENTITY=1 (OIDC off, no
+    registry) resolves per-user proxy identities — a real multi-user world;
+    the embedded-key legacy fallback must not engage there either."""
+    _setup_key(jwks_server)
+    monkeypatch.setattr(api, "_RAG_API_KEY", "deployment-admin-key")
+    monkeypatch.setenv("RAG_OIDC_ISSUER", "")
+    monkeypatch.setenv(cr.CLIENTS_ENV, "")
+    monkeypatch.setenv("RAG_ACCESS_STORE", "")
+    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    r = rest_client.get("/", headers={"X-Auth-Request-Preferred-Username": "alice"})
+    assert r.status_code == 200
+    assert 'meta name="rag-api-key"' not in r.text, (
+        "a trust-proxy deployment resolves per-user identities — no embedded master key"
+    )

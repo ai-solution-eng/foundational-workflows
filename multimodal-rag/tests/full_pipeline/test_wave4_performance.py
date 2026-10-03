@@ -841,8 +841,18 @@ def test_merge_until_budget_perf_smoke(trained_tokenizer_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_video_frames_local_streams_from_source(monkeypatch) -> None:
+def test_fetch_video_frames_local_streams_from_source(monkeypatch, tmp_path) -> None:
     """Local file:// videos take the streaming path and never the whole-file read."""
+    # The media-fetch allowlist (audit 2026-10-02 P0-2) refuses local refs
+    # outside MEDIA_ALLOW_PATH_PREFIXES — aim the fixture INSIDE it via the
+    # env override (read at import; monkeypatched before the import below
+    # would be too late, so patch the module tuple directly).
+    import multimodal_rag.utils.media_paths as _mp
+
+    video = tmp_path / "some-video.mp4"
+    video.write_bytes(b"fake-video-bytes")
+    monkeypatch.setattr(_mp, "_MEDIA_ALLOW_PATH_PREFIXES", (str(tmp_path),))
+
     emb = SimpleNamespace(
         mm_processor_kwargs={"max_pixels": 12345},
         http_async_client=None,
@@ -861,9 +871,9 @@ def test_fetch_video_frames_local_streams_from_source(monkeypatch) -> None:
     monkeypatch.setattr(InputConversion, "_extract_video_frames_from_source", staticmethod(fake_from_source))
     monkeypatch.setattr(InputConversion, "_extract_video_frames", staticmethod(fail_bytes))
 
-    out = asyncio.run(conv._fetch_video_frames("file:///tmp/some-video.mp4", num_frames=3))
+    out = asyncio.run(conv._fetch_video_frames(video.as_uri(), num_frames=3))
 
-    assert calls["args"][0] == "/tmp/some-video.mp4"
+    assert calls["args"][0] == str(video)
     assert calls["args"][1] == 3  # explicit caller cap honoured
     assert calls["args"][2] == 12345  # model max_pixels cap honoured
     assert out == [

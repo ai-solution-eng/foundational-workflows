@@ -191,6 +191,13 @@ def registry_configured() -> bool:
     ``RAG_OIDC_ISSUER``) counts as configured too — a JWT-only deployment
     must resolve identities (the D20 anonymous branch must NOT engage there),
     and once this returns True JWTs resolve through oidc_identity below.
+
+    Audit 2026-10-02 (cross-validation 3-α): a D16-only deployment
+    (``RAG_ACCESS_STORE=1``, no env registry / overlay / OIDC) is a live
+    multi-user self-service world — every identity that resolves is a
+    per-user client.  It counts as configured (the embedded-key legacy
+    fallback on the public pages must not engage there: the SPA's key-entry
+    / SSO flows are the safe paths).
     """
     if bool(os.environ.get(CLIENTS_ENV, "").strip()):
         return True
@@ -201,6 +208,18 @@ def registry_configured() -> bool:
             return True
     except Exception:
         pass
+    try:
+        from multimodal_rag.utils import access_store
+
+        if access_store.store_enabled():
+            return True
+    except Exception:
+        pass
+    # D24 (cross-validation 3-β): a trust-proxy deployment resolves
+    # proxy-injected per-user identities (every visitor is a per-user client
+    # world) — the embedded-key legacy fallback must not engage there either.
+    if os.environ.get("RAG_TRUST_PROXY_IDENTITY", "").strip().lower() in ("1", "true", "yes"):
+        return True
     try:
         from multimodal_rag.utils import oidc_identity
 

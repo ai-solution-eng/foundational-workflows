@@ -1067,6 +1067,114 @@ def _presented_pairs(request: Request) -> "list[tuple[str, str]]":
     return presented
 
 
+# ---------------------------------------------------------------------------
+# Request-body cap (audit 2026-10-02 P1-11, remediation + cross-validation
+# 2026-10-02).
+#
+# MAX_UPLOAD_BYTES caps multipart streaming, but every Body(...) endpoint
+# (/search, /batch-urls, /api/datasets/{name}/documents, the rrf knobs, …)
+# buffered the ENTIRE body in RAM before any check — one authenticated
+# request with a multi-GB body could OOM the pod (all tenants down).
+#
+# Cap: RAG_MAX_BODY_BYTES, default 256 MiB (0 disables).  Sized to cover a
+# 190 MB decoded base64 media query — far beyond any legitimate search
+# payload (the embedder downscales to 720×720 anyway) — while bounding a
+# 4-worker pod's worst-case concurrent buffering to ~1 GiB against 8 Gi
+# limits.
+#
+# Scope: every non-multipart body on a body-accepting method.  Cross-
+# validation P0-1 (2026-10-02): FastAPI buffers request.body() for ANY non-
+# form content type BEFORE inspecting the header — a `text/plain` or
+# content-type-less POST to a Body() endpoint sailed past a JSON-only gate
+# uncounted.  Multipart/form-data stays exempt (Starlette disk-spools it and
+# MAX_UPLOAD_BYTES caps the stream); every other declared-oversized body is
+# refused.  A body with no Content-Length and a non-JSON type is a
+# documented residual (declared-check only — the counting receive stays
+# JSON-scoped to keep the swap off non-JSON request paths).
+#
+# ORDERING TRUTH (cross-validation P1-2 — the previous comment had it
+# backwards): first-registered = INNERMOST, so the effective chain is
+# metrics → auth → body-cap.  Auth therefore runs BEFORE the cap: an
+# unauthenticated oversized request gets 401 (and pays the route-scan), and
+# a registry-keyed caller pays identity resolution before the 413.  That is
+# acceptable and deliberate — D20 identity contextvars must exist for
+# endpoints, and auth-on-body-reads is the house pattern.  Do NOT "fix" the
+# order based on this comment's predecessor.  Read per request (house
+# convention: flip or resize without restart).
+# ---------------------------------------------------------------------------
+
+
+def _max_body_bytes() -> int:
+    raw = os.environ.get("RAG_MAX_BODY_BYTES", "").strip()
+    if not raw:
+        return 256 * 1024 * 1024
+    try:
+        value = int(raw)
+    except ValueError:
+        return 256 * 1024 * 1024
+    if value < 0:
+        # A typo'd negative would otherwise silently DISABLE the cap
+        # (max(0, -1) == 0 == "disabled") — treat it as unset instead.
+        return 256 * 1024 * 1024
+    return value
+
+
+@app.middleware("http")
+async def _json_body_cap(request: Request, call_next):
+    limit = _max_body_bytes()
+    if limit > 0 and request.method in ("POST", "PUT", "PATCH"):
+        content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+        # Multipart is disk-spooled by Starlette and capped by the existing
+        # MAX_UPLOAD_BYTES streaming guard — never RAM-buffered wholesale.
+        is_json = content_type == "application/json"
+        if content_type == "multipart/form-data":
+            return await call_next(request)
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > limit:
+            # Return (not raise): BaseHTTPMiddleware would wrap an exception
+            # raised in this inner-middleware frame as a 500 before the app's
+            # exception handlers ever see it.  A JSONResponse flows out
+            # cleanly through every outer wrapper.
+            return JSONResponse(
+                {"detail": f"Request body exceeds RAG_MAX_BODY_BYTES ({limit} bytes) — send fewer/smaller documents per request."},
+                status_code=413,
+            )
+        # Counting-receive enforcement: JSON only (cross-validation P0-1
+        # follow-up — the receive swap stays scoped so non-JSON request
+        # paths never carry it; non-JSON bodies WITHOUT a Content-Length
+        # header are a documented residual, refused by the endpoint's own
+        # 415/422 after buffering).
+        if not is_json:
+            return await call_next(request)
+        # No/lying Content-Length: count what actually arrives and cut the
+        # stream at the cap.  BaseHTTPMiddleware bridges the inner app's
+        # body reads through request.receive → self._receive, so swapping
+        # request._receive intercepts them.  The ORIGINAL receive must be
+        # captured BEFORE the swap — calling request._receive() inside the
+        # wrapper after the assignment would recurse into itself (which
+        # surfaced as FastAPI's "error parsing the body").
+        original_receive = request._receive
+        received = 0
+
+        async def _counting_receive():
+            nonlocal received
+            message = await original_receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    # Same return-shape constraint: this raise happens inside
+                    # call_next's body pump, so the best we can do is refuse
+                    # to feed more bytes — the outer handler converts the
+                    # aborted parse into a 4xx/500 (never a clean 200).  The
+                    # declared-header fast path above is the enforced one for
+                    # honest clients.
+                    raise HTTPException(413, f"JSON body exceeds RAG_MAX_BODY_BYTES ({limit} bytes).")
+            return message
+
+        request._receive = _counting_receive
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def _api_key_auth(request: Request, call_next):
     registry_on = _clients_registry.registry_configured()
@@ -1807,6 +1915,13 @@ async def api_select_dataset(name: str, request: Request, body: dict[str, Any] =
                 identity, name, password, dm.has_password, dm.verify_password
             ),
         )
+    except _access_store.SelectionDenied as exc:
+        # Audit 2026-10-02 P0-1 follow-up (cross-validation #1): the proof
+        # gate refuses with SelectionDenied (a PermissionError, NOT a
+        # ValueError) — unhandled it surfaced as a 500.  Map it to 403 with
+        # the caller-safe message; no throttle charge (no password proof was
+        # attempted).
+        raise HTTPException(403, str(exc))
     except ValueError as exc:
         _pw_record_failure(cid)  # wrong/missing password → throttle bucket
         raise HTTPException(403, str(exc))
@@ -1903,6 +2018,157 @@ def _require_admin_file() -> None:
             409,
             "The admin key registry is not enabled (set RAG_ACCESS_STORE=1, the D16 knob).",
         )
+
+
+# ---------------------------------------------------------------------------
+# D25 SSO self-mint — the identity mints its OWN long-lived API key
+# ---------------------------------------------------------------------------
+
+
+def _sso_proof_for_identity(request: Request, identity: Any) -> "str | None":
+    """``"jwt"`` | ``"proxy-identity"`` when THIS request carries SSO proof
+    for the BOUND identity, else ``None`` (D25).
+
+    The proof is per-identity, not per-channel: the request must present a
+    credential whose verification — outside the registry — proves the realm
+    (or the enforcing proxy) vouches for exactly the identity that got
+    bound.  That keeps every D17 invariant while surviving credential
+    precedence:
+
+    * a JWT candidate (any envelope: ``Authorization: Bearer``, the
+      auth-proxy's forwarded token, the D22 SSO cookie) that RS256-verifies
+      and resolves to the bound identity's NAME — the realm signature is
+      the proof;
+    * a ``proxy-identity`` candidate equal to the bound name (only ever
+      collected when ``RAG_TRUST_PROXY_IDENTITY`` confirmed an enforcing
+      proxy) — the edge authentication is the proof.
+
+    An OPAQUE API key is never proof: a key-authenticated request with no
+    co-present SSO credential gets ``None`` → the endpoint 403s (minting
+    stays exactly the power a key must never have).  When an SSO session
+    AND a pasted key co-exist (the SPA's paste mode), a JWT resolving to
+    the SAME identity satisfies the proof — two independent attestations
+    of one human; the mint still acts only on that identity's own entry.
+    """
+    pairs = _presented_pairs(request)
+    if _trust_proxy_identity():
+        for candidate, via in pairs:
+            if via == "proxy-identity" and candidate == str(identity.name):
+                return "proxy-identity"
+    try:
+        from multimodal_rag.utils import oidc_identity
+
+        if oidc_identity.oidc_enabled():
+            for candidate, _via in pairs:
+                if not oidc_identity.is_jwt_format(candidate):
+                    continue
+                jwt_ident = oidc_identity.resolve_jwt(candidate)
+                if jwt_ident is not None and str(getattr(jwt_ident, "name", "")) == str(identity.name):
+                    return "jwt"
+    except Exception:
+        return None  # a broken verification sidecar can never mint (fail-closed)
+    return None
+
+
+def _require_self_mint(request: Request) -> Any:
+    """The full D25 gate chain — ``(identity, source)`` or a 4xx.
+
+    Order: the knob (409 — the deployment does not offer it) → an
+    authenticated non-admin per-user identity (403 — anonymous fallbacks
+    and admins are not self-mint subjects; admins hold the D17 panel) →
+    SSO proof for that identity (403 — key-only callers may never mint).
+    """
+    if not _admin_registry.self_mint_enabled():
+        raise HTTPException(
+            409,
+            "SSO self-mint is not enabled on this deployment (set RAG_ACCESS_SELF_MINT=1).",
+        )
+    identity = _clients_registry.current_identity()
+    if identity is None or identity.is_admin or not identity.name or identity.name == "__anonymous__":
+        raise HTTPException(403, "SSO self-mint applies to SSO-authenticated per-user identities only.")
+    source = _sso_proof_for_identity(request, identity)
+    if source is None:
+        raise HTTPException(
+            403,
+            "Key minting is not a power an API key carries (D15/D17) — sign in with SSO "
+            "(a verified JWT, the SSO session, or trusted proxy identity) to mint your own key.",
+        )
+    return identity, source
+
+
+@app.get("/api/access/key")
+async def api_access_own_key(request: Request):
+    """The caller's OWN key view (D25) — masked, owner-safe.
+
+    SSO-sourced identities only (verified JWT / SSO cookie / trusted proxy
+    identity).  Key material NEVER appears here — even the owner sees the
+    masked form (the full key exists exactly once, in the mint response).
+    409 when self-mint is off (the SPA hides the card), 403 for
+    key-authenticated callers.
+    """
+    identity, source = _require_self_mint(request)
+    loop = asyncio.get_running_loop()
+    try:
+        view = await loop.run_in_executor(sync_pool, _admin_registry.own_key_view, identity.name)
+    except _access_store.SelectionDenied as exc:
+        raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    view["source"] = source
+    view["enabled"] = True
+    view["identity"] = view["name"]  # the SPA-contract alias
+    return view
+
+
+@app.post("/api/access/mint-key")
+async def api_access_self_mint(request: Request, body: dict[str, Any] = Body(default=None)):
+    """Mint (or deliberately rotate) YOUR OWN long-lived API key (D25).
+
+    Request body (optional)::
+
+        {"rotate": true}   # required to replace an existing key
+
+    The generated key is returned ONCE in ``key`` — this response is the
+    only time the caller sees the material.  Rotation kills the previous
+    key immediately (everything re-reads per request).  The mint NEVER
+    touches grants: the new key carries exactly the identity's current
+    access (operator ACLs ∪ self-selections resolve on the next request).
+    """
+    identity, source = _require_self_mint(request)
+    rotate = bool((body or {}).get("rotate")) if isinstance(body, dict) else False
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            sync_pool, lambda: _admin_registry.self_mint_key(identity.name, rotate=rotate)
+        )
+    except _access_store.SelectionDenied as exc:
+        raise HTTPException(409, str(exc))
+    except FileExistsError as exc:
+        raise HTTPException(409, str(exc))
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc))
+    except KeyError as exc:
+        raise HTTPException(409, str(exc.args[0] if exc.args else exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    logger.info(
+        "SSO self-mint: identity '%s' minted/rotated its own API key (source=%s, rotated=%s)",
+        result["name"],
+        source,
+        result["rotated"],
+    )
+    return {
+        "status": "ok",
+        "name": result["name"],
+        "key": result["key"],  # the ONLY full-key response in the D25 surface
+        "rotated": result["rotated"],
+        "created": result["created"],
+        "message": (
+            f"Key rotated for '{result['name']}' — the previous key no longer authenticates."
+            if result["rotated"]
+            else f"API key minted for '{result['name']}' — shown only once, copy it now."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3262,6 +3528,79 @@ async def api_search_multimodal(
 # -- Federated multi-dataset search (roadmap feature 8) ----------------------
 
 
+def _federated_concurrency() -> int:
+    """Max datasets searched CONCURRENTLY per federated fan-out (default 8).
+
+    Read per call so the bound is tunable without a restart; unset/garbage
+    values fall back to the default.  Before this bound, the fan-out launched
+    one task per dataset (bounded only by ``sync_pool``, which then queued
+    FIFO — a caller naming 50 datasets enqueued 50 searches at once).
+    """
+    try:
+        return max(1, int(os.environ.get("RAG_FEDERATED_CONCURRENCY", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _federated_timeout_seconds() -> float:
+    """Per-dataset search timeout (seconds) for one federated fan-out.
+
+    Read per call; ``0`` DISABLES the timeout (the search is awaited
+    unwrapped).  Default 60s: one hung dataset must not pin the whole
+    federated call (Qdrant has no client timeout in the base chart, so
+    nothing else bounds a stuck ``dm.search``).
+    """
+    try:
+        return max(0.0, float(os.environ.get("RAG_FEDERATED_TIMEOUT_SECONDS", "60")))
+    except (TypeError, ValueError):
+        return 60.0
+
+
+async def _afederated_bounded_call(sem: asyncio.Semaphore, coro_fn: Any, *args: Any) -> Any:
+    """Run ONE fan-out coroutine under the concurrency bound + per-dataset deadline.
+
+    Mirror of ``mcp_server._afederated_bounded_call`` (the D-mirror
+    convention: both federated twins bound their fan-out identically).  The
+    semaphore is held for the whole per-dataset search and released on every
+    exit path (result, exception, cancellation); both env knobs are read
+    inside so they stay per-call.
+
+    The inner coroutine is wrapped in a TASK before the deadline is applied:
+    with a bare coroutine, a ``TimeoutError`` raised INSIDE the search is
+    indistinguishable from the deadline and would be mis-reported as a
+    fan-out timeout.  With a task, a deadline that fires wins synchronously,
+    so the settled state tells the two apart: ``done and not cancelled``
+    means the inner error was already raised.
+
+    An ``async def`` wrapper in both twins — callers simply ``await`` it.
+    """
+
+    async def _run() -> Any:
+        async with sem:
+            timeout = _federated_timeout_seconds()
+            if timeout <= 0:
+                return await coro_fn(*args)  # 0 = disabled: no wrap, no cancel
+            task = asyncio.ensure_future(coro_fn(*args))
+            try:
+                return await asyncio.wait_for(task, timeout)
+            except TimeoutError as exc:
+                inner = task.exception() if (task.done() and not task.cancelled()) else None
+                if inner is not None:
+                    raise inner  # the inner timeout won the race; keep it as-is
+                raise TimeoutError(f"timed out after {timeout:g}s") from exc
+            finally:
+                # Slot-release ordering (cross-validation P1-3; mirror of the
+                # MCP twin): cancel fire-and-forget so the semaphore slot
+                # frees as soon as the deadline fires, even if the abandoned
+                # task suppresses its cancellation.  The task keeps running
+                # to completion in the background (executor work cannot be
+                # un-run); it holds no semaphore resources.
+                if not task.done():
+                    task.cancel()
+
+    return await _run()
+
+
 async def _federated_rerank_rag(dm: DatasetManager, targets: list[str]) -> Any:
     """Return the first target dataset's RAG that has a reranker configured.
 
@@ -3291,8 +3630,10 @@ async def _federated_rest_search(
     Testable core behind ``POST /api/search`` (the endpoint only parses the
     request body and wires the per-client unlock predicate).  Per-dataset
     searches are the same sync ``dm.search`` calls the single-dataset
-    endpoints use, offloaded to ``sync_pool`` and gathered concurrently; a
-    failing dataset becomes a per-dataset error note and never fails the
+    endpoints use, offloaded to ``sync_pool`` and gathered concurrently
+    (bounded by ``RAG_FEDERATED_CONCURRENCY``, timed per dataset by
+    ``RAG_FEDERATED_TIMEOUT_SECONDS``); a failing or timed-out dataset
+    becomes a per-dataset error note and never fails the
     call.  Merging labels every hit with its dataset, dedups on the
     dataset-qualified twin-identity key and sorts by score; *use_reranker*
     runs ONE rerank pass over the merged pool (the reranker is content-based,
@@ -3335,7 +3676,16 @@ async def _federated_rest_search(
             ),
         )
 
-    outcomes = await asyncio.gather(*(_search_one(name) for name in targets), return_exceptions=True)
+    # Bounded (RAG_FEDERATED_CONCURRENCY, default 8) and timed
+    # (RAG_FEDERATED_TIMEOUT_SECONDS, default 60, 0=disabled) per dataset,
+    # exactly like the MCP twin: without both, N targets meant N concurrent
+    # searches and one hung dataset pinned the whole gather.  A deadline
+    # surfaces as ``TimeoutError("timed out after Ns")`` below and takes the
+    # same per-dataset error-note path as any other failure.
+    sem = asyncio.Semaphore(_federated_concurrency())
+    outcomes = await asyncio.gather(
+        *(_afederated_bounded_call(sem, _search_one, name) for name in targets), return_exceptions=True
+    )
 
     entries: list[tuple[str, Any, float]] = []
     extra_fields: dict[int, dict[str, Any]] = {}
@@ -4205,7 +4555,11 @@ async def api_staging_serve(staging_id: str):
         raise HTTPException(404, "Staged file not found or expired")
     # Ignore leftover "_preprocessed" siblings (only produced when the atomic
     # replace failed) and pick a deterministic file.
-    files = sorted(f for f in sub.iterdir() if f.is_file() and not f.name.endswith("_preprocessed"))
+    files = sorted(
+        f
+        for f in sub.iterdir()
+        if f.is_file() and not f.name.endswith("_preprocessed") and not f.name.startswith(".")
+    )
     if not files:
         raise HTTPException(404, "Staged file not found or expired")
     target = files[0]
@@ -5216,6 +5570,9 @@ def _whoami_flags() -> dict:
     * ``sso_enabled`` — the D22 browser SSO flow is fully configured.
     * ``memory_dataset`` — the caller's effective ★ binding or null (the
       same fail-soft resolution the MCP memory tools use).
+    * ``self_mint`` (D25) — the deployment offers SSO self-mint (knob +
+      overlay on).  The SPA shows the "Your API key" card from this flag;
+      the endpoints re-check everything server-side per request.
     """
     identity = _clients_registry.current_identity()
     can_create = False
@@ -5236,6 +5593,10 @@ def _whoami_flags() -> dict:
     except Exception:
         memory = None
     try:
+        self_mint = bool(_admin_registry.self_mint_enabled())
+    except Exception:
+        self_mint = False
+    try:
         from multimodal_rag.utils import oidc_sso
 
         sso_on = bool(oidc_sso.sso_enabled())
@@ -5245,6 +5606,7 @@ def _whoami_flags() -> dict:
         "can_create_datasets": bool(can_create),
         "sso_enabled": sso_on,
         "memory_dataset": memory,
+        "self_mint": self_mint,
     }
 
 
@@ -5278,7 +5640,8 @@ def _oidc_session_payload(presented: "list[tuple[str, str]]") -> dict:
     # SSO cookie is a JWT envelope, not an opaque key — it does NOT trigger
     # this bail-out.
     if any(
-        via not in ("forwarded", "cookie") and not oidc_identity.is_jwt_format(candidate)
+        via not in ("forwarded", "cookie", "proxy-identity")
+        and not oidc_identity.is_jwt_format(candidate)
         for candidate, via in presented
     ):
         return {"authenticated": False}
@@ -5305,6 +5668,37 @@ def _oidc_session_payload(presented: "list[tuple[str, str]]") -> dict:
             "flags": flags,
             "oidc": oidc_identity.oidc_status(),
         }
+    # D25 v2 (the G2 edge case): behind an ENFORCING proxy
+    # (RAG_TRUST_PROXY_IDENTITY) a request may carry ONLY the injected
+    # identity headers — no JWT envelope, no key — yet the middleware still
+    # resolves the D24 proxy-identity candidate to a real per-user identity.
+    # The whoami must preview THAT too, or the SPA renders an SSO visitor as
+    # an anonymous "API-key user" (the exact self-mint card hidden report,
+    # 2026-10-02).  Mirror the middleware's D24 precedence position: it
+    # engages only when no explicit credential resolved above.
+    if _trust_proxy_identity():
+        for candidate, via in presented:
+            if via != "proxy-identity":
+                continue
+            name = str(candidate or "").strip()
+            if not name or not _admin_registry.valid_name(name):
+                continue
+            datasets = _clients_registry.dataset_acls().get(name, frozenset())
+            ident = _clients_registry.Identity(kind="client", name=name, datasets=frozenset(datasets))
+            token = _clients_registry.set_current_identity(ident)
+            try:
+                flags = _whoami_flags()
+            finally:
+                _clients_registry.reset_current_identity(token)
+            return {
+                "authenticated": True,
+                "identity": name,
+                "source": "proxy-identity",
+                "datasets": sorted(datasets),
+                "is_admin": False,  # a proxy identity is never admin (D24)
+                "flags": flags,
+                "oidc": oidc_identity.oidc_status(),
+            }
     return {"authenticated": False}
 
 
@@ -5555,6 +5949,19 @@ async def index(request: Request = None):  # direct callers (the /manage fallbac
             f'<meta name="rag-rrf-default" content="{html.escape(content, quote=True)}"></head>',
             1,
         )
+    # The unlock endpoint's configured bounds, so the SPA's TTL selector can
+    # match the server (and carry the deployment's no-expiry knob).  The
+    # legacy /access page has always injected this meta; the D23 SPA (this
+    # route) never did — so a RAG_UNLOCK_MAX_TTL=0 deployment showed the
+    # "No expiry (0)" option DISABLED on the homepage's Unlock forms (found
+    # live on G2, 2026-10-02).  Injected UNCONDITIONALLY (the SPA treats an
+    # absent/NaN meta as bounded — injecting the actual value, whatever it
+    # is, only ever ALIGNS the selector with the server).
+    page = page.replace(
+        "</head>",
+        f'<meta name="rag-unlock-ttl-max" content="{_unlock_ttl_max()}"></head>',
+        1,
+    )
     # D21: when the request itself presents a resolvable JWT (browser SSO —
     # the auth proxy forwards the access token), DO NOT embed the admin key:
     # the page's auth header would outrank the forwarded JWT and escalate
@@ -5562,11 +5969,21 @@ async def index(request: Request = None):  # direct callers (the /manage fallbac
     # in SSO mode it sends no key and the forwarded JWT resolves per request.
     # A direct call (request=None — the /manage fallback, tests) has no SSO
     # context: presented is empty, the meta is embedded, history preserved.
+    # D23 ratified behavior (audit 2026-10-02, P1-1): the embedded key is
+    # the key-unconfigured LEGACY mode ONLY — the page is public, so an
+    # embedded master key hands full admin to anything that can reach the
+    # ClusterIP.  When multi-user key enforcement is active (D15/D17), the
+    # SPA uses its key-entry / SSO flows instead; the page renders the
+    # signed-out view and the SPA prompts for the key client-side.
     presented = _presented_pairs(request) if request is not None else []
-    if _RAG_API_KEY and not _oidc_session_payload(presented).get("authenticated", False):
+    if (
+        _RAG_API_KEY
+        and not _clients_registry.registry_configured()
+        and not _oidc_session_payload(presented).get("authenticated", False)
+    ):
         page = page.replace(
             "</head>",
-            f'<meta name="rag-api-key" content="{_RAG_API_KEY}"></head>',
+            f'<meta name="rag-api-key" content="{html.escape(_RAG_API_KEY, quote=True)}"></head>',
             1,
         )
     return page

@@ -116,7 +116,7 @@ def _dm_with(client) -> tuple[DatasetManager, dict[str, Any]]:
     recorded: dict[str, Any] = {"decrements": [], "ingested": [], "force": None}
     dm._decrement_count = lambda name, n, file_type=None: recorded["decrements"].append(n)  # type: ignore[method-assign]
 
-    def _add_files_batch(ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None):
+    def _add_files_batch(ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None):
         recorded["ingested"].append([name for _, name in file_entries])
         recorded["force"] = set(force_names or ())
         return {"status": "ok", "file_count": len(file_entries), "files": []}
@@ -283,7 +283,7 @@ def _sync_env(
     if prune is not None:
         rs.patch(dm, "_prune_sources", lambda ds, prefixes, expected: prune)
 
-    def _add_files_batch(ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None):
+    def _add_files_batch(ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None):
         recorded["ingested"].append([name for _, name in file_entries])
         recorded["force"] = set(force_names or ())
         return {"status": "ok", "file_count": len(file_entries), "files": list(batch_files or [])}
@@ -378,7 +378,7 @@ def test_watched_state_new_object_ingests_and_records():
             )
 
             # The batch now reports all three outcomes (two dedup-skips + the new one).
-            def _batch_with_skips(ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None):
+            def _batch_with_skips(ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None):
                 recorded["ingested"].append([name for _, name in file_entries])
                 return {
                     "status": "ok",
@@ -612,3 +612,110 @@ if __name__ == "__main__":
             traceback.print_exc()
     print(f"\n{'All tests passed!' if not failed else f'{failed} test(s) failed'}")
     sys.exit(1 if failed else 0)
+
+
+# ---------------------------------------------------------------------------
+# Canonical-source stamping (audit 2026-10-02 P1-3 + cross-validation F1/F7)
+# ---------------------------------------------------------------------------
+# URL ingests must carry their canonical s3:// URL as metadata.source so the
+# prune's MatchPrefix filters can match them.  The source map is keyed by
+# tmp_path (unique per download) — a basename key would collide when one sync
+# spans prefixes holding the same object name and stamp one file with the
+# other's canonical URL.
+
+
+def test_sync_passes_canonical_source_map_keyed_by_tmp_path():
+    """add_urls_batch(sync=True) must hand add_files_batch a source map with
+    one entry per download, each tmp_path mapped to ITS OWN canonical URL."""
+    rs = _Restore()
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            client = _client()
+            dm, recorded = _dm_with(client)
+            _dm_with_state_dir(dm, td)
+            rs.patch(dm_module, "_list_s3_prefix_fingerprints", lambda url: _fps(EXPANDED))
+            dl_counter: list[int] = []
+
+            def _dl(url: str) -> str:
+                dl_counter.append(1)
+                return str(Path(td) / f"dl-{len(dl_counter)}")
+
+            rs.patch(dm_module, "_download_url", _dl)
+            rs.patch(dm, "_stored_sources", lambda ds, prefixes: set())
+
+            def _capture_batch(ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None):
+                recorded["entries"] = list(file_entries)
+                recorded["source_urls"] = dict(source_urls or {})
+                return {"status": "ok", "file_count": len(file_entries), "files": []}
+
+            dm.add_files_batch = _capture_batch  # type: ignore[method-assign]
+            result = dm.add_urls_batch("ds", [PFX], sync=True)
+        finally:
+            rs.restore()
+
+    assert result["status"] == "ok"
+    entries = recorded["entries"]
+    smap = recorded["source_urls"]
+    # One map entry per downloaded file, keyed by that file's tmp_path …
+    assert set(smap.keys()) == {tmp for tmp, _ in entries}
+    # … and every entry maps to the canonical URL of the file downloaded TO
+    # that tmp_path (zip order: file_entries built in `download` order).
+    assert smap == {tmp: url for (tmp, _), url in zip(entries, EXPANDED)}
+    # tmp_path keys are unique even when basenames are not (the F1 case):
+    assert len({Path(k).name for k in smap}) <= len(smap)  # basenames may repeat
+    assert len(smap) == len(EXPANDED)
+
+
+def test_sync_source_map_survives_same_basename_across_prefixes():
+    """THE F1 collision case: two prefixes holding the same object name in
+    one sync must produce two DISTINCT canonical sources — tmp_path keys make
+    the collision impossible (the basename key collapsed both to one)."""
+    PFX_A = "s3://bucket/one/"
+    PFX_B = "s3://bucket/two/"
+    urls = ["s3://bucket/one/a.txt", "s3://bucket/two/a.txt"]
+    rs = _Restore()
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            client = _client()
+            dm, recorded = _dm_with(client)
+            _dm_with_state_dir(dm, td)
+            fps = {u: {"etag": f"e-{i}", "size": 10 + i} for i, u in enumerate(urls)}
+
+            def _fps_by_prefix(url: str) -> dict[str, dict[str, Any]]:
+                # Each prefix lists ONLY its own object — matching real
+                # _list_s3_prefix semantics (a prefix walk never returns a
+                # sibling prefix's keys).
+                if url.startswith(PFX_A):
+                    return {urls[0]: fps[urls[0]]}
+                if url.startswith(PFX_B):
+                    return {urls[1]: fps[urls[1]]}
+                return {}
+
+            rs.patch(dm_module, "_list_s3_prefix_fingerprints", _fps_by_prefix)
+            downloads: list[str] = []
+
+            def _dl(url: str) -> str:
+                p = str(Path(td) / f"dl-{len(downloads)}")
+                downloads.append(url)
+                return p
+
+            rs.patch(dm_module, "_download_url", _dl)
+            rs.patch(dm, "_stored_sources", lambda ds, prefixes: set())
+
+            def _capture_batch(ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None):
+                recorded["entries"] = list(file_entries)
+                recorded["source_urls"] = dict(source_urls or {})
+                return {"status": "ok", "file_count": len(file_entries), "files": []}
+
+            dm.add_files_batch = _capture_batch  # type: ignore[method-assign]
+            dm.add_urls_batch("ds", [PFX_A, PFX_B], sync=True)
+        finally:
+            rs.restore()
+
+    smap = recorded["source_urls"]
+    # Same basename twice — the map still carries BOTH canonical URLs.
+    assert sorted(smap.values()) == sorted(urls)
+    assert len(smap) == 2  # no collapse
+    # And the mapping is per-download: each tmp_path got its own URL.
+    by_tmp = {tmp: url for (tmp, _), url in zip(recorded["entries"], downloads)}
+    assert smap == by_tmp

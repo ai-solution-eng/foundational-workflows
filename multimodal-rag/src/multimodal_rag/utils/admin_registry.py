@@ -270,6 +270,128 @@ def generate_key() -> str:
     return secrets.token_urlsafe(18)
 
 
+# ---------------------------------------------------------------------------
+# D25 SSO self-mint — the identity mints its OWN key
+# ---------------------------------------------------------------------------
+
+SELF_MINT_ENV = "RAG_ACCESS_SELF_MINT"
+
+
+def self_mint_enabled() -> bool:
+    """True when RAG_ACCESS_SELF_MINT opts the deployment in (D25).
+
+    Read per call (the house convention — flip without a restart).  The
+    overlay must be enabled too: there is nowhere to write the self-minted
+    entry otherwise.  Default unset = the feature is INERT (byte-identical
+    behaviour).
+    """
+    if not admin_file_enabled():
+        return False
+    return os.environ.get(SELF_MINT_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def own_key_view(name: str) -> dict:
+    """The OWNER-SAFE view of an identity's overlay entry (D25).
+
+    Everything the identity itself may learn about its own key: whether one
+    exists (``has_key``), the MASKED prefix (never the material — even the
+    owner re-reads the masked form; the full key is returned exactly once,
+    at mint time), its grants, and the D21 flags that bear on it.  Unlike
+    the admin listing this refuses NOTHING for being env-authoritative —
+    the view is read-only; only the mint/rotate WRITE refuses env names.
+    An empty-key entry (auto-minted by a D23 grant or a flag PATCH) reads
+    ``has_key: False`` — it authenticates nothing, so the user may mint.
+    """
+    if not admin_file_enabled():
+        raise _base.SelectionDenied("The admin key registry is not enabled on this deployment.")
+    name = _validate_name(name)
+    from multimodal_rag.utils.clients_registry import CLIENTS_ENV, dataset_acls, parse_clients
+
+    env_names = set(parse_clients(os.environ.get(CLIENTS_ENV, "")).values())
+    entry = _load().get("clients", {}).get(name)
+    if not isinstance(entry, dict):
+        entry = {}
+    key = str(entry.get("key") or "")
+    return {
+        "name": name,
+        "has_key": bool(key),
+        "key_masked": (key[:6] + "…" + key[-2:]) if len(key) > 10 else ("…" if key else None),
+        "datasets": sorted(dataset_acls().get(name, frozenset())),
+        "oidc": str(entry.get("oidc")) if entry.get("oidc") else None,
+        "blocked": bool(entry.get("blocked")),
+        "env_managed": name in env_names,
+        "created": entry.get("created"),
+    }
+
+
+def self_mint_key(name: str, rotate: bool = False) -> dict:
+    """Mint (or deliberately rotate) the key of the CALLER'S OWN identity.
+
+    The D25 write half.  Rules, all fail-closed:
+
+    * *name* comes from the VERIFIED identity (a JWT/cookie/proxy claim),
+      never from user input — a caller can only ever mint for itself.
+    * Grants are NEVER touched: the minted key carries exactly the
+      identity's current ACLs (env ∪ overlay — the merged registry resolves
+      them on the next request).  Self-mint widens nothing; it hands an
+      EXISTING identity a second credential.
+    * An ENV-authoritative name refuses (the overlay cannot shadow the env
+      registry — the operator owns that key).
+    * A ``blocked: true`` entry refuses (a blocked identity resolves to
+      nothing; it certainly cannot mint).
+    * Minting over an EXISTING usable key requires ``rotate=True`` — the
+      deliberate, confirm-guarded path (the old key stops authenticating
+      immediately).  An empty-key entry (auto-minted by grants/flags) is
+      mintable without the flag: it never authenticated anything.
+    * The generated key is returned ONCE (the only full-key response in the
+      D25 surface); every later view is masked.
+    """
+    if not self_mint_enabled():
+        raise _base.SelectionDenied("SSO self-mint is not enabled on this deployment (RAG_ACCESS_SELF_MINT).")
+    name = _validate_name(name)
+    from multimodal_rag.utils.clients_registry import CLIENTS_ENV, parse_clients
+
+    env_names = set(parse_clients(os.environ.get(CLIENTS_ENV, "")).values())
+    if name in env_names:
+        # Env-authoritative name — refuse REGARDLESS of whether an overlay
+        # entry exists: the env registry owns that key's lifecycle, and a
+        # self-mint could otherwise rotate only the overlay half while the
+        # env key keeps authenticating for the same identity (the operator
+        # decides; own_key_view reports env_managed so the UI hides the
+        # mint/rotate affordances for these names).
+        raise KeyError(
+            f"Identity '{name}' is managed by the env registry (RAG_API_KEY_CLIENTS) — "
+            "ask an operator to mint/rotate its key."
+        )
+    result: dict = {}
+
+    def _apply(doc: dict) -> bool:
+        entry = doc["clients"].get(name)
+        if not isinstance(entry, dict):
+            entry = {"key": "", "datasets": []}
+            doc["clients"][name] = entry
+        if entry.get("blocked") is True:
+            raise PermissionError(f"Identity '{name}' is blocked — it cannot mint a key.")
+        existing_key = str(entry.get("key") or "")
+        if existing_key and not rotate:
+            raise FileExistsError(f"Identity '{name}' already has an API key — pass rotate to replace it.")
+        new_key = generate_key()
+        entry["key"] = new_key
+        entry.setdefault("datasets", [])
+        entry["created"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        result["created"] = True
+        result["key"] = new_key
+        return True
+
+    _mutate(_apply)
+    return {
+        "name": name,
+        "key": result["key"],
+        "rotated": rotate,
+        "created": result.get("created", False),
+    }
+
+
 def mint_client(name: str, datasets: list | None = None, key: str | None = None) -> dict:
     """Create (or rotate the key of) an overlay client.
 

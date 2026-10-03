@@ -128,6 +128,7 @@ The charts ship auth **on by default** (`security.apiKey` / `mediaTokenSecret` a
 | `RAG_WEBHOOK_URL` (+ `RAG_WEBHOOK_SECRET` / `RAG_WEBHOOK_TIMEOUT`) | **Ingest webhooks (opt-in, Wave-5).** When set, every completed ingest (REST or MCP: raw documents, single file, batch files, URL/S3 batches) POSTs one small JSON event to the URL — `{"dataset", "doc_count", "status", "timestamp"}` with header `X-RAG-Webhook-Secret` when `RAG_WEBHOOK_SECRET` is set. The POST is timeout-capped (`RAG_WEBHOOK_TIMEOUT`, default 5.0 s, clamped ≥ 0.1) and **failures are logged, never fatal** — a dead receiver cannot fail an ingest that already succeeded. Dataset restore/import replays are muted (one logical ingest, not one event per batch). Unset (default) = zero behaviour: no request, no latency, no log line. For the chart, pass via `extraEnv` (the values are not secrets, but treat the webhook URL as semi-sensitive). | unset (off) |
 | `RAG_API_KEY_CLIENTS` (+ `RAG_DATASET_ACLS`) | **Decision D15 — multi-user API keys → dataset ACLs (explicitly OPT-IN; enabling changes the auth model).** `RAG_API_KEY_CLIENTS="name:key;name:key"` (parsed like `K8S_MCP_CLIENTS`; keys must not contain `:` or `;`) mints per-user keys accepted by BOTH the REST and MCP surfaces; `RAG_DATASET_ACLS="name:ds1,ds2;name2:*"` binds each name to its datasets (`*` = all). A registry key matching NO ACL entry gets **NO datasets (fail-closed)**; dataset access (list/read/search/unlock/manage) is enforced per identity on both surfaces, per-key unlock caches and password-throttle buckets ride the D10 per-identity machinery (`key:<name>`), federated search restricts its fan-out to granted datasets, and ACL'd keys cannot reach `/api/admin/*` nor create datasets (unless granted `*`). The plain deployment keys — `RAG_API_KEY` plus the MCP key set (`MCP_API_KEYS` / `RAG_API_KEYS`) — keep FULL (admin) access. **Default (registry unset): today's single-key behaviour, byte-identical.** Env re-read per request (rotation without restart). Chart wiring: `mcp.apiKeyClients` / `mcp.datasetAcls` — rendered ONLY when set; the values are key material, pass them from a Secret pipeline. | unset (single-key, unchanged) |
 | `RAG_ACCESS_STORE` (+ `RAG_ACCESS_DENY_SELECT` / `RAG_MEMORY_DEFAULT`) | **Decision D16 — self-service dataset selection + per-identity access store (OPT-IN; requires D15 registry keys to be useful).** `RAG_ACCESS_STORE=1` enables the /access page's checkbox model: registry keys SELECT their own datasets — public ones freely, protected ones only with the correct password, which is then saved per identity (`{DATA_PATH}/access/<name>.json`, 0600, shared PVC) so every REST/MCP call works password-free; `list_datasets` shows only a key's EFFECTIVE datasets (grants ∪ selections — access isolation, no name discovery). Effective access = operator ACL ∪ selections (the ACL is a floor). `RAG_ACCESS_DENY_SELECT="ds1,ds2"` datasets refuse self-selection outright; `RAG_MEMORY_DEFAULT` is the deployment-wide fallback memory dataset (resolution order: arg → header → the caller's ★ binding → this → `MEMORY_DATASET`). MCP tools: `select_dataset` / `deselect_dataset` / `set_memory_dataset`. **Default (off): byte-identical D15 behaviour** — ACL'd names only, fail-closed, selection endpoints 409. Env re-read per request. Chart wiring: `security.accessStore` (chart default `true` — the base-chart render always carries the key; set `false` to opt out) / `security.accessDenySelect` / `security.memoryDefault` — the latter two rendered ONLY when set. | chart default: on (`accessStore: true`); raw env default off |
+| `RAG_ACCESS_SELF_MINT` | **Decision D25 — SSO self-mint (opt-in).** When truthy, an SSO-authenticated identity (a verified D21 Bearer JWT, a D22 SSO session cookie, or a D24 trusted-proxy identity header) may mint — and deliberately rotate — a long-lived API key for **its own** registry identity from the /access page, closing the loop D21 left open: JWT-only sign-in worked but the key still required the D17 admin panel. Hard guarantees: the minted key carries exactly the identity's existing access (self-mint **never** creates or widens dataset grants — the name comes from the verified identity, never user input); minting stays impossible for API-key-authenticated callers (403 — a registry key can never mint, the D17 invariant); env-authoritative and `blocked` names are refused; the key is shown exactly once and rotation kills the old key immediately. Endpoints: `GET /api/access/key` (owner-safe masked view) and `POST /api/access/mint-key` (optional `{"rotate": true}`); the whoami `flags` gains `self_mint` (the anonymous shape is unchanged). Enabling only makes sense with `security.oidc.enabled` (or `trustProxyIdentity` on G2) — there is no SSO identity to mint for otherwise. Read per request: flip without restart. **Default unset: byte-identical behaviour** (the mint endpoint 409s, the flag reads false). Chart wiring: `security.accessSelfMint` in all three charts — rendered ONLY when `true` (default render byte-identical). See the D25 subsection below. | disabled |
 | `RAG_UNLOCK_MAX_TTL` | Upper bound for explicit unlock TTLs on BOTH surfaces (REST `POST /unlock`, MCP `unlock_dataset(ttl=…)`; default 86400 = the historical 24 h cap). The special value `0` opts the deployment into **no-expiry unlocks** (`ttl=0` lasts until an explicit `POST /lock` on REST / until process restart on MCP) — the /access page's "No expiry (0)" option becomes meaningful only then. Read per request (rotation without restart). Chart wiring: `rag.unlockMaxTtl` (always rendered; the chart default equals the built-in default, so behaviour is unchanged). | `86400` |
 | `RAG_OIDC_ENABLED` (+ `RAG_OIDC_ISSUER` / `RAG_OIDC_AUDIENCE` / `RAG_OIDC_IDENTITY_CLAIM` / `RAG_OIDC_JWKS_URL` / `RAG_OIDC_JWKS_REFRESH_SECONDS` / `RAG_OIDC_OBSERVED_TTL` / `RAG_OIDC_FETCH_TIMEOUT_SECONDS` / `RAG_OIDC_CLOCK_SKEW_SECONDS`) | **Decision D21 — OIDC JWT as a SECOND credential for the same per-user registry identity (opt-in).** With `RAG_OIDC_ENABLED=true`, a verified `Authorization: Bearer <jwt>` (RS256 against the realm JWKS; `iss` / `aud`-as-`azp` / `exp` validated, `RAG_OIDC_CLOCK_SKEW_SECONDS` tolerance) resolves to the SAME identity as that user's minted API key — join key = the `RAG_OIDC_IDENTITY_CLAIM` (default `preferred_username`, fallback `sub`), or an explicit `"oidc": "<alias>"` field on the user's overlay client entry in `{DATA_PATH}/access/clients.json`. No OIDC discovery in v1: the JWKS URL is `RAG_OIDC_JWKS_URL` or `<issuer>/protocol/openid-connect/certs` (the Keycloak/UA-realm location), cached and refreshed every `RAG_OIDC_JWKS_REFRESH_SECONDS`; `RAG_OIDC_FETCH_TIMEOUT_SECONDS` bounds the fetch; observed JWT-only users are remembered for `RAG_OIDC_OBSERVED_TTL` and appear in `GET /api/admin/clients` as `{"source": "observed"}` entries so admins can grant them before they ask. **Issuer is REQUIRED when enabled** (loud startup warning without it). All vars are read per request — flip without restart. Chart wiring: `security.oidc.*` — rendered ONLY when `enabled: true` (default render byte-identical). See the D21 subsection below for the full semantics. | disabled (`RAG_OIDC_ENABLED` unset) |
 | `RAG_SSO_GATE` | **Decision D23 — the identity-gated unified frontend (opt-in).** When `true`, the served HTML pages (`/`, `/manage`, `/access`) require an authenticated identity (an SSO session cookie, a Bearer JWT, or an API key); anonymous visitors get a minimal 401 "Sign in required" page — with a link to `/oauth/login` when browser SSO (D22) is enabled. Health probes, the `/oauth/*` flow itself and media bytes stay exempt. When disabled (default), public-pages behavior is byte-identical to today. Enabling ONLY makes sense when `security.oidc.enabled` (or API keys) are configured — an empty deployment gates to nothing. Read per request: flip the value, no restart. Chart wiring: `security.ssoGate` — rendered ONLY when `true` (default render byte-identical). See the D23 subsection below for the full semantics (dataset ownership, the four-tab shell, `/api/stats`). | disabled — public pages |
@@ -266,6 +267,8 @@ discovery in v1 — the JWKS URL is `RAG_OIDC_JWKS_URL` or
 
 - **API keys are unchanged** — sufficient alone, valid indefinitely, rotation stays on
   the /access mint panel. The JWT is a second door to the same room, not a replacement.
+  When D25 self-mint is enabled, an SSO-sign-in user can mint/rotate their own key from
+  the Access page — the no-admin rotation path.
 - **JWT-only sign-in WORKS**: the user gets a valid registry identity with **zero
   datasets (fail-closed)** and can then self-select public datasets password-free,
   select password-protected ones with their password (saved per identity — the D16
@@ -398,6 +401,51 @@ or null) so the shell renders itself without a second probe.
 Chart wiring: `security.ssoGate` in all three charts (see the `RAG_SSO_GATE` row
 above) — rendered ONLY when `true`, default render byte-identical; values
 examples ship a commented `ssoGate: true` line in both profiles.
+
+### SSO self-mint (D25 — opt-in)
+
+D21 made JWT-only sign-in work — a verified realm token resolves to the user's
+registry identity with zero datasets, and D16 self-selection grows the world from
+there. But the LONG-LIVED credential still had a gap: minting or rotating the API
+key that opencode/MCP clients paste once and keep forever required the D17 admin
+panel, so a JWT-only user still needed an admin round-trip for their first key.
+**D25 closes the loop**: with `RAG_ACCESS_SELF_MINT` truthy (read per request —
+flip without a restart), an SSO-authenticated identity may mint — and deliberately
+rotate — a long-lived API key for ITS OWN registry identity directly from the
+Access page, no admin round-trip.
+
+**Who may mint — SSO-sourced identities only.** The three accepted sources are the
+verified D21 Bearer JWT, the D22 SSO session cookie, and the D24 trusted-proxy
+identity header. An API-key-authenticated caller is ALWAYS refused (403): minting
+stays a power keys never have — the D17 invariant that a registry key can never be
+a path to another key survives D25 untouched.
+
+**What self-mint can and cannot do.** It mints or rotates the caller's OWN key
+only — the key name comes from the verified identity, never from user input, so a
+caller cannot mint for someone else. The grants NEVER change: the minted key
+carries exactly the identity's current access (operator ACL ∪ selections), and
+self-mint never creates or widens dataset grants. Env-authoritative names
+(governed by `RAG_API_KEY_CLIENTS`) and `blocked: true` overlay entries are
+refused. The key is shown exactly once (the same copy-once discipline as the D17
+panel); rotation kills the old key immediately.
+
+**The surface.** Two REST endpoints: `GET /api/access/key` — the owner-safe view
+(`{"enabled", "source": "jwt" | "proxy-identity", "identity", "has_key",
+"key_masked", "datasets", "created", "oidc", "blocked"}`; masks the key like every
+other surface) — and `POST /api/access/mint-key` (body optional `{"rotate": true}`)
+returning the FULL key exactly once: `{"status", "name", "key", "rotated",
+"created", "message"}`; a `409` when a key already exists without `rotate`. The
+whoami (`GET /api/oidc-session`) authenticated shape gains
+`flags.self_mint: true|false` so the Access page can render the panel without a
+probe; the anonymous whoami shape stays exactly `{"authenticated": false}`.
+
+**Knob and wiring.** Env `RAG_ACCESS_SELF_MINT`, chart `security.accessSelfMint`
+(bool, default `false`) in all three charts — rendered ONLY when `true` (the
+default render is byte-identical), placed next to the D16 access-store keys.
+Default unset: the mint endpoint 409s and `flags.self_mint` reads false —
+byte-identical behaviour. Enabling only makes sense when `security.oidc.enabled`
+(or `trustProxyIdentity` on G2) is on — there is no SSO identity to mint for
+otherwise.
 
 ## Enabling the network zone
 

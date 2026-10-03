@@ -362,13 +362,13 @@ def test_throttle_buckets_are_isolated_per_key(monkeypatch):
     cid_a, cid_b = a["cid"], "key:bob"
     # max out alice's bucket (same env knobs the D10 throttle uses)
     for _ in range(mcp._MCP_PW_MAX_FAILURES):
-        mcp._mcp_pw_record_failure(cid_a)
+        mcp._mcp_pw_record_failure(cid_a, "ds")
     with pytest.raises(mcp.ToolError, match="Too many password attempts"):
-        mcp._mcp_pw_check_throttle(cid_a)
+        mcp._mcp_pw_check_throttle(cid_a, "ds")
     # bob's bucket is untouched — per-key isolation via the D10 machinery
-    assert mcp._mcp_pw_failure_count(cid_b) == 0
-    mcp._mcp_pw_check_throttle(cid_b)
-    mcp._mcp_pw_reset_failures(cid_a)
+    assert mcp._mcp_pw_failure_count(cid_b, "ds") == 0
+    mcp._mcp_pw_check_throttle(cid_b, "ds")
+    mcp._mcp_pw_reset_failures(cid_a, "ds")
 
 
 def test_registry_identity_outranks_shared_unlock_escape(monkeypatch):
@@ -427,6 +427,44 @@ def test_require_dataset_acl_tool_error(acl_dm):
     finally:
         cr.reset_current_identity(token)
     mcp._require_dataset_acl("reports")  # no identity → no enforcement
+
+
+def test_require_dataset_acl_rejects_malformed_names_without_echo(acl_dm):
+    """Audit P2: this gate is the common entry of every dataset tool, so it
+    validates the NAME first (mirroring ``DatasetManager._validate_name``) —
+    ``_dataset_dir`` joins the name onto the datasets root with no check of
+    its own, and ``search_dataset("../../datasets/<other>")`` used to reach
+    it before the existence checks.  The refusal is generic: it never echoes
+    the submitted name (no probing oracle)."""
+    for bad in ("../escape", "a/b", "../../datasets/<other>", ".", ".hidden", "-lead"):
+        with pytest.raises(mcp.ToolError) as exc:
+            mcp._require_dataset_acl(bad)
+        assert str(exc.value) == "Invalid dataset name.", bad
+    mcp._require_dataset_acl("reports")  # control: a valid name still passes
+
+
+def test_malformed_dataset_name_refused_at_tool_entry_through_middleware(acl_dm, monkeypatch):
+    """The same refusal through the production middleware chain, at the tool
+    entry points a client actually reaches (the store is never consulted for
+    the malformed name)."""
+    monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key")
+    monkeypatch.setenv(cr.ACLS_ENV, "alice:*")
+    for call in (
+        lambda: mcp.search_dataset(dataset_name="../../datasets/notes", query="x"),
+        lambda: mcp.get_dataset_files(dataset_name="../escape"),
+        lambda: mcp.get_dataset_info(dataset_name="a/b"),
+    ):
+        with pytest.raises(mcp.ToolError, match="Invalid dataset name"):
+            asyncio.run(_drive(_mw(), _scope(headers=_bearer("alice-key")), app_body=call))
+    # control: an allowed, well-formed name still reaches the dataset
+    _, captured = asyncio.run(
+        _drive(
+            _mw(),
+            _scope(headers=_bearer("alice-key")),
+            app_body=lambda: mcp.get_dataset_info(dataset_name="notes"),
+        )
+    )
+    assert json.loads(captured["result"])["name"] == "notes"
 
 
 def test_list_datasets_filtered_by_acl_with_note(acl_dm, monkeypatch):

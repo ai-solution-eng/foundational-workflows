@@ -25,7 +25,7 @@ image:
   # Packaged with the chart — leave as-is unless you built your own image.
   # (Kept in lockstep with the chart version by ./bump_version.sh.)
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v5.2.3
+  tag: v5.4.2
   pullPolicy: IfNotPresent
 
 deployment:
@@ -245,6 +245,7 @@ security:
   # Datasets that can never be self-selected (comma-separated; renders only
   # when non-empty). Empty = everything selectable with proof.
   accessDenySelect: ''
+  # accessSelfMint: true   # D25 — let SSO users mint their own long-lived MCP/REST key (no admin round-trip); pairs with the central ezaf-gateway SSO (trustProxyIdentity true)
   # Deployment-wide fallback memory dataset (RAG_MEMORY_DEFAULT) for callers
   # without a personal ★ binding. Empty = unset.
   memoryDefault: ''

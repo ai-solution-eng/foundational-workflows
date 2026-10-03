@@ -352,7 +352,7 @@ class _FakeDM:
 
 
 @pytest.fixture
-def rest_client(monkeypatch):
+def rest_client(monkeypatch, tmp_path):
     from fastapi.testclient import TestClient
 
     async def _fake_manager():
@@ -363,11 +363,25 @@ def rest_client(monkeypatch):
     monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key")
     monkeypatch.delenv(cr.ACLS_ENV, raising=False)
     monkeypatch.setenv(acc.STORE_ENV, "1")
+    # P0 proof-gate (audit 2026-10-02): a password-less dataset is only
+    # self-selectable when it is PUBLIC.  Make the fake world honest —
+    # write the real meta.json so is_public_dataset() reads True — instead
+    # of relying on the old "any unowned password-less dataset selects".
+    import json as _json
+
+    ds_dir = tmp_path / "datasets" / "public-ds"
+    ds_dir.mkdir(parents=True, exist_ok=True)
+    (ds_dir / "meta.json").write_text(_json.dumps({"public": True}))
+    monkeypatch.setenv("DATA_PATH", str(tmp_path))
     api._UNLOCK_CACHE.clear()
     acc._mtime_cache.clear()
+    cr._PUBLIC_META_CACHE.clear()
+    cr._CREATED_BY_CACHE.clear()
     yield TestClient(api.app)
     api._UNLOCK_CACHE.clear()
     acc._mtime_cache.clear()
+    cr._PUBLIC_META_CACHE.clear()
+    cr._CREATED_BY_CACHE.clear()
 
 
 def test_rest_listing_shows_only_effective_datasets(rest_client):

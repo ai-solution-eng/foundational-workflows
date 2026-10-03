@@ -10,6 +10,7 @@ import base64
 import bisect
 import contextlib
 import contextvars
+import copy
 import hashlib
 import json
 import math
@@ -447,6 +448,45 @@ def _flush_hash_index_writes() -> None:
             _write_hash_index(hashes_path, fresh)
 
 
+# ── Source-only payload projections (perf quick-win #3, audit perf P1-5) ──
+# Source scans (S3 sync's "which sources does this prefix hold?") need two
+# small payload keys — the canonical ``metadata.source`` and, for objects
+# that carry it, ``original_source`` / ``page_content``.  Asking Qdrant for
+# the whole ``metadata`` object instead drags the multi-MB base64
+# ``metadata.image`` / ``metadata.video`` / ``metadata.audio`` values over
+# the wire on every scan (the same waste ``vector_store._lightweight_payload_selector``
+# exists to avoid on the search path).
+#
+# Nested keys DO work with ``PayloadSelectorInclude`` (verified against the
+# pinned qdrant-client 1.19.x: the filter is applied server-side by Qdrant's
+# payload projection, and the local in-memory client behaves identically) —
+# ``include=["metadata.source"]`` returns exactly ``{"metadata": {"source": …}}``.
+#
+# ``_prune_sources`` uses the include form too (with page_content): its
+# scroll projects exactly ``_source_scan_payload_keys(True)``.
+_SOURCE_SCAN_PAYLOAD_KEYS: tuple[str, ...] = ("metadata.source", "metadata.original_source")
+# ``page_content`` is included only for callers that actually consume it
+# (prune's BM25 df decrement) — ``_stored_sources`` never touches it, so it
+# keeps the projection to the two source keys.
+_SOURCE_SCAN_TEXT_PAYLOAD_KEY = "page_content"
+
+
+def _source_scan_payload_keys(include_page_content: bool = False) -> list[str]:
+    """Key list for ``scroll_documents(..., payload_keys=...)`` source scans.
+
+    Nested keys are supported by ``PayloadSelectorInclude`` (verified against
+    the pinned qdrant-client 1.19.x — the projection is Qdrant-side, and the
+    local in-memory client returns exactly ``{"metadata": {"source": …}}``),
+    so only the requested leaves cross the wire: the multi-MB base64
+    ``metadata.image`` / ``metadata.video`` / ``metadata.audio`` values stay
+    on the server.
+    """
+    keys = list(_SOURCE_SCAN_PAYLOAD_KEYS)
+    if include_page_content:
+        keys.append(_SOURCE_SCAN_TEXT_PAYLOAD_KEY)
+    return keys
+
+
 # Ingest-dedup (.ingested_hashes.json) read cache — the batch loop used to
 # re-read and re-parse the whole file for every file (same O(n²) pattern).
 _ingested_hashes_cache: dict[Path, tuple[int, set[str]]] = {}
@@ -471,6 +511,46 @@ def _load_ingested_hashes(p: Path) -> set[str]:
         if len(_ingested_hashes_cache) > 100:  # bound across many datasets
             _ingested_hashes_cache.pop(next(iter(_ingested_hashes_cache)), None)
     return hashes
+
+
+# ---------------------------------------------------------------------------
+# meta.json parsed-read cache (perf P1-2)
+# ---------------------------------------------------------------------------
+# ``_read_meta`` sits on the hottest search path (once per search via
+# ``_effective_rrf``, plus once per federated target) and used to cost two NFS
+# syscalls (``exists()`` + ``read_text()``) AND a full JSON parse on every
+# call.  The parsed dict is cached per meta path under an mtime/size stamp —
+# the read discipline of ``clients_registry.is_public_dataset`` /
+# ``created_by_dataset`` and this module's own ``_load_hash_index``: stat →
+# (mtime_ns, size) compare → parse only on a miss.
+#
+# Deliberately NO TTL/max-age floor.  A stamp check is what the NFS
+# close-to-open visibility contract wants: the stat() that decides hit/miss is
+# the same syscall that observes another pod's write, so a write is picked up
+# on the very next read, whereas any TTL would serve a pre-change dict for its
+# whole window.  The win does not depend on a TTL — a hit still removes the
+# JSON parse and the exists()/open/read/close round trips, leaving one cheap
+# stat() per call.
+#
+# Every in-process writer invalidates explicitly (``_write_meta`` plus the
+# password/delete paths) so correctness never rides on timestamp granularity:
+# a rewrite landing with an identical (mtime_ns, size) — same-length value,
+# coarse clock — would otherwise match the stale entry.
+_META_CACHE: dict[str, tuple[int, int, dict[str, Any] | None]] = {}
+_meta_cache_lock = threading.Lock()
+_META_CACHE_MAX = 100  # bound across many datasets (same cap as _hash_index_cache)
+# Stamp for a stat() failure (missing/unstat-able meta): a real file always
+# carries mtime_ns >= 0 and size >= 0, so this can never collide with one.
+_META_CACHE_MISSING = (-1, -1)
+# Sentinel for "no usable cache hit" — distinct from a cached None (a missing
+# or corrupt meta, which IS a legitimate cached value).
+_META_CACHE_HIT = object()
+
+
+def _invalidate_meta_cache(path: Path) -> None:
+    """Drop the parsed-meta cache entry for *path* (call after any write)."""
+    with _meta_cache_lock:
+        _META_CACHE.pop(str(path), None)
 
 
 # Supported file extensions mapped to a media type label
@@ -810,6 +890,19 @@ def _sync_prefixes(urls: list[str]) -> list[str]:
             raise ValueError(f"sync requires an s3:// prefix (directory) URL, got a single-object URL: {u}")
         out.append(u.split("?")[0].rstrip("/") + "/")
     return out
+
+
+# -- Prune mass-deletion guards (audit 2026-10-02, P1-4) ---------------------
+# The empty-listing refusal needs no constant (it is NOT env-overridable —
+# it is the one that protects a whole corpus).  The ratio guard is tunable:
+# pruning more than max(min, ratio × in-scope points) points under one
+# prefix is refused.  The floor keeps small corpora from tripping on a
+# normal one- or two-object deletion; the ratio catches a listing that lost
+# most of a large corpus.  Both are env-overridable for operators who
+# deliberately want an aggressive prune (PRUNE_STALE_RATIO=0 disables the
+# ratio guard entirely).
+_PRUNE_STALE_RATIO: float = max(0.0, float(os.environ.get("PRUNE_STALE_RATIO", "0.2")))
+_PRUNE_STALE_MIN: int = max(0, int(os.environ.get("PRUNE_STALE_MIN", "50")))
 
 
 def _list_s3_prefix(s3_url: str) -> list[str]:
@@ -1960,6 +2053,11 @@ class DatasetManager:
     def _invalidate_has_password(self, name: str) -> None:
         with self._has_password_lock:
             self._has_password_cache.pop(name, None)
+        # Both caches describe the same file and must move together: every
+        # password set/remove (and every dataset delete/recreate, which call
+        # this) drops the parsed-meta entry too, so a has_password decision
+        # can never be served from a meta read that predates the change.
+        _invalidate_meta_cache(self._meta_path(name))
 
     def verify_password(self, name: str, password: str) -> bool:
         meta = self._read_meta(name)
@@ -2058,6 +2156,10 @@ class DatasetManager:
         # Drop any cached hash index for the deleted files dir.
         with _hash_index_cache_lock:
             _hash_index_cache.pop(self._dataset_dir(name) / "files" / ".hashes.json", None)
+
+        # …and the cached meta parse: the file is gone (mtime/size would miss
+        # anyway, but a same-stamp recreate must not inherit the dead entry).
+        _invalidate_meta_cache(self._meta_path(name))
 
         # Invalidate Redis existence cache so other pods don't retry
         _dataset_exist_delete(name)
@@ -2707,6 +2809,7 @@ class DatasetManager:
         progress_callback: Any | None = None,
         batch_score: float = 128.0,
         force_names: set[str] | None = None,
+        source_urls: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Process multiple files and store dedup-aware chunk counts.
 
@@ -2721,6 +2824,17 @@ class DatasetManager:
         dedup skip is bypassed — used for URLs that have no stored points
         (a file pruned after an upstream delete and re-appeared), so the
         content is re-embedded instead of silently skipped.
+
+        ``source_urls`` (S3 sync / URL ingest, audit 2026-10-02 P1-3 fix):
+        ``tmp_path → canonical s3:// URL`` (keyed by tmp_path — unique per
+        download; a basename key would collide when one sync spans prefixes
+        holding the same object name).  When provided, the point
+        payload's ``metadata.source`` is stamped with the canonical URL
+        instead of the stored PVC path — prune matches ``s3://`` prefixes
+        against ``metadata.source``, so a PVC-path stamp makes the prune
+        structurally dead (upstream deletions never propagate).  Mirrors
+        how the single-file ``add_file`` path stamps ``source_url``.
+        Files whose name has no entry keep the stored-path stamp.
 
         **Consumer** (background thread): calls the embedding API and
         stores results in Qdrant.  This overlap hides the embedding
@@ -2950,6 +3064,19 @@ class DatasetManager:
               ("done",)                                   — terminal; run tail logic
             """
             fname = orig_name_
+            # Canonical-source stamp (audit 2026-10-02 P1-3 fix): URL ingests
+            # carry their s3:// URL as metadata.source so prune's MatchPrefix
+            # filters can actually match them (a stored-PVC-path stamp made
+            # the prune structurally dead).  The map is keyed by THIS file's
+            # tmp_path (unique per download — a basename key collides when
+            # one sync spans prefixes holding the same object name,
+            # cross-validation finding 1) and falls through to the stored
+            # path for files with no entry.
+            def _source_for(_target_fname: str, stored: str) -> str:
+                if source_urls:
+                    return source_urls.get(tmp_path_, stored)
+                return stored
+
             try:
                 try:
                     evq.put(("progress", {"file": fname, "status": "preprocessing"}))
@@ -2985,7 +3112,7 @@ class DatasetManager:
                             # start processing the first pages while later
                             # pages are still being extracted.
                             if len(pdf_batch) >= embed_batch:
-                                _fix_source(pdf_batch, fname, dst_str)
+                                _fix_source(pdf_batch, fname, _source_for(fname, dst_str))
                                 self._save_doc_media(dataset_name, pdf_batch, model_max_pixels=max_pixels)
                                 evq.put(
                                     (
@@ -3001,7 +3128,7 @@ class DatasetManager:
 
                         # Handle remaining chunks from the generator
                         if pdf_batch:
-                            _fix_source(pdf_batch, fname, dst_str)
+                            _fix_source(pdf_batch, fname, _source_for(fname, dst_str))
                             self._save_doc_media(dataset_name, pdf_batch, model_max_pixels=max_pixels)
                             evq.put(
                                 (
@@ -3021,7 +3148,7 @@ class DatasetManager:
                         dst_str = str(dst)
                         img_proc = ImageProcessor(max_pixels=max_pixels)
                         doc = img_proc.process(dst_str)
-                        _fix_source([doc], fname, dst_str)
+                        _fix_source([doc], fname, _source_for(fname, dst_str))
                         doc["preprocessed_image"] = f"file://{dst_str}"
                         if dst_str != original_dst:
                             doc["original_image"] = f"file://{original_dst}"
@@ -3067,7 +3194,7 @@ class DatasetManager:
                             vid_chunk_count += 1
 
                             if len(vid_batch) >= embed_batch:
-                                _fix_source(vid_batch, fname, dst_str)
+                                _fix_source(vid_batch, fname, _source_for(fname, dst_str))
                                 self._save_doc_media(dataset_name, vid_batch)
                                 evq.put(
                                     (
@@ -3083,7 +3210,7 @@ class DatasetManager:
 
                         delete_original = dst_str != original_dst and not self._get_keep_originals(dataset_name)
                         if vid_batch:
-                            _fix_source(vid_batch, fname, dst_str)
+                            _fix_source(vid_batch, fname, _source_for(fname, dst_str))
                             self._save_doc_media(dataset_name, vid_batch)
                             if delete_original:
                                 # Mirrors the sequential pop over the un-flushed
@@ -3122,7 +3249,7 @@ class DatasetManager:
                                 "source": dst_str,
                                 "segment_index": seg_idx,
                             }
-                            _fix_source([doc], fname, dst_str)
+                            _fix_source([doc], fname, _source_for(fname, dst_str))
                             audio_batch.append(doc)
                         # Save each segment to disk so _strip_media_payloads
                         # doesn't replace the segment data URL with the full
@@ -3490,12 +3617,23 @@ class DatasetManager:
                 tmp_paths.append(tmp_path)
                 file_entries.append((tmp_path, orig_name))
 
+            # Canonical-source stamping (audit 2026-10-02 P1-3): every
+            # ingested URL object carries its canonical s3:// URL as
+            # metadata.source so prune's MatchPrefix(scope) can match it —
+            # a stored-PVC-path stamp makes the prune structurally dead.
+            # Keyed by tmp_path (NOT basename — cross-validation finding 1,
+            # 2026-10-02: one sync may span several prefixes and two of them
+            # can hold the SAME object name; a basename key would stamp one
+            # file with the other's canonical URL and make per-object prune
+            # reconciliation impossible. tmp_path is unique per download).
+            canonical_by_tmp = {tmp: _canonical_s3_url(u) for (tmp, _), u in zip(file_entries, download)}
             result = self.add_files_batch(
                 dataset_name,
                 file_entries,
                 progress_callback=progress_callback,
                 batch_score=batch_score,
                 force_names=force_names or None,
+                source_urls=canonical_by_tmp,
             )
             if sync:
                 result["sync"] = self._prune_sources(
@@ -4971,8 +5109,17 @@ class DatasetManager:
             should=[FieldCondition(key="metadata.source", match=MatchPrefix(prefix=p)) for p in prefixes]
         )
         out: set[str] = set()
+        # Source-only projection (perf quick-win #3): ``["metadata"]`` used to
+        # pull every key under it — including the multi-MB base64 media
+        # values — for each of up to a million points.  Nested keys are
+        # supported by ``PayloadSelectorInclude``, so ask for just the
+        # canonical source.  ``_prune_sources`` has the same waste with
+        # ``with_payload=True``; it should follow (not edited here).
         for _, payload in self.scroll_documents(
-            dataset_name, scroll_filter, limit=1_000_000, payload_keys=["metadata"]
+            dataset_name,
+            scroll_filter,
+            limit=1_000_000,
+            payload_keys=_source_scan_payload_keys(),
         ):
             src = (payload.get("metadata") or {}).get("source")
             if src:
@@ -4985,22 +5132,37 @@ class DatasetManager:
         S3 sync's prune half: objects deleted upstream disappear from the
         dataset instead of lingering.  Deletes are batched by point ID and
         the document counter is decremented accordingly.
+
+        Mass-deletion guards (audit 2026-10-02, per-prefix — a refusal skips
+        that prefix and never blocks the others, reported under
+        ``refused_prefixes`` so the CronJob log shows it):
+
+        * **empty-listing** (NOT env-overridable): the listing for a prefix
+          returned zero objects while stored sources exist under it — the
+          classic mis-typed / renamed-prefix / narrowed-bucket-policy case.
+          A listing *error* already aborts upstream; a syntactically-valid
+          EMPTY listing must not silently delete the corpus.
+        * **stale-ratio**: stale points exceed ``max(_PRUNE_STALE_MIN,
+          _PRUNE_STALE_RATIO × in-scope points)``.  ``PRUNE_STALE_RATIO``
+          (default 0.2; 0 disables) / ``PRUNE_STALE_MIN`` (default 50) are
+          env-overridable for operators who deliberately want an aggressive
+          prune.
         """
-        from qdrant_client.models import FieldCondition, Filter, MatchPrefix, PointIdsList
+        from qdrant_client.models import FieldCondition, Filter, MatchPrefix, PayloadSelectorInclude, PointIdsList
 
         rag = self._get_rag(dataset_name)
         vs = rag.vector_store
         if vs is None or isinstance(vs, dict) or not prefixes:
-            return {"pruned_points": 0, "pruned_sources": [], "scope": prefixes}
+            return {"pruned_points": 0, "pruned_sources": [], "scope": prefixes, "refused_prefixes": []}
         client = vs._client  # type: ignore[attr-defined]
         coll = vs.collection_name  # type: ignore[attr-defined]
 
         scroll_filter = Filter(
             should=[FieldCondition(key="metadata.source", match=MatchPrefix(prefix=p)) for p in prefixes]
         )
-        stale_ids: list[Any] = []
+        stale_triples: list[tuple[Any, str, str]] = []  # (point_id, source, text) — per-prefix guards need the pairing
         stale_sources: set[str] = set()
-        stale_texts: list[str] = []  # for the BM25 df decrement (payloads are already here)
+        scope_srcs: set[str] = set()  # every in-scope stored source (built in THIS pass — no second scroll)
         offset: int | str | None = None
         while True:
             pts, offset = client.scroll(
@@ -5008,32 +5170,132 @@ class DatasetManager:
                 limit=256,
                 offset=offset,
                 scroll_filter=scroll_filter,
-                with_payload=True,
+                # Payload projection (perf P1-5 follow-up): this scroll used
+                # with_payload=True, pulling metadata.image/video — the
+                # multi-MB base64 keys — on every prune tick.  The include
+                # form projects exactly what the guards consume
+                # (metadata.source + page_content; nested keys verified
+                # against qdrant-client 1.19 by the _stored_sources fix).
+                with_payload=PayloadSelectorInclude(include=_source_scan_payload_keys(include_page_content=True)),
                 with_vectors=False,
             )
             for pt in pts:
                 payload = pt.payload or {}
                 meta = payload.get("metadata") or {}
                 src = str(meta.get("source") or "").rstrip("/")
-                if src and src not in expected:
-                    stale_ids.append(pt.id)
+                if not src:
+                    continue
+                scope_srcs.add(src)
+                if src not in expected:
+                    stale_triples.append((pt.id, src, payload.get("page_content") or ""))
                     stale_sources.add(src)
-                    stale_texts.append(payload.get("page_content") or "")
             if offset is None:
                 break
 
+        # -- Per-prefix guards: split the stale set into deletable vs refused --
+        # The scroll yields (id, src, text) triples; keep them paired so a
+        # per-prefix refusal drops exactly that prefix's ids/sources/texts.
+        stale_by_prefix: dict[str, set[str]] = {p: set() for p in prefixes}
+
+        def _prefix_of(src: str) -> str | None:
+            # Prefixes from _sync_prefixes already end with exactly one "/",
+            # so startswith(p) is the accurate test — rstrip("/") would make
+            # prefix "s3://b/a/" also match sibling "s3://b/ab/..." sources
+            # (cross-validation finding 2, 2026-10-02).
+            for p in prefixes:
+                if src.startswith(p):
+                    return p
+            return None
+
+        for src in stale_sources:
+            pp = _prefix_of(src)
+            if pp is not None:
+                stale_by_prefix[pp].add(src)
+        # In-scope point estimate per prefix: stored sources under it (the
+        # expected set is canonical-URL-shaped, so only the stored side is
+        # counted — good enough for a ratio guard).
+        in_scope_by_prefix: dict[str, int] = {}
+        for s2 in scope_srcs:
+            pp = _prefix_of(s2)
+            if pp is not None:
+                in_scope_by_prefix[pp] = in_scope_by_prefix.get(pp, 0) + 1
+
+        refused: list[dict[str, Any]] = []
+        delete_srcs: set[str] = set()
+        for p in prefixes:
+            stale_p = stale_by_prefix.get(p, set())
+            # Empty-listing guard (cross-validation finding 3, rewritten):
+            # refuse ONLY when the caller's listing produced NOTHING at all
+            # (``expected`` empty) while stored sources exist under this
+            # prefix — the mis-typed/renamed-prefix/narrowed-policy case.  A
+            # legitimately EMPTIED prefix (expected == ∅ too, but the listing
+            # SUCCEEDED) also lands here; that refusal is loud and the
+            # operator clears it by confirming the prefix (or env-disabling
+            # nothing — the guard is intentionally not overridable).  A
+            # partial listing (some objects still exist upstream) never
+            # trips this branch — the ratio guard handles that case.
+            if not expected and stale_p and in_scope_by_prefix.get(p, 0) > 0:
+                refused.append(
+                    {
+                        "prefix": p,
+                        "reason": "empty-listing",
+                        "stale_points": len(stale_p),
+                        "scope_points": in_scope_by_prefix.get(p, 0),
+                        "stale_sources": sorted(stale_p),
+                    }
+                )
+                logger.warning(
+                    "PRUNE REFUSED for prefix %s: the listing returned no objects but %d stored point source(s) "
+                    "exist under it — nothing deleted for this prefix. Verify the prefix/listing (mis-typed or "
+                    "renamed prefix, narrowed bucket policy?) before pruning.",
+                    p,
+                    len(stale_p),
+                )
+                continue
+            cap = max(_PRUNE_STALE_MIN, int(in_scope_by_prefix.get(p, 0) * _PRUNE_STALE_RATIO))
+            if len(stale_p) > cap:
+                refused.append(
+                    {
+                        "prefix": p,
+                        "reason": "stale-ratio",
+                        "stale_points": len(stale_p),
+                        "scope_points": in_scope_by_prefix.get(p, 0),
+                        "cap": cap,
+                        "stale_sources": sorted(stale_p),
+                    }
+                )
+                logger.warning(
+                    "PRUNE REFUSED for prefix %s: %d stale point source(s) exceed the mass-deletion cap (%d of %d "
+                    "in scope) — nothing deleted for this prefix. Verify the listing is complete before pruning.",
+                    p,
+                    len(stale_p),
+                    cap,
+                    in_scope_by_prefix.get(p, 0),
+                )
+                continue
+            delete_srcs |= stale_p
+
+        delete_ids = [pid for pid, src, _ in stale_triples if src in delete_srcs]
+        delete_sources = delete_srcs
+        delete_texts = [txt for pid, src, txt in stale_triples if src in delete_srcs]
+
         deleted = 0
-        if stale_ids:
+        if delete_ids:
             # Terms for the BM25 df decrement — the payloads were already
             # fetched by the scroll above, so no extra round trip.
-            self._forget_bm25_texts(dataset_name, stale_texts)
-        for i in range(0, len(stale_ids), 500):
-            chunk = stale_ids[i : i + 500]
+            self._forget_bm25_texts(dataset_name, delete_texts)
+        for i in range(0, len(delete_ids), 500):
+            chunk = delete_ids[i : i + 500]
             client.delete(coll, points_selector=PointIdsList(points=chunk), wait=True)
             deleted += len(chunk)
         if deleted:
             self._decrement_count(dataset_name, deleted)
-        return {"pruned_points": deleted, "pruned_sources": sorted(stale_sources), "scope": prefixes}
+        return {
+            "pruned_points": deleted,
+            "pruned_sources": sorted(delete_sources),
+            "scope": prefixes,
+            "refused_prefixes": refused,
+        }
 
     def backfill_search_metadata(self, dataset_name: str) -> dict[str, Any]:
         """Backfill ``metadata.file_type`` and search payload indexes.
@@ -5055,6 +5317,8 @@ class DatasetManager:
         docs ingested *while* the backfill runs may be missed (re-run later —
         it is idempotent).
         """
+        from qdrant_client.models import PayloadSelectorInclude
+
         from multimodal_rag.vector_store import ensure_search_payload_indexes
 
         rag = self._get_rag(dataset_name)
@@ -5074,7 +5338,12 @@ class DatasetManager:
                 coll,
                 limit=256,
                 offset=offset,
-                with_payload=True,
+                # Payload projection (cross-validation P2-5): the write-back
+                # touches ONLY metadata — projecting ["metadata"] instead of
+                # with_payload=True keeps page_content (often the largest
+                # key on text corpora) and the twin media keys off the wire
+                # for this collection-wide pass.
+                with_payload=PayloadSelectorInclude(include=["metadata"]),
                 with_vectors=False,
             )
             # group point ids by their complete new metadata so each unique
@@ -5424,13 +5693,68 @@ class DatasetManager:
         return self._dataset_dir(name) / "meta.json"
 
     def _read_meta(self, name: str) -> dict[str, Any] | None:
+        """Return the parsed meta.json for *name*, or ``None`` (fail-closed).
+
+        Cached per meta path under an mtime/size stamp (perf P1-2) — see
+        :data:`_META_CACHE`.  Missing/corrupt meta caches the ``None`` under
+        the same stamp discipline, preserving the historical behavior exactly:
+        no meta dir -> None, unparseable meta -> None, never an exception.
+
+        Returns a defensive copy: callers mutate the returned dict (pop
+        ``password_hash``, bump ``document_count``, …) and a shared cached
+        dict would silently corrupt the cache for every later reader.
+        ``copy.deepcopy`` keeps nested structures (``rrf``,
+        ``file_type_counts``) private too, so an in-place edit of a returned
+        sub-dict cannot poison the cache either.
+        """
         p = self._meta_path(name)
-        if not p.exists():
-            return None
+        key = str(p)
         try:
-            return json.loads(p.read_text())
-        except Exception:
-            return None
+            st = p.stat()
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            stamp = _META_CACHE_MISSING  # missing (or unstat-able) meta
+        with _meta_cache_lock:
+            cached = _META_CACHE.get(key)
+            if cached is not None and (cached[0], cached[1]) == stamp:
+                hit = cached[2]
+                # Move-to-back on hit (cross-validation P3-12): makes the
+                # eviction FIFO shape an actual LRU so a >100-dataset
+                # deployment with a hot working set stops thrashing.
+                _META_CACHE[key] = _META_CACHE.pop(key)
+            else:
+                hit = _META_CACHE_HIT
+        # Copy OUTSIDE the lock: cached entries are never mutated in place (a
+        # refresh always stores a fresh object), so handing the reference out
+        # of the critical section is safe and readers do not serialise on the
+        # deep copy.
+        if hit is not _META_CACHE_HIT:
+            return copy.deepcopy(hit)
+        if stamp == _META_CACHE_MISSING:
+            meta: dict[str, Any] | None = None
+        else:
+            try:
+                meta = json.loads(p.read_text())
+            except Exception:
+                meta = None  # corrupt/racing meta: fail closed, never raise
+        # Re-stat AFTER the read (cross-validation P1-3): a write that lands
+        # between the deciding stat and read_text() would otherwise be
+        # cached under the PRE-write stamp, and a later same-stamp rewrite
+        # (same mtime_ns + size) could then serve the stale parse for the
+        # process lifetime.  Storing only when the stamp still matches the
+        # bytes we actually read closes that window in-process.
+        try:
+            post = p.stat()
+            post_stamp = (post.st_mtime_ns, post.st_size)
+        except OSError:
+            post_stamp = _META_CACHE_MISSING
+        if post_stamp != stamp:
+            return copy.deepcopy(meta)  # changed mid-read: serve fresh, cache nothing
+        with _meta_cache_lock:
+            _META_CACHE[key] = (stamp[0], stamp[1], meta)
+            if len(_META_CACHE) > _META_CACHE_MAX:  # bound across many datasets
+                _META_CACHE.pop(next(iter(_META_CACHE)), None)
+        return copy.deepcopy(meta)
 
     def read_created_by(self, name: str) -> "str | None":
         """The dataset's ``created_by`` stamp (D23 ownership), or None.
@@ -5455,6 +5779,10 @@ class DatasetManager:
         tmp = p.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(meta, indent=2, default=str))
         os.replace(tmp, p)
+        # Publish the new bytes before dropping the cached parse, so a
+        # concurrent _read_meta can only see the old entry (with the old
+        # stamp, which now misses) or the new file — never a torn mix.
+        _invalidate_meta_cache(p)
 
     def _sync_count_from_qdrant(self, name: str, meta: dict[str, Any]) -> None:
         """Update ``document_count`` in *meta* to match the actual Qdrant point count."""
@@ -5835,7 +6163,30 @@ class DatasetManager:
         dest = files_dir / f"{uuid.uuid4().hex}_{stem}{suffix}"
         import shutil
 
-        shutil.copy2(source_path, dest)
+        # Atomic copy (audit C4): write a UNIQUE ``.part`` sibling and rename
+        # it onto the final path only once the bytes are all there.  The old
+        # ``copy2(source, dest)`` wrote straight to the final path, so a
+        # crash mid-copy (pod eviction, full disk) left a TRUNCATED file
+        # under a name the hash index — and the recreate fallback — treat as
+        # a complete document, re-embedding garbage.  Same pattern as the
+        # preprocessed-media writers (unique temp sibling → validate →
+        # ``Path.replace``): the ``.part`` name keeps this call's fresh UUID
+        # prefix, so concurrent writers never share a temp path.
+        #
+        # The name is DOT-prefixed (``.<dest>.part``) — same convention as
+        # ``_unique_tmp_sibling`` — because a SIGKILL between copy and
+        # replace cannot run the cleanup below, and every file listing
+        # (MCP ``get_dataset_files``, API export/storage stats, the backup
+        # archive's ``rglob``) filters with ``name.startswith(".")``: a
+        # non-dot ``.part`` would surface as a phantom dataset file.
+        part = dest.with_name(f".{dest.name}.part")
+        try:
+            shutil.copy2(source_path, part)
+            os.replace(part, dest)  # atomic on POSIX — no partial file ever visible
+        except Exception:
+            with contextlib.suppress(OSError):
+                part.unlink(missing_ok=True)
+            raise
 
         # Load or create hash index.  The read→modify→write of .hashes.json
         # is guarded by a cross-process file lock so concurrent uploads

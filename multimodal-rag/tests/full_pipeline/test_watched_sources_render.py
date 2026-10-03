@@ -167,8 +167,13 @@ def test_enabled_cronjob_wiring(chart: str):
     spec = cron["spec"]["jobTemplate"]["spec"]["template"]["spec"]
     cont = _container(cron)
 
-    # Same image as the app (values-driven tag).
-    assert cont["image"].endswith(":v4.0.7") or ":v4." in cont["image"], cont["image"]
+    # Same image as the app (values-driven tag).  The expected tag is read
+    # from the chart's own values.yaml (NOT pinned literally — a literal
+    # pin broke on every version bump: the 2026-10-02 audit's test-drift
+    # finding; these tests failed for months of releases before the fix).
+    values = yaml.safe_load((REPO / chart / "values.yaml").read_text())
+    expected_image = f"{values['image']['repository']}:{values['image']['tag']}"
+    assert cont["image"] == expected_image, cont["image"]
 
     # envFrom: config + model-keys (the model-keys Secret carries RAG_API_KEY).
     env_from = cont["envFrom"]

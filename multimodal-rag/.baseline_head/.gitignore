@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build artifacts
+dist/
+build/
+
+# Test data / uploads
+uploads_for_test_dataset/
+tests/__pycache__/
+tests/**/__pycache__/
+
+# Backups
+.backup_pre_token_chunking/
+
+# Secrets / internal model defs with API keys
+src/multimodal_rag/utils/pcai_models.py
+
+# Local env / per-cluster deployment values — helm/local convention
+# (helm/local/README.md explains it; only README + example are trackable)
+.env
+*.local
+values-resolved.yaml
+.values*.yaml
+helm*/local/*
+!helm*/local/README.md
+!helm*/local/values.example.yaml
+
+# Editor
+.vscode/
+.idea/
+
+# Local cluster credentials (never commit)
+.g2_cluster.yaml
+
+# Packaged charts / sync-conflict duplicates
+rag-mcp-*.tar.gz
+*.sync-conflict-*
+sync-to-demos.sh

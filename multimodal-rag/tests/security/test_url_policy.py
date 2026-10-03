@@ -105,10 +105,45 @@ def test_media_policy_allows_loopback_blocks_rest():
 
 
 def test_non_http_schemes_are_not_url_policy_business():
-    # file:// (media_paths), s3:// (dedicated S3 paths), data: — inert here
+    # file:// (media_paths), s3:// (dedicated S3 paths), data: — inert HERE.
+    # (The INGEST variant still waves non-http schemes through; the MEDIA
+    # variant now enforces the local-path allowlist — see
+    # test_media_policy_enforces_local_allowlist below and
+    # tests/security/test_media_fetch_allowlist.py.)
     up._check_url_policy("file:///etc/passwd")
     up._check_media_url_policy("s3://bucket/key")
     up._check_url_policy("ftp://example.com/x")
+    up._check_media_url_policy("data:image/png;base64,AA==")
+
+
+def test_media_policy_enforces_local_allowlist(tmp_path, monkeypatch):
+    """Audit P0-2/P1-3: the media variant used to return IMMEDIATELY for
+    non-http(s) URLs, so ``file:///etc/passwd`` passed every entry gate that
+    funnels through it and was then opened by the embedder.  It now applies
+    the same ``media_paths`` allowlist (realpath, fail-closed) and raises
+    MediaRefError — a ValueError, so existing ``except ValueError`` gates
+    keep working."""
+    import multimodal_rag.utils.media_paths as mp
+    from multimodal_rag.utils.media_paths import MediaRefError
+
+    datasets = tmp_path / "datasets"
+    datasets.mkdir()
+    monkeypatch.setattr(mp, "_MEDIA_ALLOW_PATH_PREFIXES", (str(datasets),))
+    monkeypatch.setattr(mp, "_MEDIA_ALLOW_ANY", False)
+    # inside → passes
+    up._check_media_url_policy(str(datasets / "ds" / "a.jpg"))
+    up._check_media_url_policy(f"file://{datasets}/ds/a.jpg")
+    # outside (the identity store's directory lives under DATA_PATH too —
+    # prefix membership, not DATA_PATH membership, is the rule) → refused
+    with pytest.raises(MediaRefError, match="outside the allowed prefixes"):
+        up._check_media_url_policy("file:///etc/passwd")
+    with pytest.raises(MediaRefError):
+        up._check_media_url_policy(str(tmp_path / "access" / "alice.json"))
+    # traversal that realpaths outside → refused
+    with pytest.raises(MediaRefError):
+        up._check_media_url_policy(f"file://{datasets}/../../etc/shadow")
+    # s3:// stays out of scope here (dedicated rejection in media_paths)
+    up._check_media_url_policy("s3://bucket/key")
 
 
 # ---------------------------------------------------------------------------

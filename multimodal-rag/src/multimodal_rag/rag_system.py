@@ -161,9 +161,20 @@ def resolve_federated_targets(
     skipped: list[dict[str, str]] = []
     errors: list[dict[str, str]] = []
 
+    # Dataset-name shape gate (audit 2026-10-02, same class as the MCP
+    # _require_dataset_acl fix): a malformed name must be refused BEFORE it
+    # reaches dm.get_dataset → _read_meta → _dataset_dir (a name like
+    # "../datasets/<other>" would otherwise address a sibling dataset's
+    # meta as a federated target).  Mirrors DatasetManager._validate_name.
+    _DATASET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
     def _consider(name: str, *, from_all: bool = False) -> None:
         name = (name or "").strip()
         if not name or name in targets:
+            return
+        if not _DATASET_NAME_RE.match(name):
+            if not from_all:
+                errors.append({"dataset": name, "error": "Invalid dataset name."})
             return
         try:
             dm.get_dataset(name, sync_count=False)
@@ -553,7 +564,10 @@ def _bm25_ingest_context(vs: VectorStore) -> dict[str, Any] | None:
         # Working copy: load_stats returns the mtime-cached object, and this
         # snapshot is mutated per sub-batch — mutating the cache itself would
         # make the end-of-ingest locked persist re-merge the same counts.
-        "stats": bm25_lane.copy_stats(bm25_lane.load_stats(Path(stats_path))),
+        # ``effective_stats`` also folds in deltas this process has marked but
+        # not yet flushed, so a deferred batch weighs each file against the
+        # same df view immediate mode would have produced (without the write).
+        "stats": bm25_lane.effective_stats(Path(stats_path)),
         "dirty": [],
     }
 
@@ -582,18 +596,35 @@ def _bm25_sparse_vectors(sub_docs: list[Document], ctx: dict[str, Any] | None) -
     return out
 
 
-def _bm25_persist_stats(ctx: dict[str, Any] | None) -> None:
-    """Persist the ingest's df deltas under the cross-process lock (once).
+def _bm25_persist_stats(ctx: dict[str, Any] | None) -> bool:
+    """Hand the ingest's df deltas to the deferred writer; return flush-due.
 
-    A crash before this point loses only the df counts of the stored prefix
-    — the sparse vectors are already on the points, so idf drifts slightly
-    until the stats catch up (never corrupt: idf stays positive).
+    The deltas are only *recorded* here (cheap, in-memory); ``True`` means the
+    count/age threshold fired (or the sidecar is missing entirely) and the
+    caller should run :func:`bm25_lane.flush_if_dirty` off the event loop —
+    that is the once-per-interval multi-MB sidecar rewrite.  Immediate mode
+    (``RAG_BM25_FLUSH_CALLS=1``, or both triggers set <= 0) reports due on
+    every call, reproducing the historical write-per-call behaviour.
+
+    Crash semantics: losing deferred deltas is bounded, not corrupting — the
+    sparse vectors are already on the points, so idf drifts slightly (df low
+    → idf high, always positive) until the next ingest re-counts those files.
+    The sidecar is NEVER silently absent, though: the first ingest of a
+    session against a missing sidecar force-flushes (``mark_dirty`` returns
+    True via :func:`bm25_lane.stats_fully_absent`), because nothing in this
+    repo re-derives the df map from the stored points.  The deltas are
+    dropped from the context after being handed over, so a repeated call on
+    the same context can never double-count.
     """
-    if ctx is not None and ctx["dirty"]:
-        try:
-            bm25_lane.record_documents(ctx["stats_path"], ctx["dirty"])
-        except Exception as exc:
-            logger.warning("Could not persist BM25 df stats (%s) — idf weighting may drift: %s", ctx["stats_path"], exc)
+    if ctx is None or not ctx["dirty"]:
+        return False
+    try:
+        due = bm25_lane.mark_dirty(ctx["stats_path"], ctx["dirty"])
+    except Exception as exc:
+        logger.warning("Could not record BM25 df stats (%s) — idf weighting may drift: %s", ctx["stats_path"], exc)
+        return False
+    ctx["dirty"] = []
+    return bool(due)
 
 
 def _has_embeddable_content(doc: dict, embed_modalities: set[str]) -> bool:
@@ -2643,8 +2674,21 @@ class MultimodalRAG:
             # sub_embs / sub_docs fall out of scope here — released before the
             # next sub-batch starts.
 
-        # ── 4. Persist the batch's BM25 df deltas (once, locked) ─────────
-        _bm25_persist_stats(bm25_ctx)
+        # ── 4. Defer the batch's BM25 df deltas; flush only when due ──────
+        # dataset_manager calls add_to_vector_store once per FILE, so the old
+        # unconditional persist here rewrote the whole (multi-MB) df map over
+        # NFS 5000 times for a 5000-file batch.  The deltas are now recorded
+        # in memory and merged once the count/age threshold fires (or at
+        # process exit / SIGTERM), with the actual sidecar write offloaded
+        # like every other Qdrant-adjacent I/O on this path.
+        if _bm25_persist_stats(bm25_ctx):
+            _flush_guard = _store_write_guard(vs)
+
+            def _flush_bm25() -> None:
+                with _flush_guard:
+                    bm25_lane.flush_if_dirty(bm25_ctx["stats_path"])
+
+            await loop.run_in_executor(_QDRANT_IO_POOL, _flush_bm25)
 
         if total_skipped:
             logger.info("Dedup total: skipped %d document(s)", total_skipped)

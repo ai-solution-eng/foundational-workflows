@@ -1,0 +1,186 @@
+replicaCount: 1
+image:
+  repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
+  tag: v4.0.0
+  pullPolicy: IfNotPresent
+deployment:
+  name: rag-mcp-server
+  appName: rag-mcp-server
+persistence:
+  data:
+    size: 50Gi
+    storageClass: gl4f-filesystem
+    accessMode: ReadWriteMany
+  qdrant:
+    size: 50Gi
+    storageClass: gl4f-filesystem
+    accessMode: ReadWriteMany
+    mountReadOnly: true
+models:
+  embedder:
+    name: Qwen/Qwen3-VL-Embedding-8B
+    url: ''
+    className: MultiModalEmbeddings
+    extra:
+      embedding_dim: 4096
+      chunk_size: 2048
+      chunk_overlap: 256
+      code_chunk_size: 8192
+      code_chunk_overlap: 512
+      tokenizer_name: Qwen/Qwen3-VL-Embedding-8B
+      tokenizer_type: HuggingFace
+  reranker:
+    name: Qwen/Qwen3-VL-Reranker-8B
+    url: ''
+    className: MultiModalReranker
+    extra: {}
+  vlm:
+    name: Qwen/Qwen3.8-27B-FP8
+    url: ''
+    extra: {}
+  asr:
+    name: CohereLabs/cohere-transcribe-03-2026
+    url: ''
+    extra: {}
+modelSecrets:
+  embedderApiKey: ''
+  rerankerApiKey: ''
+  vlmApiKey: ''
+  asrApiKey: ''
+s3:
+  endpointUrl: http://minio.minio.svc.cluster.local:9000
+  accessKeyId: ''
+  secretAccessKey: ''
+rag:
+  ocr: false
+  captionWithAsr: true
+  captionWithVlm: true
+  remote: false
+  dedupThreshold: 0.995
+qdrant:
+  image:
+    repository: qdrant/qdrant
+    tag: v1.19.0
+    pullPolicy: IfNotPresent
+  grpcPort: 6334
+  httpPort: 6333
+  telemetryDisabled: true
+mcp:
+  enabled: true
+  port: 9090
+  # OPTIONAL API-key auth for the MCP endpoints (fleet decision 2026-09,
+  # fleet pattern: K8S-MCP). When existingSecret is set, the chart wires
+  # RAG_API_KEYS from that Secret's key and every /mcp request needs a valid
+  # key (X-API-Key or Bearer). Leave empty for gateway-fronted deployments —
+  # the server then runs open (with a loud startup warning). Comma-separated
+  # keys all authenticate: that is the rotation mechanism — append the new
+  # key, move clients over, drop the old one, no downtime. The fleet-universal
+  # MCP_API_KEYS env is honored too (either var authenticates).
+  apiKey:
+    existingSecret: ""
+    existingSecretKey: api-keys
+  # D15 (OPT-IN) multi-user API keys → dataset ACLs. Leave BOTH empty for the
+  # default single-key behaviour (nothing rendered, nothing enforced — the
+  # default chart render stays byte-identical). Enabling changes the auth
+  # model:
+  #   apiKeyClients: "alice:s3cr3t-a;bob:s3cr3t-b"   (name:key pairs,
+  #     ';'-separated; keys must not contain ':' or ';') — mints per-user keys
+  #     accepted by the REST and MCP surfaces alongside the deployment keys.
+  #   datasetAcls: "alice:reports,notes;bob:*"       (name:dataset[,dataset…];
+  #     '*' = all datasets) — binds each name to its datasets. A registry key
+  #     with NO matching ACL entry gets NO datasets (fail-closed). The plain
+  #     deployment keys (security.apiKey / the MCP key set) keep FULL (admin)
+  #     access. ACL'd keys cannot reach /api/admin/* nor create datasets
+  #     (unless granted '*').
+  # These values are KEY MATERIAL: pass them from a Secret pipeline
+  # (--set-string), never commit real keys into a values file.
+  apiKeyClients: ""
+  datasetAcls: ""
+service:
+  api:
+    type: ClusterIP
+    port: 80
+  mcp:
+    type: ClusterIP
+resources:
+  app:
+    requests:
+      memory: 2Gi
+      cpu: 2
+    limits:
+      memory: 8Gi
+      cpu: 4
+  qdrant:
+    requests:
+      memory: 16Gi
+      cpu: '4'
+    limits:
+      memory: 32Gi
+      cpu: '8'
+extraEnv: {}
+security:
+  # REST API-key (RAG_API_KEY) + media-token HMAC secret (MEDIA_TOKEN_SECRET,
+  # 64 hex): the chart ships NO key material (P0-7, 2026-09 — the previously
+  # committed default literals were removed from the delivery path; the values
+  # themselves are private and were NOT rotated). Sourcing precedence —
+  #   1. security.existingSecret: a Secret you own provides both keys
+  #      (existingSecretApiKey / existingSecretMediaTokenKey names below)
+  #   2. inline value here (kept for back-compat with existing values files)
+  #   3. the value already stored in the release Secret — reused on upgrade,
+  #      so upgrading never rotates a secret under a running deployment
+  #   4. fresh auto-generation on first install
+  # Retrieve an auto-generated key: kubectl -n <ns> get secret \
+  #   <deployment.name>-model-keys -o jsonpath='{.data.RAG_API_KEY}' | base64 -d
+  # Rotation is OPTIONAL and operator-initiated — read helm/ROTATION.md first.
+  apiKey: ''
+  mediaTokenSecret: ''
+  # Optional Secret (you manage it) providing both keys; when set the chart
+  # renders neither key into its own Secret.
+  existingSecret: ''
+  existingSecretApiKey: RAG_API_KEY
+  existingSecretMediaTokenKey: MEDIA_TOKEN_SECRET
+  mediaTokenTtl: 3600
+  ingestAllowHosts: ''
+  blockPrivateHosts: true
+  maxDownloadBytes: 536870912
+  archiveMaxTotalBytes: 2147483648
+  archiveMaxMemberBytes: 1073741824
+  archiveMaxEntries: 10000
+  mediaAllowPathPrefixes: /data/datasets:/data/staging
+  pwMaxFailures: 10
+  pwFailWindow: 300
+  trustProxyIdentity: true
+  # Gate the /metrics exposition behind an API key (env RAG_METRICS_AUTH).
+  # false (default) = public in-cluster exposition, unchanged behaviour.
+  # true = every scrape must present X-RAG-Api-Key / X-API-Key / a Bearer key
+  # (RAG_API_KEY plus the MCP key set MCP_API_KEYS / RAG_API_KEYS are all
+  # accepted); the ServiceMonitor then needs metrics.serviceMonitorBearerSecret.
+  metricsAuth: false
+redis:
+  enabled: false
+  password: ''
+metrics:
+  serviceMonitor: false
+  interval: 30s
+  # When security.metricsAuth is on, name a Secret whose <key> holds a valid
+  # API key; the ServiceMonitor presents it as the scrape bearer token
+  # (prometheus-operator: endpoints[].bearerTokenSecret).  Empty = no token
+  # on the scrape (only valid while metricsAuth stays off).
+  serviceMonitorBearerSecret: ''
+  serviceMonitorBearerSecretKey: RAG_API_KEY
+backups:
+  enabled: false
+  schedule: 0 3 * * *
+  bucket: ''
+  retentionDays: 0
+ezua:
+  enabled: true
+  virtualService:
+    endpoint: rag-mcp-server.${DOMAIN_NAME}
+    istioGateway: istio-system/ezaf-gateway
+    timeout: 300s
+    longTimeout: 3600s
+  authorizationPolicy:
+    enabled: true
+    namespace: istio-system
+    providerName: oauth2-proxy
