@@ -441,6 +441,7 @@ def _unlock_ttl_max() -> int:
         return 86400
     return val if val >= 0 else 86400
 
+
 # Optional Redis backend for cross-pod unlock sharing.  Enabled when
 # REDIS_URL is set (the scale chart sets it); otherwise the per-process
 # dict above is used (a user may be prompted to re-unlock if routed to a
@@ -842,6 +843,7 @@ def _trust_proxy_identity() -> bool:
     credential candidate, so the flag must not be frozen at import)."""
     return os.environ.get("RAG_TRUST_PROXY_IDENTITY", "").strip().lower() in ("1", "true", "yes")
 
+
 # Periodic embedder liveness monitor.  The embedder is the only required
 # model; it is probed once per minute in the background and the result is
 # surfaced in /api/admin/health.  Health/readiness probes deliberately do
@@ -859,7 +861,20 @@ _model_health: dict[str, Any] = {
     }
 }
 
-_PUBLIC_PATHS = frozenset({"/healthz", "/readyz", "/favicon.png", "/", "/manage", "/access", "/oauth/login", "/oauth/oidc/callback", "/oauth/logout", "/oauth/logged-out"})
+_PUBLIC_PATHS = frozenset(
+    {
+        "/healthz",
+        "/readyz",
+        "/favicon.png",
+        "/",
+        "/manage",
+        "/access",
+        "/oauth/login",
+        "/oauth/oidc/callback",
+        "/oauth/logout",
+        "/oauth/logged-out",
+    }
+)
 
 # Routes that must stay reachable without the API key, matched by the
 # endpoint function name so future prefix-based routes are NOT silently
@@ -906,7 +921,7 @@ def _is_public_path(path: str, endpoint: Any = None) -> bool:
 # credential at all.  No key material is ever embedded; when SSO is enabled
 # it links the browser into /oauth/login.
 _SSO_GATE_401_PAGE = (
-    "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+    '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
     "<title>Sign in required</title>"
     "<style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;"
     "justify-content:center;height:100vh;margin:0;background:#f6f7f9;color:#1f2937}"
@@ -914,7 +929,7 @@ _SSO_GATE_401_PAGE = (
     "<h1>Sign in required</h1>"
     "<p>This deployment requires an authenticated session to view this page.</p>"
     "{sso_link}"
-    "<p style=\"margin-top:1.5em\"><a href=\"/\">Retry</a></p>"
+    '<p style="margin-top:1.5em"><a href="/">Retry</a></p>'
     "</main></body></html>"
 )
 
@@ -961,9 +976,7 @@ def _sso_gate_401_response() -> Response:
     try:
         from multimodal_rag.utils import oidc_sso
 
-        sso_link = (
-            '<p><a href="/oauth/login">Sign in with SSO</a></p>' if oidc_sso.sso_enabled() else ""
-        )
+        sso_link = '<p><a href="/oauth/login">Sign in with SSO</a></p>' if oidc_sso.sso_enabled() else ""
     except Exception:
         sso_link = ""
     return HTMLResponse(_SSO_GATE_401_PAGE.replace("{sso_link}", sso_link), status_code=401)
@@ -1006,6 +1019,31 @@ def _rag_acl_path_denial(path: str, method: str, identity) -> "str | None":
             return _clients_registry.DatasetAccessDenied(
                 f"Dataset '{name}' is not permitted for this API key (dataset ACLs are configured — D15)."
             ).args[0]
+        # D26: the ro gate — PATH-SHAPED, not method-shaped (cross-validation
+        # 2026-10: a blanket POST gate 403'd the READ-shaped POST verbs —
+        # /search, /unlock, /lock, /verify-password, /media-token — killing
+        # every read for ro-only keys, the exact users D26 exists for).
+        # Gated surfaces: document ingest (POST documents/files/batch-files/
+        # batch-urls), document deletes (DELETE .../documents/{id}), and the
+        # dataset manage surfaces (PATCH/PUT/DELETE on the dataset itself).
+        # Deliberate exemptions: /select and /deselect (returned above — the
+        # D16 self-service verbs only touch the caller's OWN store:
+        # selecting a global records ro; deselecting stays the exclusion
+        # escape hatch) and */public (the D23 creator-publish surface —
+        # ownership-gated underneath; no DELETE route exists today).
+        if method in ("POST", "PUT", "PATCH", "DELETE") and not path.endswith("/public"):
+            tail = path.rstrip("/")
+            suffix = tail.rsplit("/", 1)[-1]
+            if method == "POST":
+                is_write = suffix in ("documents", "files", "batch-files", "batch-urls")
+            elif method == "DELETE":
+                is_write = suffix == name or "/documents/" in tail
+            else:  # PATCH/PUT — only the dataset root is a manage surface
+                is_write = suffix == name
+            if is_write and not _access_store.dataset_write_allowed(identity, name):
+                return _clients_registry.DatasetAccessDenied(
+                    f"Dataset '{name}' is read-only for this API key (a ro grant cannot be written — D26)."
+                ).args[0]
     return None
 
 
@@ -1026,8 +1064,8 @@ def _presented_pairs(request: Request) -> "list[tuple[str, str]]":
     ):
         val = request.headers.get(header) or ""
         if via == "authorization":
-            if val.startswith("Bearer ") and val[len("Bearer "):].strip():
-                presented.append((val[len("Bearer "):].strip(), via))
+            if val.startswith("Bearer ") and val[len("Bearer ") :].strip():
+                presented.append((val[len("Bearer ") :].strip(), via))
         elif via == "forwarded":
             val = val.strip()
             if val[:7].lower() == "bearer ":
@@ -1058,9 +1096,7 @@ def _presented_pairs(request: Request) -> "list[tuple[str, str]]":
     # direct/non-proxied caller) contribute nothing — fail closed.
     if _trust_proxy_identity():
         proxied_user = (
-            request.headers.get("X-Auth-Request-Preferred-Username")
-            or request.headers.get("X-Auth-Request-User")
-            or ""
+            request.headers.get("X-Auth-Request-Preferred-Username") or request.headers.get("X-Auth-Request-User") or ""
         ).strip()
         if proxied_user:
             presented.append((proxied_user, "proxy-identity"))
@@ -1136,7 +1172,9 @@ async def _json_body_cap(request: Request, call_next):
             # exception handlers ever see it.  A JSONResponse flows out
             # cleanly through every outer wrapper.
             return JSONResponse(
-                {"detail": f"Request body exceeds RAG_MAX_BODY_BYTES ({limit} bytes) — send fewer/smaller documents per request."},
+                {
+                    "detail": f"Request body exceeds RAG_MAX_BODY_BYTES ({limit} bytes) — send fewer/smaller documents per request."
+                },
                 status_code=413,
             )
         # Counting-receive enforcement: JSON only (cross-validation P0-1
@@ -1260,9 +1298,7 @@ async def _api_key_auth(request: Request, call_next):
         # never admin; opaque keys cost only a shape pre-check).  The
         # deployment-key fast path above can never match a JWT, so OIDC
         # engages entirely through this call — no separate middleware step.
-        identity = _clients_registry.resolve_presented(
-            [k for k, _ in presented], [via for _, via in presented]
-        )
+        identity = _clients_registry.resolve_presented([k for k, _ in presented], [via for _, via in presented])
         if identity is not None and identity.is_admin:
             # An MCP-keyset key (MCP_API_KEYS / RAG_API_KEYS) — admin semantics.
             reset_handle = _clients_registry.set_current_identity(identity)
@@ -1911,9 +1947,7 @@ async def api_select_dataset(name: str, request: Request, body: dict[str, Any] =
     try:
         entry = await loop.run_in_executor(
             sync_pool,
-            lambda: _access_store.verify_and_select(
-                identity, name, password, dm.has_password, dm.verify_password
-            ),
+            lambda: _access_store.verify_and_select(identity, name, password, dm.has_password, dm.verify_password),
         )
     except _access_store.SelectionDenied as exc:
         # Audit 2026-10-02 P0-1 follow-up (cross-validation #1): the proof
@@ -1964,7 +1998,10 @@ async def api_deselect_dataset(name: str, request: Request):
     identity = _require_select_identity()
     removed = _access_store.deselect_dataset(identity, name)
     if removed:
-        return {"status": "ok", "message": f"Dataset '{name}' removed from your datasets (saved password dropped; re-select any time)."}
+        return {
+            "status": "ok",
+            "message": f"Dataset '{name}' removed from your datasets (saved password dropped; re-select any time).",
+        }
     return {"status": "ok", "message": f"No self-selection for '{name}' on your key — nothing removed."}
 
 
@@ -2172,6 +2209,235 @@ async def api_access_self_mint(request: Request, body: dict[str, Any] = Body(def
 
 
 # ---------------------------------------------------------------------------
+# D27 — MCP Inspector: the SPA's Inspector tab (direct MCP tool calls)
+# ---------------------------------------------------------------------------
+# The homepage SPA's fifth tab lets a signed-in user browse the MCP server's
+# tool catalog and INVOKE a tool directly, authenticated as the session's own
+# credential.  The browser never talks to the MCP endpoint itself — the MCP
+# sidecar (same pod, port 9090) is not on the ingress path and the D23 hard
+# rule stands (page scripts never see an SSO-derived key) — so the calls are
+# PROXIED through this API server:
+#
+#   GET  /api/inspector/tools   → MCP ``tools/list``   (catalog for the picker)
+#   POST /api/inspector/call    → MCP ``tools/call``   (one tool invocation)
+#
+# The proxy forwards EXACTLY the credential envelope the request itself
+# authenticated with (the same `_presented_pairs` the auth middleware
+# resolved), re-expressed in the MCP middleware's accepted headers — nothing
+# more, never a wider credential:
+#
+#   * an X-RAG-Api-Key / X-API-Key session key → ``X-API-Key`` (the same
+#     registry identity resolves on the MCP surface — D19 source "x-api-key");
+#   * an Authorization Bearer session key → ``Authorization: Bearer``;
+#   * the auth-proxy's forwarded OIDC token → ``X-Auth-Request-Access-Token``;
+#   * the D22 SSO session cookie (the realm's access-token JWT) →
+#     ``Authorization: Bearer`` — the MCP middleware's D21 fall-through
+#     resolves JWTs, and a JWT can only ever yield a client identity, so the
+#     re-enveloped cookie can never escalate;
+#   * a D24 trusted-proxy identity session has NO credential to forward (the
+#     identity headers are names, not secrets) — the MCP sidecar then answers
+#     on its own terms (open when unkeyed, 401 when keyed) and the tab
+#     surfaces that verbatim.  Fail-closed, never invented around.
+#
+# The caller's identity contextvar is deliberately NOT re-bound on the proxy
+# call: the MCP sidecar resolves identity from the forwarded credential
+# itself, so ACLs / selections / ★ memory binding are the sidecar's own
+# decisions against the SAME registry store — the proxy exercises the real
+# MCP path (auth middleware, per-caller unlock scoping, audit hooks), not a
+# shortcut around it.  Target: ``RAG_INSPECTOR_MCP_URL`` (default
+# ``http://127.0.0.1:9090/mcp`` — the chart's sidecar topology), timeout
+# ``RAG_INSPECTOR_TIMEOUT_S`` (default 300; tool calls embed and search).
+
+_INSPECTOR_DEFAULT_MCP_URL = "http://127.0.0.1:9090/mcp"
+
+# Session-credential source → the short label the Inspector chip renders.
+_INSPECTOR_VIA_LABELS = {
+    "x-api-key": "api-key",
+    "authorization": "bearer-token",
+    "forwarded": "forwarded-jwt",
+    "cookie": "sso-jwt",
+}
+
+_INSPECTOR_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+
+
+def _inspector_mcp_url() -> str:
+    """The MCP endpoint the Inspector proxies to (read per request — a
+    config change needs no restart).  Default: the in-pod MCP sidecar."""
+    raw = os.environ.get("RAG_INSPECTOR_MCP_URL", "").strip()
+    if raw:
+        return raw
+    return _INSPECTOR_DEFAULT_MCP_URL
+
+
+def _inspector_timeout_s() -> float:
+    """Per-call timeout for the proxied MCP request (default 300 s)."""
+    raw = os.environ.get("RAG_INSPECTOR_TIMEOUT_S", "").strip()
+    try:
+        value = float(raw) if raw else 300.0
+    except ValueError:
+        return 300.0
+    return value if value > 0 else 300.0
+
+
+def _inspector_forward_headers(request: Request) -> "tuple[list[tuple[str, str]], str]":
+    """The MCP-accepted credential headers for THIS request's session, plus
+    the session-credential label for the UI chip.
+
+    Re-derives the presented (key, source) pairs from the request headers
+    (the identical `_presented_pairs` the auth middleware used) and maps
+    each to the MCP middleware's accepted envelope, preserving the pair
+    order so the sidecar's D19 delegation precedence sees the same
+    candidates in the same order.  Duplicate envelopes (the same value
+    twice via X-RAG-Api-Key and X-API-Key, say) are collapsed.  Returns the
+    label of the FIRST forwardable source ("none" when the session has no
+    forwardable credential at all — the D24 proxy-identity and D20
+    anonymous cases).
+    """
+    headers: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    session_via = "none"
+    for key, via in _presented_pairs(request):
+        if via == "proxy-identity":
+            # A trusted-proxy identity is a NAME, not a secret: nothing to
+            # forward.  The sidecar decides (open / 401) — never invent a
+            # credential around it.
+            continue
+        if session_via == "none":
+            session_via = _INSPECTOR_VIA_LABELS.get(via, "none")
+        if via == "forwarded":
+            name, value = "X-Auth-Request-Access-Token", key
+        elif via in ("authorization", "cookie"):
+            # The cookie token IS the realm access-token JWT (D22) — the
+            # MCP surface accepts JWTs from a Bearer envelope (D21), and a
+            # JWT can only ever resolve to a client identity (never admin).
+            name, value = "Authorization", f"Bearer {key}"
+        else:
+            # "x-api-key" — covers both X-RAG-Api-Key and X-API-Key sources;
+            # the MCP middleware's X-API-Key carries the identical D19
+            # delegation semantics.
+            name, value = "X-API-Key", key
+        dedupe = (name.lower(), value)
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        headers.append((name, value))
+    # Per-caller unlock-cache scoping rides the client IP (D10) — honored by
+    # the sidecar only under its own RAG_TRUST_PROXY_IDENTITY, so forwarding
+    # the honest peer widens nothing.
+    if request.client and request.client.host:
+        headers.append(("X-Forwarded-For", request.client.host))
+    return headers, session_via
+
+
+async def _inspector_rpc(request: Request, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    """One JSON-RPC request to the MCP endpoint, forwarding the session
+    credential.  Raises HTTPException(502/504) with a caller-safe detail on
+    every transport-level failure — the MCP JSON-RPC error objects flow back
+    to the route handlers (they are TOOL facts, not proxy failures)."""
+    url = _inspector_mcp_url()
+    fwd, _ = _inspector_forward_headers(request)
+    headers: list[tuple[str, str]] = [
+        ("Content-Type", "application/json"),
+        # Both types: a json_response=True sidecar needs only JSON, but an
+        # SSE-mode target refuses an Accept without text/event-stream.
+        ("Accept", "application/json, text/event-stream"),
+        *fwd,
+    ]
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    timeout = _inspector_timeout_s()
+    try:
+        async with httpx2.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(url, content=json.dumps(payload), headers=headers)
+    except httpx2.TimeoutException:
+        raise HTTPException(504, f"MCP endpoint timed out after {timeout:g}s ({url}).")
+    except Exception as exc:
+        raise HTTPException(502, f"MCP endpoint unreachable at {url}: {type(exc).__name__}")
+    if resp.status_code == 401:
+        raise HTTPException(
+            502,
+            "The MCP endpoint rejected this session's credential (401 unauthorized) — "
+            "this session has no credential the MCP surface accepts; paste an API key "
+            "in the Access tab.",
+        )
+    if resp.status_code != 200:
+        raise HTTPException(502, f"MCP endpoint returned HTTP {resp.status_code} ({url}).")
+    try:
+        body = resp.json()
+    except ValueError:
+        raise HTTPException(
+            502, f"MCP endpoint returned a non-JSON response ({url}) — is it the streamable-http endpoint?"
+        )
+    if not isinstance(body, dict):
+        raise HTTPException(502, f"MCP endpoint returned an unexpected response shape ({url}).")
+    return body
+
+
+@app.get("/api/inspector/tools")
+async def api_inspector_tools(request: Request) -> dict[str, Any]:
+    """The Inspector tab's tool catalog: MCP ``tools/list`` through the
+    session credential (D27).
+
+    Shape: ``{"endpoint", "session_credential", "tools": [{name, description,
+    inputSchema}, ...]}`` — the same public-schema metadata any MCP client
+    sees.  ``session_credential`` names the envelope the proxy will forward
+    (``"api-key"`` | ``"bearer-token"`` | ``"forwarded-jwt"`` | ``"sso-jwt"`` |
+    ``"none"``) so the tab can show what a call will authenticate as — never
+    the credential itself.
+    """
+    body = await _inspector_rpc(request, "tools/list", {})
+    error = body.get("error")
+    if error:
+        raise HTTPException(502, f"MCP tools/list failed: {json.dumps(error)[:300]}")
+    result = body.get("result")
+    tools = result.get("tools") if isinstance(result, dict) else None
+    if not isinstance(tools, list):
+        tools = []
+    _, session_via = _inspector_forward_headers(request)
+    return {
+        "endpoint": _inspector_mcp_url(),
+        "session_credential": session_via,
+        "tools": [t for t in tools if isinstance(t, dict)],
+    }
+
+
+@app.post("/api/inspector/call")
+async def api_inspector_call(request: Request, body: dict[str, Any] = Body(...)):
+    """Invoke ONE MCP tool as THIS session (D27).
+
+    Request body::
+
+        {"name": "search_dataset", "arguments": {"dataset_name": "notes", "query": "…"}}
+
+    Returns ``{"ok", "tool", "duration_ms", "result", "error"}``:
+    ``result`` is the MCP CallToolResult (``content`` blocks,
+    ``structuredContent``, ``isError``) and ``error`` a JSON-RPC error
+    object.  A tool-level failure (``isError: true`` or a JSON-RPC error)
+    is a 200 with ``ok: false`` — the round trip itself succeeded, and the
+    tab renders the tool's own error text.  Transport-level failures (the
+    sidecar unreachable, a rejected credential) are 502/504 HTTPException
+    from :func:`_inspector_rpc`.
+    """
+    name = body.get("name")
+    if not isinstance(name, str) or not _INSPECTOR_TOOL_NAME_RE.match(name):
+        raise HTTPException(400, "Field 'name' is required (a valid MCP tool name)")
+    arguments = body.get("arguments")
+    if arguments is None or arguments == {}:
+        arguments = {}
+    elif not isinstance(arguments, dict):
+        raise HTTPException(400, "Field 'arguments' must be an object")
+    started = time.perf_counter()
+    rpc = await _inspector_rpc(request, "tools/call", {"name": name, "arguments": arguments})
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    rpc_error = rpc.get("error")
+    if rpc_error:
+        return {"ok": False, "tool": name, "duration_ms": duration_ms, "result": None, "error": rpc_error}
+    result = rpc.get("result")
+    is_error = bool(isinstance(result, dict) and result.get("isError"))
+    return {"ok": not is_error, "tool": name, "duration_ms": duration_ms, "result": result, "error": None}
+
+
+# ---------------------------------------------------------------------------
 # D23 dataset ownership — creator stamp + owner-or-admin enforcement
 # ---------------------------------------------------------------------------
 
@@ -2335,9 +2601,7 @@ async def api_admin_grant_client(name: str, request: Request, body: dict[str, An
     try:
         result = None
         if datasets is not None:
-            result = await loop.run_in_executor(
-                sync_pool, lambda: _admin_registry.grant_datasets(name, datasets)
-            )
+            result = await loop.run_in_executor(sync_pool, lambda: _admin_registry.grant_datasets(name, datasets))
         if oidc_field is not None or blocked_field is not None:
             # set_client_flags AUTO-MINTS an empty-grant entry for unknown
             # names (the observed-JWT-user flow) — so a flag-only PATCH on an
@@ -2354,13 +2618,24 @@ async def api_admin_grant_client(name: str, request: Request, body: dict[str, An
             flags = None
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    except TypeError as exc:  # D26: a non-str/dict grants payload element
+        raise HTTPException(400, str(exc))
     except KeyError:
         raise HTTPException(404, f"Client '{name}' not found in the admin registry")
     result_datasets = result["datasets"] if result is not None else None
     if result is not None:
         logger.info("Admin updated grants for '%s' → %s", name, result["datasets"])
+
+    # D26: grants are a mixed list (legacy "name" strings = rw; {"name",
+    # "mode"} objects) — format each for the human message instead of
+    # joining, which would TypeError on the object form.
+    def _grant_label(g: Any) -> str:
+        if isinstance(g, dict):
+            return f"{g.get('name')} ({g.get('mode')})"
+        return str(g)
+
     message = (
-        f"Grants for '{name}' updated: {', '.join(result_datasets) or '(none)'}."
+        f"Grants for '{name}' updated: {', '.join(_grant_label(g) for g in (result_datasets or [])) or '(none)'}."
         if result is not None
         else f"Flags for '{name}' updated."
     )
@@ -2370,9 +2645,12 @@ async def api_admin_grant_client(name: str, request: Request, body: dict[str, An
             detail.append(f"oidc={flags['oidc'] or '(cleared)'}")
         detail.append(f"blocked={flags['blocked']}")
         message += f" D21 flags: {', '.join(detail)}."
-    return {"status": "ok", "name": name,
-            "datasets": result_datasets if result_datasets is not None else (flags or {}).get("datasets", []),
-            "message": message}
+    return {
+        "status": "ok",
+        "name": name,
+        "datasets": result_datasets if result_datasets is not None else (flags or {}).get("datasets", []),
+        "message": message,
+    }
 
 
 @app.delete("/api/admin/clients/{name}")
@@ -2395,7 +2673,10 @@ async def api_admin_revoke_client(name: str):
     from multimodal_rag.utils.clients_registry import registry_clients
 
     if name in set(registry_clients().values()):
-        return {"status": "ok", "message": f"'{name}' is defined in the ENV registry (RAG_API_KEY_CLIENTS) — remove it there; the page cannot edit env config."}
+        return {
+            "status": "ok",
+            "message": f"'{name}' is defined in the ENV registry (RAG_API_KEY_CLIENTS) — remove it there; the page cannot edit env config.",
+        }
     raise HTTPException(404, f"Client '{name}' not found in the admin registry")
 
 
@@ -2449,9 +2730,11 @@ def _rag_acl_filter_datasets(datasets: list, catalog: bool = False) -> tuple:
     visible = []
     for d in datasets:
         name = str(d.get("name", ""))
-        if (_access_store.dataset_allowed(identity, name)
-                or _clients_registry.is_public_dataset(name)
-                or name in excluded):
+        if (
+            _access_store.dataset_allowed(identity, name)
+            or _clients_registry.is_public_dataset(name)
+            or name in excluded
+        ):
             if name in excluded:
                 d = dict(d)
                 d["excluded"] = True
@@ -2533,7 +2816,9 @@ async def api_list_datasets(
     request: Request,
     cursor: str = Query("", description="Opaque continuation token from a previous page's next_cursor"),
     limit: int = Query(0, ge=0, le=10000, description="Page size; 0 = no pagination (full list, default)"),
-    catalog: bool = Query(False, description="/access page view: world + public-available + excluded (stamped excluded:true)"),
+    catalog: bool = Query(
+        False, description="/access page view: world + public-available + excluded (stamped excluded:true)"
+    ),
 ):
     """List all datasets with metadata.
 
@@ -2617,9 +2902,7 @@ def _stats_model_rows() -> "list[dict[str, Any]]":
         ):
             if model is None:
                 continue
-            healthy = bool(
-                role != "embedder" or (embedder.get("status") == "healthy")
-            )
+            healthy = bool(role != "embedder" or (embedder.get("status") == "healthy"))
             rows.append(
                 {
                     "name": str(getattr(model, "model_name", "") or ""),
@@ -2639,7 +2922,7 @@ def _stats_model_rows() -> "list[dict[str, Any]]":
 
 
 @app.get("/api/stats")
-async def api_stats(request: Request = None) -> dict[str, Any]:
+async def api_stats(request: Request = None) -> dict[str, Any]:  # type: ignore[assignment]  # direct callers/tests pass no request — FastAPI forbids Optional[Request] route params
     """Read-only deployment stats for the SPA's stats tab (D23) —
     identity-aware and deliberately cheap.
 
@@ -2674,9 +2957,7 @@ async def api_stats(request: Request = None) -> dict[str, Any]:
         presented = _presented_pairs(request)
         if presented:
             try:
-                identity = _clients_registry.resolve_presented(
-                    [k for k, _ in presented], [via for _, via in presented]
-                )
+                identity = _clients_registry.resolve_presented([k for k, _ in presented], [via for _, via in presented])
             except Exception:
                 identity = None  # fail closed to the anonymous shape
     token = None
@@ -2738,9 +3019,11 @@ async def _stats_body(identity) -> dict[str, Any]:
             for job in _upload_jobs._jobs.values():
                 if job.get("status") == "uploading":
                     active_uploads += 1
-                elif job.get("status") == "error" and job.get("completed_at") and time.time() - float(
-                    job["completed_at"]
-                ) < 3600:
+                elif (
+                    job.get("status") == "error"
+                    and job.get("completed_at")
+                    and time.time() - float(job["completed_at"]) < 3600
+                ):
                     recent_failures += 1
     except Exception:
         logger.debug("Suppressed exception", exc_info=True)
@@ -2799,18 +3082,20 @@ async def _stats_body(identity) -> dict[str, Any]:
             else:
                 qd_total = _parse_size_bytes(os.environ.get("QDRANT_PVC_SIZE", ""))
                 replicas = _qdrant_cluster_replicas()
-                usage = _qdrant_replica_usage(replicas, os.environ.get("QDRANT_HOST", ""), os.environ.get("QDRANT_PORT", "6333"))
-                qd_used = sum(usage.values())
+                replica_usage = _qdrant_replica_usage(
+                    replicas, os.environ.get("QDRANT_HOST", ""), os.environ.get("QDRANT_PORT", "6333")
+                )
+                qd_used = sum(replica_usage.values())
                 if qd_total and qd_used:
                     qdrant_pvc = {
                         "total_bytes": qd_total,
                         "used_bytes": qd_used,
                         "free_bytes": max(qd_total - qd_used, 0),
                         "used_percent": round(qd_used / qd_total * 100, 1),
-                        "replicas": dict(usage),
+                        "replicas": dict(replica_usage),
                     }
-                elif usage:
-                    qdrant_pvc = {"used_bytes": qd_used, "replicas": dict(usage)}
+                elif replica_usage:
+                    qdrant_pvc = {"used_bytes": qd_used, "replicas": dict(replica_usage)}
         except Exception:
             qdrant_pvc = None
 
@@ -4556,9 +4841,7 @@ async def api_staging_serve(staging_id: str):
     # Ignore leftover "_preprocessed" siblings (only produced when the atomic
     # replace failed) and pick a deterministic file.
     files = sorted(
-        f
-        for f in sub.iterdir()
-        if f.is_file() and not f.name.endswith("_preprocessed") and not f.name.startswith(".")
+        f for f in sub.iterdir() if f.is_file() and not f.name.endswith("_preprocessed") and not f.name.startswith(".")
     )
     if not files:
         raise HTTPException(404, "Staged file not found or expired")
@@ -4717,7 +5000,9 @@ def _qdrant_cluster_replicas() -> "list[dict[str, Any]]":
                 return []
             peers = result.get("peers") or {}
             peer_shards: dict[str, int] = {}
-            for cinfo in (result.get("collections") or {}).values() if isinstance(result.get("collections"), dict) else []:
+            for cinfo in (
+                (result.get("collections") or {}).values() if isinstance(result.get("collections"), dict) else []
+            ):
                 if not isinstance(cinfo, dict):
                     continue
                 for sh in cinfo.get("shards") or []:
@@ -5255,6 +5540,7 @@ async def api_set_dataset_public_creator(
     logger.info("Dataset '%s' public flag set to %s (creator)", name, result["public"])
     return {"status": "ok", **result}
 
+
 @app.post("/api/admin/datasets/{name}/migrate-tier-schema")
 async def api_migrate_tier_schema(
     name: str,
@@ -5561,6 +5847,7 @@ async def api_import_dataset(request: Request) -> dict[str, Any]:
 # HTML frontend
 # ---------------------------------------------------------------------------
 
+
 def _whoami_flags() -> dict:
     """The D23 ``flags`` object for an AUTHENTICATED whoami (snake_case).
 
@@ -5640,8 +5927,7 @@ def _oidc_session_payload(presented: "list[tuple[str, str]]") -> dict:
     # SSO cookie is a JWT envelope, not an opaque key — it does NOT trigger
     # this bail-out.
     if any(
-        via not in ("forwarded", "cookie", "proxy-identity")
-        and not oidc_identity.is_jwt_format(candidate)
+        via not in ("forwarded", "cookie", "proxy-identity") and not oidc_identity.is_jwt_format(candidate)
         for candidate, via in presented
     ):
         return {"authenticated": False}
@@ -5683,8 +5969,13 @@ def _oidc_session_payload(presented: "list[tuple[str, str]]") -> dict:
             name = str(candidate or "").strip()
             if not name or not _admin_registry.valid_name(name):
                 continue
-            datasets = _clients_registry.dataset_acls().get(name, frozenset())
-            ident = _clients_registry.Identity(kind="client", name=name, datasets=frozenset(datasets))
+            grants = _clients_registry.dataset_acls().get(name, {})
+            ident = _clients_registry.Identity(
+                kind="client",
+                name=name,
+                datasets=frozenset(grants),
+                grants=dict(grants),
+            )
             token = _clients_registry.set_current_identity(ident)
             try:
                 flags = _whoami_flags()
@@ -5694,7 +5985,8 @@ def _oidc_session_payload(presented: "list[tuple[str, str]]") -> dict:
                 "authenticated": True,
                 "identity": name,
                 "source": "proxy-identity",
-                "datasets": sorted(datasets),
+                "datasets": sorted(grants),
+                "grants": [{"name": n, "mode": m} for n, m in sorted(grants.items())],
                 "is_admin": False,  # a proxy identity is never admin (D24)
                 "flags": flags,
                 "oidc": oidc_identity.oidc_status(),
@@ -5906,7 +6198,7 @@ _HTML_INDEX: str | None = None
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request = None):  # direct callers (the /manage fallback, tests) pass no request
+async def index(request: Request = None):  # type: ignore[assignment]  # direct callers (the /manage fallback, tests) pass no request — FastAPI forbids Optional[Request] route params
     global _HTML_INDEX
     # D23 auth gate (RAG_SSO_GATE): an unauthenticated request with no
     # credential of any kind gets the minimal sign-in page instead — health,
@@ -6000,7 +6292,7 @@ async def favicon():
 
 
 @app.get("/manage", response_class=HTMLResponse)
-async def manage(request: Request = None):
+async def manage(request: Request = None):  # type: ignore[assignment]  # /manage forwards its own request; FastAPI forbids Optional[Request] route params
     """The management page — the same render as ``/`` (including the D23
     RAG_SSO_GATE gate: the request is forwarded so an unauthenticated
     gated deployment gets the sign-in page here too)."""
@@ -6008,7 +6300,7 @@ async def manage(request: Request = None):
 
 
 @app.get("/access", response_class=HTMLResponse)
-async def access(request: Request = None):
+async def access(request: Request = None):  # type: ignore[assignment]  # FastAPI forbids Optional[Request] route params
     """Per-user access page (the key-holder's counterpart to the operator UI).
 
     Served public like ``/`` and ``/manage`` — the page IS its own auth

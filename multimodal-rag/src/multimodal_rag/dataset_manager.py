@@ -25,7 +25,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, overload
+from typing import Any, cast, overload
 
 import httpx2
 
@@ -2123,6 +2123,7 @@ class DatasetManager:
                 "public": "public" in meta,
                 "has_password": "password_hash" in meta,
             }
+
     @staticmethod
     def _strip_password(meta: dict[str, Any]) -> dict[str, Any]:
         """Return a copy of *meta* with the password hash removed and a
@@ -2710,7 +2711,7 @@ class DatasetManager:
             if "public" in updates:
                 raise ValueError(
                     "The 'public' flag is admin-only: POST /api/admin/datasets/{name}/public"
-                )            # Weighted-RRF defaults (feature: weighted RRF, dataset-defaults
+                )  # Weighted-RRF defaults (feature: weighted RRF, dataset-defaults
             # slice): PATCH ``{"rrf": {"dense_weight": …, "sparse_weight": …,
             # "k": …}}`` with any subset of keys.  Clamped/validated like the
             # create-time surface; an empty object or a payload that reduces
@@ -3064,6 +3065,7 @@ class DatasetManager:
               ("done",)                                   — terminal; run tail logic
             """
             fname = orig_name_
+
             # Canonical-source stamp (audit 2026-10-02 P1-3 fix): URL ingests
             # carry their s3:// URL as metadata.source so prune's MatchPrefix
             # filters can actually match them (a stored-PVC-path stamp made
@@ -5717,7 +5719,7 @@ class DatasetManager:
         with _meta_cache_lock:
             cached = _META_CACHE.get(key)
             if cached is not None and (cached[0], cached[1]) == stamp:
-                hit = cached[2]
+                hit: dict[str, Any] | None | object = cached[2]
                 # Move-to-back on hit (cross-validation P3-12): makes the
                 # eviction FIFO shape an actual LRU so a >100-dataset
                 # deployment with a hot working set stops thrashing.
@@ -5729,7 +5731,9 @@ class DatasetManager:
         # of the critical section is safe and readers do not serialise on the
         # deep copy.
         if hit is not _META_CACHE_HIT:
-            return copy.deepcopy(hit)
+            # Sentinel identity already excluded above; the declared union is
+            # only there to keep the sentinel flow type-safe.
+            return copy.deepcopy(cast("dict[str, Any] | None", hit))
         if stamp == _META_CACHE_MISSING:
             meta: dict[str, Any] | None = None
         else:

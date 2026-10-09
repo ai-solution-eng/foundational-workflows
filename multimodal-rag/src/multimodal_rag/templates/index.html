@@ -253,6 +253,32 @@
   .grant-form { display: none; width: 100%; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
   .grant-form.open { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; }
   .grant-form > div { flex: 1; min-width: 200px; }
+  /* D26 ro/rw grants: searchable checkbox dropdown inside the grant form */
+  .grant-picker { width: 100%; }
+  .grant-picker .gp-search { padding: 6px 10px; font-size: .8rem; }
+  .gp-list {
+    max-height: 220px; overflow-y: auto; margin-top: 6px;
+    border: 1px solid var(--border); border-radius: 4px; background: var(--surface);
+  }
+  .gp-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: .85rem;
+  }
+  .gp-row:last-child { border-bottom: none; }
+  .gp-row.gp-head { background: var(--surface-2); font-weight: 500; }
+  .gp-row input[type="checkbox"] { width: auto; margin: 0; }
+  .gp-row .gp-name { margin-bottom: 0; flex: 1; word-break: break-all; cursor: pointer; font-weight: inherit; color: var(--text); font-size: inherit; }
+  .gp-badge { font-size: .75rem; flex-shrink: 0; }
+  .gp-empty { padding: 14px 10px; color: var(--text-muted); font-size: .85rem; }
+  .gp-hint { margin-top: 4px; font-size: .72rem; color: var(--text-muted); }
+  .gp-toggle { display: inline-flex; gap: 2px; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; flex-shrink: 0; }
+  .gp-toggle button {
+    border: none; background: transparent; color: var(--text-muted);
+    font-family: inherit; font-size: .72rem; line-height: 1.4; padding: 2px 8px; cursor: pointer;
+  }
+  .gp-toggle button.on { background: var(--accent); color: #fff; }
+  .gp-toggle button:not(.on):hover { color: var(--text); }
+  .ds-chip.ro { opacity: .65; border-style: dashed; }
   .src-tag { font-size: .7rem; padding: 1px 6px; border-radius: 8px; border: 1px solid var(--border); color: var(--text-muted); }
   .key-reveal {
     font-family: 'SF Mono', 'Fira Code', monospace; background: var(--surface-2);
@@ -382,6 +408,7 @@
       <div class="tab" data-apptab="access" onclick="switchAppTab('access')">Access</div>
       <div class="tab" data-apptab="admin" id="tab-admin" onclick="switchAppTab('admin')" style="display:none">Admin</div>
       <div class="tab" data-apptab="stats" id="tab-stats" onclick="switchAppTab('stats')" style="display:none">Stats</div>
+      <div class="tab" data-apptab="inspector" onclick="switchAppTab('inspector')">Inspector</div>
     </div>
     <span id="identity-chip" style="display:none;align-items:center;gap:8px;font-size:.78rem;color:var(--text-muted)"></span>
     <a href="#" id="use-key-link" onclick="openKeyModal(event)" style="display:none;color:var(--text-muted);font-size:.78rem;text-decoration:none">Use an API key</a>
@@ -493,7 +520,7 @@
           </div>
           <div style="flex:2;min-width:240px">
             <label for="mint-datasets">Datasets (comma-separated, <code>*</code> = all, empty = none yet)</label>
-            <input type="text" id="mint-datasets" placeholder="e.g. reports, notes — or * for everything" autocomplete="off">
+            <input type="text" id="mint-datasets" placeholder="e.g. reports, notes (ro) — or * for everything" autocomplete="off">
           </div>
           <button type="submit" class="btn btn-primary btn-sm" id="mint-submit">Mint</button>
           <button type="button" class="btn btn-outline btn-sm" onclick="closeMintForm()">Cancel</button>
@@ -527,6 +554,40 @@
       <span id="stats-generated" class="muted"></span>
     </div>
     <div id="stats-body"><div class="empty-state"><span class="spinner"></span></div></div>
+  </div>
+</div>
+
+<!-- Inspector tab (D27) — direct MCP tool calls as THIS session. The browser
+     never reaches the MCP endpoint itself (the sidecar is off the ingress
+     path and page scripts never see an SSO-derived key): the calls are
+     proxied through the API server with the session's own credential
+     envelope forwarded server-side. -->
+<div id="view-inspector" class="app-view" style="display:none">
+  <div class="card">
+    <div class="card-header">
+      <h2 style="margin-bottom:0">MCP Inspector</h2>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span id="inspector-cred-chip" class="src-tag" style="display:none" title="The credential envelope forwarded to the MCP endpoint with every call — never the credential itself"></span>
+        <button class="btn btn-outline btn-sm" onclick="ensureInspectorLoaded(true)">Refresh tools</button>
+      </div>
+    </div>
+    <div class="muted" style="margin-bottom:12px;font-size:.8rem">
+      Pick a tool, edit the JSON arguments, and run it — the call is proxied to this deployment's
+      MCP endpoint (<span class="inline-code" id="inspector-endpoint">…</span>) with the credentials
+      of THIS session. Dataset ACLs, passwords/unlocks and the ★ memory binding apply exactly as
+      they do for your MCP client.
+    </div>
+    <div id="inspector-body">
+      <div style="display:grid;grid-template-columns:minmax(220px,300px) 1fr;gap:16px;align-items:start">
+        <div>
+          <input type="text" id="inspector-filter" placeholder="Filter tools…" style="width:100%;font-size:.8rem;padding:6px 10px;margin-bottom:8px" oninput="renderInspectorTools()">
+          <div id="inspector-tool-list" style="max-height:520px;overflow:auto;border:1px solid var(--border);border-radius:4px">
+            <div class="empty-state"><span class="spinner"></span></div>
+          </div>
+        </div>
+        <div id="inspector-detail"><div class="empty-state">Select a tool on the left to inspect it.</div></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -640,22 +701,31 @@
       <input type="text" id="ds-desc" placeholder="e.g. My research paper collection" autocomplete="off">
     </div>
     <div class="form-group" style="margin-top:10px">
-      <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400" title="Transcribe audio tracks from videos via ASR at ingest time.">
-        Caption with ASR <input type="checkbox" id="ds-caption-asr">
-      </label>
-      <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400;margin-left:16px" title="Generate VLM descriptions of images/videos at ingest time. Enables VLM-skip at retrieval for generic queries.">
-        Caption with VLM <input type="checkbox" id="ds-caption-vlm">
-      </label>
-      <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400;margin-left:16px" title="Keep original full-quality files on disk after preprocessing. Uncheck to save disk space (preprocessed copies are retained).">
-        Keep originals <input type="checkbox" id="ds-keep-originals" checked>
-      </label>
-      <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400;margin-left:16px" title="OCR fallback: scanned pages (images, no text layer) are OCR'd via tesseract at ingest. Text pages are never OCR'd - costs nothing unless a page needs it.">
-        OCR fallback <input type="checkbox" id="ds-ocr">
-      </label>
-      <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400;margin-left:16px" title="Contextual retrieval: at ingest, one small LLM call per text chunk writes 1-2 sentences of document-level context, prepended before embedding (better chunk retrieval for large documents). Affects NEW ingests only - Recreate the dataset to re-contextualize existing files. Watch the cost preview when enabling on a large dataset.">
-        Contextual retrieval <input type="checkbox" id="ds-contextual">
-      </label>
-      <span id="ds-contextual-cost" style="display:none;font-size:.8rem;color:var(--text-muted);margin-left:8px"></span>
+      <table style="border-collapse:collapse;font-size:.85rem">
+        <tbody>
+          <tr>
+            <td style="padding:6px 10px 6px 0;vertical-align:middle"><input type="checkbox" id="ds-caption-asr" title="Transcribe audio tracks from videos via ASR at ingest time." style="margin:0;vertical-align:middle;cursor:pointer"></td>
+            <td style="padding:6px 0;white-space:nowrap"><label for="ds-caption-asr" style="cursor:pointer;margin-bottom:0" title="Transcribe audio tracks from videos via ASR at ingest time.">Caption with ASR</label></td>
+          </tr>
+          <tr>
+            <td style="padding:6px 10px 6px 0;vertical-align:middle"><input type="checkbox" id="ds-caption-vlm" title="Generate VLM descriptions of images/videos at ingest time. Enables VLM-skip at retrieval for generic queries." style="margin:0;vertical-align:middle;cursor:pointer"></td>
+            <td style="padding:6px 0;white-space:nowrap"><label for="ds-caption-vlm" style="cursor:pointer;margin-bottom:0" title="Generate VLM descriptions of images/videos at ingest time. Enables VLM-skip at retrieval for generic queries.">Caption with VLM</label></td>
+          </tr>
+          <tr>
+            <td style="padding:6px 10px 6px 0;vertical-align:middle"><input type="checkbox" id="ds-keep-originals" title="Keep original full-quality files on disk after preprocessing. Uncheck to save disk space (preprocessed copies are retained)." style="margin:0;vertical-align:middle;cursor:pointer" checked></td>
+            <td style="padding:6px 0;white-space:nowrap"><label for="ds-keep-originals" style="cursor:pointer;margin-bottom:0" title="Keep original full-quality files on disk after preprocessing. Uncheck to save disk space (preprocessed copies are retained).">Keep originals</label></td>
+          </tr>
+          <tr>
+            <td style="padding:6px 10px 6px 0;vertical-align:middle"><input type="checkbox" id="ds-ocr" title="OCR fallback: scanned pages (images, no text layer) are OCR'd via tesseract at ingest. Text pages are never OCR'd - costs nothing unless a page needs it." style="margin:0;vertical-align:middle;cursor:pointer"></td>
+            <td style="padding:6px 0;white-space:nowrap"><label for="ds-ocr" style="cursor:pointer;margin-bottom:0" title="OCR fallback: scanned pages (images, no text layer) are OCR'd via tesseract at ingest. Text pages are never OCR'd - costs nothing unless a page needs it.">OCR fallback</label></td>
+          </tr>
+          <tr>
+            <td style="padding:6px 10px 6px 0;vertical-align:middle"><input type="checkbox" id="ds-contextual" title="Contextual retrieval: at ingest, one small LLM call per text chunk writes 1-2 sentences of document-level context, prepended before embedding (better chunk retrieval for large documents). Affects NEW ingests only - Recreate the dataset to re-contextualize existing files. Watch the cost preview when enabling on a large dataset." style="margin:0;vertical-align:middle;cursor:pointer"></td>
+            <td style="padding:6px 0;white-space:nowrap"><label for="ds-contextual" style="cursor:pointer;margin-bottom:0" title="Contextual retrieval: at ingest, one small LLM call per text chunk writes 1-2 sentences of document-level context, prepended before embedding (better chunk retrieval for large documents). Affects NEW ingests only - Recreate the dataset to re-contextualize existing files. Watch the cost preview when enabling on a large dataset.">Contextual retrieval</label></td>
+          </tr>
+        </tbody>
+      </table>
+      <span id="ds-contextual-cost" style="display:none;font-size:.8rem;color:var(--text-muted);margin-left:24px"></span>
     </div>
     <div class="form-group" style="margin-top:10px">
       <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400" title="Weighted-RRF defaults for this dataset (hybrid text search only). Rank-space tilt, NOT a score multiplier: a higher weight makes that lane's rank positions count more (trust the order, not the magnitude). Applies only when a search carries no explicit override; multimodal (vector-only) queries ignore weights. Leave blank for the global default.">
@@ -2759,7 +2829,8 @@ async function initCaptionCheckboxes() {
 <script>
 // =======================================================================
 // D23 SPA shell — one identity-gated page with Datasets / Access / Admin /
-// Stats tabs. ONE identity probe at boot: GET /api/oidc-session with
+// Stats tabs (D27 adds the Inspector: direct MCP tool calls as the session
+// credential). ONE identity probe at boot: GET /api/oidc-session with
 // credentials:'same-origin' (the stored key rides along — under the D23
 // contract the whoami resolves a registry key to {authenticated: true,
 // identity, source: 'key', flags}; only an ADMIN key presented opaquely
@@ -2773,7 +2844,7 @@ async function initCaptionCheckboxes() {
 // backend). See the key-mode contract at the top of the main script.
 // =======================================================================
 
-const APP_TABS = ['datasets', 'access', 'admin', 'stats'];
+const APP_TABS = ['datasets', 'access', 'admin', 'stats', 'inspector'];
 
 function switchAppTab(name) {
   if (!APP_TABS.includes(name)) name = 'datasets';
@@ -2790,6 +2861,7 @@ function switchAppTab(name) {
   if (name === 'stats') startStatsPolling(); else stopStatsPolling();
   if (name === 'access') ensureAccessLoaded();
   if (name === 'admin') ensureAdminLoaded(false);
+  if (name === 'inspector') ensureInspectorLoaded();
 }
 
 window.addEventListener('hashchange', () => {
@@ -3160,6 +3232,7 @@ function handleAuthRejected(message) {
   _accessLoaded = false;
   _memoryDone = {};
   selfmintState = null;   // D25: next identity re-probes GET /api/access/key
+  resetInspector();       // D27: next identity re-probes the MCP catalog
   clients = [];
   showAdminTab(false);
   stopStatsPolling();
@@ -4068,8 +4141,9 @@ function renderClients() {
     return;
   }
   container.innerHTML = rows.map(c => {
-    const chips = (c.datasets || []).map(d =>
-      '<span class="ds-chip' + (d === '*' ? ' wild' : '') + '">' + escHtml(d) + '</span>'
+    const chips = clientGrantsOf(c).map(g =>
+      '<span class="ds-chip' + (g.name === '*' ? ' wild' : '') + (g.mode === 'ro' ? ' ro' : '') + '">' +
+      escHtml(g.name + (g.mode === 'ro' ? ' (ro)' : '')) + '</span>'
     ).join('') || '<span class="muted">no datasets granted</span>';
     const src = '<span class="src-tag">' + escHtml(c.source || 'overlay') + '</span>';
     // D21 fields when present in the clients payload: blocked flag + oidc alias.
@@ -4088,14 +4162,111 @@ function renderClients() {
       '</div>' +
       '<div class="dataset-actions">' + envManaged + '</div>' +
       '<form class="grant-form" onsubmit="submitGrant(event, this)">' +
-      '<div><label>Datasets (comma-separated, * = all)</label>' +
-      '<input type="text" name="datasets" value="' + escHtml((c.datasets || []).join(', ')) + '" autocomplete="off"></div>' +
+      '<div class="grant-picker" data-cname="' + escHtml(c.name) + '">' +
+      '<label>Grants (search, tick a dataset, choose ro/rw — * = all)</label>' +
+      '<input type="text" class="gp-search" placeholder="Filter datasets…" oninput="filterGrantPicker(this)" autocomplete="off">' +
+      '<div class="gp-list">' + buildGrantPickerRows(c) + '</div>' +
+      '<div class="gp-hint">ro = read-only · rw = read-write · unchecked rows revoke</div>' +
+      '</div>' +
       '<button type="submit" class="btn btn-primary btn-sm">Save</button>' +
       '<button type="button" class="btn btn-outline btn-sm" onclick="toggleGrant(this)">Cancel</button>' +
       '<div class="row-error" id="gerr-' + escHtml(c.name) + '"></div>' +
       '</form>' +
       '</div>';
   }).join('');
+}
+
+// D26 read-only grants: normalise a client row to {name, mode} entries.
+// New rows carry c.grants = [{name, mode}]; legacy rows only have the flat
+// c.datasets string list (all rw). '*' stays a plain string (rw-all).
+function clientGrantsOf(c) {
+  if (Array.isArray(c.grants)) return c.grants;
+  return (c.datasets || []).map(d => ({ name: d, mode: 'rw' }));
+}
+
+// Build the dropdown body of the grant picker: a pinned "All datasets (*)"
+// row plus one row per cluster dataset. Each row is a checkbox + name +
+// public/password badges + a ro/rw segmented toggle. Missing/odd entries
+// in the cluster list are skipped; if nothing loaded yet, say so instead.
+function buildGrantPickerRows(c) {
+  if (!datasets.length) {
+    return '<div class="gp-empty">No datasets visible — load the Datasets tab first</div>';
+  }
+  const granted = {};
+  clientGrantsOf(c).forEach(g => {
+    if (g && g.name) granted[g.name] = (g.mode === 'ro' ? 'ro' : 'rw');
+  });
+  const row = (name, mode, label) => {
+    const isWild = name === '*';
+    return '<div class="gp-row' + (isWild ? ' gp-head' : '') + '" data-ds="' + escHtml(name) + '">' +
+      '<input type="checkbox" class="gp-chk" data-ds="' + escHtml(name) + '"' +
+      (granted[name] ? ' checked' : '') + '>' +
+      '<label class="gp-name">' + escHtml(label) + '</label>' +
+      '<span class="gp-toggle">' +
+      '<button type="button" class="' + (mode === 'ro' ? 'on' : '') + '" data-mode="ro" onclick="setGrantMode(this)">ro</button>' +
+      '<button type="button" class="' + (mode !== 'ro' ? 'on' : '') + '" data-mode="rw" onclick="setGrantMode(this)">rw</button>' +
+      '</span>' +
+      '</div>';
+  };
+  let html = row('*', granted['*'] || 'rw', 'All datasets (*)');
+  datasets.forEach(d => {
+    if (!d || !d.name) return;
+    const badges = (d.public ? '<span class="gp-badge" title="Public dataset">🌐</span>' : '') +
+      (d.has_password ? '<span class="gp-badge" title="Password-protected">🔒</span>' : '');
+    html += '<div class="gp-row" data-ds="' + escHtml(d.name) + '">' +
+      '<input type="checkbox" class="gp-chk" data-ds="' + escHtml(d.name) + '"' + (granted[d.name] ? ' checked' : '') + '>' +
+      '<label class="gp-name">' + escHtml(d.name) + '</label>' + badges +
+      '<span class="gp-toggle">' +
+      '<button type="button" class="' + (granted[d.name] === 'ro' ? 'on' : '') + '" data-mode="ro" onclick="setGrantMode(this)">ro</button>' +
+      '<button type="button" class="' + (granted[d.name] !== 'ro' ? 'on' : '') + '" data-mode="rw" onclick="setGrantMode(this)">rw</button>' +
+      '</span>' +
+      '</div>';
+  });
+  return html;
+}
+
+// ro/rw segmented toggle inside a picker row: exactly one side lit.
+function setGrantMode(btn) {
+  const toggle = btn.closest('.gp-toggle');
+  if (!toggle) return;
+  toggle.querySelectorAll('button').forEach(b =>
+    b.classList.toggle('on', b === btn));
+}
+
+// Case-insensitive substring filter over the picker rows (name in data-ds).
+function filterGrantPicker(input) {
+  const picker = input.closest('.grant-picker');
+  if (!picker) return;
+  const q = (input.value || '').trim().toLowerCase();
+  const list = picker.querySelector('.gp-list');
+  if (!list) return;
+  list.querySelectorAll('.gp-row').forEach(rowEl => {
+    const name = (rowEl.dataset.ds || '').toLowerCase();
+    // The pinned '*' row always stays visible so the filter can't strand it.
+    rowEl.style.display = (!q || name === '*' || name.includes(q)) ? '' : 'none';
+  });
+}
+
+// D26: collect the picker state into the wire shape. Granted entries go out
+// as {name, mode} objects; the ONLY plain string is an rw-mode '*' wildcard
+// (wire-compatible with the legacy list). '*' checked with ro = ro-all
+// ({name:'*',mode:'ro'}); '*' unchecked (or its mode never mattered) revokes
+// the wildcard. A ticked dataset's mode always serialises — ro/rw is data.
+function collectGrantDatasets(picker) {
+  const out = [];
+  const wildRow = picker.querySelector('.gp-row[data-ds="*"]');
+  const wildChk = wildRow && wildRow.querySelector('.gp-chk:checked');
+  if (wildChk) {
+    const wildBtn = wildRow.querySelector('.gp-toggle button.on');
+    out.push(wildBtn && wildBtn.dataset.mode === 'ro' ? { name: '*', mode: 'ro' } : '*');
+  }
+  picker.querySelectorAll('.gp-chk:checked').forEach(chk => {
+    if (chk.dataset.ds === '*') return;
+    const rowEl = chk.closest('.gp-row');
+    const modeBtn = rowEl.querySelector('.gp-toggle button.on');
+    out.push({ name: chk.dataset.ds, mode: (modeBtn && modeBtn.dataset.mode === 'ro') ? 'ro' : 'rw' });
+  });
+  return out;
 }
 
 function openMintForm() {
@@ -4194,8 +4365,8 @@ async function submitGrant(event, form) {
   const item = form.closest('.client-item');
   const name = item ? item.dataset.cname : null;
   if (!name) return;
-  const ds = form.querySelector('input[name="datasets"]').value
-    .split(',').map(s => s.trim()).filter(Boolean);
+  const picker = form.querySelector('.grant-picker');
+  const ds = picker ? collectGrantDatasets(picker) : [];
   const errEl = document.getElementById('gerr-' + escHtml(name));
   if (errEl) errEl.classList.remove('show');
   try {
@@ -4406,6 +4577,257 @@ function statsPvcSection(s) {
     'Qdrant StatefulSet PVC — vector index & payloads');
   if (!file && !qd) return '';
   return `<div style="margin-top:18px;display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px">${file}${qd}</div>`;
+}
+</script>
+<script>
+// =======================================================================
+// Inspector tab (D27) — direct MCP tool calls as THIS session.
+//
+// GET /api/inspector/tools  → the sidecar's tools/list catalog + which
+//                             credential envelope the proxy forwards.
+// POST /api/inspector/call  → one tools/call {name, arguments} round trip.
+//
+// The proxy forwards the session's own credential (pasted key / SSO JWT /
+// forwarded token) server-side — the key material never crosses into this
+// page's reach beyond what paste mode already holds, and the SSO session's
+// JWT never does at all. Tool-level failures render as the tool's own
+// error text (the call round trip succeeded); proxy failures surface as
+// the api() error toast / inline error.
+// =======================================================================
+
+const _inspector = {
+  loaded: false, loading: false,
+  tools: [], credential: 'none', endpoint: '',
+  selected: null,           // the selected tool's catalog entry
+  argsError: '', result: null,
+};
+
+const _INSPECTOR_CRED_LABELS = {
+  'api-key': 'forwarding: session API key',
+  'bearer-token': 'forwarding: bearer credential',
+  'forwarded-jwt': 'forwarding: forwarded token',
+  'sso-jwt': 'forwarding: SSO identity',
+  'proxy-identity': 'proxy identity — no forwardable credential',
+  'none': 'no session credential',
+};
+
+async function ensureInspectorLoaded(force) {
+  if (_inspector.loading) return;
+  if (_inspector.loaded && !force) { renderInspectorCred(); return; }
+  _inspector.loading = true;
+  const list = document.getElementById('inspector-tool-list');
+  if (list && !_inspector.loaded) list.innerHTML = '<div class="empty-state"><span class="spinner"></span></div>';
+  try {
+    const meta = await api('GET', '/api/inspector/tools', undefined, 30000);
+    _inspector.tools = Array.isArray(meta && meta.tools) ? meta.tools : [];
+    _inspector.credential = (meta && meta.session_credential) || 'none';
+    _inspector.endpoint = (meta && meta.endpoint) || '';
+    _inspector.loaded = true;
+    renderInspectorCred();
+    renderInspectorTools();
+  } catch (e) {
+    if (e.status === 401 || e.status === 403) { handleAuthRejected('Your credentials were rejected by the server'); return; }
+    if (list) list.innerHTML = `<div class="empty-state" style="color:var(--red)">${escHtml(e.message || 'Could not load the tool catalog')}</div>
+      <div class="empty-state"><button class="btn btn-outline btn-sm" onclick="ensureInspectorLoaded(true)">Retry</button></div>`;
+  } finally {
+    _inspector.loading = false;
+  }
+}
+
+function renderInspectorCred() {
+  const chip = document.getElementById('inspector-cred-chip');
+  if (!chip) return;
+  const label = _INSPECTOR_CRED_LABELS[_inspector.credential] || _INSPECTOR_CRED_LABELS.none;
+  chip.textContent = label;
+  chip.style.display = 'inline-block';
+  chip.title = 'The credential envelope forwarded to the MCP endpoint with every call — never the credential itself.';
+  const ep = document.getElementById('inspector-endpoint');
+  if (ep) ep.textContent = _inspector.endpoint || 'the deployment MCP endpoint';
+}
+
+function renderInspectorTools() {
+  const list = document.getElementById('inspector-tool-list');
+  if (!list) return;
+  const q = ((document.getElementById('inspector-filter') || {}).value || '').trim().toLowerCase();
+  const rows = _inspector.tools.filter(t => {
+    if (!q) return true;
+    return String(t.name || '').toLowerCase().includes(q) ||
+      String(t.description || '').toLowerCase().includes(q);
+  });
+  if (!rows.length) {
+    list.innerHTML = `<div class="empty-state">${_inspector.tools.length === 0
+      ? 'No tools reported by the MCP endpoint.'
+      : 'No tools match the filter.'}</div>`;
+    return;
+  }
+  list.innerHTML = rows.map(t => {
+    const active = _inspector.selected && _inspector.selected.name === t.name;
+    return `<div data-inspector-tool="${escHtml(String(t.name || ''))}" onclick="selectInspectorTool(this.dataset.inspectorTool)"
+      style="padding:8px 10px;cursor:pointer;border-bottom:1px solid var(--border);${active ? 'background:var(--surface-2);border-left:2px solid var(--accent)' : ''}">
+      <div style="font-size:.82rem;font-weight:600">${escHtml(String(t.name || 'unnamed tool'))}</div>
+      <div class="muted" style="font-size:.72rem;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">${escHtml(String(t.description || '').split('\n')[0])}</div>
+    </div>`;
+  }).join('');
+}
+
+// Seed an arguments skeleton from the tool's inputSchema: schema defaults
+// when given, type-shaped placeholders otherwise, and dataset_name prefilled
+// with the first dataset visible to this identity (a pure convenience —
+// the server enforces the ACL either way).
+function inspectorSeedArgs(tool) {
+  const schema = (tool && tool.inputSchema) || {};
+  const props = (schema.properties && typeof schema.properties === 'object') ? schema.properties : {};
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  const args = {};
+  const firstDs = (typeof accessDatasets !== 'undefined' && accessDatasets.length && accessDatasets[0] && accessDatasets[0].name) ? String(accessDatasets[0].name) : '';
+  Object.keys(props).forEach(prop => {
+    const p = (props && typeof props === 'object') ? props[prop] : {};
+    if (p && p.default !== undefined && p.default !== null) { args[prop] = p.default; return; }
+    const type = Array.isArray(p.type) ? p.type[0] : p.type;
+    if (type === 'boolean') args[prop] = false;
+    else if (type === 'integer' || type === 'number') args[prop] = (required.includes(prop) ? 0 : null);
+    else if (type === 'array') args[prop] = [];
+    else if (type === 'object') args[prop] = {};
+    else if (prop === 'dataset_name' && firstDs) args[prop] = firstDs;
+    else args[prop] = '';
+    if (!required.includes(prop) && args[prop] === '') delete args[prop];
+  });
+  return args;
+}
+
+function selectInspectorTool(name) {
+  const tool = _inspector.tools.find(t => String(t.name || '') === String(name));
+  if (!tool) return;
+  _inspector.selected = tool;
+  _inspector.result = null;
+  _inspector.argsError = '';
+  renderInspectorTools();
+  renderInspectorDetail();
+}
+
+function renderInspectorDetail() {
+  const el = document.getElementById('inspector-detail');
+  if (!el) return;
+  const tool = _inspector.selected;
+  if (!tool) { el.innerHTML = '<div class="empty-state">Select a tool on the left to inspect it.</div>'; return; }
+  const schema = tool.inputSchema || {};
+  const props = (schema.properties && typeof schema.properties === 'object') ? schema.properties : {};
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  const propRows = Object.keys(props).map(prop => {
+    const p = props[prop] || {};
+    const type = Array.isArray(p.type) ? p.type.join('|') : (p.type || 'any');
+    const req = required.includes(prop) ? ' <span style="color:var(--red)">*</span>' : '';
+    return `<tr><td style="padding:2px 10px 2px 0;white-space:nowrap;font-family:var(--mono,monospace);font-size:.75rem">${escHtml(prop)}${req}</td>
+      <td class="muted" style="padding:2px 0;font-size:.72rem;white-space:nowrap">${escHtml(String(type))}</td>
+      <td class="muted" style="padding:2px 0;font-size:.72rem">${escHtml(String(p.description || ''))}</td></tr>`;
+  }).join('');
+  el.innerHTML = `
+    <div style="margin-bottom:6px">
+      <span style="font-weight:600;font-size:.95rem">${escHtml(String(tool.name || ''))}</span>
+      ${required.length ? '<span class="muted" style="font-size:.72rem;margin-left:8px"><span style="color:var(--red)">*</span> required</span>' : ''}
+    </div>
+    <div class="muted" style="font-size:.8rem;white-space:pre-wrap;margin-bottom:10px">${escHtml(String(tool.description || 'No description.'))}</div>
+    ${propRows ? `<table style="margin-bottom:12px;border-collapse:collapse"><tbody>${propRows}</tbody></table>` : ''}
+    <label for="inspector-args" style="font-size:.78rem">Arguments (JSON)</label>
+    <textarea id="inspector-args" spellcheck="false" rows="10"
+      style="width:100%;font-family:var(--mono,monospace);font-size:.78rem;padding:10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);resize:vertical">${escHtml(JSON.stringify(inspectorSeedArgs(tool), null, 2))}</textarea>
+    <div id="inspector-args-error" class="error-text" style="${_inspector.argsError ? '' : 'display:none'}">${escHtml(_inspector.argsError)}</div>
+    <div style="display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap">
+      <button class="btn btn-primary btn-sm" id="inspector-run-btn" onclick="runInspectorTool()">Run tool</button>
+      <button class="btn btn-outline btn-sm" onclick="resetInspectorArgs()">Reset arguments</button>
+    </div>
+    <div id="inspector-result"></div>`;
+}
+
+function resetInspectorArgs() {
+  if (!_inspector.selected) return;
+  _inspector.argsError = '';
+  renderInspectorDetail();
+}
+
+function _inspectorExtractText(result) {
+  // The human-readable layer: every text content block of a CallToolResult,
+  // in order. Images/audio/resource blocks are summarized as placeholders —
+  // the raw JSON below carries them verbatim.
+  const blocks = result && Array.isArray(result.content) ? result.content : [];
+  const parts = [];
+  blocks.forEach(b => {
+    if (!b || typeof b !== 'object') return;
+    if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text);
+    else if (b.type === 'image') parts.push('[image content block]');
+    else if (b.type === 'audio') parts.push('[audio content block]');
+    else if (b.type === 'resource') parts.push('[embedded resource]');
+    else if (b.type) parts.push(`[${b.type} content block]`);
+  });
+  return parts.join('\n');
+}
+
+async function runInspectorTool() {
+  const tool = _inspector.selected;
+  if (!tool) return;
+  const ta = document.getElementById('inspector-args');
+  const errEl = document.getElementById('inspector-args-error');
+  const resEl = document.getElementById('inspector-result');
+  let args = {};
+  if (ta && ta.value.trim() !== '') {
+    try { args = JSON.parse(ta.value); }
+    catch (e) {
+      _inspector.argsError = 'Arguments are not valid JSON: ' + e.message;
+      if (errEl) { errEl.textContent = _inspector.argsError; errEl.style.display = ''; }
+      return;
+    }
+  }
+  if (errEl) { errEl.style.display = 'none'; }
+  _inspector.argsError = '';
+  const btn = document.getElementById('inspector-run-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
+  if (resEl) resEl.innerHTML = '<div class="empty-state"><span class="spinner"></span></div>';
+  try {
+    const out = await api('POST', '/api/inspector/call', { name: tool.name, arguments: args });
+    _inspector.result = out;
+    renderInspectorResult();
+  } catch (e) {
+    if (e.status === 401 || e.status === 403) { handleAuthRejected('Your credentials were rejected by the server'); return; }
+    if (resEl) resEl.innerHTML = `<div style="color:var(--red);margin-top:12px;font-size:.82rem">${escHtml(e.message || 'The call failed')}</div>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Run tool'; }
+  }
+}
+
+function renderInspectorResult() {
+  const resEl = document.getElementById('inspector-result');
+  if (!resEl) return;
+  const out = _inspector.result;
+  if (!out) { resEl.innerHTML = ''; return; }
+  const ok = out.ok !== false;
+  const color = ok ? 'var(--green)' : 'var(--red)';
+  const text = _inspectorExtractText(out.result);
+  const rawJson = JSON.stringify(out.result != null ? out.result : out.error, null, 2);
+  resEl.innerHTML = `
+    <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
+      <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color}"></span>
+        <span style="font-size:.82rem;font-weight:600">${ok ? 'ok' : 'error'}</span>
+        <span class="muted" style="font-size:.75rem">${escHtml(String(out.duration_ms != null ? out.duration_ms + ' ms' : ''))}</span>
+      </div>
+      ${text ? `<pre style="white-space:pre-wrap;word-break:break-word;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:12px;font-size:.78rem;margin:0 0 10px;max-height:420px;overflow:auto">${escHtml(text)}</pre>` : ''}
+      <details${text ? '' : ' open'}>
+        <summary class="muted" style="cursor:pointer;font-size:.75rem">Raw MCP result</summary>
+        <pre style="white-space:pre-wrap;word-break:break-word;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:12px;font-size:.72rem;margin:8px 0 0;max-height:420px;overflow:auto">${escHtml(rawJson)}</pre>
+      </details>
+    </div>`;
+}
+
+// Identity change → the catalog (and the forwarded-credential chip) belong
+// to the OLD session; drop them so the next tab entry re-probes.
+function resetInspector() {
+  _inspector.loaded = false;
+  _inspector.tools = [];
+  _inspector.credential = 'none';
+  _inspector.endpoint = '';
+  _inspector.selected = null;
+  _inspector.result = null;
+  _inspector.argsError = '';
 }
 </script>
 <script>

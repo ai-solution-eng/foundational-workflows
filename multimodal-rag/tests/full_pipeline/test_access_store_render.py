@@ -10,6 +10,9 @@ asserts the gating contract:
     security.* block leaks nothing), "true" only when security.accessStore;
   * RAG_ACCESS_DENY_SELECT and RAG_MEMORY_DEFAULT render only when set
     (empty values render nothing — no empty-string env noise);
+  * RAG_ACCESS_SELF_MINT renders on the DEFAULT render (the D25 default-on
+    ruling — chart-default true, same posture as accessStore) and an
+    explicit security.accessSelfMint=false removes it entirely;
   * the default render is byte-identical to a render with the access-store
     template lines removed (the "default render byte-identical" fleet bar);
   * all three charts (helm / helm-scale-medium / helm-scale-large) carry the
@@ -98,9 +101,12 @@ def test_denylist_and_memory_default_render_only_when_set(chart):
     env = _configmap(
         _render_ok(
             chart,
-            "--set", "security.accessStore=true",
-            "--set", "security.memoryDefault=team-knowledge",
-            "--set-string", r"security.accessDenySelect=hr-data\,payroll",
+            "--set",
+            "security.accessStore=true",
+            "--set",
+            "security.memoryDefault=team-knowledge",
+            "--set-string",
+            r"security.accessDenySelect=hr-data\,payroll",
         )
     )
     assert 'RAG_ACCESS_DENY_SELECT: "hr-data,payroll"' in env
@@ -121,3 +127,16 @@ def test_access_store_always_rendered_tracks_default(chart):
     # And the opt-out state is explicit, not silent.
     off = _configmap(_render_ok(chart, "--set", "security.accessStore=false"))
     assert 'RAG_ACCESS_STORE: "false"' in off
+
+
+@pytest.mark.skipif(not _helm_available(), reason="helm binary not available")
+@pytest.mark.parametrize("chart", CHARTS)
+def test_self_mint_renders_by_default_and_opts_out(chart):
+    """D25 default-on ruling (2026-10): RAG_ACCESS_SELF_MINT renders on the
+    DEFAULT render — the same default-on, explicit-opt-out posture as
+    RAG_ACCESS_STORE — and an explicit security.accessSelfMint=false
+    removes it entirely (the pre-D25 inert render)."""
+    env = _configmap(_render_ok(chart))
+    assert 'RAG_ACCESS_SELF_MINT: "true"' in env
+    off = _configmap(_render_ok(chart, "--set", "security.accessSelfMint=false"))
+    assert "RAG_ACCESS_SELF_MINT" not in off

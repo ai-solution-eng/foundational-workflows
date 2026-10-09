@@ -292,9 +292,7 @@ def test_password_oracle_closed_at_the_tool_surface(monkeypatch):
     import asyncio
 
     monkeypatch.setenv(acc.STORE_ENV, "1")
-    token = cr.set_current_identity(
-        cr.Identity(kind="client", name="carol", datasets=frozenset({"secret"}))
-    )
+    token = cr.set_current_identity(cr.Identity(kind="client", name="carol", datasets=frozenset({"secret"})))
     monkeypatch.setattr(mcp, "get_manager", lambda: _StubDM(protected=True))
     try:
         with pytest.raises(mcp.ToolError) as wrong:

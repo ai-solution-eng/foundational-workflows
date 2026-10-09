@@ -75,8 +75,14 @@ def _generate_rsa(key_id: str = KID) -> dict:
     return {
         "key": key,
         "kid": key_id,
-        "jwk": {"kty": "RSA", "kid": key_id, "use": "sig", "alg": "RS256",
-                "n": _b64uint(nums.n), "e": _b64uint(nums.e)},
+        "jwk": {
+            "kty": "RSA",
+            "kid": key_id,
+            "use": "sig",
+            "alg": "RS256",
+            "n": _b64uint(nums.n),
+            "e": _b64uint(nums.e),
+        },
         "sign": lambda data: key.sign(data, padding.PKCS1v15(), hashes.SHA256()),
     }
 
@@ -571,9 +577,7 @@ def test_rest_blocked_identity_cannot_mint(rest_client, jwks_server, monkeypatch
     assert r.status_code == 401
 
 
-def test_rest_blocked_identity_view_is_refused_for_a_blocked_key_too(
-    rest_client, jwks_server, monkeypatch
-):
+def test_rest_blocked_identity_view_is_refused_for_a_blocked_key_too(rest_client, jwks_server, monkeypatch):
     """And the minted key of a blocked identity stops authenticating (the
     D21 blocked contract, restated — nothing about it resolves)."""
     key = _setup_key(jwks_server)
@@ -602,8 +606,7 @@ def _direct_request(headers: dict | None = None):
     from starlette.requests import Request
 
     raw = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in (headers or {}).items()]
-    scope = {"type": "http", "method": "POST", "path": "/api/access/mint-key", "headers": raw,
-             "query_string": b""}
+    scope = {"type": "http", "method": "POST", "path": "/api/access/mint-key", "headers": raw, "query_string": b""}
     return Request(scope)
 
 
@@ -678,8 +681,7 @@ def test_guard_proxy_identity_proof_source(monkeypatch):
     _self_mint_on(monkeypatch)
     monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
     identity = cr.Identity(kind="client", name="alice", datasets=frozenset())
-    ident, source = _call_direct(api._require_self_mint, identity,
-                                 {"X-Auth-Request-User": "alice"})
+    ident, source = _call_direct(api._require_self_mint, identity, {"X-Auth-Request-User": "alice"})
     assert source == "proxy-identity"
     assert ident.name == "alice"
 
@@ -737,8 +739,7 @@ def test_direct_rotate_over_existing_key_succeeds(monkeypatch):
     monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
     ar.mint_client("rich", datasets=["a"])
     identity = cr.Identity(kind="client", name="rich", datasets=frozenset())
-    result = _call_direct(api.api_access_self_mint, identity,
-                          {"X-Auth-Request-User": "rich"}, body={"rotate": True})
+    result = _call_direct(api.api_access_self_mint, identity, {"X-Auth-Request-User": "rich"}, body={"rotate": True})
     assert result["status"] == "ok" and result["rotated"] is True
     assert result["key"]
     assert ar.own_key_view("rich")["datasets"] == ["a"]
@@ -920,9 +921,7 @@ def test_rest_sso_cookie_envelope_mints(rest_client, jwks_server, monkeypatch):
     assert ar.verify_client_key("alice", mint.json()["key"]) is True
 
 
-def test_rest_sso_cookie_with_pasted_key_governs_the_datasets_but_still_mints(
-    rest_client, jwks_server, monkeypatch
-):
+def test_rest_sso_cookie_with_pasted_key_governs_the_datasets_but_still_mints(rest_client, jwks_server, monkeypatch):
     """The co-existence case: the SPA paste mode sends the key header, an
     SSO cookie sits underneath.  The KEY still governs dataset access
     (precedence unchanged — byte-identical D19/D22 behaviour); and because

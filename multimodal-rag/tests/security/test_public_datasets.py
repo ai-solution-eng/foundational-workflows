@@ -112,7 +112,7 @@ def test_public_dataset_is_availability_not_grant(monkeypatch, tmp_path):
     cr._PUBLIC_META_CACHE.clear()
     ident = cr.Identity(kind="client", name="alice", datasets=frozenset())
     assert cr.dataset_allowed(ident, "reports") is False  # not auto-granted
-    assert cr.is_public_dataset("reports") is True        # but available
+    assert cr.is_public_dataset("reports") is True  # but available
 
 
 def test_anonymous_identity_denied_public(monkeypatch, tmp_path):
@@ -193,20 +193,21 @@ def rest(monkeypatch):
 
 def test_admin_can_publish_and_unpublish(rest):
     client, dm = rest
-    r = client.post("/api/admin/datasets/notes/public", json={"public": True},
-                    headers={"X-RAG-Api-Key": "deployment-key"})
+    r = client.post(
+        "/api/admin/datasets/notes/public", json={"public": True}, headers={"X-RAG-Api-Key": "deployment-key"}
+    )
     assert r.status_code == 200 and r.json()["public"] is True
     assert dm.public_flags["notes"] is True
-    r = client.post("/api/admin/datasets/notes/public", json={"public": False},
-                    headers={"X-RAG-Api-Key": "deployment-key"})
+    r = client.post(
+        "/api/admin/datasets/notes/public", json={"public": False}, headers={"X-RAG-Api-Key": "deployment-key"}
+    )
     assert r.status_code == 200 and r.json()["public"] is False
 
 
 def test_client_key_cannot_reach_admin_toggle(rest):
     """The middleware 403s registry clients on /api/admin/*."""
     client, _ = rest
-    r = client.post("/api/admin/datasets/reports/public", json={"public": True},
-                    headers={"X-RAG-Api-Key": "alice-key"})
+    r = client.post("/api/admin/datasets/reports/public", json={"public": True}, headers={"X-RAG-Api-Key": "alice-key"})
     assert r.status_code == 403
 
 
@@ -222,8 +223,7 @@ def test_generic_patch_rejects_public_key(rest):
     layer deeper and is pinned separately below via the deployment key.
     """
     client, _ = rest
-    r = client.patch("/api/datasets/reports", json={"public": True},
-                     headers={"X-RAG-Api-Key": "alice-key"})
+    r = client.patch("/api/datasets/reports", json={"public": True}, headers={"X-RAG-Api-Key": "alice-key"})
     assert r.status_code == 403
     assert "not permitted for this API key" in r.json()["detail"]
 
@@ -234,8 +234,7 @@ def test_generic_patch_public_key_rejected_at_handler(rest):
     generic PATCH — the admin-only ValueError maps to 400 with the
     designated admin route named."""
     client, _ = rest
-    r = client.patch("/api/datasets/notes", json={"public": True},
-                     headers={"X-RAG-Api-Key": "deployment-key"})
+    r = client.patch("/api/datasets/notes", json={"public": True}, headers={"X-RAG-Api-Key": "deployment-key"})
     assert r.status_code == 400
     assert "admin-only" in r.json()["detail"]
 
@@ -262,9 +261,7 @@ def test_public_dataset_catalog_visibility_and_self_selection(rest, tmp_path, mo
     same meta, so the fixture mirrors that.
     """
     (tmp_path / "datasets" / "reports").mkdir(parents=True)
-    (tmp_path / "datasets" / "reports" / "meta.json").write_text(
-        json.dumps({"name": "reports", "public": True})
-    )
+    (tmp_path / "datasets" / "reports" / "meta.json").write_text(json.dumps({"name": "reports", "public": True}))
     (tmp_path / "datasets" / "notes").mkdir(parents=True)
     (tmp_path / "datasets" / "notes" / "meta.json").write_text(json.dumps({"name": "notes"}))
     monkeypatch.setenv("DATA_PATH", str(tmp_path))
@@ -275,10 +272,12 @@ def test_public_dataset_catalog_visibility_and_self_selection(rest, tmp_path, mo
     H = {"X-RAG-Api-Key": "alice-key"}
 
     # Before selection: plain listing is world-only (alice's ACL names
-    # 'private-reports', which the manager does not list here → empty);
-    # the catalog advertises exactly the public dataset.
+    # 'private-reports', which the manager does not list here → empty) —
+    # PLUS, D26: the global dataset is included for every identity at
+    # read-only mode (fleet ruling 2026-10), so it appears WITHOUT a
+    # selection; the catalog still advertises it.
     names = [d["name"] for d in client.get("/api/datasets", headers=H).json()["datasets"]]
-    assert names == []
+    assert names == ["reports"]
     cat = client.get("/api/datasets", params={"catalog": "true"}, headers=H).json()["datasets"]
     assert [d["name"] for d in cat] == ["reports"]
     assert cat[0]["public"] is True
@@ -290,7 +289,8 @@ def test_public_dataset_catalog_visibility_and_self_selection(rest, tmp_path, mo
     assert names == ["reports"]
     assert "notes" not in names  # private stays hidden throughout
 
-    # Deselect → exclusion hides it everywhere...
+    # Deselect → exclusion hides it everywhere (an exclusion beats even
+    # the D26 global inclusion)...
     r = client.post("/api/datasets/reports/deselect", headers=H)
     assert r.status_code == 200
     names = [d["name"] for d in client.get("/api/datasets", headers=H).json()["datasets"]]

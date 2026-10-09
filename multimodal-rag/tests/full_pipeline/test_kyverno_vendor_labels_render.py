@@ -30,7 +30,6 @@ Run::
     pytest tests/full_pipeline/test_kyverno_vendor_labels_render.py   # under pytest
 """
 
-import os
 import shutil
 import subprocess
 import sys

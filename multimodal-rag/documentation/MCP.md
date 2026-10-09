@@ -58,7 +58,9 @@ If the cluster ingress uses `oauth2-proxy` (EZUA), include a bearer token in the
 
 ---
 
-## 2. Available tools (19)
+## 2. Available tools (20)
+
+> **Read-only grants (D26):** when the caller's key carries mode ACLs (`RAG_DATASET_ACLS` token form `name:ds1:ro` or an overlay `{"name": …, "mode": "ro"}`), the write tools — `dataset_add_documents`, `dataset_delete_documents`, `dataset_replace_document`, `add_memory`, `delete_memory`, `forget_session` — require an **rw** grant for the target dataset: an ro (or ro-only) dataset refuses with a clear `ToolError`; read tools are unchanged.
 
 | Tool | Purpose | Needs `dataset_name`? | Needs `password`? |
 |------|---------|----------------------|-------------------|
@@ -69,6 +71,7 @@ If the cluster ingress uses `oauth2-proxy` (EZUA), include a bearer token in the
 | `set_memory_dataset(dataset_name?)` | **D16**: bind your ★ memory dataset (omit the arg to clear) — `add_memory`/`search_memory` then need no `dataset_name`/`password` | no | — |
 | `search_dataset(dataset_name, query, image?, video?, audio?, top_k?, use_reranker?, reranker_top_k?, base_llm_modalities?, password?, media_base_url?, file_types?, severities?, source_prefix?, date_from?, date_to?)` | Full multimodal retrieval with post-processing; optional metadata filters (`file_types`, `severities`, `source_prefix`, `date_from`/`date_to`) applied server-side before ranking | yes | if protected |
 | `get_dataset_files(dataset_name, file_path?, limit?, offset?, password?)` | List or retrieve files in a dataset | yes | if protected |
+| `get_dataset_file_bytes(dataset_name, file_path, password?)` | ONE file's raw bytes as base64 (JSON: `{dataset, file, size_bytes, type, mime_type, encoding, data}`) — the way to actually GET a picture/audio/video into the calling agent's hands so it can be displayed or inspected locally; companion to `get_dataset_files` (which returns metadata + a download URL for binaries, never the bytes). Size-capped by `MCP_FILE_BYTES_MAX` (default 256 KiB — enough for `*_preprocessed` image previews, too small to move bulk media; over-cap refuses with the REST/download-URL fallback) | yes | if protected |
 | `get_dataset_info(dataset_name, password?)` | Dataset metadata | yes | if protected |
 | `dataset_add_documents(dataset_name, paths?, texts?, password?)` | Add documents to a dataset — local file paths (inside the media allowlist), `http(s)://`/`s3://` URLs, or raw text; the MCP twin of the REST ingest endpoints, same pipeline and download policy | yes | if protected |
 | `dataset_delete_documents(dataset_name, doc_ids?, filter?, limit?, password?)` | Delete documents **by explicit point ID(s)** or by `{"source_prefix": …}` filter (exactly one selector); the MCP twin of the REST delete-document endpoint, extended with batch IDs and prefix filter | yes | if protected |
@@ -126,7 +129,7 @@ If the calling LLM doesn't support a modality (set via `base_llm_modalities`), r
 }
 ```
 
-All 19 tools are exposed on every connection. The client (or its `tools` config) can disable specific tools it doesn't want the model to see.
+All 20 tools are exposed on every connection. The client (or its `tools` config) can disable specific tools it doesn't want the model to see.
 
 ### 3.2 opencode (unified single connection, 2026-10)
 
@@ -191,3 +194,23 @@ Requires local access to the embedder/reranker/VLM/ASR endpoints (set via `MODEL
 2. Otherwise, the file hash + embedder model + query text form a cache key in an in-process LRU. Same file in a later turn — cache hit.
 
 Audio queries are auto-transcribed via ASR before embedding (the embedder doesn't support audio natively); transcripts are cached too.
+
+---
+
+## 5. The Inspector tab (D27)
+
+The unified frontend (`/`, `RAG_SSO_GATE`-gated) ships a fifth tab, **Inspector**, next to Datasets / Access / (Admin) / Stats: a browser playground for the MCP tool calls. Pick a tool from the catalog (fetched live via MCP `tools/list`), edit the JSON arguments (seeded from the tool's `inputSchema` defaults, with `dataset_name` prefilled from your first visible dataset), and run it — the result's text content blocks render directly, with the raw MCP result in a collapsible JSON view.
+
+**No new trust path.** The browser never talks to the MCP endpoint itself — the sidecar is off the ingress path and page scripts never see an SSO-derived key (the D23 hard rule). Calls go through the API server, which forwards EXACTLY the credential envelope the request authenticated with, re-expressed in the headers the MCP middleware accepts:
+
+| Session authenticated via | Forwarded to MCP as |
+|---|---|
+| `X-RAG-Api-Key` / `X-API-Key` (paste, embedded, delegated) | `X-API-Key` |
+| `Authorization: Bearer <key>` | `Authorization: Bearer` |
+| `X-Auth-Request-Access-Token` (proxy-forwarded JWT) | `X-Auth-Request-Access-Token` |
+| SSO session cookie (realm access-token JWT) | `Authorization: Bearer <jwt>` |
+| Trusted-proxy identity headers (D24) | nothing — no forwardable secret; a keyed sidecar replies 401 and the tab says so |
+
+The sidecar then resolves identity itself from the forwarded credential against the SAME registry store (D15 ACLs ∪ D16 selections, ★ memory binding, per-caller unlock scoping) — the Inspector exercises the real MCP path, not a shortcut around it. Tool-level failures render as the tool's own error text.
+
+**Env:** `RAG_INSPECTOR_MCP_URL` (default `http://127.0.0.1:9090/mcp` — the chart's sidecar topology; point it at `http://localhost:8001/mcp` for `kubectl port-forward` dev setups) and `RAG_INSPECTOR_TIMEOUT_S` (default 300 — tool calls embed and search). Read per request.

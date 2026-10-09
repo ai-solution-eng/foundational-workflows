@@ -126,6 +126,13 @@ spec:
                     name: {{ .Values.deployment.name }}-config
                 - secretRef:
                     name: {{ .Values.deployment.name }}-model-keys
+                {{- if .Values.modelSecrets.existingSecret }}
+                # User-owned model Secret — S3_*/REDIS_PASSWORD (and any model
+                # keys) it carries override the chart-managed Secret here too;
+                # keys it omits keep the seeded/stored values.
+                - secretRef:
+                    name: {{ .Values.modelSecrets.existingSecret }}
+                {{- end }}
               env:
                 - name: BACKUP_API_URL
                   value: "http://{{ .Values.deployment.name }}-api.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.api.port }}"

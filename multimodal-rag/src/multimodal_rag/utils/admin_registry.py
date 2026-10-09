@@ -68,6 +68,7 @@ import time
 from pathlib import Path
 
 from multimodal_rag.utils import access_store as _base
+from multimodal_rag.utils.clients_registry import ALL_DATASETS, GRANT_RO, GRANT_RW
 
 ADMIN_FILE_ENABLED_ENV = "RAG_ACCESS_ADMIN_FILE"
 CLIENTS_FILE = "clients.json"
@@ -105,10 +106,7 @@ def _file_path() -> Path:
 def _validate_name(name: str) -> str:
     name = str(name).strip()
     if not _NAME_RE.match(name):
-        raise ValueError(
-            "client name must be 1-64 chars of letters, digits, '.', '_' or '-' "
-            "(must start alphanumeric)"
-        )
+        raise ValueError("client name must be 1-64 chars of letters, digits, '.', '_' or '-' (must start alphanumeric)")
     return name
 
 
@@ -231,17 +229,40 @@ def overlay_clients() -> dict:
 
 
 def overlay_acls() -> dict:
-    """``{name: frozenset(datasets)}`` from the overlay file (empty when off)."""
+    """``{name: {dataset: mode}}`` from the overlay file (empty when off).
+
+    D26: each ``datasets`` element is EITHER a plain string (``"reports"``
+    = rw — every pre-D26 file unchanged, byte-compatible) OR an object
+    ``{"name": "reports", "mode": "ro" | "rw"}``.  Unknown modes FAIL
+    CLOSED (the dataset is dropped from the grants) — a hand-edited file
+    can never widen a key's write power by typo.  The ``*`` wildcard is a
+    plain string or ``{"name": "*", "mode": ...}`` exactly like any other
+    token.
+    """
     if not admin_file_enabled():
         return {}
-    acls: dict[str, frozenset] = {}
+    acls: dict[str, dict] = {}
     for name, entry in _load().get("clients", {}).items():
-        if isinstance(entry, dict):
-            ds = entry.get("datasets")
-            if isinstance(ds, list):
-                acls[str(name)] = frozenset(str(d) for d in ds if d)
-            else:
-                acls[str(name)] = frozenset()
+        if not isinstance(entry, dict):
+            continue
+        ds = entry.get("datasets")
+        grants: dict[str, str] = {}
+        if isinstance(ds, list):
+            for d in ds:
+                if isinstance(d, dict):
+                    ds_name = str(d.get("name") or "").strip()
+                    if not ds_name:
+                        continue
+                    mode = str(d.get("mode") or "").strip().lower()
+                    if mode == GRANT_RO:
+                        grants[ds_name] = GRANT_RO
+                    elif mode == GRANT_RW:
+                        grants[ds_name] = GRANT_RW
+                    else:
+                        grants.pop(ds_name, None)  # unknown mode → no grant (fail-closed)
+                elif d:
+                    grants[str(d)] = GRANT_RW
+        acls[str(name)] = grants
     return acls
 
 
@@ -312,11 +333,13 @@ def own_key_view(name: str) -> dict:
     if not isinstance(entry, dict):
         entry = {}
     key = str(entry.get("key") or "")
+    grants = dataset_acls().get(name, {})
     return {
         "name": name,
         "has_key": bool(key),
         "key_masked": (key[:6] + "…" + key[-2:]) if len(key) > 10 else ("…" if key else None),
-        "datasets": sorted(dataset_acls().get(name, frozenset())),
+        "datasets": sorted(grants),
+        "grants": [{"name": n, "mode": m} for n, m in sorted(grants.items())],
         "oidc": str(entry.get("oidc")) if entry.get("oidc") else None,
         "blocked": bool(entry.get("blocked")),
         "env_managed": name in env_names,
@@ -396,17 +419,18 @@ def mint_client(name: str, datasets: list | None = None, key: str | None = None)
     """Create (or rotate the key of) an overlay client.
 
     *name* must pass :func:`_validate_name`.  *datasets* is the client's ACL
-    (list of names; ``["*"]`` = everything; empty = nothing until granted).
-    When *key* is given it replaces the stored one (rotation — e.g. the
-    operator pastes a known value); otherwise a fresh key is generated and
-    returned in the result dict (the ONLY copy the caller ever gets).
+    (list; ``["*"]`` = everything; empty = nothing until granted).  D26: each
+    element is a plain string (rw) OR ``{"name": ..., "mode": "ro"|"rw"}``;
+    a ``"name:mode"`` STRING (``"reports:ro"``) is accepted as the env-style
+    shorthand and normalized to the object form.  When *key* is given it
+    replaces the stored one (rotation — e.g. the operator pastes a known
+    value); otherwise a fresh key is generated and returned in the result
+    dict (the ONLY copy the caller ever gets).
     """
     if not admin_file_enabled():
         raise _base.SelectionDenied("The admin key registry is not enabled on this deployment.")
     name = _validate_name(name)
-    ds = [str(d).strip() for d in (datasets or []) if str(d).strip()]
-    for d in ds:
-        _validate_dataset_token(d)
+    ds = _normalize_grants(datasets or [])
     new_key = (str(key).strip() if key else "") or generate_key()
     if ":" in new_key or ";" in new_key or len(new_key) < 8:
         raise ValueError("custom key must be >=8 chars without ':' or ';'")
@@ -493,7 +517,7 @@ def revoke_client(name: str) -> bool:
     return removed["v"]
 
 
-def grant_datasets(name: str, datasets: list) -> dict:
+def grant_datasets(name: str, datasets: list | None = None) -> dict:
     """Replace an overlay client's dataset grant (the checkbox set).
 
     D23 (lead fix, 2026-10): an UNKNOWN name is AUTO-MINTED (empty key,
@@ -506,13 +530,16 @@ def grant_datasets(name: str, datasets: list) -> dict:
     exact pattern for Block/OIDC-bind on observed rows.  ENV-authoritative
     names still refuse here (the overlay cannot shadow the env registry —
     delete the env entry to manage the name from the page).
+
+    D26: *datasets* accepts plain strings (rw), ``{"name", "mode"}``
+    objects, and ``"name:mode"`` shorthand strings; the stored grant is
+    normalized to objects so modes survive the save and the merged
+    registry honors them on the next request.
     """
     if not admin_file_enabled():
         raise _base.SelectionDenied("The admin key registry is not enabled on this deployment.")
     name = _validate_name(name)
-    ds = sorted({str(d).strip() for d in (datasets or []) if str(d).strip()})
-    for d in ds:
-        _validate_dataset_token(d)
+    ds = _normalize_grants(datasets or [])
 
     def _apply(doc: dict) -> bool:
         entry = doc["clients"].get(name)
@@ -538,6 +565,56 @@ def _validate_dataset_token(d: str) -> None:
         raise ValueError(f"invalid dataset token {d!r}")
 
 
+def _normalize_grants(datasets: list | None) -> list[dict | str]:
+    """Normalize a REST/PATCH grants payload to the D26 stored form.
+
+    Accepted inputs: a plain name string (→ rw string, wire-legacy form),
+    a ``"name:mode"`` shorthand string (→ ``{"name", "mode"}``), and a
+    ``{"name": ..., "mode": "ro"|"rw"}`` object.  ``*`` keeps the string
+    form.  Duplicate names: LAST entry wins (deterministic).  Raises
+    ``ValueError`` on unknown modes / malformed tokens — the REST PATCH
+    maps that to 400 (fail loud, the D15 convention).
+    """
+    out: list[dict | str] = []
+    seen: dict[str, dict | str] = {}
+    for raw in datasets or []:
+        if isinstance(raw, dict):
+            ds_name = str(raw.get("name") or "").strip()
+            mode = str(raw.get("mode") or "rw").strip().lower()
+            if not ds_name:
+                raise ValueError("grant object requires a 'name'")
+            if mode not in (GRANT_RO, GRANT_RW):
+                raise ValueError(f"invalid grant mode {mode!r} (expected 'ro' or 'rw')")
+            _validate_dataset_token(ds_name)
+            seen[ds_name] = {"name": ds_name, "mode": mode}
+        elif isinstance(raw, str):
+            token = raw.strip()
+            if not token:
+                continue
+            base, msep, mode = token.partition(":")
+            base = base.strip()
+            if msep:
+                if base != ALL_DATASETS:
+                    _validate_dataset_token(base)
+                if mode not in (GRANT_RO, GRANT_RW):
+                    raise ValueError(f"invalid grant mode {mode!r} in token {token!r}")
+                if base == ALL_DATASETS:
+                    seen[ALL_DATASETS] = {"name": ALL_DATASETS, "mode": mode}
+                else:
+                    seen[base] = {"name": base, "mode": mode}
+            else:
+                if token != ALL_DATASETS:
+                    _validate_dataset_token(token)
+                seen[token] = token  # legacy wire form for plain-rw grants
+        else:
+            # A TYPE problem (neither string nor object) — TRY004: TypeError,
+            # not ValueError.  The REST PATCH maps both to 400.
+            raise TypeError(f"invalid dataset grant {raw!r} (expected a name string or {{name, mode}})")
+    for key in sorted(seen):
+        out.append(seen[key])
+    return out
+
+
 def list_clients() -> list:
     """The overlay registry for the admin UI — key material MASKED.
 
@@ -560,10 +637,14 @@ def list_clients() -> list:
             continue
         key = str(entry.get("key") or "")
         env_name = env_clients.get(key)
+        grants = dataset_acls().get(name, {})
         row = {
             "name": name,
             "key_masked": (key[:6] + "…" + key[-2:]) if len(key) > 10 else "…",
-            "datasets": list(entry.get("datasets") or []),
+            "datasets": sorted(grants),
+            # D26: the mode-carrying form — legacy flat list kept alongside
+            # for older consumers.
+            "grants": [{"name": n, "mode": m} for n, m in sorted(grants.items())],
             "source": "env+overlay" if env_name == name else "overlay",
             "created": entry.get("created"),
         }
@@ -577,12 +658,13 @@ def list_clients() -> list:
     for key, env_name in env_clients.items():
         if env_name in doc.get("clients", {}):
             continue
-        env_acls = dataset_acls().get(env_name, frozenset())
+        env_grants = dataset_acls().get(env_name, {})
         out.append(
             {
                 "name": env_name,
                 "key_masked": (key[:6] + "…" + key[-2:]) if len(key) > 10 else "…",
-                "datasets": sorted(env_acls),
+                "datasets": sorted(env_grants),
+                "grants": [{"name": n, "mode": m} for n, m in sorted(env_grants.items())],
                 "source": "env",
                 "created": None,
             }

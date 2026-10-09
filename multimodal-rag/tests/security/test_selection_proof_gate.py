@@ -81,9 +81,7 @@ def test_unowned_passwordless_private_dataset_refused(tmp_path):
     _mk_dataset(tmp_path, "bob-private", {"created_by": "bob"})
     ident = _client("alice", {"alice-mem"})
     with pytest.raises(acc.SelectionDenied):
-        acc.verify_and_select(
-            ident, "bob-private", None, _no_pw, _check
-        )
+        acc.verify_and_select(ident, "bob-private", None, _no_pw, _check)
     # And the world did not widen.
     assert acc.selections_for(ident) == frozenset()
     assert acc.dataset_allowed(ident, "bob-private") is False
@@ -106,12 +104,15 @@ def test_refusal_leaves_no_store_entry(tmp_path):
 
 
 def test_public_dataset_still_selectable_without_password(tmp_path):
-    """Public = availability: password-free self-selection stays the feature."""
+    """Public = availability: password-free self-selection stays the feature.
+    D26: selecting a global stamps write_mode "ro" (source self-ro) — the
+    selection carries no write power upgrade."""
     _mk_dataset(tmp_path, "pub-ds", {"public": True})
     ident = _client("alice")
     entry = acc.verify_and_select(ident, "pub-ds", None, _no_pw, _check)
-    assert entry["source"] == "self"
+    assert entry["source"] == "self-ro"
     assert acc.dataset_allowed(ident, "pub-ds") is True
+    assert acc.dataset_write_allowed(ident, "pub-ds") is False
 
 
 def test_acl_granted_dataset_still_selectable(tmp_path):
@@ -125,9 +126,7 @@ def test_acl_granted_dataset_still_selectable(tmp_path):
 def test_protected_dataset_with_correct_password_still_works(tmp_path):
     """The password path is unchanged — proof IS the correct password."""
     ident = _client("alice")
-    entry = acc.verify_and_select(
-        ident, "secret-ds", "correct-pw", lambda n: True, _check
-    )
+    entry = acc.verify_and_select(ident, "secret-ds", "correct-pw", lambda n: True, _check)
     assert entry["source"] == "self"
     assert acc.selection_password(ident, "secret-ds") == "correct-pw"
 
@@ -151,9 +150,7 @@ def test_denylist_still_refuses_even_with_password(tmp_path):
     try:
         ident = _client("alice")
         with pytest.raises(acc.SelectionDenied):
-            acc.verify_and_select(
-                ident, "hr-data", "correct-pw", lambda n: True, _check
-            )
+            acc.verify_and_select(ident, "hr-data", "correct-pw", lambda n: True, _check)
     finally:
         os.environ.pop(acc.DENY_ENV, None)
 

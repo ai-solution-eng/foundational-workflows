@@ -1,5 +1,11 @@
 # Deployment Guide
 
+> **What changed (2026-10-07 doc wave):**
+> - The SSO migration is now documented values-first and ORDERED — a new §5b subsection gives the enablement chain (keys/registry → D21 `oidc.enabled` → D22 browser SSO → D23 `ssoGate` → D25 `accessSelfMint` last) with the G2-vs-Hosted edge posture, and two previously undocumented values rows were added: `security.trustProxyIdentity` (D24) and `security.oidc.sso.*` (D22).
+> - §5b was re-verified key-by-key against `helm/values.yaml`, the chart templates and the shipped examples — including `values-hardened-g2.yaml`, the base chart's MCP network-zone overlay (now referenced here).
+> - The `${DOMAIN_NAME}` gotcha is sharpened: raw-CLI deploys pass the placeholder through and the istio validation webhook denies the VirtualService (the values editor envsubs it; CLI must resolve it first).
+> - Chart-truth fixes: packaged image default is `v5.6.2` (was v4.4.1); the MCP tool count is 20; `mcp.apiKey.existingSecret` renders in all three charts (the v4.0.0 scale wiring); the large chart adds `security.oidc.platformCa.*`.
+
 > **PCAI is a Kubernetes wrapper — you never run `helm` or `kubectl`.** You import the packaged chart (`rag-mcp-server` `.tar.gz`) into PCAI once, then drive the deployment by setting the chart's
 > **`values.yaml`** in the PCAI *Helm Values* editor (or via the PCAI API). Every `--set` in this guide maps 1:1 to a key in `values.yaml`. There is no `envsubst` step — set the actual domain value
 > directly in `values.yaml`.
@@ -32,13 +38,13 @@
 
 ## 1. Import the chart in PCAI and set the image
 
-The packaged charts ship with the chart default `image.tag` as the default image — no image build is required (the current packaged default is `ghcr.io/ai-solution-eng/multimodal-rag-mcp:v4.4.1`, per `image.repository`/`image.tag` in each chart's `values.yaml`). If you need a custom build, the Dockerfile lives at `docker/Dockerfile` and expects the repo root as the build context; push the result to your registry and override the values:
+The packaged charts ship with the chart default `image.tag` as the default image — no image build is required (the current packaged default is `ghcr.io/ai-solution-eng/multimodal-rag-mcp:v5.6.2`, per `image.repository`/`image.tag` in each chart's `values.yaml`). If you need a custom build, the Dockerfile lives at `docker/Dockerfile` and expects the repo root as the build context; push the result to your registry and override the values:
 
 ```yaml
 # values.yaml
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v4.4.1
+  tag: v5.6.2
 ```
 
 > **Note on models**: The image does not bundle any ML models. It connects to remote model endpoints configured via values; the defaults point to models hosted on the PCAI internal cluster.
@@ -90,6 +96,16 @@ continues without them (reranking/captioning/transcription degrade).
 
 # Model API keys (stored in a Kubernetes Secret, never in the image)
 modelSecrets:
+  # ALTERNATIVE — bring your own Secret (key material never transits values):
+  # point at a Secret you own carrying the canonical key names
+  # (MODEL_EMBEDDER_API_KEY / MODEL_RERANKER_API_KEY / MODEL_VLM_API_KEY /
+  # MODEL_ASR_API_KEY — optionally MODEL_*_URL endpoints, S3_ACCESS_KEY_ID /
+  # S3_SECRET_ACCESS_KEY, REDIS_PASSWORD). Hard-wired (missing Secret =
+  # CreateContainerConfigError). Every key it carries OVERRIDES the
+  # chart-managed <name>-model-keys Secret (wired last in envFrom and
+  # CONFIG_DIR); keys it omit keep the seeds below and the sticky stored
+  # values. Rotation is kubectl/ESO-native and hot-reloads (<=15s).
+  existingSecret: ""
   embedderApiKey: "eyJ..."
   rerankerApiKey: "eyJ..."
   vlmApiKey: "eyJ..."
@@ -105,6 +121,7 @@ s3:
 
 # RAG pipeline defaults
 rag:
+  ocr: false             # OCR fallback for scanned PDFs (RAG_OCR_DEFAULT; a per-dataset flag still wins)
   captionWithAsr: true    # Transcribe video audio tracks via ASR during ingestion (auto-disables if no ASR model)
   captionWithVlm: true    # VLM-describe images/videos at ingest (auto-disables if no VLM; enables VLM-skip at retrieval)
   remote: false           # Use remote model URLs vs in-cluster .svc.cluster.local
@@ -171,24 +188,43 @@ in `values.yaml` (both examples in `helm/values-examples/` set them too):
 | `security.mediaAllowPathPrefixes` | `/data/datasets:/data/staging` | `file://` prefixes the MCP `describe_media`/`transcribe_audio`/audio-query tools may read (`:`-separated, fail-closed) |
 | `security.pwMaxFailures` | `10` | Password-failure throttle: failures per identity before 429s (REST + MCP unlock) |
 | `security.pwFailWindow` | `300` | Window (seconds) those failures are counted over |
+| `security.trustProxyIdentity` | `true` | **D24** — trust the auth proxy's identity headers (`X-Auth-Request-*`) as a presented credential (one of the three D25 mint sources). Correct `true` behind an ENFORCING proxy that overwrites these headers on every request (the ezaf-gateway / oauth2-proxy — both site examples keep it); `false` (the raw-env default) for direct unmeshed callers, which could otherwise spoof the headers — with D25 on, a spoofed identity could mint keys. |
 | `security.metricsAuth` | `false` | Require an API key on `/metrics` (`X-RAG-Api-Key`/`X-API-Key`/Bearer); pair with `metrics.serviceMonitorBearerSecret` |
 
 ### Multi-user access knobs (D15/D16/D17 — opt-in)
 
 | Key | Default | Effect |
 |---|---|---|
-| `mcp.apiKeyClients` / `mcp.datasetAcls` | `""` / `""` | **D15** — per-user registry keys + dataset ACLs (`name:key;name:key` / `name:ds1,ds2;name2:*`). KEY MATERIAL — render only when set; provide from a Secret pipeline, never commit. See the `RAG_API_KEY_CLIENTS` row in the base README. |
+| `mcp.apiKeyClients` / `mcp.datasetAcls` | `""` / `""` | **D15** — per-user registry keys + dataset ACLs (`name:key;name:key` / `name:ds1,ds2;name2:*`). **Since D26** the ACL value also accepts the per-dataset mode token form (`name:ds1:ro,ds2:rw,ds3`; the legacy `name:ds1,ds2` form = rw — byte-compatible, no new env var): an ro dataset refuses every write surface (MCP write tools + REST ingest/delete + dataset-manage endpoints) while reads work. KEY MATERIAL — render only when set; provide from a Secret pipeline, never commit. See the `RAG_API_KEY_CLIENTS` row in the base README. |
 | `security.accessStore` | `true` | **D16** — the `/access` checkbox model: registry keys select their own datasets (protected ones with the password, saved per identity under `/data/access`) and bind their ★ memory dataset. Effective access = operator ACL ∪ selections. |
 | `security.accessDenySelect` / `security.memoryDefault` | `""` / `""` | **D16** ceiling/fallback: datasets that can never be self-selected; the deployment-wide fallback memory dataset. Render only when non-empty. |
 | `rag.unlockMaxTtl` | `86400` | Bound for explicit unlock TTLs on both surfaces; `0` opts into no-expiry unlocks (the `/access` page's "No expiry (0)" option). |
 | `security.oidc.*` | `enabled: false` | **D21** — OIDC JWT as a second credential for the same per-user registry identity. `enabled` (default `false`) / `issuer` (REQUIRED when enabled — the Keycloak realm URL, e.g. `https://keycloak.<your-domain>/realms/UA`) / `audience` (`ua`) / `identityClaim` (`preferred_username`) / `jwksUrl` (empty = `<issuer>/protocol/openid-connect/certs`) / `jwksRefreshSeconds` (`3600`) / `observedTtl` (`86400`) / `fetchTimeoutSeconds` (`3`) / `clockSkewSeconds` (`60`). Rendered ONLY when enabled (default render byte-identical); see the OIDC subsection in § 5b. |
+| `security.oidc.sso.*` | `enabled: false` | **D22** — browser SSO, the app as an OIDC CLIENT (the Open WebUI pattern; no gateway config needed): `GET /oauth/login` → realm → `GET /oauth/oidc/callback` exchanges the code, verifies through the SAME D21 machinery, and plants an HttpOnly session cookie (lowest-priority envelope — an explicit key always wins); the /access page gains a "Sign in with SSO" button. Sub-keys (all with verified chart defaults): `clientId` (`ua`), `clientSecret` (KEY MATERIAL — prefer `clientExistingSecret` + `clientExistingSecretKey: clientSecret`), `redirectUri` (`https://<endpoint>/oauth/oidc/callback` — register it in the realm client FIRST via `scripts/configure-oidc-rag.sh`, idempotent), `providerUrl` (the IN-CLUSTER Keycloak URL, plain HTTP — sidesteps the platform-CA TLS gap; the external `issuer` stays claim-compared only), `scopes` (`openid profile email`), `cookieName` (`pcai-sso`), `cookieMaxAgeSeconds` (`43200`), `cookieSecure` (`true`). Requires `oidc.enabled` (+ issuer) — the `/oauth/*` routes 404 when unconfigured. Rendered ONLY when `sso.enabled: true` (default render byte-identical); enablement order in § 5b. |
 | `security.ssoGate` | `false` | **D23** — the identity-gated unified frontend. `true` = the served HTML pages (`/`, `/manage`, `/access`) require an authenticated identity (SSO cookie / Bearer JWT / API key); anonymous visitors get the minimal 401 "Sign in required" page (a `/oauth/login` link when SSO is enabled). Probes/health, the `/oauth/*` flow and media bytes stay exempt. `false` (default) = byte-identical public pages. Meaningful only with `oidc.enabled` or API keys configured (an empty deployment gates to nothing). Read per request — flip without a restart. Rendered ONLY when `true`; see the Identity-gated frontend subsection in § 5b. |
-| `security.accessSelfMint` | `false` | **D25** — SSO self-mint. `true` = an SSO-authenticated identity (verified D21 Bearer JWT / D22 SSO cookie / D24 trusted-proxy identity header) may mint — and rotate — a long-lived API key for its OWN registry identity from the Access page, no admin round-trip. The minted key carries exactly the identity's existing access (never creates or widens grants); API-key-authenticated callers are always 403 (a registry key can never mint); the key is shown exactly once. Meaningful only with `oidc.enabled` (or `trustProxyIdentity` on G2). Read per request — flip without a restart. `false` (default) = byte-identical behaviour (mint 409s, whoami `flags.self_mint` false). Rendered ONLY when `true`. See README § Security hardening (D25). |
+| `security.accessSelfMint` | `true` | **D25** — SSO self-mint (chart default ON, the same default-on, explicit-opt-out posture as `accessStore`). `true` = an SSO-authenticated identity (verified D21 Bearer JWT / D22 SSO cookie / D24 trusted-proxy identity header) may mint — and rotate — a long-lived API key for its OWN registry identity from the Access page, no admin round-trip. The minted key carries exactly the identity's existing access (never creates or widens grants); API-key-authenticated callers are always 403 (a registry key can never mint); the key is shown exactly once. Meaningful only with `oidc.enabled` (or `trustProxyIdentity` on G2) AND the access overlay on (`accessStore: true` — the minted entry needs somewhere to live); without those it is inert (no SSO session can carry the mint proof). Read per request — flip without a restart. `false` = opt-out — byte-identical pre-D25 behaviour (mint 409s, whoami `flags.self_mint` false). Rendered ONLY when `true`. See README § Security hardening (D25). |
 
 With the access store on, an ADMIN key additionally gets the **User keys** panel on
 `/access` (**D17**): mint per-user keys, set dataset grants, rotate, revoke — against a
 file-backed overlay at `{DATA_PATH}/access/clients.json` (merged with the
 `mcp.apiKeyClients` env; env authoritative on key conflicts). No restart needed.
+
+**Read-only grants (D26, 2026-10).** Every grant now carries a mode — `rw` (default)
+or `ro` — set in the Admin tab's User keys grants editor: a searchable checkbox
+dropdown per key, one row per dataset with ro/rw toggles, 🌐 global and 🔒 password
+badges, and a pinned "All datasets (*)" row (the mint form is unchanged). The overlay
+stores each `datasets` element as a plain string (`"reports"` = rw — existing files
+unchanged) or an object `{"name": "reports", "mode": "ro"}`. An ro dataset keeps its
+read surfaces (list/read/search/unlock/select/★-bind) but refuses every write surface
+(the MCP write tools, REST document ingest/delete, and the PATCH/DELETE/public-toggle
+manage endpoints); 🌐 **globals are read-only by default** — a public dataset is
+included for every authenticated identity at mode ro, and only its creator, an explicit
+`rw` grant, or an admin can write it. Precedence across sources is
+strongest-restriction-wins: env rw ∪ overlay ro ⇒ ro, an explicit per-dataset ro in any
+source overrides a `*` rw, and a `*:ro` token downgrades the `*` grant. Plain-string
+grants, the legacy ACL form and mode-less overlay files all mean rw — deployments that
+never touch modes are byte-identical, and a write against an ro dataset is refused,
+never degraded. Full semantics: README § Security hardening (D26).
 
 ### Standard Kubernetes knobs
 
@@ -226,7 +262,7 @@ resources:
       memory: 2Gi
       cpu: 2
     limits:
-      memory: 4Gi
+      memory: 8Gi
       cpu: 4
   qdrant:
     requests:
@@ -257,9 +293,21 @@ The optional backup CronJob (`backups.enabled`) exports every
 non-password-protected dataset on a schedule (`backups.schedule`), uploads the
 `.tar.gz` archives to `backups.bucket` (reusing the `s3.*` credentials), and —
 when `backups.retentionDays` > 0 — prunes backup objects older than that.
+`backups.bucket` is a **bare bucket name** (no `s3://` scheme — it is passed
+straight to boto3) and **must exist before the first run** (MinIO does not
+auto-create buckets; a missing bucket fails the run until the next tick).
+Use a dedicated bucket — pointing it at a watched-sources prefix makes every
+backup re-ingest as documents. Create it once from any running pod (which
+already carries the credentials):
+
+```bash
+kubectl -n <ns> exec deploy/<deployment.name> -- python -c "import boto3,os; boto3.client('s3', endpoint_url='http://minio.minio.svc.cluster.local:9000', aws_access_key_id=os.environ['S3_ACCESS_KEY_ID'], aws_secret_access_key=os.environ['S3_SECRET_ACCESS_KEY']).create_bucket(Bucket='<backup-bucket>'); print('bucket created')"
+```
 
 > The `${DOMAIN_NAME}` placeholder is resolved by PCAI's deployment pipeline before helm runs — submitted values are envsubst-ed (verified: the deployed release stores the fully-resolved endpoint). Keep
-> the placeholder in `ezua.virtualService.endpoint` as-is. Note that `ezua.domainName` itself is a platform-convention key no chart template reads; the VirtualService is built from
+> the placeholder in `ezua.virtualService.endpoint` as-is. **CLI deploys are the exception:** a raw `helm upgrade -f helm/values-examples/values.g2.yaml` passes the literal through, the istio
+> validation webhook DENIES the VirtualService (invalid host), and the release marks `failed` while earlier-rendered objects have already applied — resolve the placeholder first, e.g.
+> `sed "s/\${DOMAIN_NAME}/<site-domain>/g" values.g2.yaml > values.resolved.yaml` (see the fleet SSO-ROLLOUT-G2 runbook). Note that `ezua.domainName` itself is a platform-convention key no chart template reads; the VirtualService is built from
 > `ezua.virtualService.endpoint`.
 
 ---
@@ -274,7 +322,7 @@ To change a setting later, edit the values in PCAI and apply again — that is t
 # values.yaml — the keys PCAI renders from (also shown above)
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v4.4.1
+  tag: v5.6.2
 models:
   embedder:
     name: "Qwen/Qwen3-VL-Embedding-8B"
@@ -330,7 +378,7 @@ curl http://localhost:8000/api/datasets
 # → {"datasets": []}
 ```
 
-Pods and logs are visible from the PCAI workload view (\cmd{kubectl get pods -l app=rag-mcp-server} and \cmd{kubectl logs -l app=rag-mcp-server -c rag-api-server} work the same as ever for operators who have cluster access).
+Pods and logs are visible from the PCAI workload view (`kubectl get pods -l app=rag-mcp-server` and `kubectl logs -l app=rag-mcp-server -c rag-api-server` work the same as ever for operators who have cluster access).
 
 ---
 
@@ -370,12 +418,77 @@ sanitized paste-ready values document for each profile:
 | `mcp.apiKey.existingSecret` | `mcp-fleet-apikeys` (pre-created in the namespace) | `mcp-fleet-apikeys` or empty — see the Secret strategy in §3 |
 
 Pick the matching example file, paste it into the *Helm Values* editor, adjust
-the `# SITE:` lines, apply. The same two postures exist for the
-`helm-scale-medium/` and `helm-scale-large/` variants (each chart's
-`values-examples/` carries both files). The scale charts expose the same
-`metrics.serviceMonitorBearerSecret` / `…BearerSecretKey` keys as the base
-chart, so a `security.metricsAuth`-on deployment keeps Prometheus scraping
-working at every chart size.
+the `# SITE:` lines, apply. A third shipped file serves the hardened posture:
+`values-examples/values-hardened-g2.yaml` is an OVERLAY to merge into a profile
+file (it carries no model/security blocks of its own) that turns the MCP
+network zone ON (`networkPolicy.enabled: true` — a BASE-chart-only knob; the
+scale charts ship no NetworkPolicy template). Only the listed caller
+namespaces, the edge-gateway pods and the probe CIDRs reach the service; its
+comments carry the two live-verified G2 traps — list the LLM-gateway relay
+namespace FIRST (every unlisted in-cluster caller times out — deny by
+absence), and list the namespace Prometheus actually scrapes `/metrics` from
+(an unlisted scrape namespace dies SILENTLY — check targets after enabling).
+
+The same two postures exist for the `helm-scale-medium/` and
+`helm-scale-large/` variants (each chart's `values-examples/` carries
+`values.g2.yaml` + `values.hosted-trial.yaml`; no hardened overlay — there is
+no `networkPolicy` knob on those charts). Chart-parity notes (v4.0.0): the
+`mcp.apiKey.existingSecret` → `RAG_API_KEYS` sidecar wiring renders in ALL
+three charts, so the optional MCP key gate is identical at every chart size;
+the scale charts expose the same `metrics.serviceMonitorBearerSecret` /
+`…BearerSecretKey` keys as the base chart, so a `security.metricsAuth`-on
+deployment keeps Prometheus scraping working at every chart size; and the
+large chart additionally ships `security.oidc.platformCa.*` (a ConfigMap-mounted
+platform root CA enabling EXTERNAL-https OIDC issuer/provider URLs — absent
+from the base and medium charts).
+
+### Enabling the SSO stack — the order matters (D21 → D22 → D23 → D25)
+
+The SSO knobs stack; enable them in THIS order (the gated knobs render only
+when true — default render byte-identical, EXCEPT D25 self-mint, which now
+ships default-ON in all three charts and is inert by construction without an
+identity source; the rendered envs are read per request — flipping an
+already-rendered flag needs no restart, but a NEW env needs one values
+apply):
+
+1. **Keys + registry first** — the platform Secret (`security.existingSecret`)
+   and the per-user key registry (D15/D17). D20 makes an unkeyed deployment
+   fail-closed, so the key posture must exist before any SSO work is
+   meaningful.
+2. **The SSO identity source** — D21 `security.oidc.enabled: true` + `issuer`
+   (REQUIRED when enabled), and/or D24 `trustProxyIdentity: true` behind an
+   enforcing edge proxy. Add D22 `security.oidc.sso.*` for the browser cookie
+   flow (requires D21 enabled + the client secret + the callback URI
+   registered in the realm client). Flipping D24 `true` WITHOUT an enforcing
+   proxy is a forgery exposure — in-cluster callers could spoof the
+   `X-Auth-Request-*` headers and, once D25 is on, mint keys under a forged
+   identity.
+3. **D23 `security.ssoGate: true`** — gates the served HTML pages; meaningful
+   only with an identity source (D21/D22) or API keys configured (an empty
+   deployment gates to nothing).
+4. **D25 `security.accessSelfMint`** — chart-default ON in all three charts
+   (the same default-on, explicit-opt-out posture as the access store). Its
+   only accepted identity sources are the SSO ones (D21 JWT / D22 cookie / D24
+   proxy header): without one, no session can ever carry the mint proof —
+   the default-on knob is inert by construction, not a broken state (it also
+   needs the access store on, so the minted entry has somewhere to live).
+   `false` restores the pre-D25 inert behaviour (mint 409s). An
+   API-key-authenticated caller can never mint regardless.
+
+**Edge posture per site:** on Internal G2 the ezaf-gateway applies HPE SSO
+centrally — `ezua.authorizationPolicy.enabled: false` (the chart creates no
+AuthorizationPolicy) with `trustProxyIdentity: true`, and app-level OIDC (D21)
+binds that edge-proven identity to the registry. On a hosted trial the
+oauth2-proxy AuthorizationPolicy stays on (`enabled: true`) and is
+COMPLEMENTARY, not competing — edge auth gates ingress, D21 binds app
+identity — with `trustProxyIdentity: true` likewise correct behind the
+enforcing proxy. One G2 edge caveat (observed 2026-10): the shared gateway
+chains SSO on all paths — it 302s non-browser fetches (even the app's signed
+media URLs in cross-site `<img>` tags; see the CHANGELOG's
+`get_dataset_file_bytes` entry for why base64-via-MCP was the fix) — so
+key-carrying REST/MCP access from OUTSIDE the cluster needs a platform-side
+skip-auth decision; in-cluster callers (the LLM-gateway relay, MCP clients
+behind it) reach the service directly and are unaffected.
 
 ### Secret requirements — front and center
 
@@ -400,6 +513,28 @@ Secrets/values must exist — everything else is optional tuning:
    already-seeded key is inert — rotate with `kubectl edit secret` (hot-reloads live, see
    §8) or delete the Secret and upgrade to reseed from values. The same sticky rule covers
    `s3.accessKeyId`/`secretAccessKey` and `redis.password`.
+   **Key material out of values entirely (2026-10):** set `modelSecrets.existingSecret`
+   to a Secret you own with the canonical key names — every key it carries OVERRIDES the
+   chart-managed Secret (wired last in `envFrom` and `CONFIG_DIR` on the API + MCP
+   containers, the embed-batcher, and both CronJobs), keys it omits keep the seeded/stored
+   values, and `MODEL_<ROLE>_URL` entries there override the ConfigMap endpoints. The
+   wiring is hard-wired (missing Secret = `CreateContainerConfigError`, loud). After the
+   Secret is in place the values seeds are optional — blank them; the stored/sticky values
+   survive (never delete the `<name>-model-keys` object itself: the REST keys live there).
+   Upgrade guard: an in-cluster `helm upgrade` fails the render when NO source (user
+   Secret, stored chart Secret, values seeds) provides an embedder URL or API key — the
+   embedder is the only truly required model, and without it every ingest fails.
+   **The broadest possible Secret (one object, every deployment credential):** a single
+   Secret can carry all of it — `MODEL_<ROLE>_API_KEY` (4 keys), `MODEL_<ROLE>_URL`
+   (optional endpoint overrides), `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`,
+   `REDIS_PASSWORD` (scale charts) — referenced by `modelSecrets.existingSecret`; and the
+   same object can serve as `security.existingSecret` (add `RAG_API_KEY` +
+   `MEDIA_TOKEN_SECRET`) and even `mcp.apiKey.existingSecret` (add `api-keys`). Build it
+   from **`helm/local/secrets.template.yaml`**, apply with `kubectl apply -n <ns>`, blank
+   the values seeds, and rotation becomes `kubectl apply` alone (pods hot-reload ≤15s, no
+   rollout, no helm involvement). `kubectl apply` does NOT envsubst — bake real domains
+   into `MODEL_*_URL` (the values editor resolves `${DOMAIN_NAME}`; a Secret literal does
+   not). Live example: `helm-scale-large/local/secrets.g2.yaml` (keys + endpoints + S3).
 3. **MCP keys (optional)** — `mcp.apiKey.existingSecret: mcp-fleet-apikeys` +
    `kubectl -n <ns> create secret generic mcp-fleet-apikeys
    --from-literal='api-keys=<key1>,<key2>'`. The chart never creates or inlines
@@ -435,7 +570,9 @@ Bearer`); observed JWT-only users appear in `GET /api/admin/clients` as
 `{"source": "observed"}` entries. Issuer is **REQUIRED** when enabled (the app logs a
 loud startup warning without it) and every knob is read per request — no restart.
 Chart wiring renders the `RAG_OIDC_*` envs into BOTH containers only when
-`oidc.enabled: true` (the default render is byte-identical).
+`oidc.enabled: true` (the default render is byte-identical). Browser sign-in
+(D22) rides on this same resolver via `security.oidc.sso.*` — the §2 values
+row and the §5b ordered-enablement subsection cover it.
 
 **G2 note:** the ezaf-gateway applies SSO centrally at the edge
 (`ezua.authorizationPolicy.enabled: false` on this site), so app-level OIDC is the
@@ -450,8 +587,10 @@ not competing: edge auth gates ingress, D21 binds app identity. Full semantics: 
 folds the three HTML pages into ONE identity-gated shell: the homepage re-glasses
 into a four-tab app — **Datasets** (the identity-scoped upload/search workspace),
 **Access** (the D15/D16 dataset checkboxes, unlock/TTL panel and ★ memory binding),
-**Admin** (the operator dashboard, rendered only for `is_admin` identities), and
-**Stats** (a read-only dashboard for everyone). `/manage` and `/access` redirect
+**Admin** (the operator dashboard, rendered only for `is_admin` identities),
+**Stats** (a read-only dashboard for everyone), and — since D27 — **Inspector**
+(a browser playground for direct MCP tool calls, authenticated as the session;
+see MCP.md § 5). `/manage` and `/access` redirect
 into their tabs; anonymous visitors get a minimal 401 "Sign in required" page
 (with a `/oauth/login` link when browser SSO is configured). Sign-in: SSO button
 first, API-key paste fallback; the embedded admin key is used only in the
@@ -479,7 +618,7 @@ When `mcp.enabled=true` (default), the MCP server runs as a sidecar container ex
 
 For the full tool list, connection configs (opencode, Claude Desktop, Open WebUI, stdio), and the long-term memory setup, see:
 
-- **[MCP.md](MCP.md)** — all 19 MCP tools + connection configs for any client
+- **[MCP.md](MCP.md)** — all 20 MCP tools + connection configs for any client
 - **[MEMORY.md](MEMORY.md)** — per-user long-term memory setup (opencode + Open WebUI)
 
 ### Quick reference

@@ -265,26 +265,103 @@ def selection_password(identity: Any | None, dataset_name: str) -> str | None:
 
 
 def dataset_allowed(identity: Any | None, dataset_name: str) -> bool:
-    """D16-effective access: (operator ACL ∪ self-selections) − exclusions.
+    """D16-effective access: (operator ACL ∪ self-selections ∪ globals) − exclusions.
 
     Semantics preserved exactly when the store is off / identity is None or
-    admin (byte-identical default).  For a registry client:
+    admin (byte-identical default).  For a registry client the inclusion
+    sources are, D26:
 
-      * the operator ACL and self-selections are the inclusion sources (the
-        denylist can never be SELECTED in the first place);
-      * the 2026-10 revision: a user may EXCLUDE any dataset — including an
-        operator-granted or public one — by deselecting it; the exclusion
-        hides the dataset until re-selected;
-      * public datasets are NOT auto-granted: they are password-free
-        self-selections (availability, not inclusion).
+      * the operator ACL (any mode — ro grants INCLUDE for reading);
+      * self-selections (the denylist can never be SELECTED in the first
+        place);
+      * 🌐 GLOBAL datasets (the ``public`` meta flag, fleet-owner ruling
+        2026-10): included for EVERY authenticated identity at mode ro —
+        no checkbox needed.  This supersedes the D16 "public = opt-in
+        availability" inclusion semantics (the selection store still
+        works; the write gate, not this predicate, enforces the ro);
+      * minus exclusions: a user may EXCLUDE any dataset — including an
+        operator-granted, public, or self-selected one — by deselecting
+        it; the exclusion hides the dataset until re-selected.
     """
     from multimodal_rag.utils.clients_registry import dataset_allowed as operator_allows
+    from multimodal_rag.utils.clients_registry import is_public_dataset
 
     if identity is None:
         return operator_allows(identity, dataset_name)
+    if getattr(identity, "is_admin", False):
+        return True
+    if dataset_name in exclusions_for(identity):
+        return False
     if operator_allows(identity, dataset_name) or dataset_name in selections_for(identity):
-        return dataset_name not in exclusions_for(identity)
-    return False
+        return True
+    # D26 global-by-default: a published dataset is in everyone's world —
+    # but NOT the D20 anonymous identity's (cross-validation 2026-10: an
+    # unconfigured deployment binds __anonymous__, whose ONLY grant is the
+    # env MEMORY_DATASET; letting globals ride in would re-open the
+    # fail-closed posture D20 closed).  The exclusion check above ran
+    # first, so a deselected global stays hidden.
+    if str(getattr(identity, "name", "") or "") == "__anonymous__":
+        return False
+    return is_public_dataset(dataset_name)
+
+
+def dataset_write_allowed(identity: Any | None, dataset_name: str) -> bool:
+    """D26-effective WRITE access for *dataset_name*.
+
+    The ro sources, in precedence order (the first explicit mode wins):
+
+    1. the caller's operator-ACL grant mode (D15/D26 — an explicit
+       per-dataset ``ro``, a ``*`` downgraded to ro, or their rw
+       counterparts; the strongest-restriction env ∪ overlay merge already
+       happened in ``clients_registry.dataset_acls`` and
+       :func:`clients_registry.grant_mode` resolves specificity);
+    2. a 🌐 GLOBAL dataset the identity reaches ONLY via the global flag —
+       globals are read-only by default (fleet-owner ruling): ro unless an
+       explicit grant covers the dataset.  A SELF-SELECTION of a global
+       dataset is the documented ro path — it never upgrades to rw (it
+       carries no password and no write power).
+
+    Everything else — admin, identity-less, rw grants, the store-off
+    single-user default — writes as before (byte-identical default).  The
+    EXISTING write gates stay layered around this predicate (inclusion is
+    checked first by every caller, manage stays ``*``/owner-or-admin, D23
+    ownership unchanged): this adds ONLY the mode check.
+    """
+    from multimodal_rag.utils.clients_registry import (
+        GRANT_RO,
+        GRANT_RW,
+        grant_mode,
+        is_public_dataset,
+    )
+
+    if identity is None or getattr(identity, "is_admin", False):
+        return True
+    mode = grant_mode(identity, dataset_name)
+    if mode is not None:
+        return mode == GRANT_RW
+    # D26 (cross-validation 2026-10): a GLOBAL dataset reached ONLY via the
+    # global flag — with or without a self-selection — is read-only by
+    # construction, and it must STAY ro if the flag is later unpublished:
+    # the selection entry carries a "ro" stamp (written by select_dataset
+    # at selection time), so the mode follows the ACCESS PATH, not a flag
+    # snapshot.  An ACL/selection entry that is not stamped ro stays rw
+    # (pre-D26 selections unchanged).
+    entry = selection_entry(identity, dataset_name)
+    if entry is not None and entry.get("write_mode") == GRANT_RO:
+        return False
+    # global-by-default: ro without an explicit grant
+    return not is_public_dataset(dataset_name)
+
+
+def require_dataset_write(identity: Any | None, dataset_name: str) -> None:
+    """Raise :class:`DatasetAccessDenied` when the caller may not write."""
+    from multimodal_rag.utils.clients_registry import DatasetAccessDenied
+
+    if dataset_write_allowed(identity, dataset_name):
+        return
+    raise DatasetAccessDenied(
+        f"Dataset '{dataset_name}' is read-only for this API key (a ro grant cannot be written — D26)."
+    )
 
 
 def filter_dataset_names(identity: Any | None, names) -> tuple[list, int]:
@@ -332,6 +409,22 @@ def select_dataset(identity: Any | None, dataset_name: str, password: str | None
         if isinstance(exc, list) and dataset_name in exc:
             exc.remove(dataset_name)
             cleared = True
+        # D26: a GLOBAL dataset selected without any rw grant carries a
+        # "ro" write-mode stamp — the selection never upgrades a global to
+        # rw, and the stamp keeps it ro even if the flag is later
+        # unpublished (the ro follows the access path, not the flag).
+        from multimodal_rag.utils.clients_registry import is_public_dataset
+
+        if not already and is_public_dataset(dataset_name):
+            entry = {
+                "dataset": dataset_name,
+                "password": password or "",
+                "selected_at": selected_at,
+                "write_mode": "ro",
+            }
+            doc["datasets"][dataset_name] = entry
+            stored_source["v"] = "self-ro"
+            return True
         entry = {"dataset": dataset_name, "password": password or "", "selected_at": selected_at}
         if already:
             if password:
@@ -418,18 +511,26 @@ def memory_dataset_for(identity: Any | None, fallback: str | None = None) -> str
 def set_memory_dataset(identity: Any | None, dataset_name: str | None) -> str | None:
     """Star/unstar the identity's memory dataset (the page's ★, server-side).
 
-    Setting a name requires it to be ACCESSIBLE (operator ACL or selection);
-    clearing (None) always works.  Returns the effective binding afterwards.
+    Setting a name requires it to be ACCESSIBLE (operator ACL, selection,
+    or — D26 — global-by-default) and WRITABLE: the ★ binding is the
+    identity's ONE writable memory store, so a dataset the key can only
+    reach read-only refuses (D26 — "bind a dataset you can write").
+    Clearing (None) always works.  Returns the effective binding after.
     """
     if identity is None or getattr(identity, "is_admin", False):
         raise SelectionDenied("Memory binding is available for per-user API keys.")
     if not store_enabled():
         raise SelectionDenied("Memory binding is not enabled on this deployment (RAG_ACCESS_STORE).")
     name = str(dataset_name).strip() if dataset_name else ""
-    if name and not dataset_allowed(identity, name):
-        raise SelectionDenied(
-            f"Dataset '{name}' is not accessible to this key — select it first."
-        )
+    if name:
+        from multimodal_rag.utils.clients_registry import DatasetAccessDenied
+
+        if not dataset_allowed(identity, name):
+            raise SelectionDenied(f"Dataset '{name}' is not accessible to this key — select it first.")
+        try:
+            require_dataset_write(identity, name)
+        except DatasetAccessDenied:
+            raise SelectionDenied(f"Dataset '{name}' is read-only for your key (D26) — bind a dataset you can write.")
     doc = _mutate(identity.client_id, lambda d: _set_memory(d, name))
     return str(doc.get("memory_dataset") or "") or None
 

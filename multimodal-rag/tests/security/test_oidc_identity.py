@@ -84,8 +84,14 @@ def _generate_rsa(key_id: str = KID) -> dict:
     return {
         "key": key,
         "kid": key_id,
-        "jwk": {"kty": "RSA", "kid": key_id, "use": "sig", "alg": "RS256",
-                "n": _b64uint(nums.n), "e": _b64uint(nums.e)},
+        "jwk": {
+            "kty": "RSA",
+            "kid": key_id,
+            "use": "sig",
+            "alg": "RS256",
+            "n": _b64uint(nums.n),
+            "e": _b64uint(nums.e),
+        },
         "sign": lambda data: key.sign(data, padding.PKCS1v15(), hashes.SHA256()),
     }
 
@@ -418,7 +424,12 @@ def test_resolve_jwt_identity_datasets_and_client_id(monkeypatch, jwks_server):
     monkeypatch.setenv(cr.ACLS_ENV, "andrew-bydlon:ds1,ds2")
     ident = oidc.resolve_jwt(_mint(key, _claims()))
     assert ident is not None
-    assert ident == cr.Identity(kind="client", name="andrew-bydlon", datasets=frozenset({"ds1", "ds2"}))
+    assert ident == cr.Identity(
+        kind="client",
+        name="andrew-bydlon",
+        datasets=frozenset({"ds1", "ds2"}),
+        grants={"ds1": cr.GRANT_RW, "ds2": cr.GRANT_RW},
+    )
     assert ident.client_id == "key:andrew-bydlon"  # the shared unlock-cache key
     assert not ident.is_admin
 
@@ -487,9 +498,7 @@ def test_delegation_jwt_in_authorization_loses_to_opaque_x_api_key(monkeypatch, 
     monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key;andrew-bydlon:andrew-key")
     monkeypatch.setenv(cr.ACLS_ENV, "alice:ds1;andrew-bydlon:ds2")
     jwt_token = _mint(key, _claims())
-    ident = cr.resolve_presented(
-        [jwt_token, "alice-key"], ["authorization", "x-api-key"]
-    )
+    ident = cr.resolve_presented([jwt_token, "alice-key"], ["authorization", "x-api-key"])
     assert ident is not None
     assert ident.name == "alice", "the delegated X-API-Key identity must win"
     assert cr.dataset_allowed(ident, "ds1") and not cr.dataset_allowed(ident, "ds2")
@@ -503,9 +512,7 @@ def test_delegation_jwt_via_x_api_key_resolves(monkeypatch, jwks_server):
     monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key")
     monkeypatch.setenv(cr.ACLS_ENV, "alice:ds1;andrew-bydlon:ds2")
     jwt_token = _mint(key, _claims())
-    ident = cr.resolve_presented(
-        ["alice-key", jwt_token], ["authorization", "x-api-key"]
-    )
+    ident = cr.resolve_presented(["alice-key", jwt_token], ["authorization", "x-api-key"])
     assert ident is not None
     assert ident.name == "andrew-bydlon"
     assert ident.datasets == frozenset({"ds2"})
@@ -535,9 +542,7 @@ def test_delegation_unknown_x_api_key_does_not_fall_through_to_jwt(monkeypatch, 
     alone → None; the co-forwarded Authorization JWT must NOT rescue it."""
     key = _setup_key(jwks_server)
     monkeypatch.setenv(cr.ACLS_ENV, "andrew-bydlon:ds1")
-    ident = cr.resolve_presented(
-        [_mint(key, _claims()), "unknown-key"], ["authorization", "x-api-key"]
-    )
+    ident = cr.resolve_presented([_mint(key, _claims()), "unknown-key"], ["authorization", "x-api-key"])
     assert ident is None
 
 
@@ -550,9 +555,7 @@ def test_jwt_in_authorization_alongside_x_api_key_never_resolves_via_oidc(monkey
     monkeypatch.setenv(cr.ACLS_ENV, "alice:ds1;andrew-bydlon:ds2")
     # unknown x-api-key + valid Authorization JWT → None (pinned above); and
     # a KNOWN opaque x-api-key resolves as ITS OWN identity, not the JWT's.
-    ident = cr.resolve_presented(
-        [_mint(key, _claims()), "alice-key"], ["authorization", "x-api-key"]
-    )
+    ident = cr.resolve_presented([_mint(key, _claims()), "alice-key"], ["authorization", "x-api-key"])
     assert ident is not None and ident.name == "alice"
 
 
@@ -601,9 +604,7 @@ def _write_overlay(entry: dict) -> None:
 def test_overlay_blocked_user_jwt_denied(monkeypatch, jwks_server):
     key = _setup_key(jwks_server)
     monkeypatch.setenv("RAG_ACCESS_STORE", "1")
-    _write_overlay(
-        {"name": "alice", "key": "blocked-alice-opaque-key", "datasets": ["ds1"], "blocked": True}
-    )
+    _write_overlay({"name": "alice", "key": "blocked-alice-opaque-key", "datasets": ["ds1"], "blocked": True})
     token = _mint(key, _claims(preferred="alice"))
     assert oidc.resolve_jwt(token) is None
     assert cr.resolve_presented([token]) is None, "blocked must hold on the middleware path too"
@@ -619,9 +620,7 @@ def test_overlay_blocked_user_minted_key_denied_too(monkeypatch, jwks_server):
     its datasets, a fail-open gap).
     """
     monkeypatch.setenv("RAG_ACCESS_STORE", "1")
-    _write_overlay(
-        {"name": "alice", "key": "blocked-alice-opaque-key", "datasets": ["ds1"], "blocked": True}
-    )
+    _write_overlay({"name": "alice", "key": "blocked-alice-opaque-key", "datasets": ["ds1"], "blocked": True})
     assert cr.resolve_presented(["blocked-alice-opaque-key"]) is None, (
         "a blocked client's minted key must stop authenticating (docstring contract)"
     )
@@ -807,9 +806,7 @@ def _bearer(token: str):
 def test_mcp_middleware_valid_jwt_binds_identity(monkeypatch, jwks_server):
     key = _setup_key(jwks_server)
     monkeypatch.setenv(cr.ACLS_ENV, "alice:ds1")
-    messages, captured = asyncio.run(
-        _drive(_mw(), _scope(headers=_bearer(_mint(key, _claims(preferred="alice")))))
-    )
+    messages, captured = asyncio.run(_drive(_mw(), _scope(headers=_bearer(_mint(key, _claims(preferred="alice"))))))
     assert messages[0]["status"] == 200, "a valid JWT must not 401 on /mcp"
     ident = captured["identity"]
     assert ident is not None and ident.kind == "client" and ident.name == "alice"
@@ -819,9 +816,7 @@ def test_mcp_middleware_valid_jwt_binds_identity(monkeypatch, jwks_server):
 def test_mcp_middleware_invalid_jwt_is_401(monkeypatch, jwks_server):
     key = _setup_key(jwks_server)
     monkeypatch.setenv(cr.ACLS_ENV, "alice:ds1")
-    messages, _ = asyncio.run(
-        _drive(_mw(), _scope(headers=_bearer(_mint(key, _claims(exp=_now() - 9999)))))
-    )
+    messages, _ = asyncio.run(_drive(_mw(), _scope(headers=_bearer(_mint(key, _claims(exp=_now() - 9999))))))
     assert messages[0]["status"] == 401
 
 
@@ -993,9 +988,7 @@ def test_rest_oidc_session_whoami(rest_client, monkeypatch, jwks_server):
     )
     assert bad.json() == {"authenticated": False}
     monkeypatch.setenv("RAG_OIDC_ENABLED", "0")
-    off = rest_client.get(
-        "/api/oidc-session", headers={"Authorization": f"Bearer {_mint(key, _claims())}"}
-    )
+    off = rest_client.get("/api/oidc-session", headers={"Authorization": f"Bearer {_mint(key, _claims())}"})
     assert off.json() == {"authenticated": False}
 
 
@@ -1102,9 +1095,7 @@ def sso_idp(monkeypatch, jwks_server):
             if self.path == "/token":
                 hits["token"] += 1
                 length = int(self.headers.get("Content-Length", "0"))
-                form = dict(
-                    kv.split("=", 1) for kv in self.rfile.read(length).decode().split("&")
-                )
+                form = dict(kv.split("=", 1) for kv in self.rfile.read(length).decode().split("&"))
                 from urllib.parse import unquote_plus
 
                 form = {k: unquote_plus(v) for k, v in form.items()}
@@ -1128,7 +1119,6 @@ def sso_idp(monkeypatch, jwks_server):
     yield {"base": base, "minted": minted, "hits": hits}
     server.shutdown()
     server.server_close()
-
 
 
 def test_sso_inert_by_default(monkeypatch, rest_client):
@@ -1277,14 +1267,13 @@ def test_proxy_identity_ignored_without_trust_flag(monkeypatch):
     import importlib
 
     import multimodal_rag.api_server as api
+
     monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "")
     importlib.reload(api)
     try:
         from starlette.testclient import TestClient
 
-        r = TestClient(api.app).get(
-            "/api/datasets", headers={"X-Auth-Request-User": "andrew"}
-        )
+        r = TestClient(api.app).get("/api/datasets", headers={"X-Auth-Request-User": "andrew"})
         assert r.status_code in (401, 403), "the header must not authenticate"
     finally:
         monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "true")
@@ -1321,6 +1310,7 @@ def test_proxy_identity_spoof_rejected_without_trust(monkeypatch, rest_client):
     import importlib
 
     import multimodal_rag.api_server as api
+
     monkeypatch.setenv(cr.CLIENTS_ENV, "andrew:andrew-key")
     monkeypatch.setenv(cr.ACLS_ENV, "andrew:ds1,ds2")
     monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "")
@@ -1328,9 +1318,7 @@ def test_proxy_identity_spoof_rejected_without_trust(monkeypatch, rest_client):
     try:
         from fastapi.testclient import TestClient
 
-        r = TestClient(api.app).get(
-            "/api/datasets/ds1", headers={"X-Auth-Request-User": "andrew"}
-        )
+        r = TestClient(api.app).get("/api/datasets/ds1", headers={"X-Auth-Request-User": "andrew"})
         assert r.status_code in (401, 403)
     finally:
         monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "true")

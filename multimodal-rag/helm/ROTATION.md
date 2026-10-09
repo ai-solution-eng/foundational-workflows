@@ -109,6 +109,7 @@ rotation, which was explicitly not wanted**:
 |---|---|---|
 | `helm-scale-large/local/values.g2.yaml` (ex-se_g2.yaml; deleted 2026-09-18 — merged into values.g2.yaml) | `security.apiKey`, `security.mediaTokenSecret` | `_55_V…PoPd`, `5787d…a7dd` |
 | `helm-scale-large/local/values.g2.yaml` (57-60, 144-145) | `modelSecrets.*ApiKey` (4 model-serving **JWTs**), `security.apiKey`, `security.mediaTokenSecret` | JWTs (`eyJhbG…`), `_55_V…PoPd`, `5787d…a7dd` |
+| `helm-scale-large/local/secrets.g2.yaml` (**NEW 2026-10**, gitignored, mode 0600) | `MODEL_*_API_KEY` (the 4 MLIS **JWTs**, moved out of values.g2.yaml), `MODEL_*_URL` (4 endpoint overrides — site domain baked, not secret material), `S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY` (MinIO) | JWTs (`eyJhbG…`, 914-char, iat 1778014789–1786843671), `admin-io` / `MinIO$2K` — apply as Secret `rag-model-keys` (ns `mm-rag`) via `modelSecrets.existingSecret` |
 
 > **2026-09 update (g2):** the `security.apiKey` / `security.mediaTokenSecret` literals were
 > removed from `helm-scale-large/local/values.g2.yaml` and the release now provisions both
@@ -118,6 +119,13 @@ rotation, which was explicitly not wanted**:
 > away** (D1 consequences applied: old REST key dead, previously issued media tokens
 > invalid). The model-serving JWTs and MinIO credentials remain in the file (gitignored),
 > still listed here as the working credentials.
+>
+> **2026-10 update (g2):** the model-serving JWTs + MinIO credentials + model endpoint
+> overrides moved out of `values.g2.yaml` into the operator-owned Secret
+> `helm-scale-large/local/secrets.g2.yaml` (Secret `rag-model-keys`, ns `mm-rag`, wired via
+> `modelSecrets.existingSecret`). Rotation is now `kubectl apply` of that manifest (pods
+> hot-reload ≤15s, no rollout) — the values seeds are blanked fallbacks. While the Secret
+> carries `MODEL_*_URL`, values `models.*.url` edits are inert for the running deployment.
 | `helm-scale-large/local/values.omnilife.yaml` (ex-omnilife.yaml, restored 2026-09-18) (88-104, 215-216) | `modelSecrets` JWTs, `s3.accessKeyId`/`s3.secretAccessKey` (MinIO), `security.apiKey`/`mediaTokenSecret` | JWTs, `iZEud…Cbu6`, `MYSwK…Qw81`, `Y4GlF…5M5g`, `ed735…06be` |
 | `helm-scale-large/local/migrate-my-memory.py` (31) | `API_KEY` (G2 REST key baked into the helper script) | `_55_V…PoPd` |
 | ~~`MultimodalRAG/.g2_cluster.yaml`~~ (DELETED 2026-09-30 — legacy parallel site-values copy superseded by `helm-scale-large/local/values.g2.yaml`, which sources keys from the `rag-platform-keys` Secret and holds no literals) | was: `modelSecrets.*ApiKey` JWTs + `security.mediaTokenSecret` | JWTs (`eyJhbG…`), `5787d…a7dd` — the media-token literal lived ONLY here; if a rotation ever requires it, mint a FRESH `MEDIA_TOKEN_SECRET` (rolling media-token invalidation) instead of hunting for the old value |
@@ -159,6 +167,19 @@ deleted). Nothing is auto-generated. Practical consequences:
   recreates the Secret.
 - **Values edits to already-seeded keys are inert** — the stored value always wins. This
   is deliberate: an upgrade can never clobber a key rotated out-of-band.
+- **`MODEL_<ROLE>_URL` entries** added out-of-band are sticky the same way (re-rendered
+  from the stored Secret on every upgrade, 2026-10) and OVERRIDE the ConfigMap endpoints
+  (secrets merge after config in `envFrom` and `CONFIG_DIR`). They are never seeded from
+  values — the ConfigMap remains the values-borne source.
+- **User-owned Secret (`modelSecrets.existingSecret`, 2026-10)** — keep key material out
+  of values entirely: point the chart at a Secret you own (canonical key names
+  `MODEL_*_API_KEY`, optional `MODEL_*_URL`, `S3_*`, `REDIS_PASSWORD`). It is wired LAST
+  in `envFrom` and `CONFIG_DIR`, so every key it carries overrides the chart Secret and
+  keys it omits keep the seeded/stored values; rotation is plain `kubectl apply` (or your
+  ESO pipeline) + the ≤15s hot reload, no rollout, no chart involvement. Hard-wired: a
+  missing Secret = `CreateContainerConfigError` (loud), matching
+  `security.existingSecret` semantics. An in-cluster upgrade whose NO source provides an
+  embedder URL/API key fails the render (guard; offline `helm template` skips it).
 
 ---
 

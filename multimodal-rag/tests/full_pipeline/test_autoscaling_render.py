@@ -75,9 +75,7 @@ class TestHpaDefaultRender:
     def test_no_hpa_by_default(self, chart: str) -> None:
         assert not [d for d in _docs(_render_ok(chart)) if d.get("kind") == "HorizontalPodAutoscaler"]
 
-    @pytest.mark.parametrize(
-        "chart,replicas", [("helm", 1), ("helm-scale-medium", 2), ("helm-scale-large", 4)]
-    )
+    @pytest.mark.parametrize("chart,replicas", [("helm", 1), ("helm-scale-medium", 2), ("helm-scale-large", 4)])
     def test_pinned_default_replica_count(self, chart: str, replicas: int) -> None:
         dep = _app_deployment(_docs(_render_ok(chart)))
         assert dep["spec"]["replicas"] == replicas
@@ -90,26 +88,25 @@ class TestHpaDefaultRender:
         "chart,app_mem,app_cpu",
         [("helm-scale-medium", "4Gi", "1.5"), ("helm-scale-large", "4Gi", "2")],
     )
-    def test_default_app_requests_hpa_calibrated(
-        self, chart: str, app_mem: str, app_cpu: str
-    ) -> None:
+    def test_default_app_requests_hpa_calibrated(self, chart: str, app_mem: str, app_cpu: str) -> None:
         dep = _app_deployment(_docs(_render_ok(chart)))
         for c in dep["spec"]["template"]["spec"]["containers"]:
             res = c["resources"]
-            assert {k: str(v) for k, v in res["requests"].items()} == {
-                "memory": app_mem, "cpu": app_cpu
-            }, res["requests"]
+            assert {k: str(v) for k, v in res["requests"].items()} == {"memory": app_mem, "cpu": app_cpu}, res[
+                "requests"
+            ]
             assert res["limits"]["memory"] == "8Gi"
 
     # cpu quantities render as YAML int or str depending on quoting in
     # values.yaml — normalize both sides through str() for the comparison.
-    @pytest.mark.parametrize("chart,qdrant_max_mem,qdrant_max_cpu", [
-        ("helm-scale-medium", "20Gi", "6"),
-        ("helm-scale-large", "32Gi", "8"),
-    ])
-    def test_default_qdrant_requests_burst_to_limit(
-        self, chart: str, qdrant_max_mem: str, qdrant_max_cpu: str
-    ) -> None:
+    @pytest.mark.parametrize(
+        "chart,qdrant_max_mem,qdrant_max_cpu",
+        [
+            ("helm-scale-medium", "20Gi", "6"),
+            ("helm-scale-large", "32Gi", "8"),
+        ],
+    )
+    def test_default_qdrant_requests_burst_to_limit(self, chart: str, qdrant_max_mem: str, qdrant_max_cpu: str) -> None:
         sts = _doc(_docs(_render_ok(chart)), "StatefulSet", "rag-mcp-server-qdrant")
         res = sts["spec"]["template"]["spec"]["containers"][0]["resources"]
         assert {k: str(v) for k, v in res["requests"].items()} == {"memory": "4Gi", "cpu": "1"}, res["requests"]
@@ -129,7 +126,9 @@ class TestHpaEnabledRender:
         hpa = _doc(self._render(chart), "HorizontalPodAutoscaler", "rag-mcp-server")
         assert hpa["apiVersion"] == "autoscaling/v2"
         assert hpa["spec"]["scaleTargetRef"] == {
-            "apiVersion": "apps/v1", "kind": "Deployment", "name": "rag-mcp-server"
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "name": "rag-mcp-server",
         }
 
     def test_deployment_omits_replicas(self, chart: str) -> None:
@@ -147,19 +146,23 @@ class TestHpaEnabledRender:
         spec = hpa["spec"]
         assert spec["minReplicas"] == 2  # HA floor: 1 replica is not HA
         assert spec["metrics"][0]["resource"]["target"]["averageUtilization"] == 70
-        assert (
-            spec["behavior"]["scaleDown"]["stabilizationWindowSeconds"] == 300
-        ), "bursty RAG traffic needs a scale-down stabilization window"
+        assert spec["behavior"]["scaleDown"]["stabilizationWindowSeconds"] == 300, (
+            "bursty RAG traffic needs a scale-down stabilization window"
+        )
 
     def test_hpa_values_overrides(self, chart: str) -> None:
         hpa = _doc(
             self._render(
                 chart,
-                "--set", "autoscaling.minReplicas=3",
-                "--set", "autoscaling.maxReplicas=10",
-                "--set", "autoscaling.targetCPUUtilizationPercentage=80",
+                "--set",
+                "autoscaling.minReplicas=3",
+                "--set",
+                "autoscaling.maxReplicas=10",
+                "--set",
+                "autoscaling.targetCPUUtilizationPercentage=80",
             ),
-            "HorizontalPodAutoscaler", "rag-mcp-server",
+            "HorizontalPodAutoscaler",
+            "rag-mcp-server",
         )
         spec = hpa["spec"]
         assert spec["minReplicas"] == 3

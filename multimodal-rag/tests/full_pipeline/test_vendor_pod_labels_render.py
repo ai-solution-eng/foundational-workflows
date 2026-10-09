@@ -38,6 +38,7 @@ import yaml
 REPO = Path(__file__).resolve().parents[2]
 CHARTS = ["helm", "helm-scale-medium", "helm-scale-large"]
 
+
 # workload kind + name suffix per chart variant
 def _workloads(chart: str) -> list[tuple[str, str]]:
     v = yaml.safe_load((REPO / chart / "values.yaml").read_text())
@@ -57,7 +58,9 @@ def _helm_available() -> bool:
 def _render_ok(chart: str, *set_args: str) -> str:
     proc = subprocess.run(
         ["helm", "template", "render-test", str(REPO / chart), *set_args],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     assert proc.returncode == 0, f"helm template failed for {chart}:\n{proc.stderr}"
     return proc.stdout
@@ -102,16 +105,19 @@ class TestVendorPodLabels:
         (platform scheduler-stamping vendor policy; G2 incident 2026-09-24)."""
         rendered = _render_ok(
             chart,
-            "--set", "watchedSources.enabled=true",
-            "--set", "watchedSources.sources[0].dataset=reports",
-            "--set", "watchedSources.sources[0].prefixes[0]=s3://bucket/reports/",
-            "--set", "backups.enabled=true",
-            "--set", "backups.bucket=s3://backup-bucket",
+            "--set",
+            "watchedSources.enabled=true",
+            "--set",
+            "watchedSources.sources[0].dataset=reports",
+            "--set",
+            "watchedSources.sources[0].prefixes[0]=s3://bucket/reports/",
+            "--set",
+            "backups.enabled=true",
+            "--set",
+            "backups.bucket=s3://backup-bucket",
         )
         for cron in [d for d in _docs(rendered) if d.get("kind") == "CronJob"]:
-            labels = (
-                cron["spec"]["jobTemplate"]["spec"]["template"]["metadata"].get("labels", {})
-            )
+            labels = cron["spec"]["jobTemplate"]["spec"]["template"]["metadata"].get("labels", {})
             assert "hpe-ezua/type" not in labels and "hpe-ezua/app" not in labels, cron["metadata"]["name"]
 
     def test_pods_keep_their_app_label(self, chart: str) -> None:
@@ -119,7 +125,9 @@ class TestVendorPodLabels:
         the anti-affinity rule keep working unchanged."""
         docs = _docs(_render_ok(chart))
         v = yaml.safe_load((REPO / chart / "values.yaml").read_text())
-        dep = next(d for d in docs if d.get("kind") == "Deployment" and d["metadata"]["name"] == v["deployment"]["name"])
+        dep = next(
+            d for d in docs if d.get("kind") == "Deployment" and d["metadata"]["name"] == v["deployment"]["name"]
+        )
         labels = dep["spec"]["template"]["metadata"]["labels"]
         assert labels.get("app") == v["deployment"]["appName"]
         assert dep["spec"]["selector"]["matchLabels"]["app"] == v["deployment"]["appName"]

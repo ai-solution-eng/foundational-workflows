@@ -347,6 +347,19 @@ def _mcp_pool_size() -> int:
 _mcp_pool = concurrent.futures.ThreadPoolExecutor(max_workers=_mcp_pool_size(), thread_name_prefix="mcp-tool")
 
 
+def _file_bytes_max() -> int:
+    """Byte cap for ``get_dataset_file_bytes`` (default 256 KiB).
+
+    Bounds how much binary payload one MCP tool response can carry: enough
+    for a preprocessed image preview, far below bulk-media scale.  Override
+    with ``MCP_FILE_BYTES_MAX`` (int, bytes).
+    """
+    try:
+        return max(1024, int(os.environ.get("MCP_FILE_BYTES_MAX", str(256 * 1024))))
+    except (TypeError, ValueError):
+        return 256 * 1024
+
+
 async def _offload(fn: Any, *args: Any, **kwargs: Any) -> Any:
     """Run a sync callable in the MCP thread pool.
 
@@ -811,9 +824,30 @@ def _require_dataset_acl(dataset_name: str) -> None:
     if _access.dataset_allowed(ident, dataset_name):
         return
     raise ToolError(
-        f"Dataset '{dataset_name}' is not permitted for this API key "
-        "(dataset ACLs/selections are configured)."
+        f"Dataset '{dataset_name}' is not permitted for this API key (dataset ACLs/selections are configured)."
     )
+
+
+def _require_dataset_write(dataset_name: str) -> None:
+    """D26: raise ToolError when the caller's key may only READ *dataset_name*.
+
+    The write-side sibling of :func:`_require_dataset_acl` — run AFTER it
+    (inclusion first, then the mode) on every mutating surface:
+    ``add_memory`` / ``delete_memory`` / ``forget_session``,
+    ``dataset_add_documents`` / ``dataset_delete_documents`` /
+    ``dataset_replace_document``.  Refuses when the caller's effective mode
+    is ro — an explicit ``ro`` grant, a ``*`` downgraded to ro, OR a
+    🌐 global dataset reached only via the global flag (globals are
+    read-only by default).  Admins, identity-less callers (the
+    store-off/legacy default) and rw grants pass unchanged — the
+    byte-identical default.  The name is already validated by the ACL gate
+    that precedes every call, so no re-validation here.
+    """
+    ident = _current_key_identity()
+    try:
+        _access.require_dataset_write(ident, dataset_name)
+    except Exception as exc:  # DatasetAccessDenied → a caller-safe ToolError
+        raise ToolError(str(exc))
 
 
 class _RagClientAuthMiddleware(ApiKeyAuthMiddleware):
@@ -863,9 +897,7 @@ class _RagClientAuthMiddleware(ApiKeyAuthMiddleware):
         # oidc_identity pipeline (same registry identity as the user's key,
         # never admin) — the MCP surface needs no separate OIDC step.
         pairs = presented_keys_with_source(scope)
-        identity = _clients.resolve_presented(
-            [k for k, _ in pairs], [via for _, via in pairs]
-        )
+        identity = _clients.resolve_presented([k for k, _ in pairs], [via for _, via in pairs])
         if identity is None:
             from multimodal_rag.utils.mcp_auth import UNAUTHORIZED_BODY
 
@@ -936,8 +968,7 @@ def _resolve_memory_dataset(dataset_name: str | None) -> str:
     if bound:
         if dataset_name and str(dataset_name) != bound:
             raise ToolError(
-                "dataset_name does not match your memory binding — omit the "
-                "argument or update your binding."
+                "dataset_name does not match your memory binding — omit the argument or update your binding."
             )
         return bound
     if dataset_name:
@@ -2177,6 +2208,12 @@ def _format_retrieval_result(
                 "token. Copy them exactly as printed — do not shorten, re-type, "
                 "or substitute the hostname (e.g. do not invent an "
                 "'example.com' variant); doing so breaks the signed link."
+                "\nIf your client environment cannot display these signed URLs "
+                "(an SSO edge may refuse cross-site image fetches from "
+                "non-browser agents), fetch the file's bytes with the "
+                "get_dataset_file_bytes tool instead, decode the base64 payload "
+                "to a local file in your workspace, and embed that file with a "
+                "workspace-relative markdown image."
             )
 
     # -- Append HTML5 audio players for matched audio --
@@ -2830,7 +2867,7 @@ try:
                 next_cursor = page["next_cursor"]
             # D15/D16: a registry-key identity's listing shows ONLY its
             # effective datasets (operator ACL ∪ self-selections) — access
-# isolation is the design: names a key cannot use are hidden, not shown
+            # isolation is the design: names a key cannot use are hidden, not shown
             # for discovery. (The ratified 2026-09-24 ruling REVERSED the
             # earlier discovery-mode flip: users learn dataset names from
             # their grants/admin, not from the listing.)
@@ -2961,7 +2998,9 @@ try:
         def _impl() -> str:
             ident = _current_key_identity()
             if ident is None or ident.is_admin:
-                raise ToolError("select_dataset applies to per-user API keys (registry keys) — admin keys see everything already.")
+                raise ToolError(
+                    "select_dataset applies to per-user API keys (registry keys) — admin keys see everything already."
+                )
             cid = _unlock_client_id()
             # KEPT DELIBERATELY (audit P1-7 disposition): this explicit
             # pre-check covers the NO-password path, which never reaches
@@ -3011,8 +3050,10 @@ try:
             if entry.get("source") == "acl+pw":
                 # ACL-granted, password proven anyway: saved as a password-only
                 # sidecar (the memory-binding case).
-                return (f"Password saved for '{dataset_name}' (already ACL-granted) — "
-                        f"memory tools need no password argument now.")
+                return (
+                    f"Password saved for '{dataset_name}' (already ACL-granted) — "
+                    f"memory tools need no password argument now."
+                )
             protected = " (password saved — no password argument needed on any tool)" if entry.get("password") else ""
             return f"Dataset '{dataset_name}' selected for your key{protected}."
 
@@ -3437,6 +3478,7 @@ try:
             ds_name = _resolve_memory_dataset(dataset_name)
             pw = _resolve_memory_password(password)
             _require_dataset_acl(ds_name)
+            _require_dataset_write(ds_name)  # D26: ro datasets refuse writes
 
             # Auto-tag the opencode session ID if one is available (from a
             # request header, env var, or the caller's metadata).  An explicit
@@ -3687,6 +3729,7 @@ try:
 
         def _impl() -> str:
             dm, ds_name = _memory_tool_dataset(dataset_name, password)
+            _require_dataset_write(ds_name)  # D26: ro datasets refuse deletes
 
             ids = [str(m).strip() for m in (memory_ids or []) if str(m).strip()]
             if not ids:
@@ -3841,6 +3884,7 @@ try:
 
         def _impl() -> str:
             dm, ds_name = _memory_tool_dataset(dataset_name, password)
+            _require_dataset_write(ds_name)  # D26: ro datasets refuse writes
             try:
                 deleted = dm.delete_session_history(ds_name, str(session_id))
             except Exception as exc:
@@ -4136,6 +4180,7 @@ try:
         def _impl() -> str:
             dm = get_manager()
             _require_dataset_acl(dataset_name)
+            _require_dataset_write(dataset_name)  # D26: ro datasets refuse ingest
             try:
                 dm.get_dataset(dataset_name)
             except FileNotFoundError:
@@ -4228,6 +4273,7 @@ try:
         def _impl() -> str:
             dm = get_manager()
             _require_dataset_acl(dataset_name)
+            _require_dataset_write(dataset_name)  # D26: ro datasets refuse deletes
             try:
                 dm.get_dataset(dataset_name)
             except FileNotFoundError:
@@ -4316,6 +4362,7 @@ try:
         def _impl() -> str:
             dm = get_manager()
             _require_dataset_acl(dataset_name)
+            _require_dataset_write(dataset_name)  # D26: ro datasets refuse replace
             try:
                 dm.get_dataset(dataset_name)
             except FileNotFoundError:
@@ -4668,6 +4715,92 @@ try:
 
         return await _offload(_impl)
 
+    @mcp.tool()
+    async def get_dataset_file_bytes(
+        dataset_name: str,
+        file_path: str,
+        password: str | None = None,
+    ) -> str:
+        """Return ONE dataset file's raw bytes as base64 — the way to actually
+        GET a picture/audio/video into the calling agent's hands so it can be
+        displayed or inspected locally.  Companion to ``get_dataset_files``
+        (which lists files and returns metadata + a download URL for binaries
+        but never the bytes themselves): call ``get_dataset_files`` /
+        ``search_dataset`` first to learn the path, then this to fetch bytes.
+        Size-capped (``MCP_FILE_BYTES_MAX``, default 256 KiB — enough for
+        preprocessed image previews, too small to move bulk media); ask for a
+        ``*_preprocessed`` image when one exists, or the original when it is
+        small enough.
+
+        Parameters
+        ----------
+        dataset_name:
+            Name of the dataset.
+        file_path:
+            Relative path of the file inside the dataset (from
+            ``get_dataset_files``).
+        password:
+            Optional if already unlocked (``unlock_dataset`` /
+            ``select_dataset``); required otherwise.  Providing it also
+            unlocks for future calls.
+        """
+
+        def _impl() -> str:
+            import base64
+            import mimetypes
+
+            dm = get_manager()
+            _require_dataset_acl(dataset_name)
+            try:
+                dm.get_dataset(dataset_name)
+            except FileNotFoundError:
+                raise ToolError(f"Dataset '{dataset_name}' not found.")
+            _check_unlocked_or_password(dm, dataset_name, password)
+
+            files_dir = dm._dataset_dir(dataset_name) / "files"
+            target = files_dir / file_path
+            # Resolve to prevent directory traversal (same discipline as
+            # get_dataset_files).
+            try:
+                target = target.resolve()
+                target.relative_to(files_dir.resolve())
+            except ValueError:
+                raise ToolError("Invalid file path.")
+
+            if not target.exists() or not target.is_file():
+                raise ToolError(f"File '{file_path}' not found in dataset '{dataset_name}'.")
+
+            from multimodal_rag.dataset_manager import _classify_file
+
+            file_type = _classify_file(file_path)
+            size = target.stat().st_size
+            max_bytes = _file_bytes_max()
+            if size > max_bytes:
+                raise ToolError(
+                    f"File '{file_path}' is {size} bytes — over the "
+                    f"{max_bytes}-byte tool cap (MCP_FILE_BYTES_MAX). "
+                    "Use the REST API / download URL for bulk media; "
+                    "preprocessed previews usually fit."
+                )
+
+            data = target.read_bytes()
+            encoded = base64.b64encode(data).decode("ascii")
+            mime_type, _ = mimetypes.guess_type(target.name)
+            return json.dumps(
+                {
+                    "dataset": dataset_name,
+                    "file": file_path,
+                    "size_bytes": size,
+                    "type": file_type,
+                    "mime_type": mime_type,
+                    "encoding": "base64",
+                    "data": encoded,
+                },
+                default=str,
+            )
+
+        return await _offload(_impl)
+
 except ImportError:
     logger.error("MCP package not installed. Run: pip install mcp>=1.0.0")
     raise
@@ -4771,7 +4904,7 @@ def main() -> None:
     elif args.transport == "sse":
         mcp_auth_warn_if_open()
         logger.info("Starting MCP SSE server on %s:%s", args.host, args.port)
-        app = mcp.sse_app(transport_security=_mcp_transport_security)
+        app: ASGIApp = mcp.sse_app(transport_security=_mcp_transport_security)
         # SECURITY (audit P1-10): the SSE transport's routes are ``/sse`` and
         # the ``/messages/`` mount — NOT ``/mcp``, which only exists on the
         # streamable-http transport.  The old predicate

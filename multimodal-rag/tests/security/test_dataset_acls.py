@@ -67,11 +67,12 @@ def test_parse_clients_duplicate_key_last_wins():
 
 
 def test_parse_acls_valid_and_star():
+    # D26: grants parse to {dataset: mode} maps (bare tokens = rw).
     assert cr.parse_acls("alice:ds1,ds2;bob:*") == {
-        "alice": frozenset({"ds1", "ds2"}),
-        "bob": frozenset({"*"}),
+        "alice": {"ds1": cr.GRANT_RW, "ds2": cr.GRANT_RW},
+        "bob": {"*": cr.GRANT_RW},
     }
-    assert cr.parse_acls("nobody:") == {"nobody": frozenset()}  # explicit empty = nothing
+    assert cr.parse_acls("nobody:") == {"nobody": {}}  # explicit empty = nothing
     assert cr.parse_acls("") == {}
 
 
@@ -119,9 +120,9 @@ def test_resolve_presented_admin_over_registry(monkeypatch):
     monkeypatch.setenv(cr.ACLS_ENV, "alice:ds1")
     ident = cr.resolve_presented(["admin-key"])
     assert ident is not None and ident.is_admin and ident.datasets is None
-    # registry key → client identity with its grant
+    # registry key → client identity with its grant (D26: grants carry modes)
     ident = cr.resolve_presented(["alice-key"])
-    assert ident == cr.Identity(kind="client", name="alice", datasets=frozenset({"ds1"}))
+    assert ident == cr.Identity(kind="client", name="alice", datasets=frozenset({"ds1"}), grants={"ds1": cr.GRANT_RW})
     assert not ident.is_admin
     # unknown / absent → None
     assert cr.resolve_presented(["wrong"]) is None

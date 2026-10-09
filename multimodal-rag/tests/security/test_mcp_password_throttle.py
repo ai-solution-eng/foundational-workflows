@@ -172,9 +172,7 @@ def _run(coro):
 
 
 def _auth_mw(auth_mod, protected):
-    return auth_mod._RagClientAuthMiddleware(
-        app=None, env_names=auth_mod.AUTH_ENV_NAMES, protected=protected
-    )
+    return auth_mod._RagClientAuthMiddleware(app=None, env_names=auth_mod.AUTH_ENV_NAMES, protected=protected)
 
 
 # ===========================================================================
@@ -384,9 +382,7 @@ def test_auth_gate_streamable_401s_anonymous_mcp(monkeypatch):
 
     status, _, _ = _run(_drive(mw, _scope("/mcp")))
     assert status == 401
-    status, _, _ = _run(
-        _drive(mw, _scope("/mcp", headers=[(b"authorization", f"Bearer {_KEY}".encode())]))
-    )
+    status, _, _ = _run(_drive(mw, _scope("/mcp", headers=[(b"authorization", f"Bearer {_KEY}".encode())])))
     assert status == 200
     # The SSE route is NOT gated on this transport (it does not exist there).
     status, _, _ = _run(_drive(mw, _scope("/sse")))
@@ -401,10 +397,7 @@ def test_wiring_predicates_are_structural_not_add_middleware():
     """
     import inspect
 
-    code_lines = [
-        line.split("#", 1)[0].strip()
-        for line in inspect.getsource(mcp.main).splitlines()
-    ]
+    code_lines = [line.split("#", 1)[0].strip() for line in inspect.getsource(mcp.main).splitlines()]
     code = "\n".join(code_lines)
     assert "add_middleware(" not in code, "middleware must be applied by wrapping the built app"
     assert "protected=_protected_sse_path" in code
@@ -481,9 +474,7 @@ def test_end_to_end_throttle_via_middleware_and_admin_key(monkeypatch, _throttle
     assert captured["cid"] == "10.9.0.1"  # peer identity (admin key → D10 identity)
 
     _run(_drive(mw, _scope("/messages/x", headers=headers), lambda: _gate("wrong")))
-    status, _, captured = _run(
-        _drive(mw, _scope("/messages/x", headers=headers), lambda: _gate("correct-pw"))
-    )
+    status, _, captured = _run(_drive(mw, _scope("/messages/x", headers=headers), lambda: _gate("correct-pw")))
     assert status == 200
     err = captured.get("result")
     assert isinstance(err, mod.ToolError)

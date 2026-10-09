@@ -45,17 +45,33 @@ spec:
             - sh
             - -c
             - |
-              {{- if .Values.redis.password }}
+              {{- /* In user-secret mode the gate is ON unconditionally: the
+                     password (if any) arrives via the envFrom chain below —
+                     user Secret > stored chart value > values seed; empty
+                     everywhere still means --requirepass "" (auth off, the
+                     documented fallback). */ -}}
+              {{- if or .Values.redis.password .Values.modelSecrets.existingSecret }}
               exec redis-server --save "" --appendonly no --requirepass "$REDIS_PASSWORD"
               {{- else }}
               exec redis-server --save "" --appendonly no
               {{- end }}
+          {{- if .Values.modelSecrets.existingSecret }}
+          # Per-key envFrom merge (later source wins): an explicit env
+          # secretKeyRef here would SHADOW the user Secret's REDIS_PASSWORD
+          # and desync the server from the API containers' client password.
+          envFrom:
+            - secretRef:
+                name: {{ .Values.deployment.name }}-model-keys
+            - secretRef:
+                name: {{ .Values.modelSecrets.existingSecret }}
+          {{- else }}
           env:
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.deployment.name }}-model-keys
                   key: REDIS_PASSWORD
+          {{- end }}
           ports:
             - containerPort: {{ .Values.redis.port }}
               name: redis

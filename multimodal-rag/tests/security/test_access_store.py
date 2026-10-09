@@ -62,7 +62,7 @@ def test_store_off_is_inert(monkeypatch):
     assert acc.store_enabled() is False
     assert acc.selections_for(ident) == frozenset()
     assert acc.selection_password(ident, "a") is None
-    assert acc.dataset_allowed(ident, "a") is True   # via ACL
+    assert acc.dataset_allowed(ident, "a") is True  # via ACL
     assert acc.dataset_allowed(ident, "b") is False  # no store → no widening
     with pytest.raises(acc.SelectionDenied):
         acc.select_dataset(ident, "b")
@@ -171,20 +171,26 @@ def test_verify_and_select_password_flow(monkeypatch):
     monkeypatch.setenv(acc.STORE_ENV, "1")
     ident = _client("alice")
     entry = acc.verify_and_select(
-        ident, "secret-ds", "correct",
+        ident,
+        "secret-ds",
+        "correct",
         has_password=lambda n: True,
         verify_password=lambda n, pw: pw == "correct",
     )
     assert entry["password"] == "correct"
     with pytest.raises(ValueError, match="Incorrect password"):
         acc.verify_and_select(
-            ident, "secret-ds", "WRONG",
+            ident,
+            "secret-ds",
+            "WRONG",
             has_password=lambda n: True,
             verify_password=lambda n, pw: pw == "correct",
         )
     with pytest.raises(ValueError, match="password protected"):
         acc.verify_and_select(
-            ident, "secret-ds", None,
+            ident,
+            "secret-ds",
+            None,
             has_password=lambda n: True,
             verify_password=lambda n, pw: pw == "correct",
         )
@@ -386,14 +392,17 @@ def rest_client(monkeypatch, tmp_path):
 
 def test_rest_listing_shows_only_effective_datasets(rest_client):
     """The 2026-09-24 ruling REVERSED discovery mode: the listing shows only
-    the caller's EFFECTIVE datasets (operator grants ∪ self-selections) —
-    access isolation, not name discovery.  With no grants/selections the
-    list is empty (with the honest hidden count)."""
+    the caller's EFFECTIVE datasets (operator grants ∪ self-selections ∪
+    D26 globals) — access isolation, not name discovery.  With no
+    grants/selections the list carries ONLY the global dataset (the 🌐
+    public one is included for every identity, read-only, by the D26
+    fleet ruling) plus the honest hidden count."""
     r = rest_client.get("/api/datasets", headers={"X-RAG-Api-Key": "alice-key"})
     assert r.status_code == 200
-    assert r.json()["datasets"] == []
-    assert r.json()["acl_hidden"] == 2
-    # After a selection the dataset appears in the listing.
+    assert [d["name"] for d in r.json()["datasets"]] == ["public-ds"]
+    assert r.json()["acl_hidden"] == 1
+    # After a selection the same dataset appears (idempotent — selecting a
+    # global records ro and changes nothing about inclusion).
     rest_client.post("/api/datasets/public-ds/select", headers={"X-RAG-Api-Key": "alice-key"})
     r = rest_client.get("/api/datasets", headers={"X-RAG-Api-Key": "alice-key"})
     assert [d["name"] for d in r.json()["datasets"]] == ["public-ds"]
@@ -475,7 +484,7 @@ def test_rest_selections_endpoint_never_returns_passwords(rest_client):
     assert body["enabled"] is True
     entry = body["selections"]["protected-ds"]
     assert entry["has_password"] is True  # boolean flag only…
-    assert "right" not in r.text          # …never the password value itself
+    assert "right" not in r.text  # …never the password value itself
     assert set(entry.keys()) == {"selected_at", "source", "has_password"}
 
 
@@ -500,11 +509,18 @@ def test_rest_select_endpoint_reachable_for_ungranted_datasets(rest_client):
 
 def test_rest_memory_binding_endpoint(rest_client):
     rest_client.post("/api/datasets/public-ds/select", headers={"X-RAG-Api-Key": "alice-key"})
-    r = rest_client.post("/api/access/memory-dataset", json={"dataset": "public-ds"}, headers={"X-RAG-Api-Key": "alice-key"})
-    assert r.status_code == 200
-    assert r.json()["memory_dataset"] == "public-ds"
-    # Binding to an inaccessible dataset is refused.
-    r = rest_client.post("/api/access/memory-dataset", json={"dataset": "protected-ds"}, headers={"X-RAG-Api-Key": "alice-key"})
+    r = rest_client.post(
+        "/api/access/memory-dataset", json={"dataset": "public-ds"}, headers={"X-RAG-Api-Key": "alice-key"}
+    )
+    # D26: public-ds is a GLOBAL dataset (the fixture stamps meta public)
+    # and alice holds no rw grant for it — the ★ binding is the ONE
+    # writable memory store, so a read-only dataset refuses (409).
+    assert r.status_code == 409
+    assert "read-only" in r.json()["detail"].lower()
+    # Binding to an inaccessible dataset is refused too.
+    r = rest_client.post(
+        "/api/access/memory-dataset", json={"dataset": "protected-ds"}, headers={"X-RAG-Api-Key": "alice-key"}
+    )
     assert r.status_code == 409
     # Clear.
     r = rest_client.post("/api/access/memory-dataset", json={}, headers={"X-RAG-Api-Key": "alice-key"})
@@ -588,12 +604,12 @@ def test_public_available_then_excluded_then_reincluded(monkeypatch):
     excluded (gone from the world) -> re-selected (back, password-free)."""
     monkeypatch.setenv(acc.STORE_ENV, "1")
     ident = _client("alice")
-    assert acc.dataset_allowed(ident, "public-ds") is False   # availability only
+    assert acc.dataset_allowed(ident, "public-ds") is False  # availability only
     acc.select_dataset(ident, "public-ds")
     assert acc.dataset_allowed(ident, "public-ds") is True
     acc.deselect_dataset(ident, "public-ds")
     assert acc.dataset_allowed(ident, "public-ds") is False
-    entry = acc.select_dataset(ident, "public-ds")            # password-free again
+    entry = acc.select_dataset(ident, "public-ds")  # password-free again
     assert entry["password"] == ""
     assert acc.dataset_allowed(ident, "public-ds") is True
 
@@ -604,13 +620,16 @@ def test_exclusions_inert_without_store(monkeypatch):
     assert acc.deselect_dataset(ident, "acl-ds") is False
     assert acc.dataset_allowed(ident, "acl-ds") is True  # operator behaviour intact
 
+
 def test_verify_and_select_passes_password_for_acl_granted(monkeypatch):
     """The REST/MCP shared proof flow feeds the password through for
     ACL-granted datasets too (it used to be swallowed by the no-op branch)."""
     monkeypatch.setenv(acc.STORE_ENV, "1")
     ident = _client("andrew", {"andrew-memory"})
     entry = acc.verify_and_select(
-        ident, "andrew-memory", "mempw",
+        ident,
+        "andrew-memory",
+        "mempw",
         has_password=lambda n: True,
         verify_password=lambda n, pw: pw == "mempw",
     )

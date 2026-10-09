@@ -2681,7 +2681,7 @@ class MultimodalRAG:
         # in memory and merged once the count/age threshold fires (or at
         # process exit / SIGTERM), with the actual sidecar write offloaded
         # like every other Qdrant-adjacent I/O on this path.
-        if _bm25_persist_stats(bm25_ctx):
+        if _bm25_persist_stats(bm25_ctx) and bm25_ctx is not None:
             _flush_guard = _store_write_guard(vs)
 
             def _flush_bm25() -> None:

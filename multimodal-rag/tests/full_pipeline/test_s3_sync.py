@@ -116,7 +116,9 @@ def _dm_with(client) -> tuple[DatasetManager, dict[str, Any]]:
     recorded: dict[str, Any] = {"decrements": [], "ingested": [], "force": None}
     dm._decrement_count = lambda name, n, file_type=None: recorded["decrements"].append(n)  # type: ignore[method-assign]
 
-    def _add_files_batch(ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None):
+    def _add_files_batch(
+        ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None
+    ):
         recorded["ingested"].append([name for _, name in file_entries])
         recorded["force"] = set(force_names or ())
         return {"status": "ok", "file_count": len(file_entries), "files": []}
@@ -283,7 +285,9 @@ def _sync_env(
     if prune is not None:
         rs.patch(dm, "_prune_sources", lambda ds, prefixes, expected: prune)
 
-    def _add_files_batch(ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None):
+    def _add_files_batch(
+        ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None
+    ):
         recorded["ingested"].append([name for _, name in file_entries])
         recorded["force"] = set(force_names or ())
         return {"status": "ok", "file_count": len(file_entries), "files": list(batch_files or [])}
@@ -378,7 +382,9 @@ def test_watched_state_new_object_ingests_and_records():
             )
 
             # The batch now reports all three outcomes (two dedup-skips + the new one).
-            def _batch_with_skips(ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None):
+            def _batch_with_skips(
+                ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None
+            ):
                 recorded["ingested"].append([name for _, name in file_entries])
                 return {
                     "status": "ok",
@@ -643,7 +649,9 @@ def test_sync_passes_canonical_source_map_keyed_by_tmp_path():
             rs.patch(dm_module, "_download_url", _dl)
             rs.patch(dm, "_stored_sources", lambda ds, prefixes: set())
 
-            def _capture_batch(ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None):
+            def _capture_batch(
+                ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None
+            ):
                 recorded["entries"] = list(file_entries)
                 recorded["source_urls"] = dict(source_urls or {})
                 return {"status": "ok", "file_count": len(file_entries), "files": []}
@@ -702,7 +710,9 @@ def test_sync_source_map_survives_same_basename_across_prefixes():
             rs.patch(dm_module, "_download_url", _dl)
             rs.patch(dm, "_stored_sources", lambda ds, prefixes: set())
 
-            def _capture_batch(ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None):
+            def _capture_batch(
+                ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None
+            ):
                 recorded["entries"] = list(file_entries)
                 recorded["source_urls"] = dict(source_urls or {})
                 return {"status": "ok", "file_count": len(file_entries), "files": []}

@@ -91,6 +91,15 @@ spec:
                 name: {{ .Values.deployment.name }}-config
             - secretRef:
                 name: {{ .Values.deployment.name }}-model-keys
+            {{- if .Values.modelSecrets.existingSecret }}
+            # User-owned model Secret (modelSecrets.existingSecret) — wired
+            # LAST: every key it carries overrides the chart-managed Secret
+            # and the ConfigMap (K8s merges later envFrom sources over
+            # earlier ones); keys it omits fall back to the seeded/stored
+            # values.  Missing Secret = CreateContainerConfigError (loud).
+            - secretRef:
+                name: {{ .Values.modelSecrets.existingSecret }}
+            {{- end }}
           env:
             - name: RAG_REMOTE
               value: {{ .Values.rag.remote | quote }}
@@ -109,7 +118,10 @@ spec:
             - name: QDRANT_PVC_SIZE
               value: {{ .Values.persistence.qdrant.size | quote }}
             - name: CONFIG_DIR
-              value: "/etc/rag/config:/etc/rag/secrets"
+              # The user-owned model Secret dir goes LAST: the watcher
+              # (model_config.apply_config_dirs) merges dirs in order, later
+              # over earlier — same precedence as envFrom above.
+              value: "/etc/rag/config:/etc/rag/secrets{{ if .Values.modelSecrets.existingSecret }}:/etc/rag/model-keys-user{{ end }}"
             {{- if .Values.security.metricsAuth }}
             # Gate the /metrics exposition behind an API key (scrapers must
             # present X-RAG-Api-Key / X-API-Key / Bearer from the MCP key
@@ -246,6 +258,11 @@ spec:
             - name: rag-model-keys
               mountPath: /etc/rag/secrets
               readOnly: true
+            {{- if .Values.modelSecrets.existingSecret }}
+            - name: rag-model-keys-user
+              mountPath: /etc/rag/model-keys-user
+              readOnly: true
+            {{- end }}
             {{- if .Values.security.oidc.platformCa.configMapName }}
             - name: platform-ca
               mountPath: /etc/platform-ca
@@ -315,6 +332,15 @@ spec:
                 name: {{ .Values.deployment.name }}-config
             - secretRef:
                 name: {{ .Values.deployment.name }}-model-keys
+            {{- if .Values.modelSecrets.existingSecret }}
+            # User-owned model Secret (modelSecrets.existingSecret) — wired
+            # LAST: every key it carries overrides the chart-managed Secret
+            # and the ConfigMap (K8s merges later envFrom sources over
+            # earlier ones); keys it omits fall back to the seeded/stored
+            # values.  Missing Secret = CreateContainerConfigError (loud).
+            - secretRef:
+                name: {{ .Values.modelSecrets.existingSecret }}
+            {{- end }}
           env:
             - name: RAG_REMOTE
               value: {{ .Values.rag.remote | quote }}
@@ -331,7 +357,10 @@ spec:
               value: ""
               {{- end }}
             - name: CONFIG_DIR
-              value: "/etc/rag/config:/etc/rag/secrets"
+              # The user-owned model Secret dir goes LAST: the watcher
+              # (model_config.apply_config_dirs) merges dirs in order, later
+              # over earlier — same precedence as envFrom above.
+              value: "/etc/rag/config:/etc/rag/secrets{{ if .Values.modelSecrets.existingSecret }}:/etc/rag/model-keys-user{{ end }}"
             {{- if .Values.security.existingSecret }}
             # REST API key + media-token secret: provided by a Secret YOU own
             # (security.existingSecret) — overrides the chart-managed Secret.
@@ -471,6 +500,11 @@ spec:
             - name: rag-model-keys
               mountPath: /etc/rag/secrets
               readOnly: true
+            {{- if .Values.modelSecrets.existingSecret }}
+            - name: rag-model-keys-user
+              mountPath: /etc/rag/model-keys-user
+              readOnly: true
+            {{- end }}
             {{- if .Values.security.oidc.platformCa.configMapName }}
             - name: platform-ca
               mountPath: /etc/platform-ca
@@ -516,6 +550,13 @@ spec:
         - name: rag-model-keys
           secret:
             secretName: {{ .Values.deployment.name }}-model-keys
+        {{- if .Values.modelSecrets.existingSecret }}
+        # User-owned model Secret (see envFrom note) — mounted so the
+        # CONFIG_DIR watcher hot-reloads its keys too (<=15s, no rollout).
+        - name: rag-model-keys-user
+          secret:
+            secretName: {{ .Values.modelSecrets.existingSecret }}
+        {{- end }}
         {{- if .Values.persistence.qdrant.mountReadOnly }}
         - name: qdrant-data
           persistentVolumeClaim:

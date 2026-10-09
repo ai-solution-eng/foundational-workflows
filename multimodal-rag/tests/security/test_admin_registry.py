@@ -233,7 +233,8 @@ def test_rest_registry_key_cannot_mint(admin_client):
 
 def test_rest_listing_masks_key_material(admin_client):
     admin_client.post(
-        "/api/admin/clients", json={"name": "alice", "datasets": []},
+        "/api/admin/clients",
+        json={"name": "alice", "datasets": []},
         headers={"X-RAG-Api-Key": "deployment-key"},
     )
     r = admin_client.get("/api/admin/clients", headers={"X-RAG-Api-Key": "deployment-key"})
@@ -249,13 +250,15 @@ def test_rest_listing_masks_key_material(admin_client):
 
 def test_rest_grant_patch_and_revoke(admin_client):
     r = admin_client.post(
-        "/api/admin/clients", json={"name": "bob", "datasets": []},
+        "/api/admin/clients",
+        json={"name": "bob", "datasets": []},
         headers={"X-RAG-Api-Key": "deployment-key"},
     )
     bob_key = r.json()["key"]
     # Grant, then verify the key's access flips on the next request.
     r = admin_client.patch(
-        "/api/admin/clients/bob", json={"datasets": ["reports"]},
+        "/api/admin/clients/bob",
+        json={"datasets": ["reports"]},
         headers={"X-RAG-Api-Key": "deployment-key"},
     )
     assert r.status_code == 200
@@ -280,26 +283,24 @@ def test_rest_admin_endpoints_require_admin(admin_client, monkeypatch):
     monkeypatch.delenv("RAG_API_KEY_CLIENTS", raising=False)
     # A registry key (minted via the admin) cannot even list.
     admin_client.post(
-        "/api/admin/clients", json={"name": "alice", "datasets": []},
+        "/api/admin/clients",
+        json={"name": "alice", "datasets": []},
         headers={"X-RAG-Api-Key": "deployment-key"},
     )
     # (covered by test_rest_registry_key_cannot_mint; here: the overlay-off case)
     monkeypatch.setenv("RAG_ACCESS_STORE", "0")
     r = admin_client.get("/api/admin/clients", headers={"X-RAG-Api-Key": "deployment-key"})
     assert r.status_code == 409
-    r = admin_client.post(
-        "/api/admin/clients", json={"name": "x"}, headers={"X-RAG-Api-Key": "deployment-key"}
-    )
+    r = admin_client.post("/api/admin/clients", json={"name": "x"}, headers={"X-RAG-Api-Key": "deployment-key"})
     assert r.status_code == 409
 
 
 def test_rest_mint_validation_errors(admin_client):
-    r = admin_client.post(
-        "/api/admin/clients", json={"name": "bad name!"}, headers={"X-RAG-Api-Key": "deployment-key"}
-    )
+    r = admin_client.post("/api/admin/clients", json={"name": "bad name!"}, headers={"X-RAG-Api-Key": "deployment-key"})
     assert r.status_code == 400
     r = admin_client.post(
-        "/api/admin/clients", json={"name": "ok", "datasets": "not-a-list"},
+        "/api/admin/clients",
+        json={"name": "ok", "datasets": "not-a-list"},
         headers={"X-RAG-Api-Key": "deployment-key"},
     )
     assert r.status_code == 400
@@ -359,9 +360,7 @@ def test_delegation_registry_key_never_escalates_to_admin(monkeypatch):
 def test_delegation_x_api_key_can_carry_admin_key(monkeypatch):
     """X-API-Key presenting the deployment key itself = a legitimate admin
     presentation (de-escalation path is optional, not mandatory)."""
-    ident = cr.resolve_presented(
-        ["deployment-key"], ["x-api-key"]
-    ) if False else None
+    ident = cr.resolve_presented(["deployment-key"], ["x-api-key"]) if False else None
     # (deployment-key admin matching is exercised via _RAG_API_KEY paths
     # elsewhere; here pin the source-aware admin matching helper.)
     monkeypatch.setenv("RAG_API_KEY_CLIENTS", "andrew:andrew-key")

@@ -46,11 +46,18 @@ spec:
                 name: {{ .Values.deployment.name }}-config
             - secretRef:
                 name: {{ .Values.deployment.name }}-model-keys
+            {{- if .Values.modelSecrets.existingSecret }}
+            # User-owned model Secret (modelSecrets.existingSecret) — wired
+            # LAST: every key it carries overrides the chart-managed Secret
+            # (the batcher needs the embedder key/URL overrides most).
+            - secretRef:
+                name: {{ .Values.modelSecrets.existingSecret }}
+            {{- end }}
           env:
             - name: RAG_REMOTE
               value: {{ .Values.rag.remote | quote }}
             - name: CONFIG_DIR
-              value: "/etc/rag/config:/etc/rag/secrets"
+              value: "/etc/rag/config:/etc/rag/secrets{{ if .Values.modelSecrets.existingSecret }}:/etc/rag/model-keys-user{{ end }}"
             # Never route to ourselves (would recurse).
             - name: RAG_EMBED_BATCH_URL
               value: ""
@@ -68,6 +75,11 @@ spec:
             - name: rag-model-keys
               mountPath: /etc/rag/secrets
               readOnly: true
+            {{- if .Values.modelSecrets.existingSecret }}
+            - name: rag-model-keys-user
+              mountPath: /etc/rag/model-keys-user
+              readOnly: true
+            {{- end }}
             - name: tmp
               mountPath: /tmp
           resources: {{ toYaml .Values.resources.embedBatcher | nindent 12 }}
@@ -99,6 +111,11 @@ spec:
         - name: rag-model-keys
           secret:
             secretName: {{ .Values.deployment.name }}-model-keys
+        {{- if .Values.modelSecrets.existingSecret }}
+        - name: rag-model-keys-user
+          secret:
+            secretName: {{ .Values.modelSecrets.existingSecret }}
+        {{- end }}
         - name: tmp
           emptyDir: {}
 ---

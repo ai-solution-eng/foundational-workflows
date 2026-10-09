@@ -349,7 +349,7 @@ def test_atexit_flush_registered_and_runs(tmp_path: Path | None = None) -> None:
     """
 
     tmp = tempfile.TemporaryDirectory() if tmp_path is None else None
-    base = Path(tmp.name) if tmp is not None else Path(tmp_path)
+    base = Path(tmp.name) if tmp is not None else Path(tmp_path)  # type: ignore[arg-type]  # tmp_path is non-None whenever tmp is None
     try:
         _run_atexit_check(base)
     finally:
@@ -439,7 +439,7 @@ def test_sigterm_handler_flushes_and_keeps_exit_status(tmp_path: Path | None = N
     """
 
     tmp = tempfile.TemporaryDirectory() if tmp_path is None else None
-    base = Path(tmp.name) if tmp is not None else Path(tmp_path)
+    base = Path(tmp.name) if tmp is not None else Path(tmp_path)  # type: ignore[arg-type]  # tmp_path is non-None whenever tmp is None
     try:
         _run_sigterm_check(base)
     finally:

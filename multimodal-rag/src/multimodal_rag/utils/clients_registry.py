@@ -47,6 +47,14 @@ ACLS_ENV = "RAG_DATASET_ACLS"
 REST_API_KEY_ENV = "RAG_API_KEY"
 ALL_DATASETS = "*"
 
+# D26 grant modes. A grant is either rw (read+write — the historical default,
+# byte-compatible) or ro (read-only: list/read/search/select/bind only; every
+# document/memory WRITE refuses). Modes travel with the credential exactly
+# like the grant itself — a key holder can never widen ro to rw.
+GRANT_RO = "ro"
+GRANT_RW = "rw"
+_GRANT_MODES = (GRANT_RO, GRANT_RW)
+
 
 class ClientConfigError(ValueError):
     """A malformed RAG_API_KEY_CLIENTS / RAG_DATASET_ACLS entry (fail loud)."""
@@ -64,11 +72,22 @@ class Identity(NamedTuple):
     ``name``  — registry entry name for clients, ``None`` for admins.
     ``datasets`` — frozenset of allowed dataset names; ``None`` = unrestricted
                 (admins).  An empty frozenset = NO datasets (fail-closed).
+    ``grants``  — D26: ``{dataset_name: mode}`` for the SAME dataset set
+                (``mode`` is :data:`GRANT_RO` or :data:`GRANT_RW`) — or
+                ``None`` = unrestricted/unmodelled (admins, and any caller
+                constructed before modes existed; ``grant_mode`` treats a
+                missing entry or a ``None`` map as rw).  The ``datasets``
+                frozenset REMAINS the authoritative inclusion set — every
+                existing predicate (``dataset_allowed``, listings, the
+                middleware) keeps reading it; only the WRITE gate consults
+                ``grants``.  A frozenset-built identity (all pre-D26 tests)
+                resolves to all-rw.
     """
 
     kind: str
     name: str | None
     datasets: frozenset | None
+    grants: "frozenset | dict | None" = None
 
     @property
     def is_admin(self) -> bool:
@@ -106,13 +125,29 @@ def parse_clients(raw: str) -> dict:
 
 
 def parse_acls(raw: str) -> dict:
-    """Parse ``RAG_DATASET_ACLS`` into ``{name: frozenset(datasets)}``.
+    """Parse ``RAG_DATASET_ACLS`` into ``{name: {dataset: mode}}``.
 
-    Entries are ';'-separated: ``name:ds1,ds2`` — the special dataset ``*``
-    grants everything; an entry with an empty dataset list (``name:``) grants
-    nothing.  Names with NO entry get no datasets (fail-closed).
+    Entries are ';'-separated.  D26 accepted dataset-token forms:
+
+    * ``ds1``          — rw (the historical form, byte-compatible)
+    * ``ds1:rw``       — explicit rw
+    * ``ds1:ro``       — READ-ONLY: every write surface refuses for it
+    * ``*``            — rw all (historical)
+    * ``*:ro``         — ro all (globals stay writable only via explicit
+                          per-dataset rw tokens)
+
+    A bare ``name:ds1,ds2`` list (no ``:mode`` suffixes) keeps the exact
+    historical meaning — all-rw.  The ``:ro``/``:rw`` suffix is only taken
+    when it is EXACTLY one of the two mode words (a dataset literally named
+    ``weird:rw``-shaped names cannot occur — dataset names never contain
+    ``:``, enforced by ``_validate_dataset_token``-equivalents at creation
+    and by the name regex everywhere else).  Malformed entries raise
+    ``ClientConfigError`` at import — the fail-loud convention (a typo'd
+    registry must never silently degrade to "no ACLs enforced").
+
+    Names with NO entry get no datasets (fail-closed).
     """
-    acls: dict[str, frozenset] = {}
+    acls: dict[str, dict] = {}
     raw = (raw or "").strip()
     if not raw:
         return acls
@@ -124,8 +159,31 @@ def parse_acls(raw: str) -> dict:
         name = name.strip()
         if not sep or not name:
             raise ClientConfigError(f"invalid ACL entry {chunk!r} in {ACLS_ENV}: expected name:dataset[,dataset...]")
-        datasets = frozenset(d.strip() for d in datasets_raw.split(",") if d.strip())
-        acls[name] = datasets
+        grants: dict[str, str] = {}
+        for token in datasets_raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            # D26: an exact ":ro"/":rw" suffix on a token carries the mode.
+            # One partition only — a dataset NAME can never contain ':' so
+            # there is nothing to mis-split, and an empty base ('':ro'')
+            # is rejected by the name check below.
+            base, msep, mode = token.partition(":")
+            base = base.strip()
+            if not base:
+                raise ClientConfigError(f"invalid ACL entry {chunk!r} in {ACLS_ENV}: empty dataset token {token!r}")
+            if not msep:
+                grants[base] = GRANT_RW
+            elif mode == GRANT_RO:
+                grants[base] = GRANT_RO
+            elif mode == GRANT_RW:
+                grants[base] = GRANT_RW
+            else:
+                raise ClientConfigError(
+                    f"invalid ACL entry {chunk!r} in {ACLS_ENV}: unknown mode {mode!r} "
+                    f"on token {token!r} (expected 'ro' or 'rw')"
+                )
+        acls[name] = grants
     return acls
 
 
@@ -157,12 +215,16 @@ def registry_clients() -> dict:
 
 
 def dataset_acls() -> dict:
-    """``{name: frozenset(datasets)}`` (re-read per request).
+    """``{name: {dataset: mode}}`` (re-read per request).
 
     D17: env ACLs are UNIONED per name with the overlay's grants (an overlay
     client with no env entry is added wholesale; a name in BOTH keeps the
-    union — neither source can silently revoke the other).  Disabled overlay
-    → exactly the env parse.
+    union — neither source can silently revoke the other).  D26 modes merge
+    by dataset with the STRONGEST restriction winning across sources: env rw
+    ∪ overlay ro ⇒ ro; env ro ∪ overlay rw ⇒ ro (an operator ro is a floor
+    the admin panel cannot silently lift, mirroring the D17 union rule that
+    neither source silently revokes the other).  Disabled overlay → exactly
+    the env parse.
     """
     env = parse_acls(os.environ.get(ACLS_ENV, ""))
     try:
@@ -171,10 +233,15 @@ def dataset_acls() -> dict:
         overlay = admin_registry.overlay_acls()
     except Exception:
         return env
-    merged = {name: set(ds) for name, ds in env.items()}
+    merged = {name: dict(ds) for name, ds in env.items()}
     for name, ds in overlay.items():
-        merged.setdefault(name, set()).update(ds)
-    return {name: frozenset(ds) for name, ds in merged.items()}
+        target = merged.setdefault(name, {})
+        for ds_name, mode in ds.items():
+            if target.get(ds_name) == GRANT_RW and mode == GRANT_RO:
+                target[ds_name] = GRANT_RO
+            else:
+                target.setdefault(ds_name, mode)
+    return merged
 
 
 def registry_configured() -> bool:
@@ -299,11 +366,7 @@ def resolve_presented(presented: list, presenters: "list | None" = None) -> "Ide
             # Delegation mode: the X-API-Key candidate IS the caller's
             # chosen identity — resolve on it alone (never escalate to
             # admin from the co-forwarded Authorization token).
-            return (
-                _resolve_registry_only(xkey)
-                or _resolve_jwt_candidates(xkey)
-                or _admin_identity_for(xkey)
-            )
+            return _resolve_registry_only(xkey) or _resolve_jwt_candidates(xkey) or _admin_identity_for(xkey)
     admins = admin_keys()
     if admins and _match(presented, admins):
         return Identity(kind="admin", name=None, datasets=None)
@@ -322,8 +385,7 @@ def resolve_presented(presented: list, presenters: "list | None" = None) -> "Ide
             candidate = str(name).strip()
             if not candidate:
                 continue
-            acls = dataset_acls().get(candidate, frozenset())
-            return Identity(kind="client", name=candidate, datasets=frozenset(acls))
+            return _client_identity_for(candidate)
     return _resolve_registry_only(presented) or _resolve_jwt_candidates(presented)
 
 
@@ -364,9 +426,21 @@ def _resolve_registry_only(candidates: list) -> "Identity | None":
     for candidate in candidates:
         for key, name in clients.items():
             if hmac.compare_digest(candidate.encode("utf-8"), key.encode("utf-8")):
-                acls = dataset_acls().get(name, frozenset())
-                return Identity(kind="client", name=name, datasets=frozenset(acls))
+                return _client_identity_for(name)
     return None
+
+
+def _client_identity_for(name: str) -> Identity:
+    """The registry identity for one name (D26): grants carry modes,
+    ``datasets`` stays the flat inclusion frozenset every legacy predicate
+    reads."""
+    grants = dataset_acls().get(name, {})
+    return Identity(
+        kind="client",
+        name=name,
+        datasets=frozenset(grants),
+        grants=dict(grants),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +489,7 @@ _public_meta_lock = threading.Lock()
 _CREATED_BY_CACHE: dict[str, tuple[int, int, "str | None"]] = {}
 _created_by_lock = threading.Lock()
 
+
 def is_public_dataset(dataset_name: str) -> bool:
     """True when *dataset_name* is stamped "public" in its meta.json.
 
@@ -437,9 +512,7 @@ def is_public_dataset(dataset_name: str) -> bool:
         is_public = False
         try:
             meta = json.loads(path.read_text(encoding="utf-8"))
-            is_public = bool(
-                isinstance(meta, dict) and meta.get("public") and not meta.get("password_hash")
-            )
+            is_public = bool(isinstance(meta, dict) and meta.get("public") and not meta.get("password_hash"))
         except (json.JSONDecodeError, OSError):
             is_public = False
         with _public_meta_lock:
@@ -484,6 +557,7 @@ def created_by_dataset(dataset_name: str) -> "str | None":
         _CREATED_BY_CACHE.pop(key, None)
     return None
 
+
 def dataset_allowed(identity: "Identity | None", dataset_name: str) -> bool:
     """May *identity* touch *dataset_name*?
 
@@ -507,6 +581,64 @@ def require_dataset_access(identity: "Identity | None", dataset_name: str) -> No
         return
     raise DatasetAccessDenied(
         f"Dataset '{dataset_name}' is not permitted for this API key (dataset ACLs are configured — D15)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# D26 write gate — grant modes
+# ---------------------------------------------------------------------------
+
+
+def grant_mode(identity: "Identity | None", dataset_name: str) -> "str | None":
+    """The caller's effective D26 mode for *dataset_name*, or ``None``.
+
+    ``None`` means "no mode semantics for this caller" — the write gate
+    must ALLOW (byte-identical default):
+
+    * ``identity is None`` (D15/D26 inactive — single-user, store-off);
+    * an ADMIN identity (deployment keys / MCP keyset — D23's "admin full
+      power" principle; modes are a registry-identity concept);
+    * an identity with ``grants is None`` or an entry missing for an
+      otherwise-allowed dataset (a frozenset-built identity — every
+      pre-D26 construction site and test — resolves all-rw).
+
+    Otherwise the mode of the MOST SPECIFIC grant wins: an explicit
+    per-dataset entry outranks the ``*`` wildcard in either direction
+    (``*:ro`` + ``ds1:rw`` ⇒ ds1 is rw; ``*:rw`` + ``ds1:ro`` ⇒ ds1 is ro).
+    """
+    if identity is None or identity.is_admin:
+        return None
+    grants = identity.grants
+    if not isinstance(grants, dict):
+        return None
+    specific = grants.get(dataset_name)
+    if specific in _GRANT_MODES:
+        return specific
+    wildcard = grants.get(ALL_DATASETS)
+    if wildcard in _GRANT_MODES:
+        return wildcard
+    return None
+
+
+def dataset_write_allowed(identity: "Identity | None", dataset_name: str) -> bool:
+    """May *identity* WRITE to *dataset_name*? (D26 — the ro gate.)
+
+    True unless the caller resolves to an explicit ``ro`` mode
+    (:func:`grant_mode` returns ``GRANT_RO``).  Everything else — admin,
+    identity-less, pre-D26 grants, rw — writes as before.  Callers layer
+    their EXISTING gates on top (dataset manage stays ``*``/owner-or-admin;
+    document writes stay ACL-inclusion-checked first); this predicate adds
+    ONLY the mode check.
+    """
+    return grant_mode(identity, dataset_name) != GRANT_RO
+
+
+def require_dataset_write(identity: "Identity | None", dataset_name: str) -> None:
+    """Raise :class:`DatasetAccessDenied` when the caller's mode is ro."""
+    if dataset_write_allowed(identity, dataset_name):
+        return
+    raise DatasetAccessDenied(
+        f"Dataset '{dataset_name}' is read-only for this API key (a ro grant cannot be written — D26)."
     )
 
 

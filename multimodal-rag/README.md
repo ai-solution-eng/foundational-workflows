@@ -19,7 +19,7 @@ End-to-end multimodal retrieval-augmented generation: ingest documents in 17+ fo
 - **Modality conversion** — retrieved media the LLM doesn't support is auto-converted (images/video → VLM description, audio → ASR transcript)
 - **Dataset management** — password-protected datasets, per-dataset Qdrant collections, dedup (cosine ≥ 0.995), S3/HTTP URL ingestion with sync reconciliation
 - **Watched S3 sources** (opt-in) — a reconciler CronJob keeps datasets in sync with S3/MinIO prefixes on a schedule: new/changed objects ingest, objects deleted upstream are pruned, unchanged objects are skipped via a per-dataset ETag/Size state (no re-download)
-- **MCP server** — 19 tools (search, federated search, list, document management add/delete/replace, self-service dataset selection + ★ memory binding, recall + memory management, describe media, transcribe audio) over streamable-http / stdio / sse
+- **MCP server** — 20 tools (search, federated search, list, document management add/delete/replace, file-bytes fetch, self-service dataset selection + ★ memory binding, recall + memory management, describe media, transcribe audio) over streamable-http / stdio / sse
 - **Long-term memory** — per-user LLM-curated memory store for opencode and Open WebUI, with SSO-backed isolation
 - **Open WebUI extension** — filter that routes unsupported modalities to the RAG MCP tool, plus inlet/outlet memory hooks
 - **Helm chart** — 2-container pod (API + MCP sidecar), Qdrant StatefulSet, Istio/EZUA ingress with oauth2-proxy
@@ -61,8 +61,8 @@ Both the API server and MCP server connect to the same Qdrant instance and share
 |---|---|
 | **[USAGE.md](USAGE.md)** | HTML frontend usage + programmatic Python API |
 | **[documentation/API.md](documentation/API.md)** | REST API reference with `curl`/Python examples — create datasets, add/delete files |
-| **[documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md)** | Build the image, install the helm chart, verify, troubleshoot |
-| **[documentation/MCP.md](documentation/MCP.md)** | All 19 MCP tools + connection configs for opencode, Claude Desktop, OWUI, stdio |
+| **[documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md)** | Import the chart, set values in the PCAI *Helm Values* editor (G2 vs hosted-trial profiles, the ordered SSO stack), verify, troubleshoot |
+| **[documentation/MCP.md](documentation/MCP.md)** | All 20 MCP tools + connection configs for opencode, Claude Desktop, OWUI, stdio |
 | **[documentation/MEMORY.md](documentation/MEMORY.md)** | Long-term memory setup per client (opencode + Open WebUI), multi-user isolation, operations |
 | **[documentation/FEATURES.md](documentation/FEATURES.md)** | Deep technical reference: every format, chunking strategy, embedding, reranking, storage |
 | **[documentation/AGENTS.md](documentation/AGENTS.md)** | opencode agent policy: when to recall / write memories |
@@ -114,6 +114,8 @@ The charts ship auth **on by default** (`security.apiKey` / `mediaTokenSecret` a
 | `QUERY_EMB_CACHE_MAX`, `FILE_HASH_CACHE_MAX`, `ASR_TRANSCRIPT_CACHE_MAX`, `UNLOCK_CACHE_MAX` | Bounded sizes for the in-process caches (query vectors are stored packed — `array('f')`). | 4096 / 4096 / 512 / 4096 |
 | `RAG_TRUST_PROXY_IDENTITY` | Trust the auth proxy's identity headers (`X-Auth-Request-*`/`X-Email`/`X-User`) — and, when no identity header is present, the `X-Forwarded-For` chain — as the per-caller unlock-cache/throttle identity (decision D10). Keep **off** unless an enforcing auth proxy overwrites these headers on every request — otherwise clients can spoof them to hijack unlocks or rotate identities past the throttle. Direct (no proxy) deployments don't need it: the socket peer is the identity. | `false` (socket peer; charts default `true`) |
 | `RAG_METRICS_AUTH` | Require an API key on `/metrics` (accepted: `X-RAG-Api-Key` / `X-API-Key` / `Authorization: Bearer`, validated against `RAG_API_KEY` + the MCP key set). For in-cluster scrapers pair with the chart's `metrics.serviceMonitorBearerSecret`. | `false` (public in-cluster exposition, unchanged) |
+| `RAG_INSPECTOR_MCP_URL` | **Decision D27 — the SPA's Inspector tab.** MCP endpoint the browser tab proxies tool calls through (default `http://127.0.0.1:9090/mcp` — the chart's sidecar topology; no chart changes needed). The proxy forwards the session's own credential envelope re-expressed for the MCP surface (`X-API-Key` / `Authorization: Bearer` / `X-Auth-Request-Access-Token`); trusted-proxy identity sessions have no forwardable secret. | sidecar `http://127.0.0.1:9090/mcp` |
+| `RAG_INSPECTOR_TIMEOUT_S` | Per-call timeout for the Inspector's proxied MCP request (tool calls embed and search). Read per request. | `300` |
 | `QDRANT_CLIENT_TIMEOUT` | Hard timeout (s) for sync Qdrant calls, so a hung Qdrant cannot pin `sync_pool`/`qdrant-io` threads forever. | unset (no timeout; charts set 30) |
 | `QDRANT_POOL_SIZE` / `MEDIA_POOL_SIZE` | Dedicated thread-pool sizes for Qdrant I/O (batched searches, upserts) and ffmpeg/media work — kept off the event loop and out of the default executor. Size `QDRANT_POOL_SIZE` comfortably above the concurrent searches a single process serves — it is the Qdrant-side bottleneck under saturation. | 4 / 2 (charts wire 16) |
 | `EMBEDDING_QUERY_IDLE_WAIT_MS` (+ `EMBEDDING_QUERY_IDLE_MAX_BATCH`) | Opt-in idle early-flush for the embedding query batchers: a **small, stalled** queue (≤ `IDLE_MAX_BATCH`, default 2) flushes after `IDLE_WAIT_MS` instead of the full `EMBEDDING_QUERY_BATCH_WAIT_MS` window, cutting interactive-search latency ~4x. A growing queue (any burst) always waits for the window/cap — burst batching is structurally untouched. **Default 0 (disabled)** — the unguarded v1 (10ms, no batch guard) was benchmark-convicted: it shattered batches at load and collapsed throughput. Enable only after a benchmark pass. | 0 (disabled) |
@@ -126,9 +128,9 @@ The charts ship auth **on by default** (`security.apiKey` / `mediaTokenSecret` a
 | `RAG_CONTEXTUAL_DIGEST_CHARS` | Size of the document excerpt (chars) in the shared prompt preamble — stable per document so the serving engine's prefix cache absorbs it across a document's chunks. | 512 |
 | `RAG_RERANK_MEDIA_LITE` | Wave-4 media-lite rerank: the reranker scores candidates on their text/caption representation — the candidate pool is fetched WITHOUT the heavy tier-3 base64 `image`/`video` payloads, and the full payloads are back-filled onto the surviving top_k docs only (one point-retrieve after scoring). Combined with the rerank over-fetch (`max(top_k, 4 × reranker_top_k)` candidates scored instead of `top_k`; output size unchanged). Set `false` to restore full-media scoring (every fetched candidate carries its base64 to the reranker — pre-Wave-4, much heavier transfer for media-heavy datasets). | `true` (media-lite) |
 | `RAG_WEBHOOK_URL` (+ `RAG_WEBHOOK_SECRET` / `RAG_WEBHOOK_TIMEOUT`) | **Ingest webhooks (opt-in, Wave-5).** When set, every completed ingest (REST or MCP: raw documents, single file, batch files, URL/S3 batches) POSTs one small JSON event to the URL — `{"dataset", "doc_count", "status", "timestamp"}` with header `X-RAG-Webhook-Secret` when `RAG_WEBHOOK_SECRET` is set. The POST is timeout-capped (`RAG_WEBHOOK_TIMEOUT`, default 5.0 s, clamped ≥ 0.1) and **failures are logged, never fatal** — a dead receiver cannot fail an ingest that already succeeded. Dataset restore/import replays are muted (one logical ingest, not one event per batch). Unset (default) = zero behaviour: no request, no latency, no log line. For the chart, pass via `extraEnv` (the values are not secrets, but treat the webhook URL as semi-sensitive). | unset (off) |
-| `RAG_API_KEY_CLIENTS` (+ `RAG_DATASET_ACLS`) | **Decision D15 — multi-user API keys → dataset ACLs (explicitly OPT-IN; enabling changes the auth model).** `RAG_API_KEY_CLIENTS="name:key;name:key"` (parsed like `K8S_MCP_CLIENTS`; keys must not contain `:` or `;`) mints per-user keys accepted by BOTH the REST and MCP surfaces; `RAG_DATASET_ACLS="name:ds1,ds2;name2:*"` binds each name to its datasets (`*` = all). A registry key matching NO ACL entry gets **NO datasets (fail-closed)**; dataset access (list/read/search/unlock/manage) is enforced per identity on both surfaces, per-key unlock caches and password-throttle buckets ride the D10 per-identity machinery (`key:<name>`), federated search restricts its fan-out to granted datasets, and ACL'd keys cannot reach `/api/admin/*` nor create datasets (unless granted `*`). The plain deployment keys — `RAG_API_KEY` plus the MCP key set (`MCP_API_KEYS` / `RAG_API_KEYS`) — keep FULL (admin) access. **Default (registry unset): today's single-key behaviour, byte-identical.** Env re-read per request (rotation without restart). Chart wiring: `mcp.apiKeyClients` / `mcp.datasetAcls` — rendered ONLY when set; the values are key material, pass them from a Secret pipeline. | unset (single-key, unchanged) |
+| `RAG_API_KEY_CLIENTS` (+ `RAG_DATASET_ACLS`) | **Decision D15 — multi-user API keys → dataset ACLs (explicitly OPT-IN; enabling changes the auth model).** `RAG_API_KEY_CLIENTS="name:key;name:key"` (parsed like `K8S_MCP_CLIENTS`; keys must not contain `:` or `;`) mints per-user keys accepted by BOTH the REST and MCP surfaces; `RAG_DATASET_ACLS="name:ds1,ds2;name2:*"` binds each name to its datasets (`*` = all). **Since D26 (2026-10) the ACL also carries per-dataset write modes:** the token form `name:ds1:ro,ds2:rw,ds3` grants `ds1` read-only (the token after the second colon pair is `ro`/`rw`; a bare token = rw, and the legacy `name:ds1,ds2` form means rw everywhere — existing values are byte-compatible, no migration); on an ro dataset the read surfaces work but every write path (MCP `dataset_add_documents`/`dataset_delete_documents`/`dataset_replace_document`/`add_memory`/`delete_memory`/`forget_session`, REST document ingest/delete and the dataset-manage endpoints) is refused; malformed entries still raise `ClientConfigError` at import (fail-loud). Precedence across sources is strongest-restriction-wins (env rw ∪ overlay ro ⇒ ro; an explicit per-dataset ro in any source overrides a `*` rw; `*` is rw-all unless a `*:ro` token downgrades it) — see the D26 subsection below. A registry key matching NO ACL entry gets **NO datasets (fail-closed)**; dataset access (list/read/search/unlock/manage) is enforced per identity on both surfaces, per-key unlock caches and password-throttle buckets ride the D10 per-identity machinery (`key:<name>`), federated search restricts its fan-out to granted datasets, and ACL'd keys cannot reach `/api/admin/*` nor create datasets (unless granted `*`). The plain deployment keys — `RAG_API_KEY` plus the MCP key set (`MCP_API_KEYS` / `RAG_API_KEYS`) — keep FULL (admin) access. **Default (registry unset): today's single-key behaviour, byte-identical.** Env re-read per request (rotation without restart). Chart wiring: `mcp.apiKeyClients` / `mcp.datasetAcls` — rendered ONLY when set; the values are key material, pass them from a Secret pipeline. | unset (single-key, unchanged) |
 | `RAG_ACCESS_STORE` (+ `RAG_ACCESS_DENY_SELECT` / `RAG_MEMORY_DEFAULT`) | **Decision D16 — self-service dataset selection + per-identity access store (OPT-IN; requires D15 registry keys to be useful).** `RAG_ACCESS_STORE=1` enables the /access page's checkbox model: registry keys SELECT their own datasets — public ones freely, protected ones only with the correct password, which is then saved per identity (`{DATA_PATH}/access/<name>.json`, 0600, shared PVC) so every REST/MCP call works password-free; `list_datasets` shows only a key's EFFECTIVE datasets (grants ∪ selections — access isolation, no name discovery). Effective access = operator ACL ∪ selections (the ACL is a floor). `RAG_ACCESS_DENY_SELECT="ds1,ds2"` datasets refuse self-selection outright; `RAG_MEMORY_DEFAULT` is the deployment-wide fallback memory dataset (resolution order: arg → header → the caller's ★ binding → this → `MEMORY_DATASET`). MCP tools: `select_dataset` / `deselect_dataset` / `set_memory_dataset`. **Default (off): byte-identical D15 behaviour** — ACL'd names only, fail-closed, selection endpoints 409. Env re-read per request. Chart wiring: `security.accessStore` (chart default `true` — the base-chart render always carries the key; set `false` to opt out) / `security.accessDenySelect` / `security.memoryDefault` — the latter two rendered ONLY when set. | chart default: on (`accessStore: true`); raw env default off |
-| `RAG_ACCESS_SELF_MINT` | **Decision D25 — SSO self-mint (opt-in).** When truthy, an SSO-authenticated identity (a verified D21 Bearer JWT, a D22 SSO session cookie, or a D24 trusted-proxy identity header) may mint — and deliberately rotate — a long-lived API key for **its own** registry identity from the /access page, closing the loop D21 left open: JWT-only sign-in worked but the key still required the D17 admin panel. Hard guarantees: the minted key carries exactly the identity's existing access (self-mint **never** creates or widens dataset grants — the name comes from the verified identity, never user input); minting stays impossible for API-key-authenticated callers (403 — a registry key can never mint, the D17 invariant); env-authoritative and `blocked` names are refused; the key is shown exactly once and rotation kills the old key immediately. Endpoints: `GET /api/access/key` (owner-safe masked view) and `POST /api/access/mint-key` (optional `{"rotate": true}`); the whoami `flags` gains `self_mint` (the anonymous shape is unchanged). Enabling only makes sense with `security.oidc.enabled` (or `trustProxyIdentity` on G2) — there is no SSO identity to mint for otherwise. Read per request: flip without restart. **Default unset: byte-identical behaviour** (the mint endpoint 409s, the flag reads false). Chart wiring: `security.accessSelfMint` in all three charts — rendered ONLY when `true` (default render byte-identical). See the D25 subsection below. | disabled |
+| `RAG_ACCESS_SELF_MINT` | **Decision D25 — SSO self-mint (chart-default ON; opt out with `security.accessSelfMint: false`).** When truthy, an SSO-authenticated identity (a verified D21 Bearer JWT, a D22 SSO session cookie, or a D24 trusted-proxy identity header) may mint — and deliberately rotate — a long-lived API key for **its own** registry identity from the /access page, closing the loop D21 left open: JWT-only sign-in worked but the key still required the D17 admin panel. Hard guarantees: the minted key carries exactly the identity's existing access (self-mint **never** creates or widens dataset grants — the name comes from the verified identity, never user input); minting stays impossible for API-key-authenticated callers (403 — a registry key can never mint, the D17 invariant); env-authoritative and `blocked` names are refused; the key is shown exactly once and rotation kills the old key immediately. Endpoints: `GET /api/access/key` (owner-safe masked view) and `POST /api/access/mint-key` (optional `{"rotate": true}`); the whoami `flags` gains `self_mint` (the anonymous shape is unchanged). Enabling only makes sense with `security.oidc.enabled` (or `trustProxyIdentity` on G2) — there is no SSO identity to mint for otherwise. Read per request: flip without restart. **Default unset: byte-identical behaviour** (the mint endpoint 409s, the flag reads false). Chart wiring: `security.accessSelfMint` in all three charts — rendered ONLY when `true`, which is now the chart default (the same default-on, explicit-opt-out posture as `accessStore`; `false` restores the inert pre-D25 render). See the D25 subsection below. | chart default: enabled (bare env: unset = disabled) |
 | `RAG_UNLOCK_MAX_TTL` | Upper bound for explicit unlock TTLs on BOTH surfaces (REST `POST /unlock`, MCP `unlock_dataset(ttl=…)`; default 86400 = the historical 24 h cap). The special value `0` opts the deployment into **no-expiry unlocks** (`ttl=0` lasts until an explicit `POST /lock` on REST / until process restart on MCP) — the /access page's "No expiry (0)" option becomes meaningful only then. Read per request (rotation without restart). Chart wiring: `rag.unlockMaxTtl` (always rendered; the chart default equals the built-in default, so behaviour is unchanged). | `86400` |
 | `RAG_OIDC_ENABLED` (+ `RAG_OIDC_ISSUER` / `RAG_OIDC_AUDIENCE` / `RAG_OIDC_IDENTITY_CLAIM` / `RAG_OIDC_JWKS_URL` / `RAG_OIDC_JWKS_REFRESH_SECONDS` / `RAG_OIDC_OBSERVED_TTL` / `RAG_OIDC_FETCH_TIMEOUT_SECONDS` / `RAG_OIDC_CLOCK_SKEW_SECONDS`) | **Decision D21 — OIDC JWT as a SECOND credential for the same per-user registry identity (opt-in).** With `RAG_OIDC_ENABLED=true`, a verified `Authorization: Bearer <jwt>` (RS256 against the realm JWKS; `iss` / `aud`-as-`azp` / `exp` validated, `RAG_OIDC_CLOCK_SKEW_SECONDS` tolerance) resolves to the SAME identity as that user's minted API key — join key = the `RAG_OIDC_IDENTITY_CLAIM` (default `preferred_username`, fallback `sub`), or an explicit `"oidc": "<alias>"` field on the user's overlay client entry in `{DATA_PATH}/access/clients.json`. No OIDC discovery in v1: the JWKS URL is `RAG_OIDC_JWKS_URL` or `<issuer>/protocol/openid-connect/certs` (the Keycloak/UA-realm location), cached and refreshed every `RAG_OIDC_JWKS_REFRESH_SECONDS`; `RAG_OIDC_FETCH_TIMEOUT_SECONDS` bounds the fetch; observed JWT-only users are remembered for `RAG_OIDC_OBSERVED_TTL` and appear in `GET /api/admin/clients` as `{"source": "observed"}` entries so admins can grant them before they ask. **Issuer is REQUIRED when enabled** (loud startup warning without it). All vars are read per request — flip without restart. Chart wiring: `security.oidc.*` — rendered ONLY when `enabled: true` (default render byte-identical). See the D21 subsection below for the full semantics. | disabled (`RAG_OIDC_ENABLED` unset) |
 | `RAG_SSO_GATE` | **Decision D23 — the identity-gated unified frontend (opt-in).** When `true`, the served HTML pages (`/`, `/manage`, `/access`) require an authenticated identity (an SSO session cookie, a Bearer JWT, or an API key); anonymous visitors get a minimal 401 "Sign in required" page — with a link to `/oauth/login` when browser SSO (D22) is enabled. Health probes, the `/oauth/*` flow itself and media bytes stay exempt. When disabled (default), public-pages behavior is byte-identical to today. Enabling ONLY makes sense when `security.oidc.enabled` (or API keys) are configured — an empty deployment gates to nothing. Read per request: flip the value, no restart. Chart wiring: `security.ssoGate` — rendered ONLY when `true` (default render byte-identical). See the D23 subsection below for the full semantics (dataset ownership, the four-tab shell, `/api/stats`). | disabled — public pages |
@@ -223,14 +225,19 @@ SELECTS the datasets it needs (a listing shows only a key's effective datasets �
 password-protected ones only with their correct password, which is then saved per identity
 (`{DATA_PATH}/access/<name>.json`, 0600, on the shared PVC) so every REST/MCP call works
 without sending it again. Effective access = **operator ACL ∪ selections** (the ACL is a
-guaranteed floor; deselect removes only self-added widening). `security.accessDenySelect`
+guaranteed floor; deselect removes only self-added widening). D26 revises the inclusion
+side: 🌐 global (public) datasets are included for every authenticated key at read-only
+mode — the selection store still governs what the key adds itself, and deselecting still
+excludes. `security.accessDenySelect`
 (`RAG_ACCESS_DENY_SELECT`) names datasets that can never be self-selected, and
 `security.memoryDefault` (`RAG_MEMORY_DEFAULT`) is the deployment-wide fallback memory
 dataset for callers without a personal ★ binding. MCP gains `select_dataset` /
 `deselect_dataset` / `set_memory_dataset`; the memory resolution order becomes arg →
 header → the caller's ★ binding → `RAG_MEMORY_DEFAULT` → `MEMORY_DATASET` — so an opencode
 user needs only their API key: select your memory dataset once (password once), star it,
-done.
+done. Since D26, a 🌐 global dataset is also **included** for every authenticated
+identity by default — at read-only mode (only the creator, an explicit `rw` grant, or
+an admin can write it); see "Read-only dataset grants (D26)" below.
 
 ```yaml
 # values.yaml (all three charts; denylist/memoryDefault render only when set)
@@ -336,12 +343,12 @@ D21 issuer, every `/oauth/*` route 404s and no cookie is ever accepted.
 
 D23 is the capstone that turns the accumulation of D15–D22 into a single coherent
 product: when `RAG_SSO_GATE` is enabled, the three HTML pages fuse into ONE
-identity-gated shell — the homepage (`/`) re-glasses into a four-tab app, `/manage`
+identity-gated shell — the homepage (`/`) re-glasses into a tabbed app, `/manage`
 and `/access` redirect into its tabs, and everything you see is scoped to who you
 are. Unauthenticated visitors get a minimal 401 "Sign in required" page (with a
 "Sign in with SSO" link when D22 is configured) instead of the old open pages.
 
-**The tab map** — four tabs render from the public whoami
+**The tab map** — the tabs render from the public whoami
 (`GET /api/oidc-session` → `{authenticated, identity, is_admin, flags, …}`):
 
 - **Datasets** — the existing homepage workspace (upload, search, ingest),
@@ -353,13 +360,18 @@ are. Unauthenticated visitors get a minimal 401 "Sign in required" page (with a
 - **Stats** — a read-only dashboard for EVERYONE (see `/api/stats` below): the
   caller's own dataset/document/storage numbers, model-endpoint health, and job
   queue state — filtered exactly like the listings, so it leaks nothing.
+- **Inspector (D27)** — a browser playground for the MCP tool calls: pick a tool
+  from the live `tools/list` catalog, edit JSON arguments seeded from the tool's
+  `inputSchema`, and run it as YOUR session credential, proxied server-side to
+  the MCP endpoint (see MCP.md § 5; env `RAG_INSPECTOR_MCP_URL` /
+  `RAG_INSPECTOR_TIMEOUT_S`).
 
 **Sign-in flow** — the SSO button comes first (it probes the whoami; an inert
 D22 deployment simply never shows it), the API-key paste is the fallback for
 key-only deployments, and the embedded admin key is used ONLY in the
 key-unconfigured legacy mode (the D20 fail-closed posture otherwise binds
 anonymous visitors to a memory-dataset-only identity). One sign-in serves all
-four tabs; credentials never cross tabs.
+tabs; credentials never cross tabs.
 
 **The 8 ratified semantics** (decision D23, 2026-10 — the contract the backend,
 frontend, charts and docs all implement):
@@ -383,7 +395,8 @@ frontend, charts and docs all implement):
    Datasets created before D23 have no owner recorded — admins delete them; no
    ownership is backfilled.
 7. **Creator publish-global** — the creator of a dataset may toggle it public
-   (visible to every identity, per the availability semantics); non-creators are
+   (visible to every identity, per the availability semantics (D26: included at
+   read-only mode)); non-creators are
    denied. Pre-D23 datasets (no `created_by`) can only be made global by an admin.
 8. **The Stats tab is read-only for everyone** — `GET /api/stats` never mutates;
    a user sees their own footprint, an admin sees the deployment's.
@@ -402,7 +415,7 @@ Chart wiring: `security.ssoGate` in all three charts (see the `RAG_SSO_GATE` row
 above) — rendered ONLY when `true`, default render byte-identical; values
 examples ship a commented `ssoGate: true` line in both profiles.
 
-### SSO self-mint (D25 — opt-in)
+### SSO self-mint (D25 — chart-default on)
 
 D21 made JWT-only sign-in work — a verified realm token resolves to the user's
 registry identity with zero datasets, and D16 self-selection grows the world from
@@ -440,12 +453,72 @@ whoami (`GET /api/oidc-session`) authenticated shape gains
 probe; the anonymous whoami shape stays exactly `{"authenticated": false}`.
 
 **Knob and wiring.** Env `RAG_ACCESS_SELF_MINT`, chart `security.accessSelfMint`
-(bool, default `false`) in all three charts — rendered ONLY when `true` (the
-default render is byte-identical), placed next to the D16 access-store keys.
-Default unset: the mint endpoint 409s and `flags.self_mint` reads false —
-byte-identical behaviour. Enabling only makes sense when `security.oidc.enabled`
-(or `trustProxyIdentity` on G2) is on — there is no SSO identity to mint for
-otherwise.
+(bool, chart default `true` — the same default-on, explicit-opt-out posture as
+`accessStore`) in all three charts — rendered ONLY when `true`; `false` restores
+the inert pre-D25 render, and a bare-env (non-chart) deployment still defaults
+unset. Default unset: the mint endpoint 409s and `flags.self_mint` reads false —
+byte-identical behaviour. The feature only ever ACTIVATES for SSO-sourced
+sessions: it makes sense when `security.oidc.enabled` (or `trustProxyIdentity`
+on G2) is on — there is no SSO identity to mint for otherwise — and it needs the
+access overlay (`accessStore: true`, itself chart-default on) so the minted
+entry has somewhere to live. Inert by construction everywhere else: no SSO
+identity source means no session can ever carry the mint proof, so the card
+never renders and the endpoints refuse — defaulting the knob on is safe
+precisely because a fresh SSO identity holds only the read-only public datasets
+until an operator widens it.
+
+### Read-only dataset grants (D26)
+
+Fleet decision D26 (ratified 2026-10) attaches a **mode** to every D15 dataset
+grant — `rw` (the default) or `ro` — because until now the write path travelled
+inseparably with every grant: handing a colleague read access to `reports` also
+handed them ingest, delete and replace. Read surfaces (list, read, search,
+unlock, select, ★-bind) are unchanged for ro datasets; every **write** surface
+now requires an rw-mode grant — the MCP document/memory mutators
+(`dataset_add_documents`, `dataset_delete_documents`, `dataset_replace_document`,
+`add_memory`, `delete_memory`, `forget_session`), the REST ingest/delete
+endpoints (`POST /api/datasets/{name}/documents|/files|/batch-files|/batch-urls`,
+`DELETE /api/datasets/{name}/documents/{doc_id}`), and the dataset-manage
+surfaces already restricted to `*`/owner-or-admin (PATCH/DELETE the dataset, the
+public toggles). Admin identities — and store-off/identity-less deployments —
+are exempt, so single-key deployments are byte-identical.
+
+The three wire forms: the D17 overlay `clients.json` takes each `datasets`
+element as either a plain string (`"reports"` = rw) or an object
+`{"name": "reports", "mode": "ro"}`; the env ACL `RAG_DATASET_ACLS` gains the
+token form `name:ds1:ro,ds2:rw,ds3` (the legacy `name:ds1,ds2` form means rw —
+existing values need no migration; malformed entries still raise
+`ClientConfigError` at import); the admin REST PATCH body accepts strings or
+`{name, mode}` objects and reports the normalized grants. **No new env var is
+introduced** — modes ride the existing `RAG_DATASET_ACLS` and the overlay.
+
+Two ratified rulings ride along:
+
+- **Globals are read-only by default.** A 🌐 public dataset
+  (`public: true` in meta.json) is now INCLUDED for every authenticated
+  registry/SSO identity — no checkbox needed — but at mode ro: every key can
+  list, read and search it; only the creator, an explicit `rw` grant, or an
+  admin can write it. Self-selecting a global records ro; deselecting still
+  excludes it. This deliberately revisions the D16 "public = availability, not
+  inclusion" ruling for inclusion (the D16 selection store still works, and
+  `RAG_ACCESS_DENY_SELECT` still blocks selection outright).
+- **One writable memory dataset per identity (unchanged invariant).**
+  `set_memory_dataset` (the ★ binding) now REFUSES a dataset the identity can
+  only reach ro ("…read-only for your key — bind a dataset you can write"); the
+  single-binding resolution order is untouched (header → ★ →
+  `RAG_MEMORY_DEFAULT` → `MEMORY_DATASET`).
+
+Precedence is **strongest-restriction-wins** across sources: env rw ∪ overlay ro
+⇒ ro, and env ro ∪ overlay rw ⇒ ro; `*` behaves as rw-all unless a `*:ro` env
+token or an overlay `{"name": "*", "mode": "ro"}` downgrades it, and an explicit
+per-dataset ro in ANY source overrides a `*` rw. Exclusions (deselect) still
+hide a dataset entirely. Fail-closed: a write against an ro dataset is refused,
+never degraded.
+
+In the Admin tab, the User keys grants editor is now a searchable checkbox
+dropdown per key — one row per dataset with ro/rw toggles, 🌐 global and 🔒
+password badges, and a pinned "All datasets (*)" row (the mint form is
+unchanged). Test coverage: see `tests/security/test_grant_modes.py`.
 
 ## Enabling the network zone
 

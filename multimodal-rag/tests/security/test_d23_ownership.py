@@ -88,8 +88,14 @@ def _generate_rsa(key_id: str = KID) -> dict:
     return {
         "key": key,
         "kid": key_id,
-        "jwk": {"kty": "RSA", "kid": key_id, "use": "sig", "alg": "RS256",
-                "n": _b64uint(nums.n), "e": _b64uint(nums.e)},
+        "jwk": {
+            "kty": "RSA",
+            "kid": key_id,
+            "use": "sig",
+            "alg": "RS256",
+            "n": _b64uint(nums.n),
+            "e": _b64uint(nums.e),
+        },
         "sign": lambda data: key.sign(data, padding.PKCS1v15(), hashes.SHA256()),
     }
 
@@ -318,10 +324,19 @@ def rest_client(monkeypatch, tmp_path):
                     cache.pop(key, None)
 
         # -- endpoints' surface --
-        def create_dataset(self, name, description="", caption_with_asr=False,
-                           caption_with_vlm=False, keep_originals=True,
-                           password=None, ocr=False, rrf=None, contextual=False,
-                           created_by=None):
+        def create_dataset(
+            self,
+            name,
+            description="",
+            caption_with_asr=False,
+            caption_with_vlm=False,
+            keep_originals=True,
+            password=None,
+            ocr=False,
+            rrf=None,
+            contextual=False,
+            created_by=None,
+        ):
             if self._meta_path(name).exists():
                 raise FileExistsError(f"Dataset '{name}' already exists")
             meta = {"name": name, "description": description, "document_count": 0}
@@ -450,7 +465,9 @@ def test_create_stamps_anonymous_identity_as_anonymous(rest_client, monkeypatch)
     the way a future/D20-store-enabled surface would.)"""
     _client, dm = rest_client
     assert api._creator_name_for_request() == "anonymous"
-    r = asyncio.run(_call_create_direct("anon-ds", cr.Identity(kind="client", name="__anonymous__", datasets=frozenset())))
+    r = asyncio.run(
+        _call_create_direct("anon-ds", cr.Identity(kind="client", name="__anonymous__", datasets=frozenset()))
+    )
     assert r["dataset"]["created_by"] == "anonymous"
     assert dm._read_meta_raw("anon-ds")["created_by"] == "anonymous"
 
@@ -521,9 +538,7 @@ def test_delete_by_other_identity_403_with_exact_message(rest_client, monkeypatc
     monkeypatch.setenv(cr.ACLS_ENV, "bob:theirs")
     r = client.delete("/api/datasets/theirs", headers=_BOB)
     assert r.status_code == 403
-    assert r.json()["detail"] == (
-        "Dataset 'theirs' is owned by 'alice' — only its creator or an admin can delete it."
-    )
+    assert r.json()["detail"] == ("Dataset 'theirs' is owned by 'alice' — only its creator or an admin can delete it.")
     assert dm.deleted == []
 
 
@@ -849,7 +864,9 @@ def test_whoami_anonymous_shape_exactly_unchanged(rest_client, jwks_server):
     _setup_key(jwks_server)
     assert client.get("/api/oidc-session").json() == {"authenticated": False}
     # An invalid JWT also stays anonymous-shaped.
-    r = client.get("/api/oidc-session", headers={"Authorization": f"Bearer {_mint(_generate_rsa('forged'), _claims())}"})
+    r = client.get(
+        "/api/oidc-session", headers={"Authorization": f"Bearer {_mint(_generate_rsa('forged'), _claims())}"}
+    )
     assert r.json() == {"authenticated": False}
 
 
