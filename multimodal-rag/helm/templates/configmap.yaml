@@ -71,6 +71,13 @@ data:
   # with the password, saved per identity under /data/access); effective
   # access = operator ACL ∪ selections.  Explicit false opts out.
   RAG_ACCESS_STORE: {{ .Values.security.accessStore | default false | quote }}
+  # Dataset creation by ordinary users (SSO / named API keys). Default true: a
+  # dataset is owned by whoever created it and reaches nobody else until an
+  # operator grants it. Set false for admin-only creation. A per-user override
+  # on the /access page beats this default in either direction. Read per request.
+  # NOT '| default true' — sprig treats false as empty, which would make the
+  # knob impossible to turn off.
+  RAG_DATASETS_CREATE_ALLOWED: {{ .Values.security.datasetsCreateAllowed | quote }}
   {{- if .Values.security.accessDenySelect }}
   RAG_ACCESS_DENY_SELECT: {{ .Values.security.accessDenySelect | quote }}
   {{- end }}

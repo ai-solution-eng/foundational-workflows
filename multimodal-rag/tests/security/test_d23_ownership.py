@@ -550,6 +550,62 @@ def test_delete_by_admin_succeeds(rest_client):
     assert dm.deleted == ["any"]
 
 
+def test_s1_client_named_admin_cannot_manage_admin_datasets(rest_client, monkeypatch):
+    """S1 (2026-10), BOTH defensive layers pinned:
+
+    * layer 1 (impl-storage): a reserved name ("admin") is REFUSED at env
+      parse time — the key resolves to NOTHING (401 at the auth layer), so
+      the collision cannot even be created;
+    * layer 2 (impl-storage, inside identity_owns_dataset): even if a
+      reserved-named client somehow exists, the ownership decision refuses
+      to match a RESERVED stamp — pinned directly in the unit test below.
+    """
+    client, dm = rest_client
+    _seed_dataset(dm, "adm-ds", created_by="admin")
+    _seed_dataset(dm, "anon-ds", created_by="anonymous")
+    monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key;bob:bob-key;admin:admin-key")
+    monkeypatch.setenv(cr.ACLS_ENV, "admin:adm-ds,anon-ds")
+    # Layer 1: the reserved entry never becomes an identity — the key is
+    # dead (401), NOT a passing owner (200) and NOT even an ownership 403.
+    r = client.delete("/api/datasets/adm-ds", headers={"X-RAG-Api-Key": "admin-key"})
+    assert r.status_code == 401, "the reserved-named entry must be refused at parse time (fail-closed)"
+    assert dm.deleted == []
+
+
+def test_s1_identity_owns_dataset_reserved_stamps_refused(monkeypatch, tmp_path):
+    """Unit pin for the S1 helper's sentinel refusal (direct call, real meta
+    files on disk — the helper reads created_by through the mtime-cached
+    created_by_dataset, so the stamps are written for real): a client NAMED
+    "admin" (had one slipped through any path) is still refused at the
+    comparison.  Layer 2 of the defence."""
+    import json as _json
+
+    from multimodal_rag.utils import clients_registry as cr
+
+    monkeypatch.setenv("DATA_PATH", str(tmp_path))
+    meta = {"a": "admin", "b": "anonymous", "c": "alice", "d": None}
+    for name, stamp in meta.items():
+        d = tmp_path / "datasets" / name
+        d.mkdir(parents=True)
+        body = {"name": name}
+        if stamp:
+            body["created_by"] = stamp
+        (d / "meta.json").write_text(_json.dumps(body))
+    cr._CREATED_BY_CACHE.clear()
+
+    admin_named_client = cr.Identity(kind="client", name="admin", datasets=frozenset({"*"}))
+    alice = cr.Identity(kind="client", name="alice", datasets=frozenset({"*"}))
+    # RESERVED stamps are never owned by a non-admin, even on exact match:
+    assert cr.identity_owns_dataset(admin_named_client, "a") is False  # stamp "admin"
+    assert cr.identity_owns_dataset(admin_named_client, "b") is False  # stamp "anonymous"
+    # A REAL name match owns:
+    assert cr.identity_owns_dataset(alice, "c") is True
+    # Pre-D23 (no stamp) owns nobody:
+    assert cr.identity_owns_dataset(alice, "d") is False
+    # No identity is not an owner:
+    assert cr.identity_owns_dataset(None, "a") is False
+
+
 def test_delete_pre_d23_dataset_admin_only(rest_client, monkeypatch):
     """A dataset with NO created_by is deletable by admins only — never by
     a random registry key (no backfill, no proof of creation)."""
@@ -828,7 +884,13 @@ def test_whoami_authenticated_shape_with_flags(rest_client, jwks_server, monkeyp
     assert body["source"] == "oidc"
     assert body["is_admin"] is False
     assert body["flags"] == {
-        "can_create_datasets": False,  # named ACL, no '*'
+        # 2026-10 configurable-create (D1/D27): a named-ACL identity may now
+        # create by DEFAULT (deployment knob default true, no per-user
+        # override recorded).  This pin previously asserted False from the
+        # old '*' rule — that was the user-reported bug (SSO users could not
+        # create).  The flag now comes from the SAME three-level helper the
+        # middleware create gate calls, so they cannot drift.
+        "can_create_datasets": True,
         "sso_enabled": False,
         "memory_dataset": "ds1",
         "self_mint": False,  # D25: the knob is off in this test's env
@@ -842,6 +904,25 @@ def test_whoami_star_grant_can_create(rest_client, jwks_server, monkeypatch):
     monkeypatch.setenv(cr.ACLS_ENV, "alice:*")
     r = client.get("/api/oidc-session", headers={"Authorization": f"Bearer {_mint(key, _claims(preferred='alice'))}"})
     assert r.json()["flags"]["can_create_datasets"] is True
+
+
+def test_whoami_can_create_follows_knob_and_override(rest_client, jwks_server, monkeypatch, tmp_path):
+    """The whoami flag tracks the SAME three-level decision as the gate:
+    knob off -> False; a per-user override -> the override wins."""
+    from multimodal_rag.utils import admin_registry as ar
+
+    client, _dm = rest_client
+    key = _setup_key(jwks_server)
+    monkeypatch.setenv(cr.ACLS_ENV, "alice:ds1")
+    monkeypatch.setenv(acc.STORE_ENV, "1")
+    monkeypatch.setenv("DATA_PATH", str(tmp_path))
+    monkeypatch.setenv("RAG_DATASETS_CREATE_ALLOWED", "0")
+    r = client.get("/api/oidc-session", headers={"Authorization": f"Bearer {_mint(key, _claims(preferred='alice'))}"})
+    assert r.json()["flags"]["can_create_datasets"] is False  # knob off, no override
+    ar.mint_client("alice", datasets=["ds1"])  # overlay entry for the JWT identity
+    ar.set_client_flags("alice", can_create_datasets=True)
+    r = client.get("/api/oidc-session", headers={"Authorization": f"Bearer {_mint(key, _claims(preferred='alice'))}"})
+    assert r.json()["flags"]["can_create_datasets"] is True  # override wins
 
 
 def test_whoami_admin_key_stays_anonymous_shaped(rest_client, jwks_server, monkeypatch):

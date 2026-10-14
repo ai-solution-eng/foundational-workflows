@@ -157,7 +157,7 @@ def test_dataset_manager_verify_password(base_path, embedder):
 
 @pytest.fixture
 def token_secret(monkeypatch):
-    secret = "unit-test-media-token-secret-0123456789abcdef"
+    secret = "unit-test-media-token-secret-0123456789abcdef"  # secret-scan:allow (fake unit-test fixture)
     import multimodal_rag.api_server as api
     import multimodal_rag.mcp_server as mcp
 

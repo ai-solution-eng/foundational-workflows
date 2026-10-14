@@ -1,36 +1,34 @@
-# =============================================================================
-# Multimodal RAG — HOSTED TRIAL values (sanitized) — scale-large chart.
-# Variant: helm-scale-large/ (rag-mcp-scale-large: 4 API replicas x 4
-# workers, 3-shard Qdrant, Redis unlock cache, shared embed-batcher) —
-# throughput deployments.  The embed-batcher keeps batch size independent of
-# process count (v3.1.8 benchmark: 49.3 req/s @ N=100, 72.8 @ N=250).
-# Pilots / single-team use: helm/.
-# Sanitized hosted-trial deployment for a CUSTOMER PCAI cluster:
-# - ${DOMAIN_NAME} placeholder — PCAI substitutes it before rendering.
-# - oauth2-proxy AuthorizationPolicy on (customer SSO at the gateway).
-# - The pre-install Kyverno vendor-label ClusterPolicy labels Deployments
-# and Services with hpe-ezua/* (Deployment/Service only since -24 —
-# Pods must stay unlabeled); the customer admin may need to permit
-# ClusterPolicy creation on locked-down clusters.
-# - ALL credentials are fillers (folder hardlinked to the public repo —
-# never add real credentials); real per-site values live in
-# helm-scale-large/local/ (gitignored + never packaged).
-# PCAI usage: import the packaged chart once, paste this whole file into the
-# release's Helm Values editor, apply.
-# Operators with cluster access may render-check first:
-# helm template <release> helm-scale-large/ -f helm-scale-large/values-examples/values.hosted-trial.yaml
-# =============================================================================
 # ============================================================================
-#
+# Multimodal RAG — HOSTED TRIAL values (sanitized) — helm-scale-large/ chart.
+# Variant: rag-mcp-scale-large (4 API replicas x 4 workers, 3-shard Qdrant,
+# Redis unlock cache, shared embed-batcher singleton).
+# Sanitized for a CUSTOMER PCAI cluster: PCAI substitutes ${DOMAIN_NAME};
+# oauth2-proxy AuthorizationPolicy is ON at the gateway; the pre-install Kyverno
+# vendor-label ClusterPolicy labels Deployments/Services only (Pods unlabeled).
+# ALL credentials are fillers — this folder is hardlinked to the public repo.
+# PCAI: paste this file into the release's Helm Values editor, adjust, apply.
+# Full guide: documentation/DEPLOYMENT.md + documentation/SCALE.md.
+# ============================================================================
+
 # ### REQUIRED ### — key material lives in Secrets you own, NOT in values
 # (missing Secret = CreateContainerError; every key the Secret carries
 # overrides the values seeds below it).
 #   1. modelSecrets.existingSecret — the broad secret: MODEL_*_API_KEY per
-#      enabled role, optionally MODEL_*_URL / S3_* / REDIS_PASSWORD
+#      enabled role, optionally MODEL_*_URL / S3_* / REDIS_PASSWORD.
 #   2. models.embedder.url — reachable embedder endpoint (startup ABORTS if
-#      unreachable) unless the Secret carries MODEL_EMBEDDER_URL
-#   3. security.existingSecret — RAG_API_KEY + MEDIA_TOKEN_SECRET
-#   4. ezua.virtualService.endpoint — RENDER FAILS without it while ezua.enabled
+#      unreachable) unless the Secret carries MODEL_EMBEDDER_URL.
+#   3. security.existingSecret — RAG_API_KEY + MEDIA_TOKEN_SECRET.
+#      Rotation runbook: helm/ROTATION.md.
+#   4. ezua.virtualService.endpoint — RENDER FAILS without it while ezua.enabled.
+
+# ### OPTIONAL ###
+# Major tuning setups (copy the shape from the pointer):
+#   Scaling: replicaCount / qdrant.replicas / app.workers — SCALE.md §12
+#   MCP API-key gate: mcp.apiKey.existingSecret (pre-create the Secret) — §2
+#   Metrics: metrics.serviceMonitor (+ bearer Secret when security.metricsAuth) — §2
+#   Storage: s3.* / backups.* / watchedSources.* (each source REQUIRES dataset + >=1 prefix) — §2 + §7b
+#   Optional model roles: models.reranker / vlm / asr (url "" disables) — §2
+#   RAG pipeline: rag.ocr / rag.contextual / rag.rrfDefault — §2
 
 # ============================================================================
 # Image / Scaling
@@ -40,15 +38,12 @@ deployment:
   name: rag-mcp-server
   appName: rag-mcp-server
 
-# Concurrency = replicaCount * workers * syncPoolSize (gunicorn event loops);
-# query batching folds concurrent text-only searches into one embedder call.
-
 replicaCount: 4
 
 image:
   # Packaged with the chart — leave as-is unless you built your own image.
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v5.7.0
+  tag: v5.8.0
   pullPolicy: IfNotPresent
 
 qdrant:
@@ -77,8 +72,7 @@ redis:
   port: 6379
   password: ""
 
-# All pods POST text-only embedding queries here — batch size stays
-# independent of process count (per-process batchers split the pool).
+# Shared singleton: all pods POST text-only embedding queries here, so batch size stays independent of process count.
 embedBatcher:
   enabled: true
   port: 8002
@@ -91,12 +85,15 @@ resources:
   app:
     requests: {cpu: 2, memory: 4Gi}
     limits: {cpu: 4, memory: 8Gi}
+
   qdrant:
     requests: {cpu: '4', memory: 16Gi}
     limits: {cpu: '8', memory: 32Gi}
+
   redis:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {cpu: 500m, memory: 512Mi}
+
   embedBatcher:
     requests: {cpu: 500m, memory: 512Mi}
     limits: {cpu: '2', memory: 1Gi}
@@ -106,38 +103,32 @@ persistence:
     size: 100Gi
     storageClass: gl4f-filesystem
     accessMode: ReadWriteMany
+
   qdrant:
     size: 100Gi
     storageClass: gl4f-filesystem
     accessMode: ReadWriteOnce
     mountReadOnly: false
 
-# Point each role at the customer's model-serving (MLIS) endpoint; the
-# embedder is the only required one. Leave url "" to disable a role.
-
 # ============================================================================
 # App Parallelism
 # ============================================================================
 
-# Concurrency = replicaCount * workers * syncPoolSize (gunicorn event loops);
-# query batching folds concurrent text-only searches into one embedder call.
+# gunicorn + UvicornWorker: concurrency = replicaCount * workers * syncPoolSize.
 app:
   workers: 4
   syncPoolSize: 64
   mcpPoolSize: 64
   embeddingQueryBatchSize: 128
   embeddingQueryBatchWaitMs: 200
-  # Idle early-flush (batch-guarded): a small stalled queue flushes after
-  # 50ms instead of the full window — interactive latency down ~4x, bursts
-  # never split.
+  # Idle early-flush: a small stalled queue flushes after this many ms; 0 disables.
   embeddingQueryIdleWaitMs: 50
   embeddingMaxImagesPerPrompt: 4
   qdrantQueryBatchSize: 128
   qdrantQueryBatchWaitMs: 5
   qdrantPoolSize: 16
 
-# Above the single-replica default so the embedder (on every search's critical
-# path) is not the concurrency bottleneck.
+# Per-process httpx connection pool limits for model endpoint clients.
 modelPool:
   maxConnections: 200
   maxKeepaliveConnections: 50
@@ -161,20 +152,22 @@ models:
       code_chunk_overlap: 512
       tokenizer_name: Qwen/Qwen3-VL-Embedding-8B
       tokenizer_type: HuggingFace
-      # Fingerprint-guard alias: datasets indexed under the old id survive the
-      # FP8 swap (>=0.95 cosine); requires an alias-capable image (v4.0.0 rejects unknown extra keys).
+      # Fingerprint-guard alias: datasets indexed under the old id survive the FP8 swap.
       alias: Qwen/Qwen3-VL-Embedding-8B
+
   reranker:
     name: Qwen/Qwen3-VL-Reranker-8B
     # optional — precision at the cost of latency
     url: ""
     className: MultiModalReranker
     extra: {}
+
   vlm:
     name: Qwen/Qwen3.8-27B-FP8
     # optional — captions images/videos, converts them at query time
     url: ""
     extra: {}
+
   asr:
     name: CohereLabs/cohere-transcribe-03-2026
     # optional — transcribes audio + video soundtracks
@@ -183,16 +176,12 @@ models:
 
 # Rendered into the <name>-model-keys Secret (env MODEL_*_API_KEY).
 modelSecrets:
-  # Broadest-secret mode: one Secret you own carries MODEL_*_API_KEY (+ optional
-  # MODEL_*_URL, S3_*, REDIS_PASSWORD) — build from helm/local/secrets.template.yaml.
+  # Broad secret: MODEL_*_API_KEY (+ optional MODEL_*_URL, S3_*, REDIS_PASSWORD) — build from helm/local/secrets.template.yaml.
   existingSecret: ""
   embedderApiKey: "<EMBEDDER_API_KEY>"
   rerankerApiKey: "<RERANKER_API_KEY>"
   vlmApiKey: "<VLM_API_KEY>"
   asrApiKey: "<ASR_API_KEY>"
-
-# Above the single-replica default so the embedder (on every search's critical
-# path) is not the concurrency bottleneck.
 
 # ============================================================================
 # App Defaults
@@ -202,49 +191,36 @@ rag:
   ocr: false
   captionWithAsr: true
   captionWithVlm: true
-  # Keep false for in-cluster endpoints ('.serving.' URLs rewrite to
-  #.svc.cluster.local); true only for endpoints outside the cluster.
+  # false = ".serving." URLs rewritten to in-cluster .svc form; true only for endpoints outside the cluster.
   remote: false
   dedupThreshold: 0.995
-  # Multi-replica: do not auto-sync document counts from Qdrant on every read
-  # (avoids cross-replica meta.json write races).
+  # Multi-replica: document counts are not auto-synced from Qdrant on every read.
   deferCountSync: true
-  # Ingest-time contextual retrieval (RAG_CONTEXTUAL_DEFAULT).  Keep false
-  # unless the per-chunk LLM cost is understood — check
-  # POST /api/admin/datasets/{name}/contextual-preview first.
+  # Ingest-time contextual retrieval — OFF; the per-dataset checkbox is the recommended path.
   contextual: false
 
-  # Weighted-RRF per-dataset create-time defaults (RAG_RRF_DEFAULT).
-  # enabled: false = no default stamped; new datasets inherit the global
-  # 1.0/1.0 (rank order unchanged).  When enabled, NEW datasets are stamped
-  # dense/sparse[/k] at create time (existing datasets untouched).
+  # Weighted-RRF create-time defaults — DISABLED (per-dataset is the path).
   rrfDefault:
     enabled: false
     dense: 1.0
     sparse: 1.0
     k: 2
 
-  # Unlock TTL bound (RAG_UNLOCK_MAX_TTL; 86400 here = the built-in default,
-  # informational).  0 = NO-EXPIRY unlocks (the "No expiry (0)" option).
+  # Caps explicit unlock TTLs; 0 = the /access "No expiry (0)" option becomes selectable.
   unlockMaxTtl: 86400
 
 mcp:
   apiKey:
     # pre-create first — the chart never creates/inlines this key:
-    # kubectl -n <ns> create secret generic mcp-fleet-apikeys \
-    # --from-literal='api-keys=<key1>,<key2>'
+    # kubectl -n <ns> create secret generic mcp-fleet-apikeys --from-literal='api-keys=<key1>,<key2>'
     existingSecret: "mcp-fleet-apikeys"
     existingSecretKey: "api-keys"
-  # per-user keys + ACLs — KEY MATERIAL (Secret pipeline; never commit).
-  # Empty = single-key behaviour.
+  # Per-user keys + ACLs — key material; empty = single-key behaviour.
   apiKeyClients: ""
   datasetAcls: ""
 
   enabled: true
   port: 9090
-
-# All pods POST text-only embedding queries here — batch size stays
-# independent of process count (per-process batchers split the pool).
 
 antiAffinity:
   enabled: true
@@ -255,13 +231,11 @@ extraEnv: {}
 # Security
 # ============================================================================
 
-# mediaTokenSecret is REQUIRED: both the API and MCP containers refuse to
-# start without it. Generate: python -c "import secrets; print(secrets.token_hex(32))"
+# mediaTokenSecret is REQUIRED: both containers refuse to start without it.
+# Generate: python -c "import secrets; print(secrets.token_hex(32))"
 security:
-  # the chart ships NO key material. Replace both
-  # fillers, leave '' to auto-generate per install, or point
-  # security.existingSecret at a Secret you manage.  Rotation runbook:
-  # MultimodalRAG/helm/ROTATION.md.
+  # REST API-key auth: when non-empty every /api/* call must send X-RAG-Api-Key;
+  # leave '' to auto-generate per install, or use security.existingSecret.
   apiKey: "<RAG_API_KEY>"
   mediaTokenSecret: "<MEDIA_TOKEN_SECRET>"
   # Optional: a Secret you manage providing both keys (key names below).
@@ -283,23 +257,18 @@ security:
 
   # Per-user self-selection off: central oauth2-proxy owns identity here.
   accessStore: false
-  # ceiling: comma-separated datasets that can never be self-selected.
+  # Comma-separated datasets that can never be self-selected.
   accessDenySelect: ''
-  # accessSelfMint is ON by chart default but INERT here while accessStore
-  # stays false (no per-identity registry to mint into) — set accessStore: true
-  # to activate it for the oauth2-proxy identities (trustProxyIdentity above).
+  # accessSelfMint is ON by chart default but INERT here while accessStore is false.
   # Fallback memory dataset (RAG_MEMORY_DEFAULT) for callers without a ★ binding.
   memoryDefault: ''
-  # Keep false: in-cluster Prometheus scrapes without a token.  If true, also
-  # set metrics.serviceMonitorBearerSecret (the scraper's bearer token).
+  # Keep false: in-cluster Prometheus scrapes without a token (if true, set metrics.serviceMonitorBearerSecret).
   metricsAuth: false
-  # ssoGate: true
 
 metrics:
   serviceMonitor: false
   interval: 30s
-  # With metricsAuth on: the Secret/key the ServiceMonitor presents as its
-  # scrape bearer token (same keys as the base chart).
+  # With metricsAuth on: the Secret/key the ServiceMonitor presents as its scrape bearer token.
   serviceMonitorBearerSecret: ''
   serviceMonitorBearerSecretKey: RAG_API_KEY
 
@@ -319,18 +288,13 @@ backups:
   bucket: ''
   retentionDays: 0
 
-# Opt-in reconciler CronJob: each tick POSTs the prefixes to batch-urls with
-# sync=true (new/changed ingest, deleted prune, unchanged skip via the
-# ETag/Size state; s3:// directory URLs validated at render time).  Off by
-# default — renders nothing.
+# Opt-in reconciler CronJob: each tick POSTs each source's s3:// prefixes to
+# batch-urls (new/changed ingest, deleted pruned). s3:// directory URLs only.
 watchedSources:
   enabled: false
   schedule: '*/30 * * * *'
   sources: []
-  # sources:
-  # - dataset: reports
-  # prefixes:
-  # - s3://mm-rag-drop/reports/
+  # Each source: dataset name + >=1 s3:// directory prefix (validated at render).
 
 # ============================================================================
 # PCAI Networking
@@ -340,6 +304,7 @@ service:
   api:
     type: ClusterIP
     port: 80
+
   mcp:
     type: ClusterIP
 
@@ -351,6 +316,7 @@ ezua:
     istioGateway: istio-system/ezaf-gateway
     timeout: 300s
     longTimeout: 3600s
+
   authorizationPolicy:
     # Enabled for hosted trials: customer SSO via oauth2-proxy at the gateway.
     enabled: true

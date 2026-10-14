@@ -1304,6 +1304,23 @@ function renderClients() {
       escHtml(g.name + (g.mode === 'ro' ? ' (ro)' : '')) + '</span>'
     ).join('') || '<span class="muted">no datasets granted</span>';
     const src = '<span class="src-tag">' + escHtml(c.source || 'overlay') + '</span>';
+    // 2026-10 configurable-create: a per-user can_create_datasets override is
+    // an OVERLAY field, so an env-managed client can only follow the
+    // deployment default (RAG_DATASETS_CREATE_ALLOWED) until the admin mints
+    // an overlay entry for it — stated here rather than implied.
+    let createCtl;
+    if (c.source === 'env') {
+      createCtl = '<span class="muted" title="Env clients have no overlay entry — the deployment default (RAG_DATASETS_CREATE_ALLOWED) applies">create: default</span>';
+    } else {
+      const state = (c.can_create_datasets === true) ? 'allow'
+                  : (c.can_create_datasets === false) ? 'deny' : 'default';
+      const tag = state === 'allow' ? ' <span class="src-tag" style="color:var(--green,#2a9d5c);border-color:var(--green,#2a9d5c)">create: allowed</span>'
+                : state === 'deny'  ? ' <span class="src-tag" style="color:var(--red);border-color:var(--red)">create: denied</span>'
+                : '';
+      createCtl = tag +
+        '<button class="btn btn-outline btn-sm" onclick="toggleCreatePerm(this)" data-name="' + escHtml(c.name) + '" data-state="' + state + '">' +
+        (state === 'deny' ? 'Allow create' : 'Deny create') + '</button>';
+    }
     const edit = c.source === 'env'
       ? '<span class="muted" title="Defined in RAG_API_KEY_CLIENTS — edit it in the env">env-managed</span>'
       : '<button class="btn btn-outline btn-sm" onclick="toggleGrant(this)" data-name="' + escHtml(c.name) + '">Grants…</button>' +
@@ -1313,7 +1330,7 @@ function renderClients() {
       '<div class="client-name">' + escHtml(c.name) + ' ' + src + ' <span class="client-meta">' + escHtml(c.key_masked || '') + '</span></div>' +
       '<div class="client-datasets">' + chips + '</div>' +
       '</div>' +
-      '<div class="dataset-actions">' + edit + '</div>' +
+      '<div class="dataset-actions">' + createCtl + ' ' + edit + '</div>' +
       '<form class="grant-form" onsubmit="submitGrant(event, this)">' +
       '<div class="grant-picker" data-cname="' + escHtml(c.name) + '">' +
       '<label>Grants (search, tick a dataset, choose ro/rw — * = all)</label>' +
@@ -1532,6 +1549,25 @@ async function revokeClient(btn) {
   } catch (e) {
     if (e.status === 401) { handleAuthRejected(); return; }
     toast(e.message || 'Revoke failed', 'error');
+  }
+}
+
+// 2026-10 configurable-create: flip the per-user can_create_datasets override.
+// allow <-> deny cycles the override; a client on 'default' (no overlay flag)
+// gets an explicit deny first (the least surprising single click: the button
+// always shows the NEXT state).  Flag-only PATCH — no grants touched.
+async function toggleCreatePerm(btn) {
+  const name = btn.dataset.name;
+  const state = btn.dataset.state || 'default';
+  const next = state === 'deny' ? true : false;
+  try {
+    const res = await api('PATCH', '/api/admin/clients/' + encodeURIComponent(name),
+      { can_create_datasets: next });
+    toast(res.message || ("Create permission updated for '" + name + "'"));
+    await loadClients();
+  } catch (e) {
+    if (e.status === 401) { handleAuthRejected(); return; }
+    toast(e.message || 'Create-permission update failed', 'error');
   }
 }
 

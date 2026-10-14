@@ -19,7 +19,7 @@ End-to-end multimodal retrieval-augmented generation: ingest documents in 17+ fo
 - **Modality conversion** — retrieved media the LLM doesn't support is auto-converted (images/video → VLM description, audio → ASR transcript)
 - **Dataset management** — password-protected datasets, per-dataset Qdrant collections, dedup (cosine ≥ 0.995), S3/HTTP URL ingestion with sync reconciliation
 - **Watched S3 sources** (opt-in) — a reconciler CronJob keeps datasets in sync with S3/MinIO prefixes on a schedule: new/changed objects ingest, objects deleted upstream are pruned, unchanged objects are skipped via a per-dataset ETag/Size state (no re-download)
-- **MCP server** — 20 tools (search, federated search, list, document management add/delete/replace, file-bytes fetch, self-service dataset selection + ★ memory binding, recall + memory management, describe media, transcribe audio) over streamable-http / stdio / sse
+- **MCP server** — 21 tools (search, federated search, list, document management add/delete/replace, file-bytes fetch, self-service dataset selection + ★ memory binding, recall + memory management, describe media, transcribe audio) over streamable-http / stdio / sse
 - **Long-term memory** — per-user LLM-curated memory store for opencode and Open WebUI, with SSO-backed isolation
 - **Open WebUI extension** — filter that routes unsupported modalities to the RAG MCP tool, plus inlet/outlet memory hooks
 - **Helm chart** — 2-container pod (API + MCP sidecar), Qdrant StatefulSet, Istio/EZUA ingress with oauth2-proxy
@@ -144,7 +144,7 @@ security:
   blockPrivateHosts: true
 ```
 
-### MCP document-management tools (Wave-5)
+### MCP document-management tools (Wave-5, memory-write capability probe)
 
 The dataset **write** path is no longer REST-only — the MCP server exposes the same
 operations as thin tools over the identical `DatasetManager` logic (same validation, the

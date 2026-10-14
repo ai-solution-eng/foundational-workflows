@@ -45,3 +45,12 @@ helm*/local/*
 rag-mcp-*.tar.gz
 *.sync-conflict-*
 sync-to-demos.sh
+
+
+# Session/local artifacts (baseline discipline 2026-10-09, mirrors pcai-llm-gateway)
+.baseline_head/
+.rewrite_settings.py
+.scratch/
+andrew-memory-rebuilt-*.tar.gz
+MORNING-REPORT.md
+andrew-card.md

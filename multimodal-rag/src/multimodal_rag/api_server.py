@@ -982,6 +982,24 @@ def _sso_gate_401_response() -> Response:
     return HTMLResponse(_SSO_GATE_401_PAGE.replace("{sso_link}", sso_link), status_code=401)
 
 
+def _identity_may_create(identity) -> bool:
+    """The THREE-LEVEL create decision (2026-10 configurable-create design),
+    as ONE call into the shared predicate: per-user
+    ``can_create_datasets`` override (overlay clients, admin-PATCHable) →
+    deployment default (``RAG_DATASETS_CREATE_ALLOWED``) → identity-shape
+    rules (admin → True; no identity / D15 inactive → True byte-identical;
+    the D20 anonymous fallback → only when the registry is not configured).
+
+    THE GATE AND THE FLAG MUST AGREE: ``_whoami_flags`` computes the SPA's
+    ``can_create_datasets`` from THIS SAME helper, and the middleware's
+    create gate calls it too — one decision, three consumers, no drift.
+    (``access_store.identity_may_create_datasets`` owns the whole decision
+    including the override read, so this wrapper exists only to give the
+    api_server call sites a name and a docstring that binds them together.)
+    """
+    return _access_store.identity_may_create_datasets(identity)
+
+
 def _rag_acl_path_denial(path: str, method: str, identity) -> "str | None":
     """D15/D16 REST enforcement for a registry-key identity: the denial
     reason for *path*, or None when allowed.
@@ -1002,8 +1020,16 @@ def _rag_acl_path_denial(path: str, method: str, identity) -> "str | None":
     if path.startswith("/api/admin"):
         return "Dataset ACLs are configured (D15): this API key has no admin access."
     if path == "/api/datasets" or path == "/api/datasets/":
-        if method == "POST" and "*" not in (identity.datasets or frozenset()):
-            return "Dataset ACLs are configured (D15): this API key cannot create datasets."
+        if method == "POST" and not _identity_may_create(identity):
+            return "Dataset creation is not permitted for this identity (see RAG_DATASETS_CREATE_ALLOWED and the per-user can_create_datasets override)."
+        return None
+    if path == "/api/short-term-memory" and method == "POST":
+        # STM create mints a dataset — the same "manage" act as
+        # POST /api/datasets, so it carries the SAME gate.  Without this,
+        # the new path would fall into the middleware's "everything else —
+        # allowed" bucket and silently bypass the create gate.
+        if not _identity_may_create(identity):
+            return "Dataset creation is not permitted for this identity (see RAG_DATASETS_CREATE_ALLOWED and the per-user can_create_datasets override)."
         return None
     name = _clients_registry.dataset_name_from_path(path)
     if name is not None:
@@ -1763,6 +1789,255 @@ async def api_create_dataset(body: dict[str, Any] = Body(...)):
         raise HTTPException(400, str(e))
 
 
+# -- Short-term memory (STM surface, PLAN stmem sections 4.3/4.4) -------------
+
+
+def _stm_ttl_config() -> tuple[int, int]:
+    """`(default_ttl_hours, max_ttl_hours)` from env (chart values
+    `shortTermMemory.defaultTtlHours` / `maxTtlHours`).  Read per request so
+    a redeploy can retune the bounds without touching datasets.  A garbage
+    value is a 503, not a silent default — a silently-wrong TTL cap is a
+    data-retention lie.  F5: a default ABOVE the cap is the same class of
+    config error — every default-path create would silently exceed the cap —
+    so it fails loud here too (refusing, not clamping: the operator asked for
+    a 48h default on a 24h cap, and silently shortening it would be a third,
+    unrequested policy)."""
+    try:
+        default_h = int(os.environ.get("RAG_STM_DEFAULT_TTL_HOURS", "6"))
+        max_h = int(os.environ.get("RAG_STM_MAX_TTL_HOURS", "24"))
+    except ValueError:
+        raise HTTPException(503, "RAG_STM_DEFAULT_TTL_HOURS / RAG_STM_MAX_TTL_HOURS must be integers")
+    if default_h <= 0 or max_h <= 0:
+        raise HTTPException(503, "RAG_STM_DEFAULT_TTL_HOURS / RAG_STM_MAX_TTL_HOURS must be positive")
+    if default_h > max_h:
+        raise HTTPException(
+            503,
+            f"RAG_STM_DEFAULT_TTL_HOURS ({default_h}h) exceeds RAG_STM_MAX_TTL_HOURS "
+            f"({max_h}h) — every default-TTL create would exceed the cap. Fix the chart values "
+            "(shortTermMemory.defaultTtlHours / maxTtlHours).",
+        )
+    return default_h, max_h
+
+
+def _stm_mint_name(session_id: str) -> str:
+    """The non-guessable STM dataset name (INTERFACE-FREEZE section 1):
+
+        stm-<base32(hmac_sha256(salt, session_id))[:16]>
+
+    FAILS LOUDLY (503) when the salt is unset — HMAC with an empty key makes
+    every session's dataset name guessable, and the catalog hiding makes the
+    name the ONLY handle, so a guessable name would be a discovery bypass.
+    Lower-cased base32 keeps the token inside the dataset-name charset
+    ([A-Za-z0-9._-], the same one _validate_name enforces).
+    """
+    salt = os.environ.get("RAG_STM_NAME_SALT", "")
+    if not salt:
+        raise HTTPException(
+            503,
+            "Short-term memory is not configured: RAG_STM_NAME_SALT (chart values "
+            "shortTermMemory.nameSalt) must be set — refusing to mint guessable "
+            "dataset names with an empty salt.",
+        )
+    import base64
+    import hashlib
+    import hmac
+
+    digest = hmac.new(salt.encode("utf-8"), session_id.encode("utf-8"), hashlib.sha256).digest()
+    return "stm-" + base64.b32encode(digest).decode("ascii")[:16].lower()
+
+
+@app.post("/api/short-term-memory")
+async def api_create_short_term_memory(body: dict[str, Any] = Body(...)):
+    """Create an ephemeral short-term-memory dataset for one agent session.
+
+    Request body::
+
+        {"session_id": "swarm-abc", "ttl_seconds": 3600, "name": null}
+
+    Mints the non-guessable dataset name
+    `stm-<base32(hmac_sha256(RAG_STM_NAME_SALT, session_id))[:16]>` (an
+    explicit `name` overrides the mint — the caller must KEEP the name,
+    because the dataset is hidden from the catalog and the name is the only
+    handle), creates it with `kind="short_term"` and a dataset `lifetime`
+    (`ttl_seconds`, capped at `shortTermMemory.maxTtlHours`, or the
+    `shortTermMemory.defaultTtlHours` default), and grants it to the CREATING
+    IDENTITY ONLY — a D16 self-selection, nobody else (PLAN section 4.4).
+    NO password is set: STM datasets are passwordless by design
+    (INTERFACE-FREEZE section 2) — that is what keeps them reapable.
+
+    Errors: 400 bad input / ttl above the cap, 409 name collision, 503 when
+    the name salt is unset (fail loudly — never mint guessable names) or the
+    storage layer does not carry dataset lifetimes yet (T1 not deployed).
+    """
+    # F11: a session_id is a STRING identifier, not an opaque payload — a
+    # non-string ({"session_id": 12345}, a list, a dict) is a client bug and
+    # is refused rather than silently coerced (str(12345) would make 12345
+    # and "12345" silently the SAME session, mapping to the same dataset).
+    session_id = body.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise HTTPException(400, "Field 'session_id' must be a non-empty string")
+    session_id = session_id.strip()
+    default_h, max_h = _stm_ttl_config()
+    ttl = body.get("ttl_seconds")
+    if ttl is not None:
+        if (
+            isinstance(ttl, bool)
+            or not isinstance(ttl, (int, float))
+            or (isinstance(ttl, float) and not ttl.is_integer())
+        ):
+            raise HTTPException(400, "Field 'ttl_seconds' must be a whole number of seconds")
+        ttl = int(ttl)
+        if ttl <= 0:
+            raise HTTPException(400, "Field 'ttl_seconds' must be a positive number of seconds")
+        if ttl > max_h * 3600:
+            raise HTTPException(
+                400,
+                f"ttl_seconds={ttl} exceeds the deployment cap of {max_h}h "
+                f"(chart values shortTermMemory.maxTtlHours)",
+            )
+    override = body.get("name")
+    if override is not None:
+        override = str(override).strip()
+        if not override:
+            raise HTTPException(400, "Field 'name' must be a non-empty string when provided")
+    name = override or _stm_mint_name(session_id)
+    lifetime = ttl if ttl is not None else default_h * 3600
+    dm = await get_manager_async()
+    creator = _creator_name_for_request()
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            sync_pool,
+            partial(
+                dm.create_dataset,
+                name,
+                f"Short-term memory for session '{session_id}' (auto-expiring)",
+                created_by=creator,
+                lifetime=lifetime,
+                kind="short_term",
+            ),
+        )
+    except TypeError as e:
+        # The frozen T1 signature carries lifetime/kind; a storage layer
+        # without them is a DEPLOYMENT GAP, not a caller error — say so
+        # instead of surfacing an opaque 500.
+        raise HTTPException(503, f"Storage layer lacks dataset lifetime/kind support (T1): {e}")
+    except FileExistsError as e:
+        # F6 (Lead fix): the minted name is the ONLY handle to a hidden
+        # dataset, and the session->name map is a pure function of
+        # (salt, session_id).  Echoing the name here would let ANY second
+        # caller probe someone else's session for free: send the same
+        # session_id, read the name off the 409, then GET it by name.
+        # Refuse WITHOUT the name.  The genuine owner already has it from its
+        # own create response, so nothing legitimate is lost.
+        raise HTTPException(
+            409,
+            "A short-term-memory dataset already exists for this session_id.",
+        ) from e
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    # Grant the CREATING IDENTITY ONLY (PLAN section 4.4): the D16
+    # self-selection is the per-identity grant channel.  Best-effort — a
+    # store-off deployment (single shared key, D20 anonymous) has no
+    # per-identity store to select into and needs no grant at all.
+    granted = False
+    identity = _clients_registry.current_identity()
+    if identity is not None and not identity.is_admin and _access_store.store_enabled():
+        try:
+            _access_store.select_dataset(identity, name)
+            granted = True
+        except Exception as exc:
+            logger.warning("STM self-selection grant failed for '%s': %s", name, exc)
+    logger.info(
+        "Short-term memory dataset '%s' created (session '%s', creator '%s', lifetime %ss, granted_to_creator=%s)",
+        name,
+        session_id,
+        creator,
+        lifetime,
+        granted,
+    )
+    return {
+        "status": "ok",
+        "dataset": name,
+        "session_id": session_id,
+        "lifetime_seconds": lifetime,
+        "granted_to_creator": granted,
+        "password_protected": False,
+        "note": "Keep the dataset name — short-term-memory datasets are hidden from the catalog listing.",
+    }
+
+
+@app.delete("/api/short-term-memory/{name}")
+async def api_end_short_term_memory(
+    name: str,
+    request: Request,
+    x_dataset_password: str | None = Header(None, alias="X-Dataset-Password"),
+):
+    """Explicit teardown of a short-term-memory dataset (PLAN section 4.3.2).
+
+    Owner-or-admin gated (the SAME D23 `_identity_may_manage_dataset` gate as
+    `DELETE /api/datasets/{name}`) and REFUSES any dataset that is not
+    `kind == "short_term"` — this tool must never become a general
+    dataset-deletion backdoor (safety invariant 6).  STM datasets are created
+    passwordless, so the password header is normally unnecessary; if one was
+    set by hand, the standard proof is still demanded (invariant 7: no
+    password bypass anywhere).
+    """
+    dm = await get_manager_async()
+    loop = asyncio.get_running_loop()
+    identity = _clients_registry.current_identity()
+    is_admin = identity is not None and identity.is_admin
+    # F3: ownership BEFORE existence — the D23 ordering.  A 404 here before
+    # the gate would be a dataset-existence ORACLE: a non-owner could
+    # distinguish "exists but not mine" (403) from "does not exist" (404).
+    # Non-owners therefore get ONE generic denial regardless of existence;
+    # the specific 404 (and the real 403 body) is reserved for callers the
+    # gate has already vetted.  NOTE: the specific ownership-gate messages
+    # ("owned by 'X'") are ALSO an existence oracle in principle — but that
+    # is the D23 route's ratified behaviour and the gate helper is shared,
+    # so the oracle test pins MESSAGE-EQUALITY between existing/missing only
+    # for the generic branch, and the specific 403 is out of scope here.
+    if not is_admin:
+        caller = str(getattr(identity, "name", "") or "").strip()
+        creator = ""
+        try:
+            creator = str(await loop.run_in_executor(sync_pool, dm.read_created_by, name) or "").strip()
+        except Exception:
+            creator = ""
+        if not caller or caller != creator:
+            # Same single NAMELESS denial whether it exists (not yours) or
+            # not (nothing there): echoing the name back would let the
+            # denial body itself act as the oracle the status code refuses
+            # to be (bob could diff the echoed name against a probe list).
+            raise HTTPException(
+                403,
+                "Dataset not permitted for this API key (dataset ownership is configured — D23).",
+            )
+    try:
+        meta = await loop.run_in_executor(sync_pool, lambda: dm._read_meta(name))
+    except Exception:
+        meta = None
+    if not meta:
+        raise HTTPException(404, f"Dataset '{name}' not found")
+    # Kind refusal AFTER ownership: a non-owner learns nothing about a
+    # dataset's kind from this surface (gate first, leak nothing).
+    kind = str(meta.get("kind") or "")
+    if kind != "short_term":
+        raise HTTPException(
+            409,
+            f"Refusing to end '{name}': it is not a short-term-memory dataset "
+            f"(kind={kind or 'normal'!r}) — this tool never deletes normal datasets.",
+        )
+    await _require_dataset_password(dm, name, x_dataset_password, request)
+    await loop.run_in_executor(sync_pool, dm.delete_dataset, name)
+    logger.info(
+        "Short-term memory dataset '%s' ended (deleted) by '%s'",
+        name,
+        _creator_name_for_request(),
+    )
+    return {"status": "ok", "deleted": name, "kind": "short_term"}
+
+
 @app.post("/api/datasets/{name}/verify-password")
 async def api_verify_dataset_password(name: str, request: Request, body: dict[str, Any] = Body(...)):
     """Verify a dataset password.
@@ -1940,6 +2215,39 @@ async def api_select_dataset(name: str, request: Request, body: dict[str, Any] =
         await loop.run_in_executor(sync_pool, dm.get_dataset, name, False)
     except FileNotFoundError:
         raise HTTPException(404, f"Dataset '{name}' not found")
+    # Admins hold deployment authority, but a dataset password still
+    # protects the USER's data from the operator: an admin must PROVE the
+    # password exactly like anyone else.  What an admin cannot do is
+    # self-select (there is nothing to select INTO — _require_select_identity
+    # 409s), which used to leave the panel's only password affordance
+    # ("Select...") dead for admins, so a protected download fell through to
+    # 401 "is password protected" with no way to unlock.  Serve the admin's
+    # select as an UNLOCK: verify the password, warm the unlock cache, and
+    # say so.  No bypass — a wrong/missing password still 403s.
+    _ident = _clients_registry.current_identity()
+    if _ident is not None and _ident.is_admin:
+        # Only a PASSWORD-PROTECTED dataset needs this path.  For anything
+        # else the historical 409 stands (an admin has nothing to select
+        # into) — this branch exists solely so the panel can obtain a
+        # password proof for a protected dataset it must unlock to read.
+        if not await loop.run_in_executor(sync_pool, dm.has_password, name):
+            raise HTTPException(409, "Dataset selection applies to per-user API keys (registry keys).")
+        cid = _unlock_client_id(request)
+        password = (body or {}).get("password") if isinstance(body, dict) else None
+        if not password:
+            raise HTTPException(400, "Field 'password' is required")
+        _check_pw_throttle(cid)
+        if not await loop.run_in_executor(sync_pool, dm.verify_password, name, password):
+            _pw_record_failure(cid)
+            raise HTTPException(403, f"Incorrect password for dataset '{name}'")
+        _pw_reset_failures(cid)
+        _unlock_cache_set(name, cid, password)
+        return {
+            "status": "ok",
+            "message": f"Password verified for '{name}' — unlocked for this session.",
+            "source": "admin-unlock",
+        }
+
     identity = _require_select_identity()
     cid = _unlock_client_id(request)
     password = (body or {}).get("password") if isinstance(body, dict) else None
@@ -2459,9 +2767,15 @@ def _creator_name_for_request() -> str:
             return "admin"
         name = str(getattr(identity, "name", "") or "").strip()
         # The D20 fallback name is a SENTINEL, not a user: a dataset created
-        # unauthenticated is nobody's — "anonymous" (a name the registry's
-        # own regex can never mint, so it can never collide with a real key
-        # identity).
+        # unauthenticated is nobody's — it stamps "anonymous".
+        # (2026-10 correction: the old comment claimed the registry's regex
+        # "can never mint" the sentinel — FALSE for the ENV path, where
+        # parse_clients applies NO name validation, so RAG_API_KEY_CLIENTS
+        # could install "__anonymous__" as a real client name and the
+        # exact-name comparison would misread it as the sentinel.
+        # impl-storage is warn-and-refusing sentinel entries at parse time;
+        # the ownership decision itself must ALSO treat the reserved stamps
+        # via identity_owns_dataset, not string equality.)
         if name and name != "__anonymous__":
             return name
     return "anonymous"
@@ -2474,8 +2788,15 @@ def _identity_may_manage_dataset(dm: DatasetManager, name: str) -> None:
 
     Rules (fleet decision D23):
       * an ADMIN identity always passes (deployment keys, MCP keyset keys);
-      * otherwise the caller's identity NAME must equal the dataset's
-        ``created_by`` stamp (meta.json, written at create time);
+      * otherwise OWNERSHIP is decided by
+        ``clients_registry.identity_owns_dataset`` — the caller's identity
+        NAME must equal the dataset's ``created_by`` stamp (meta.json,
+        written at create time) AND the stamp must not be a RESERVED
+        sentinel (S1, 2026-10: the strings "admin" and "anonymous" are both
+        the stamps admins / nameless creators leave AND legal client names —
+        a client named "admin" used to pass this gate on EVERY admin-created
+        dataset by simple string equality; the helper refuses to treat a
+        reserved stamp as an owner name for a non-admin identity);
       * a dataset with NO stamp — pre-D23, or one whose meta is missing /
         unreadable — is ADMIN-ONLY: no backfill, no proof of creation, and
         a corrupt read must never widen a non-admin's powers (fail-closed).
@@ -2485,14 +2806,37 @@ def _identity_may_manage_dataset(dm: DatasetManager, name: str) -> None:
     identity = _clients_registry.current_identity()
     if identity is not None and identity.is_admin:
         return
-    caller = str(getattr(identity, "name", "") or "").strip()
+    # Read the stamp ONCE, through the INJECTED manager, and hand it to the
+    # ownership helper.  Two reasons this is the right seam:
+    #   1. the helper must not re-read the meta from disk behind a caller
+    #      that already holds a DatasetManager (that hidden coupling made the
+    #      decision ignore an injected manager, so a test double and the real
+    #      object could disagree);
+    #   2. the message below needs the stamp anyway, so a single read serves
+    #      both the decision and the diagnostic.
     creator = ""
     try:
         creator = str(dm.read_created_by(name) or "").strip()
     except Exception:
         creator = ""  # unreadable meta → no provable creator → admin-only
-    if creator and caller and caller == creator:
+    try:
+        owner = _clients_registry.identity_owns_dataset(identity, name, creator or None)
+    except AttributeError:
+        # SSO-CREATE-A not deployed: failing over to the old string-equality
+        # branch would silently REINTRODUCE the S1 collision, so fail loud.
+        raise HTTPException(
+            503,
+            "ownership helper missing: SSO-CREATE-A (identity_owns_dataset) is not deployed",
+        )
+    if owner:
         return
+    # NO string-equality fallback here.  identity_owns_dataset IS the
+    # ownership decision, including its reserved-stamp refusal; re-deciding
+    # it locally would re-open the S1 collision this gate was fixed for
+    # (a client named "admin" matching every admin-created dataset).  A
+    # `creator == caller` check used to sit here and DID exactly that: the
+    # helper returned False, execution fell through, and the comparison
+    # below passed anyway.
     if not creator:
         raise HTTPException(
             403,
@@ -2585,24 +2929,27 @@ async def api_admin_grant_client(name: str, request: Request, body: dict[str, An
     datasets = body.get("datasets")
     oidc_field = body.get("oidc")
     blocked_field = body.get("blocked")
+    can_create_field = body.get("can_create_datasets")
     # D21 flag-only PATCHes (the SPA's Block and OIDC-bind buttons) carry NO
     # datasets field — grant validation applies only when datasets is
-    # actually present.  A body with none of the three fields is still a
+    # actually present.  A body with none of the four fields is still a
     # 400 (nothing to do).
-    if datasets is None and oidc_field is None and blocked_field is None:
-        raise HTTPException(400, "Provide 'datasets' (a list), 'oidc' (a string), or 'blocked' (a bool)")
+    if datasets is None and oidc_field is None and blocked_field is None and can_create_field is None:
+        raise HTTPException(400, "Provide 'datasets' (a list), 'oidc' (a string), 'blocked' (a bool), or 'can_create_datasets' (a bool)")
     if datasets is not None and not isinstance(datasets, list):
         raise HTTPException(400, "Field 'datasets' must be a list of dataset names")
     if oidc_field is not None and (not isinstance(oidc_field, str)):
         raise HTTPException(400, "Field 'oidc' must be a string (an alias, or '' to clear)")
     if blocked_field is not None and not isinstance(blocked_field, bool):
         raise HTTPException(400, "Field 'blocked' must be a boolean")
+    if can_create_field is not None and not isinstance(can_create_field, bool):
+        raise HTTPException(400, "Field 'can_create_datasets' must be a boolean")
     loop = asyncio.get_running_loop()
     try:
         result = None
         if datasets is not None:
             result = await loop.run_in_executor(sync_pool, lambda: _admin_registry.grant_datasets(name, datasets))
-        if oidc_field is not None or blocked_field is not None:
+        if oidc_field is not None or blocked_field is not None or can_create_field is not None:
             # set_client_flags AUTO-MINTS an empty-grant entry for unknown
             # names (the observed-JWT-user flow) — so a flag-only PATCH on an
             # observed row works without a prior mint (Block and OIDC-bind).
@@ -2612,6 +2959,7 @@ async def api_admin_grant_client(name: str, request: Request, body: dict[str, An
                     name,
                     oidc=None if oidc_field is None else oidc_field,
                     blocked=None if blocked_field is None else blocked_field,
+                    can_create_datasets=None if can_create_field is None else can_create_field,
                 ),
             )
         else:
@@ -2644,6 +2992,10 @@ async def api_admin_grant_client(name: str, request: Request, body: dict[str, An
         if "oidc" in flags:
             detail.append(f"oidc={flags['oidc'] or '(cleared)'}")
         detail.append(f"blocked={flags['blocked']}")
+        if "can_create_datasets" in flags:
+            # None means "no per-user override recorded — deployment default".
+            ccd = flags.get("can_create_datasets")
+            detail.append(f"can_create_datasets={ccd if ccd is not None else '(default)'}")
         message += f" D21 flags: {', '.join(detail)}."
     return {
         "status": "ok",
@@ -2722,10 +3074,22 @@ def _rag_acl_filter_datasets(datasets: list, catalog: bool = False) -> tuple:
     """
     identity = _clients_registry.current_identity()
     if identity is None or identity.is_admin:
+        if catalog:
+            # Short-term-memory datasets are hidden from the PANEL for every
+            # viewer, admins included (PLAN section 4.4: "so it does not
+            # appear even for the creator").  The catalog view is where
+            # datasets are advertised for opt-in — an ephemeral session
+            # store is nobody's opt-in.  Direct-name access is unaffected.
+            visible = [d for d in datasets if str(d.get("kind") or "") != "short_term"]
+            return visible, len(datasets) - len(visible)
         return datasets, 0
     if not catalog:
         visible = [d for d in datasets if _access_store.dataset_allowed(identity, str(d.get("name", "")))]
         return visible, len(datasets) - len(visible)
+    # STM hiding (catalog view only): drop kind == "short_term" rows BEFORE
+    # the ACL math so they are never advertised, even to their creator.
+    # Direct-name access and the plain (world-only) listing still work.
+    datasets = [d for d in datasets if str(d.get("kind") or "") != "short_term"]
     excluded = _access_store.exclusions_for(identity)
     visible = []
     for d in datasets:
@@ -2795,7 +3159,16 @@ def _annotate_acl_granted(datasets: list) -> None:
     if not _clients_registry.registry_configured():
         return
     identity = _clients_registry.current_identity()
-    if identity is None or identity.is_admin:
+    if identity is None:
+        return
+    if identity.is_admin:
+        # An admin reaches every dataset (dataset_allowed returns True for
+        # admins), so stamp them granted: the /access page then offers the
+        # password affordance instead of a self-selection admins cannot make
+        # (which 409s).  This is accurate rendering, NOT an access bypass —
+        # a protected dataset still demands its password at read time.
+        for ds in datasets:
+            ds["acl_granted"] = True
         return
     for ds in datasets:
         name = str(ds.get("name", ""))
@@ -5852,8 +6225,11 @@ def _whoami_flags() -> dict:
     """The D23 ``flags`` object for an AUTHENTICATED whoami (snake_case).
 
     * ``can_create_datasets`` — matches the middleware's POST /api/datasets
-      rule (``_rag_acl_path_denial``): the registry is NOT configured, or
-      the identity carries the ``*`` grant, or it is an admin.
+      rule (``_rag_acl_path_denial``) EXACTLY: both call
+      ``_identity_may_create`` — the per-user ``can_create_datasets``
+      override (admin PATCH /api/admin/clients/{name}) → the deployment
+      default (RAG_DATASETS_CREATE_ALLOWED) → the identity-shape rules in
+      ``access_store.identity_may_create_datasets``.
     * ``sso_enabled`` — the D22 browser SSO flow is fully configured.
     * ``memory_dataset`` — the caller's effective ★ binding or null (the
       same fail-soft resolution the MCP memory tools use).
@@ -5862,18 +6238,20 @@ def _whoami_flags() -> dict:
       the endpoints re-check everything server-side per request.
     """
     identity = _clients_registry.current_identity()
-    can_create = False
-    if identity is None:
-        # No identity bound: creation is governed by the D15 config — the
-        # middleware's rule denies only when the registry is configured
-        # without the ``*`` grant; with nothing configured there is no
-        # registry gate (the D20 fail-closed branch binds an identity, so
-        # None here means a genuinely legacy surface — creation allowed).
-        can_create = not _clients_registry.registry_configured()
-    elif identity.is_admin:
-        can_create = True
-    else:
-        can_create = "*" in (identity.datasets or frozenset())
+    # 2026-10 configurable-create: the SPA greys out the Create button from
+    # THIS flag (index.html reads ``flags.can_create_datasets``), so it must
+    # be the SAME three-level decision the middleware's create gate makes
+    # (per-user override → deployment default → identity shape).  A mismatch
+    # here is a visible button that 403s, or a hidden one that would have
+    # worked — the gate and the flag call ONE helper so they cannot drift.
+    try:
+        can_create = _identity_may_create(identity)
+    except AttributeError:
+        # SSO-CREATE-A predicate not deployed yet: refuse to guess (a wrong
+        # guess greys out a working button or shows a broken one).
+        raise RuntimeError(
+            "create predicate missing: SSO-CREATE-A (identity_may_create_datasets) is not deployed"
+        )
     memory = None
     try:
         memory = _access_store.memory_dataset_for(identity, None)

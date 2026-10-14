@@ -56,6 +56,7 @@ from multimodal_rag.input_processing import (
     YAMLProcessor,
 )
 from multimodal_rag.rag_system import MultimodalRAG, _record_ingest_warning, _store_write_guard
+from multimodal_rag.stm_lifetime import validate_lifetime, validate_stored_lifetime
 from multimodal_rag.utils.general_tools import retry_call
 from multimodal_rag.utils.logging_utils import logging
 from multimodal_rag.vector_store import RrfParams
@@ -1153,6 +1154,20 @@ def _download_url(url: str, timeout: int = 120) -> str:
 
 _PBKDF2_ITERATIONS = 600_000  # OWASP 2023 minimum for PBKDF2-SHA256
 
+# Sentinel for the short-term-memory cap argument on the file-ingest path.
+#
+# dataset_lifetime=None is a MEANINGFUL value (an immortal dataset), so a
+# plain '= None' default cannot distinguish 'the caller resolved the cap and
+# it is infinite' from 'the caller forgot to pass the cap'.  That ambiguity
+# is exactly how a file-ingested point escaped a finite dataset's cap: every
+# leaf silently fell back to immortal, and PLAN section 2.2 row 4 forbids
+# permanent samples in a finite dataset.
+#
+# With this sentinel a forgotten argument RAISES at the point of the mistake
+# instead of quietly minting an immortal point.  Callers must pass the value
+# explicitly, even when it is None.
+_CAP_REQUIRED: Any = object()
+
 
 def _hash_password(password: str) -> str:
     salt = secrets.token_hex(16)
@@ -1892,6 +1907,8 @@ class DatasetManager:
         rrf: "dict[str, Any] | None" = None,
         contextual: bool = False,
         created_by: "str | None" = None,
+        lifetime: "int | None" = None,
+        kind: "str | None" = None,
     ) -> dict[str, Any]:
         """Create a new dataset.
 
@@ -1952,8 +1969,35 @@ class DatasetManager:
             public by a non-admin).  The REST surface passes the request's
             resolved identity: a registry/JWT/SSO name, ``"admin"`` (admins
             act as the deployment), or ``"anonymous"``.
+        lifetime:
+            Short-term-memory dataset cap, in SECONDS (stmem/PLAN section
+            4.1).  ``None`` (the default) means INFINITE — every dataset that
+            predates this field has no ``lifetime`` key at all and is therefore
+            immortal, which is what makes Phase 1 unreachable by the reaper by
+            arithmetic rather than by a filter we have to remember to write.
+            Validated with :func:`stm_lifetime.validate_lifetime`, so a
+            malformed value (0, negative, bool, non-integer, or a value whose
+            ``expires_at`` would overflow the signed 64-bit Qdrant Range
+            bound) raises ``ValueError`` here rather than minting a dataset
+            whose lifetime nobody can reason about.
+        kind:
+            Dataset class (stmem/PLAN section 4.1).  ``"short_term"`` marks a
+            session-scoped dataset that may eventually be deleted by the
+            reaper.  ``None`` (the default) stores NOTHING — an absent ``kind``
+            means "normal dataset", and :func:`stm_lifetime.dataset_deletable`
+            requires the exact string ``"short_term"`` before it will ever
+            consider deleting a dataset.
         """
         self._validate_name(name)
+        # Short-term memory (stmem/PLAN section 4.1): validate the dataset
+        # lifetime BEFORE touching the filesystem, so a malformed value can
+        # never leave a half-created dataset behind.  validate_lifetime is the
+        # frozen write-time gate — it RAISES on 0/negative/bool/non-integer and
+        # on anything whose expires_at would overflow the signed 64-bit Qdrant
+        # Range bound.  We deliberately do not catch it: a caller bug must be
+        # loud here, because a silently-accepted lifetime is data whose
+        # lifetime nobody can reason about (and the reaper would act on it).
+        lifetime = validate_lifetime(lifetime, field="dataset lifetime")
         dataset_dir = self.datasets_path / name
         if dataset_dir.exists():
             raise FileExistsError(f"Dataset '{name}' already exists")
@@ -1979,6 +2023,18 @@ class DatasetManager:
         rrf_meta = self._sanitize_rrf_meta(rrf)
         if rrf_meta is not None:
             meta["rrf"] = rrf_meta
+        # Short-term memory (stmem/PLAN section 4.1).  ``lifetime`` is stored
+        # for EVERY create, ``None`` included: the explicit null is the
+        # "immortal" stamp, and it keeps every post-STM meta self-describing
+        # (the reaper reads the key, not its absence).  Pre-STM metas have no
+        # key at all — ``validate_stored_lifetime`` reads both shapes as
+        # INFINITE, so nothing that predates this field can ever be selected.
+        meta["lifetime"] = lifetime
+        # ``kind`` is OMITTED when None: an absent kind IS "normal dataset",
+        # and stm_lifetime.dataset_deletable requires the exact string
+        # "short_term" before any dataset-deletion path may fire.
+        if kind is not None:
+            meta["kind"] = kind
         # D23 ownership: the creator's identity name — the delete/public
         # surfaces read it back.  Empty/None stores nothing (pre-D23 shape).
         creator = str(created_by or "").strip()
@@ -1998,11 +2054,13 @@ class DatasetManager:
         # Pre-create the Qdrant collection by initialising the RAG instance
         self._get_rag(name)
         logger.info(
-            "Created dataset '%s' (caption_with_asr=%s, rrf_defaults=%s, contextual=%s)",
+            "Created dataset '%s' (caption_with_asr=%s, rrf_defaults=%s, contextual=%s, lifetime=%s, kind=%s)",
             name,
             caption_with_asr,
             rrf_meta is not None,
             bool(contextual),
+            lifetime,
+            kind,
         )
         return self._strip_password(meta)
 
@@ -2124,13 +2182,50 @@ class DatasetManager:
                 "has_password": "password_hash" in meta,
             }
 
+    def _dataset_lifetime(self, dataset_name: str) -> int | None:
+        """The dataset's stored short-term-memory lifetime, or None (INFINITE).
+
+        None is the value every dataset that predates this feature reads as,
+        and the reason such a dataset can never be reaped.
+
+        Read FRESH from meta.json on every ingest rather than cached on the
+        RAG instance: setting a dataset's lifetime later must apply to
+        subsequent ingests, and a cached value would silently stamp a stale
+        cap.  The read is cheap -- the parsed meta is cached under an
+        mtime/size stamp and invalidated on every write.
+
+        The STORED value goes through validate_stored_lifetime, which never
+        raises.  This is a read-back of data we already wrote, and the frozen
+        reaper gate stm_lifetime.dataset_point_reapable applies the very same
+        fail-closed read to the very same field -- so a malformed value reads
+        as INFINITE here exactly as it does there.  The points get stamped
+        immortal and the reaper skips the dataset: the two can never
+        disagree.  (Contrast create_dataset, which applies the STRICT
+        validate_lifetime to the CALLER's value -- a caller bug must be loud,
+        a stored value must fail closed.)
+        """
+        meta = self._read_meta(dataset_name) or {}
+        return validate_stored_lifetime(meta.get("lifetime"), field="dataset lifetime")
+
     @staticmethod
     def _strip_password(meta: dict[str, Any]) -> dict[str, Any]:
         """Return a copy of *meta* with the password hash removed and a
-        ``has_password`` boolean added."""
+        ``has_password`` boolean added.
+
+        The short-term-memory fields ``lifetime`` and ``kind`` are pinned
+        explicitly (stmem/INTERFACE-FREEZE.md section 1, T1): every meta the
+        create/get/list surfaces return must carry BOTH keys, so the reaper's
+        dataset gate (:func:`stm_lifetime.dataset_point_reapable`) and the
+        catalog's ``kind == "short_term"` filter can read them straight off a
+        listing row without a second meta read.  A pre-STM meta has neither
+        key; materialising them here as ``None`` keeps the row shape uniform
+        and is still read as INFINITE / "normal" by the frozen algebra.
+        """
         m = dict(meta)
         m["has_password"] = "password_hash" in m
         m.pop("password_hash", None)
+        m.setdefault("lifetime", None)
+        m.setdefault("kind", None)
         return m
 
     def delete_dataset(self, name: str) -> None:
@@ -2740,9 +2835,23 @@ class DatasetManager:
 
         Documents are embedded and stored in the dataset's Qdrant collection.
         Returns the list of stored point IDs.
+
+        Short-term memory (stmem/PLAN section 4.2): this is the ONE ingest
+        entry point that holds BOTH the target dataset and the documents, so
+        the dataset's lifetime is resolved here and handed to the RAG core as
+        a keyword argument.  The RAG core itself stays dataset-agnostic — it
+        never reads meta.json and never accepts a dataset name from the
+        request body (PLAN section 2.3: nothing about a document's lifetime
+        may come from the client).
+
+        The lifetime is read FRESH from meta.json on every ingest rather than
+        cached on the RAG instance: setting a dataset's lifetime later must
+        apply to subsequent ingests, and a cached value would silently stamp
+        a stale cap.  The read is cheap (TTL'd meta cache, invalidated on
+        write) and this call already does NFS work for the embed + upsert.
         """
         rag = self._get_rag(dataset_name)
-        ids = rag.add_to_vector_store(documents)
+        ids = rag.add_to_vector_store(documents, dataset_lifetime=self._dataset_lifetime(dataset_name))
         self._increment_count(dataset_name, len(ids))
         # Opt-in ingest webhook (RAG_WEBHOOK_URL) — logged-not-fatal, no-op
         # when unset.
@@ -2771,6 +2880,12 @@ class DatasetManager:
         chunk_size = rag.embedder.chunk_size
         chunk_overlap = rag.embedder.chunk_overlap
         text_splitter = rag.embedder.text_splitter
+        # Short-term memory: the dataset's lifetime is resolved ONCE here and
+        # threaded down to every store call the file path makes (see
+        # _add_file_processed).  Resolving it at the entry point rather than at
+        # each leaf keeps one meta read per file operation and makes it
+        # impossible to add a new per-filetype branch that forgets the cap.
+        dataset_lifetime = self._dataset_lifetime(dataset_name)
 
         # Download remote URLs (HTTP or S3) to a temporary file — they are
         # processed directly without a separate PVC copy.
@@ -2792,6 +2907,7 @@ class DatasetManager:
                 text_splitter=text_splitter,
                 original_name=original_name,
                 source_url=source_url,
+                dataset_lifetime=dataset_lifetime,
             )
             # Opt-in ingest webhook (RAG_WEBHOOK_URL) — logged-not-fatal.
             _notify_ingest_hook(dataset_name, len(result.get("stored_ids") or []))
@@ -2855,6 +2971,11 @@ class DatasetManager:
         mpk = rag.embedder.mm_processor_kwargs
         chunk_size = rag.embedder.chunk_size
         chunk_overlap = rag.embedder.chunk_overlap
+        # Short-term memory: resolved once per batch and threaded into BOTH
+        # store paths below (the batched media/PDF consumer and the direct
+        # per-filetype handler), so no file-ingested point can escape the
+        # dataset's hard cap (PLAN section 2.2, truth-table row 4).
+        dataset_lifetime = self._dataset_lifetime(dataset_name)
         max_pixels = mpk.get("max_pixels", 720 * 720)
         fps = mpk.get("fps", 1.0)
         total_pixels = mpk.get("total_pixels", 0)
@@ -2944,7 +3065,7 @@ class DatasetManager:
                             offset += count
                             try:
                                 ids = retry_call(
-                                    lambda fd=file_docs: rag.add_to_vector_store(fd),
+                                    lambda fd=file_docs: rag.add_to_vector_store(fd, dataset_lifetime=dataset_lifetime),
                                     max_attempts=3,
                                     base_delay=2.0,
                                     connection_delay=10.0,
@@ -3279,6 +3400,7 @@ class DatasetManager:
                             chunk_size,
                             chunk_overlap,
                             original_name=fname,
+                            dataset_lifetime=dataset_lifetime,
                         )
                         evq.put(("direct_result", fname, result.get("chunks", 0)))
 
@@ -3705,13 +3827,37 @@ class DatasetManager:
         text_splitter=None,
         original_name: str | None = None,
         source_url: str | None = None,
+        dataset_lifetime: Any = _CAP_REQUIRED,
     ) -> dict[str, Any]:
         """Core file processing logic (shared by ``add_file`` and URL ingestion).
 
         If *source_url* is set (HTTP/S3 URL), the file is processed from the
         temp download and **not** copied to the PVC files directory.  The
         original URL is used as the canonical ``source``.
+
+        *dataset_lifetime* is the target dataset's STM lifetime in seconds
+        (``None`` = infinite).  It is resolved ONCE by the calling entry point
+        (:meth:`add_file` / :meth:`add_files_batch` / the URL path) and passed
+        down, because this function fans out into ~15 per-filetype store calls
+        and each of them must carry the dataset's hard cap (PLAN section 2.2:
+        the dataset lifetime caps every point in it).  Threading it as a
+        parameter — rather than re-reading meta here — keeps ONE meta read per
+        file operation and, more importantly, makes the cap impossible to
+        forget in a new branch: a leaf that omits it is a visible omission
+        rather than a silent immortal point.
+
+        The default is the _CAP_REQUIRED sentinel rather than None precisely
+        because None is a legal value here: a caller that FORGETS the cap
+        must fail loudly instead of silently storing immortal points inside
+        a finite dataset.  See _CAP_REQUIRED.
         """
+        if dataset_lifetime is _CAP_REQUIRED:
+            raise TypeError(
+                "_add_file_processed() requires dataset_lifetime explicitly "
+                "(pass the dataset's STM lifetime, or None for an immortal "
+                "dataset). A missing cap would store points the reaper can "
+                "never collect -- see _CAP_REQUIRED."
+            )
         fname = original_name or Path(file_path).name
         # Archives: extract and process each contained file through the same
         # per-file handler used for standalone uploads (_add_file_processed), so
@@ -3739,6 +3885,7 @@ class DatasetManager:
                         chunk_overlap,
                         text_splitter=text_splitter,
                         original_name=member_name,
+                        dataset_lifetime=dataset_lifetime,
                     )
                     return list(result.get("stored_ids") or [])
                 except ValueError as exc:
@@ -3797,7 +3944,7 @@ class DatasetManager:
             )
             _fix_source(chunks, fname, source_str)
             self._save_doc_media(dataset_name, chunks, model_max_pixels=mpk.get("max_pixels", 720 * 720))
-            ids = rag.add_to_vector_store(chunks)
+            ids = rag.add_to_vector_store(chunks, dataset_lifetime=dataset_lifetime)
             self._strip_media_payloads(rag, ids)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
             self._cleanup_dropped_file(dataset_name, rag, source_url, str(dst_path), content_hash, ids)
@@ -3816,7 +3963,7 @@ class DatasetManager:
             doc["preprocessed_image"] = store_url
             if not source_url and source_str != original_path:
                 doc["original_image"] = f"file://{original_path}"
-            ids = rag.add_to_vector_store([doc])
+            ids = rag.add_to_vector_store([doc], dataset_lifetime=dataset_lifetime)
             self._strip_media_payloads(rag, ids, store_url)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
             self._cleanup_dropped_file(dataset_name, rag, source_url, original_path, content_hash, ids)
@@ -3848,7 +3995,7 @@ class DatasetManager:
                     doc["original_video"] = original_url
             _fix_source(docs, fname, source_str)
             if docs:
-                ids = rag.add_to_vector_store(docs)
+                ids = rag.add_to_vector_store(docs, dataset_lifetime=dataset_lifetime)
                 self._strip_media_payloads(rag, ids, store_url)
                 self._increment_count(dataset_name, len(ids), file_type=file_type)
             else:
@@ -3888,7 +4035,7 @@ class DatasetManager:
             # file (which could be tens of MB and exceed the ASR endpoint's
             # size cap at query time).
             self._save_doc_media(dataset_name, audio_docs)
-            ids = rag.add_to_vector_store(audio_docs)
+            ids = rag.add_to_vector_store(audio_docs, dataset_lifetime=dataset_lifetime)
             self._strip_media_payloads(rag, ids, store_url)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
             self._cleanup_dropped_file(dataset_name, rag, source_url, str(dst_path), content_hash, ids)
@@ -3904,7 +4051,7 @@ class DatasetManager:
             )
             chunks = json_proc.process(source_str)
             _fix_source(chunks, fname, source_str)
-            ids = rag.add_to_vector_store(chunks) if chunks else []
+            ids = rag.add_to_vector_store(chunks, dataset_lifetime=dataset_lifetime) if chunks else []
             self._increment_count(dataset_name, len(ids), file_type=file_type)
             return self._finish_ingest(
                 dataset_name, content_hash, {"type": "json", "chunks": len(ids), "stored_ids": ids}
@@ -3914,7 +4061,7 @@ class DatasetManager:
             table_proc = TableProcessor(chunk_size=chunk_size, text_splitter=text_splitter)
             chunks = table_proc.process(source_str)
             _fix_source(chunks, fname, source_str)
-            ids = rag.add_to_vector_store(chunks) if chunks else []
+            ids = rag.add_to_vector_store(chunks, dataset_lifetime=dataset_lifetime) if chunks else []
             self._increment_count(dataset_name, len(ids), file_type=file_type)
             return self._finish_ingest(
                 dataset_name, content_hash, {"type": "table", "chunks": len(ids), "stored_ids": ids}
@@ -3928,7 +4075,7 @@ class DatasetManager:
             )
             chunks = code_proc.process(source_str)
             _fix_source(chunks, fname, source_str)
-            ids = rag.add_to_vector_store(chunks)
+            ids = rag.add_to_vector_store(chunks, dataset_lifetime=dataset_lifetime)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
             return self._finish_ingest(
                 dataset_name, content_hash, {"type": "code", "chunks": len(ids), "stored_ids": ids}
@@ -3944,7 +4091,7 @@ class DatasetManager:
             _fix_source(chunks, fname, source_str)
             if chunks:
                 self._save_doc_media(dataset_name, chunks)
-                ids = rag.add_to_vector_store(chunks)
+                ids = rag.add_to_vector_store(chunks, dataset_lifetime=dataset_lifetime)
                 self._strip_media_payloads(rag, ids, store_url)
                 self._increment_count(dataset_name, len(ids), file_type=file_type)
             else:
@@ -3961,7 +4108,7 @@ class DatasetManager:
             )
             chunks = html_proc.process(source_str)
             _fix_source(chunks, fname, source_str)
-            ids = rag.add_to_vector_store(chunks)
+            ids = rag.add_to_vector_store(chunks, dataset_lifetime=dataset_lifetime)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
             return self._finish_ingest(
                 dataset_name, content_hash, {"type": "html", "chunks": len(ids), "stored_ids": ids}
@@ -3975,7 +4122,7 @@ class DatasetManager:
             )
             chunks = xml_proc.process(source_str)
             _fix_source(chunks, fname, source_str)
-            ids = rag.add_to_vector_store(chunks) if chunks else []
+            ids = rag.add_to_vector_store(chunks, dataset_lifetime=dataset_lifetime) if chunks else []
             self._increment_count(dataset_name, len(ids), file_type=file_type)
             return self._finish_ingest(
                 dataset_name, content_hash, {"type": "xml", "chunks": len(ids), "stored_ids": ids}
@@ -3989,7 +4136,7 @@ class DatasetManager:
             )
             chunks = yaml_proc.process(source_str)
             _fix_source(chunks, fname, source_str)
-            ids = rag.add_to_vector_store(chunks) if chunks else []
+            ids = rag.add_to_vector_store(chunks, dataset_lifetime=dataset_lifetime) if chunks else []
             self._increment_count(dataset_name, len(ids), file_type=file_type)
             return self._finish_ingest(
                 dataset_name, content_hash, {"type": "yaml", "chunks": len(ids), "stored_ids": ids}
@@ -4005,7 +4152,7 @@ class DatasetManager:
             _fix_source(chunks, fname, source_str)
             if chunks:
                 self._save_doc_media(dataset_name, chunks)
-                ids = rag.add_to_vector_store(chunks)
+                ids = rag.add_to_vector_store(chunks, dataset_lifetime=dataset_lifetime)
                 self._strip_media_payloads(rag, ids)
                 self._increment_count(dataset_name, len(ids), file_type=file_type)
             else:
@@ -4024,7 +4171,7 @@ class DatasetManager:
             _fix_source(chunks, fname, source_str)
             if chunks:
                 self._save_doc_media(dataset_name, chunks)
-                ids = rag.add_to_vector_store(chunks)
+                ids = rag.add_to_vector_store(chunks, dataset_lifetime=dataset_lifetime)
                 self._strip_media_payloads(rag, ids)
                 self._increment_count(dataset_name, len(ids), file_type=file_type)
             else:
@@ -4037,7 +4184,7 @@ class DatasetManager:
             log_proc = LogProcessor(chunk_size=chunk_size, text_splitter=text_splitter)
             chunks = log_proc.process(source_str)
             _fix_source(chunks, fname, source_str)
-            ids = rag.add_to_vector_store(chunks)
+            ids = rag.add_to_vector_store(chunks, dataset_lifetime=dataset_lifetime)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
             return self._finish_ingest(
                 dataset_name, content_hash, {"type": "log", "chunks": len(ids), "stored_ids": ids}
@@ -4051,7 +4198,7 @@ class DatasetManager:
             )
             chunks = text_proc.process(source_str)
             _fix_source(chunks, fname, source_str)
-            ids = rag.add_to_vector_store(chunks)
+            ids = rag.add_to_vector_store(chunks, dataset_lifetime=dataset_lifetime)
             self._increment_count(dataset_name, len(ids), file_type=file_type)
             return self._finish_ingest(
                 dataset_name, content_hash, {"type": "text", "chunks": len(ids), "stored_ids": ids}
@@ -4965,16 +5112,37 @@ class DatasetManager:
         )
         self._decrement_count(dataset_name, 1)
 
-    def delete_session_history(self, dataset_name: str, session_id: str) -> int:
-        """Delete every ``session_history`` document for *session_id*.
+    def delete_session_memories(
+        self,
+        dataset_name: str,
+        session_id: str,
+        kinds: Sequence[str] | None = None,
+    ) -> int:
+        """Delete this session's stored memories of the given *kinds*.
 
-        Used by ``add_memory`` so a session's history is **replaced in
-        place**: when a session is re-flushed (e.g. it grew on a later
-        restart), the new chunks supersede the old ones instead of
-        accumulating copies in the store.
+        Used by ``add_memory`` so a re-distilled session is **replaced in
+        place**: when a session is distilled again (it went quiet, then
+        continued, and the transcript changed), the new summary supersedes the
+        old one instead of accumulating a copy.
+
+        *kinds* defaults to ``("session_history",)`` -- the historical
+        behaviour, byte-identical for the reaper and for any caller that does
+        not pass it.
+
+        WHY THIS TAKES KINDS AT ALL (2026-10-14): the replacement gate in
+        ``add_memory`` was ``kind == "session_history"``, but the gateway
+        distiller writes distilled sessions as ``project-summary``
+        (pcai_llm.core.distiller.KIND_SUMMARY). So every re-distill appended a
+        NEW summary instead of replacing the old one, and a conversation
+        resumed after a quiet window accumulated one memory per resume --
+        live evidence: session 3baae9d4d58e765b carried two summaries 27
+        minutes apart. The ``source`` label is useless for attribution here
+        (mm-rag hardcodes ``source: "opencode:memory"`` on every add_memory,
+        gateway writes included).
 
         Returns the number of points deleted.
         """
+        want = tuple(kinds) if kinds else ("session_history",)
         rag = self._get_rag(dataset_name)
         vs = rag.vector_store
         assert vs is not None and not isinstance(vs, dict)
@@ -4984,13 +5152,19 @@ class DatasetManager:
         from qdrant_client.models import (
             FieldCondition,
             Filter,
+            MatchAny,
             MatchValue,
             PointIdsList,
         )
 
+        kind_cond = (
+            FieldCondition(key="metadata.memory_kind", match=MatchValue(value=want[0]))
+            if len(want) == 1
+            else FieldCondition(key="metadata.memory_kind", match=MatchAny(any=list(want)))
+        )
         scroll_filter = Filter(
             must=[
-                FieldCondition(key="metadata.memory_kind", match=MatchValue(value="session_history")),
+                kind_cond,
                 FieldCondition(key="metadata.session_id", match=MatchValue(value=session_id)),
             ]
         )
@@ -5021,6 +5195,15 @@ class DatasetManager:
             )
             self._decrement_count(dataset_name, len(ids))
         return len(ids)
+
+    def delete_session_history(self, dataset_name: str, session_id: str) -> int:
+        """Delete every ``session_history`` document for *session_id*.
+
+        Thin alias over :meth:`delete_session_memories` (which generalised this
+        to take a kind list). Kept because the short-term-memory reaper and
+        existing callers depend on the name and on the history-only semantics.
+        """
+        return self.delete_session_memories(dataset_name, session_id, ("session_history",))
 
     def delete_documents(self, dataset_name: str, doc_ids: list[str]) -> int:
         """Delete multiple documents by Qdrant point ID in one batched call.

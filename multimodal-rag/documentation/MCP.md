@@ -1,3 +1,4 @@
+| `memory_status()` | Report-only probe: the CURRENT caller's memory-write capability (`{memory_available, dataset, writable, unlocked, detail}`) — the cheap pre-flight for automated memory writers (gateway distiller, harness shims). No arguments, no cross-identity oracle, no side effects (no unlock-cache write, no password-throttle consumption, no dataset mutation). A writer calls this BEFORE spending model tokens on a summary — `memory_available && writable && unlocked` predicts `add_memory` success (residual failure modes are storage errors, not ACL) | no | — |
 # Configuring MCP Access
 
 How to connect any MCP-compatible client (opencode, Claude Desktop, Open WebUI, etc.) to the Multimodal RAG server's MCP sidecar.
@@ -58,7 +59,7 @@ If the cluster ingress uses `oauth2-proxy` (EZUA), include a bearer token in the
 
 ---
 
-## 2. Available tools (20)
+## 2. Available tools (21)
 
 > **Read-only grants (D26):** when the caller's key carries mode ACLs (`RAG_DATASET_ACLS` token form `name:ds1:ro` or an overlay `{"name": …, "mode": "ro"}`), the write tools — `dataset_add_documents`, `dataset_delete_documents`, `dataset_replace_document`, `add_memory`, `delete_memory`, `forget_session` — require an **rw** grant for the target dataset: an ro (or ro-only) dataset refuses with a clear `ToolError`; read tools are unchanged.
 
@@ -129,7 +130,7 @@ If the calling LLM doesn't support a modality (set via `base_llm_modalities`), r
 }
 ```
 
-All 20 tools are exposed on every connection. The client (or its `tools` config) can disable specific tools it doesn't want the model to see.
+All 21 tools are exposed on every connection. The client (or its `tools` config) can disable specific tools it doesn't want the model to see.
 
 ### 3.2 opencode (unified single connection, 2026-10)
 

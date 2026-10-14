@@ -1,0 +1,60 @@
+# One-shot: list s3://rag-mcp-backups to verify backup artifacts actually exist.
+# Mirrors the backup CronJob's env wiring (config map + model-keys secrets).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backup-bucket-check
+  namespace: mm-rag
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: check
+          image: ghcr.io/ai-solution-eng/multimodal-rag-mcp:v5.7.2
+          command: ["python", "-c"]
+          args:
+            - |
+              import os, boto3
+              s3 = boto3.client(
+                  "s3",
+                  endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,
+                  aws_access_key_id=os.environ.get("S3_ACCESS_KEY_ID") or None,
+                  aws_secret_access_key=os.environ.get("S3_SECRET_ACCESS_KEY") or None,
+              )
+              bucket = os.environ.get("BACKUP_BUCKET") or "rag-mcp-backups"
+              print("[check] endpoint:", os.environ.get("S3_ENDPOINT_URL"))
+              print("[check] bucket:", bucket)
+              try:
+                  total = 0
+                  newest = None
+                  for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket):
+                      for o in page.get("Contents", []):
+                          total += 1
+                          if newest is None or o["LastModified"] > newest[1]:
+                              newest = (o["Key"], o["LastModified"])
+                          if total <= 40:
+                              print(f"[check]   {o['Key']}  {o['Size']} bytes  {o['LastModified']}")
+                  print(f"[check] TOTAL OBJECTS: {total}")
+                  print(f"[check] NEWEST: {newest}")
+                  print("[check] VERDICT:", "BACKUPS EXIST" if total else "BUCKET EMPTY")
+              except Exception as exc:
+                  print("[check] LIST FAILED:", type(exc).__name__, exc)
+          env:
+            - name: BACKUP_BUCKET
+              value: rag-mcp-backups
+          envFrom:
+            - configMapRef:
+                name: rag-mcp-server-config
+            - secretRef:
+                name: rag-mcp-server-model-keys
+            - secretRef:
+                name: rag-model-keys
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

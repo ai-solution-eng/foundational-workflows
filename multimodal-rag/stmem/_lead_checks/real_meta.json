@@ -1,0 +1,85 @@
+{
+  "MLS": {
+    "name": "MLS",
+    "document_count": 46,
+    "schema_version": 2
+  },
+  "PCAI-Documentation": {
+    "name": "PCAI-Documentation",
+    "document_count": 1826,
+    "schema_version": 2,
+    "created_by": "admin",
+    "public": true
+  },
+  "alejandro-memory": {
+    "name": "alejandro-memory",
+    "document_count": 10,
+    "password_hash": "b015...",
+    "schema_version": 2
+  },
+  "andrew-memory": {
+    "name": "andrew-memory",
+    "document_count": 802,
+    "password_hash": "d36f...",
+    "schema_version": 2
+  },
+  "andrew-test-dataset": {
+    "name": "andrew-test-dataset",
+    "document_count": 688,
+    "schema_version": 2,
+    "public": true
+  },
+  "finance-docs": {
+    "name": "finance-docs",
+    "document_count": 243,
+    "schema_version": 2
+  },
+  "francesco-memory": {
+    "name": "francesco-memory",
+    "document_count": 420,
+    "password_hash": "647d...",
+    "schema_version": 2
+  },
+  "jeff-memory": {
+    "name": "jeff-memory",
+    "document_count": 0,
+    "password_hash": "b922...",
+    "schema_version": 2,
+    "created_by": "admin"
+  },
+  "random-manual-documents": {
+    "name": "random-manual-documents",
+    "document_count": 333,
+    "schema_version": 2
+  },
+  "showcase-docs": {
+    "name": "showcase-docs",
+    "document_count": 4,
+    "schema_version": 2,
+    "public": true
+  },
+  "showcase-reports": {
+    "name": "showcase-reports",
+    "document_count": 2,
+    "schema_version": 2,
+    "public": true
+  },
+  "stacks-project": {
+    "name": "stacks-project",
+    "document_count": 4444,
+    "schema_version": 2
+  },
+  "swarm-stmem": {
+    "name": "swarm-stmem",
+    "document_count": 0,
+    "schema_version": 2,
+    "created_by": "admin"
+  },
+  "team-memory": {
+    "name": "team-memory",
+    "document_count": 0,
+    "schema_version": 2,
+    "created_by": "admin",
+    "public": true
+  }
+}

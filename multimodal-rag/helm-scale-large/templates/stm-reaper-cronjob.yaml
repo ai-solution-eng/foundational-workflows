@@ -1,0 +1,105 @@
+{{- if .Values.shortTermMemory.enabled }}
+# Opt-in short-term-memory reaper — PHASE 1: expired POINTS only.
+#
+# It runs the app image's own reaper module IN-PROCESS against
+# DatasetManager (never through the REST surface), so it needs NO dataset
+# password: the password gate is an API-boundary concept and the storage
+# layer takes no password argument at all (see stmem/INTERFACE-FREEZE.md
+# section 2).  A dataset that somehow DOES carry a password is skipped and
+# reported, never bypassed.
+#
+# Safety posture: the sweep only ever looks at datasets that carry a
+# lifetime (every pre-STM dataset is therefore unreachable), it re-checks
+# every candidate against the frozen lifetime algebra before deleting, and
+# it never deletes a dataset.  Run it once with --dry-run before trusting a
+# new deployment (see stmem/PLAN-short-term-memory.md section 4.5).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Values.deployment.name }}-stm-reaper
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.deployment.appName }}
+spec:
+  schedule: {{ .Values.shortTermMemory.reapSchedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          # Deliberately NO hpe-ezua vendor labels on cron pods: the platform's
+          # scheduler-stamping vendor policy makes labeled pods undeletable on
+          # pod update (immutable schedulerName; G2 2026-09-24 incident). The
+          # app-catalog status comes from the long-running pods — see the
+          # pod-template comment in templates/deployment.yaml.
+          labels:
+            app: {{ .Values.deployment.appName }}
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: OnFailure
+          containers:
+            - name: stm-reaper
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - python
+                - -m
+                - multimodal_rag.stm_reaper
+              args:
+                - --data-path
+                - /data
+                - --qdrant-host
+                - {{ .Values.deployment.name }}-qdrant
+                - --qdrant-port
+                - {{ .Values.qdrant.httpPort | quote }}
+              envFrom:
+                - configMapRef:
+                    name: {{ .Values.deployment.name }}-config
+                - secretRef:
+                    name: {{ .Values.deployment.name }}-model-keys
+                {{- if .Values.modelSecrets.existingSecret }}
+                # User-owned model Secret — the reaper builds the same model
+                # pack as the API server (the embedder is required), and the
+                # MODEL_*_URL entries live here in that mode.
+                - secretRef:
+                    name: {{ .Values.modelSecrets.existingSecret }}
+                {{- end }}
+              env:
+                - name: DATA_PATH
+                  value: "/data"
+                - name: QDRANT_HOST
+                  value: {{ .Values.deployment.name }}-qdrant
+                - name: QDRANT_PORT
+                  value: {{ .Values.qdrant.httpPort | quote }}
+                - name: RAG_REMOTE
+                  value: {{ .Values.rag.remote | quote }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                # Dataset meta lives on the shared /data PVC (the sweep reads
+                # it to decide which datasets are eligible); the reaper also
+                # needs it WRITABLE because a dataset listing syncs counts.
+                - name: data
+                  mountPath: /data
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                requests:
+                  memory: "256Mi"
+                  cpu: "200m"
+                limits:
+                  memory: "1Gi"
+                  cpu: "1"
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: {{ .Values.deployment.name }}-data
+            - name: tmp
+              emptyDir: {}
+{{- end }}

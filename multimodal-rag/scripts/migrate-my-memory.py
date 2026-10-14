@@ -28,7 +28,15 @@ import gzip, io, tarfile
 
 API = "https://rag-mcp-server.pcai-se-ai-application.hst.rdlabs.hpecorp.net"
 DATASET = "francesco-memory"
-API_KEY = "_55_VDr0Rq_Eelbqmqtx2eX7g9gwPoPd"  # fleet API key (REST endpoints)
+# Fleet API key (REST endpoints): prompted or env-provided, never a literal.
+# Resolution order: RAG_API_KEY env -> interactive getpass. (The historical
+# hardcoded key was revoked after the P0-9 secret-scan gate flagged it in
+# git HEAD and the delivery tree; mint a fresh key with scripts/mint_key.py
+# or the /access page and pass it via RAG_API_KEY.)
+API_KEY = os.environ.get("RAG_API_KEY", "").strip() or getpass.getpass("RAG API key: ").strip()
+if not API_KEY:
+    print("no API key provided -- aborting, nothing was changed.")
+    sys.exit(1)
 
 def build_opener():
     ca = os.environ.get("RAG_CA_BUNDLE") or os.environ.get("NODE_EXTRA_CA_CERTS") \

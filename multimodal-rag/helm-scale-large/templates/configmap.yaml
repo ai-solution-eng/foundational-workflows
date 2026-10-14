@@ -72,6 +72,16 @@ data:
   # with the password, saved per identity under /data/access); effective
   # access = operator ACL ∪ selections.  Explicit false opts out.
   RAG_ACCESS_STORE: {{ .Values.security.accessStore | default false | quote }}
+  # Dataset creation by ordinary users (SSO / named API keys).  Default TRUE:
+  # an authenticated human may create a dataset, which is then owned by them
+  # and reaches nobody else until an operator grants it.  Set false to make
+  # creation an admin-only act.  A per-user override on the /access page
+  # beats this default in either direction.  Read per request.
+  # NOTE: NOT '| default true' — sprig's default treats false as EMPTY, so a
+  # 'default true' here would render "true" even when the operator sets false,
+  # making the knob impossible to turn off.  Render the value directly; the
+  # chart's values.yaml always defines it.
+  RAG_DATASETS_CREATE_ALLOWED: {{ .Values.security.datasetsCreateAllowed | quote }}
   {{- if .Values.security.accessDenySelect }}
   RAG_ACCESS_DENY_SELECT: {{ .Values.security.accessDenySelect | quote }}
   {{- end }}

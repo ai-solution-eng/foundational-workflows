@@ -2798,6 +2798,76 @@ def _clamp_rrf_k(value: Any) -> int:
     return max(1, min(k, 1000))
 
 
+# -- Short-term memory (STM surface, PLAN stmem sections 4.3/4.4) -------------
+
+
+def _stm_ttl_config() -> tuple[int, int]:
+    """`(default_ttl_hours, max_ttl_hours)` from env (chart values
+    `shortTermMemory.defaultTtlHours` / `maxTtlHours`).  Same env names as
+    the REST surface (api_server._stm_ttl_config).  F5: a default ABOVE the
+    cap fails loud here — same discipline as the REST config read (refusing,
+    not clamping: a 48h default on a 24h cap is an operator config error,
+    and silently shortening it would be a third, unrequested policy)."""
+    try:
+        default_h = int(os.environ.get("RAG_STM_DEFAULT_TTL_HOURS", "6"))
+        max_h = int(os.environ.get("RAG_STM_MAX_TTL_HOURS", "24"))
+    except ValueError:
+        raise ToolError("RAG_STM_DEFAULT_TTL_HOURS / RAG_STM_MAX_TTL_HOURS must be integers")
+    if default_h <= 0 or max_h <= 0:
+        raise ToolError("RAG_STM_DEFAULT_TTL_HOURS / RAG_STM_MAX_TTL_HOURS must be positive")
+    if default_h > max_h:
+        raise ToolError(
+            f"RAG_STM_DEFAULT_TTL_HOURS ({default_h}h) exceeds RAG_STM_MAX_TTL_HOURS "
+            f"({max_h}h) — every default-TTL create would exceed the cap. Fix the chart values "
+            "(shortTermMemory.defaultTtlHours / maxTtlHours)."
+        )
+    return default_h, max_h
+
+
+def _stm_creator_stamp() -> str:
+    """The creator stamp for STM datasets — the SAME semantics as REST's
+    `_creator_name_for_request` (F2: one stamp, both surfaces).  The D20
+    `__anonymous__` sentinel is NOT a user: it stamps "anonymous" so a
+    dataset created unauthenticated reads back with the same name the REST
+    surface wrote — otherwise a REST-created anon STM dataset could never
+    be ended via MCP by its (nonexistent) creator.  Admin identities act as
+    the deployment and stamp "admin".
+    """
+    ident = _current_key_identity()
+    if ident is not None:
+        if ident.is_admin:
+            return "admin"
+        name = str(getattr(ident, "name", "") or "").strip()
+        if name and name != "__anonymous__":
+            return name
+    return "anonymous"
+
+
+def _stm_mint_name(session_id: str) -> str:
+    """The non-guessable STM dataset name (INTERFACE-FREEZE section 1):
+
+        stm-<base32(hmac_sha256(salt, session_id))[:16]>
+
+    FAILS LOUDLY (ToolError) when the salt is unset — HMAC with an empty key
+    makes every session's dataset name guessable, and the catalog hiding
+    makes the name the ONLY handle.  Lower-cased base32 keeps the token
+    inside the dataset-name charset the registry validates.
+    """
+    salt = os.environ.get("RAG_STM_NAME_SALT", "")
+    if not salt:
+        raise ToolError(
+            "Short-term memory is not configured: RAG_STM_NAME_SALT (chart values "
+            "shortTermMemory.nameSalt) must be set — refusing to mint guessable "
+            "dataset names with an empty salt."
+        )
+    import base64
+    import hashlib
+    import hmac
+
+    digest = hmac.new(salt.encode("utf-8"), session_id.encode("utf-8"), hashlib.sha256).digest()
+    return "stm-" + base64.b32encode(digest).decode("ascii")[:16].lower()
+
+
 try:
     from mcp.server import MCPServer
     from mcp.server.mcpserver.exceptions import ToolError
@@ -2872,13 +2942,21 @@ try:
             # earlier discovery-mode flip: users learn dataset names from
             # their grants/admin, not from the listing.)
             hidden = 0
+            # A1 / PLAN 4.4: short-term-memory datasets are EPHEMERAL session
+            # working sets, not advertised catalog entries — they are hidden
+            # from the REST catalog view for every viewer, and the SAME rule
+            # applies here (the create tool's note promises this).  Counted
+            # in the hidden note, exactly like the ACL-hidden rows.
+            total = len(datasets)
+            datasets = [d for d in datasets if str(d.get("kind") or "") != "short_term"]
+            hidden += total - len(datasets)
             # Filter whenever an identity is bound (D20: the anonymous
             # identity of an unconfigured deployment is fail-closed too —
             # its only grant is the MEMORY_DATASET env, when set).
             if _clients.current_identity() is not None:
                 total = len(datasets)
                 datasets = [d for d in datasets if _identity_dataset_allowed(str(d.get("name", "")))]
-                hidden = total - len(datasets)
+                hidden += total - len(datasets)
             if not datasets:
                 if hidden:
                     return "No datasets found (all listing entries hidden by API-key dataset ACLs)."
@@ -2942,7 +3020,12 @@ try:
                     raise ToolError(
                         "ttl=0 (no expiry) is disabled on this deployment (set RAG_UNLOCK_MAX_TTL=0 to enable)."
                     )
-            elif ttl < 60 or ttl > ttl_max:
+            elif ttl < 60 or (ttl_max and ttl > ttl_max):
+                # ``ttl_max == 0`` is the RAG_UNLOCK_MAX_TTL=0 "no expiry
+                # allowed" sentinel, NOT a zero-second cap: with it set, any
+                # positive TTL is valid (mirrors api_server.py:1839).  The old
+                # unguarded comparison rejected EVERY positive TTL on such a
+                # deployment, leaving ttl=0 as the only working unlock.
                 raise ToolError(f"TTL must be between 60 and {ttl_max} seconds (or 0 for no expiry when enabled).")
             cid = _unlock_client_id()
             _require_dataset_acl(dataset_name)
@@ -3084,6 +3167,197 @@ try:
             if removed:
                 return f"Dataset '{dataset_name}' removed from your datasets (re-select any time)."
             return f"No self-selection for '{dataset_name}' on your key — nothing removed."
+
+        return await _offload(_impl)
+
+    @mcp.tool()
+    async def create_short_term_memory(
+        session_id: str,
+        ttl_seconds: int | None = None,
+        name: str | None = None,
+    ) -> str:
+        """Create an ephemeral short-term-memory dataset for one agent session.
+
+        Mints a NON-GUESSABLE dataset name
+        ('`stm-<base32(hmac_sha256(salt, session_id))[:16]>`'), creates the
+        dataset with kind='short_term' and a lifetime (ttl_seconds, capped
+        at the deployment max — default 6h, max 24h), and grants it to YOU
+        only.  NO password is set (short-term memories are passwordless by
+        design).  The dataset is HIDDEN from the catalog listing — KEEP the
+        returned name; it is the only handle.
+
+        Use add_memory / search_dataset / dataset_add_documents with the
+        minted name to write into and read from it; end the session with
+        end_short_term_memory.
+
+        Parameters
+        ----------
+        session_id:
+            The agent-session identifier the memory belongs to (the name is
+            derived from it, so the same session maps to the same dataset).
+        ttl_seconds:
+            Optional lifetime override in seconds; omitted → the deployment
+            default (6h).  Above the deployment cap (24h) → refused.
+        name:
+            Optional explicit dataset name overriding the minted one.
+        """
+
+        def _impl() -> str:
+            # F11: a session_id is a STRING identifier — a non-string is a
+            # client bug, refused rather than silently coerced (str(12345)
+            # would make 12345 and "12345" silently the SAME session).
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ToolError("session_id must be a non-empty string.")
+            session = session_id.strip()
+            # F1: create = MANAGE.  The same D15 gate the REST route carries
+            # (api_server._rag_acl_path_denial): a named-ACL key without "*"
+            # must not mint datasets outside its grant on EITHER surface.
+            ident = _current_key_identity()
+            if (
+                ident is not None
+                and not ident.is_admin
+                and "*" not in (ident.datasets or frozenset())
+            ):
+                raise ToolError(
+                    "Dataset ACLs are configured (D15): this API key cannot create datasets."
+                )
+            default_h, max_h = _stm_ttl_config()
+            ttl = ttl_seconds
+            if ttl is not None:
+                if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
+                    raise ToolError("ttl_seconds must be a positive whole number of seconds.")
+                if ttl > max_h * 3600:
+                    raise ToolError(
+                        f"ttl_seconds={ttl} exceeds the deployment cap of {max_h}h "
+                        "(shortTermMemory.maxTtlHours)."
+                    )
+            override = str(name).strip() if name else None
+            if name is not None and not override:
+                raise ToolError("name must be a non-empty string when provided.")
+            ds_name = override or _stm_mint_name(session)
+            lifetime = ttl if ttl is not None else default_h * 3600
+            dm = get_manager()
+            creator = _stm_creator_stamp()
+            try:
+                dm.create_dataset(
+                    ds_name,
+                    f"Short-term memory for session '{session}' (auto-expiring)",
+                    created_by=creator,
+                    lifetime=lifetime,
+                    kind="short_term",
+                )
+            except TypeError as exc:
+                raise ToolError(f"Storage layer lacks dataset lifetime/kind support (T1): {exc}") from exc
+            except FileExistsError as exc:
+                # F6 parity with the REST route (api_server STM create): the
+                # minted name is the ONLY handle to a hidden dataset and the
+                # session->name map is a pure function of (salt, session_id),
+                # so echoing it here would hand any caller that reaches this
+                # branch the key to another session's memory.  Refuse WITHOUT
+                # the name — a genuine owner already has it from its own
+                # create response, so nothing legitimate is lost.
+                raise ToolError(
+                    "A short-term-memory dataset already exists for this session_id."
+                ) from exc
+            except ValueError as exc:
+                raise ToolError(str(exc)) from exc
+            granted = False
+            if ident is not None and not ident.is_admin and _access.store_enabled():
+                try:
+                    _access.select_dataset(ident, ds_name)
+                    granted = True
+                except Exception as exc:
+                    logger.warning("STM self-selection grant failed for '%s': %s", ds_name, exc)
+            logger.info(
+                "Short-term memory dataset '%s' created via MCP (session '%s', creator '%s', lifetime %ss, granted_to_creator=%s)",
+                ds_name,
+                session,
+                creator,
+                lifetime,
+                granted,
+            )
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "dataset": ds_name,
+                    "session_id": session,
+                    "lifetime_seconds": lifetime,
+                    "granted_to_creator": granted,
+                    "password_protected": False,
+                    "note": "KEEP this name — short-term-memory datasets are hidden from list_datasets.",
+                },
+                indent=2,
+            )
+
+        return await _offload(_impl)
+
+    @mcp.tool()
+    async def end_short_term_memory(
+        dataset_name: str,
+    ) -> str:
+        """Explicitly tear down (delete) a short-term-memory dataset.
+
+        Owner-or-admin gated, and REFUSES any dataset that is not a
+        short-term-memory dataset — this is never a general dataset-deletion
+        backdoor.  Pass the exact name returned by create_short_term_memory.
+
+        Parameters
+        ----------
+        dataset_name:
+            The short-term-memory dataset to delete.
+        """
+
+        def _impl() -> str:
+            if not _DATASET_NAME_RE.match(dataset_name or ""):
+                raise ToolError("Invalid dataset name.")
+            dm = get_manager()
+            # F4: existence FIRST.  The ownership gate used to run before the
+            # meta read, so ending a NONEXISTENT dataset told a non-owner it
+            # "predates dataset ownership" — a false statement AND an
+            # existence oracle in one (bob: existing → owned-by error,
+            # missing → pre-D23 error).  Resolve existence first; then the
+            # ownership gate (which still reads nothing kind-shaped past it);
+            # then the kind refusal.
+            try:
+                meta = dm._read_meta(dataset_name)
+            except Exception:
+                meta = None
+            if not meta:
+                raise ToolError(f"Dataset '{dataset_name}' not found.")
+            ident = _current_key_identity()
+            # Owner-or-admin (the same D23 matrix as the REST delete): the
+            # caller's identity name must equal the dataset's created_by
+            # stamp, or the caller is an admin.  Run BEFORE the kind refusal
+            # so a non-owner learns nothing about the dataset's kind from
+            # this tool.
+            caller = str(getattr(ident, "name", "") or "").strip()
+            is_admin = ident is not None and ident.is_admin
+            try:
+                creator = str(dm.read_created_by(dataset_name) or "").strip()
+            except Exception:
+                creator = ""  # unreadable meta → no provable creator → admin-only
+            if not is_admin:
+                if not creator:
+                    raise ToolError(
+                        f"Dataset '{dataset_name}' predates dataset ownership (no creator recorded) — only an admin can manage it."
+                    )
+                if not caller or caller != creator:
+                    raise ToolError(
+                        f"Dataset '{dataset_name}' is owned by '{creator}' — only its creator or an admin can delete it."
+                    )
+            kind = str(meta.get("kind") or "")
+            if kind != "short_term":
+                raise ToolError(
+                    f"Refusing to end '{dataset_name}': it is not a short-term-memory dataset "
+                    f"(kind={kind or 'normal'!r}) — this tool never deletes normal datasets."
+                )
+            dm.delete_dataset(dataset_name)
+            logger.info(
+                "Short-term memory dataset '%s' ended (deleted) via MCP by '%s'",
+                dataset_name,
+                caller or "anonymous",
+            )
+            return json.dumps({"status": "ok", "deleted": dataset_name, "kind": "short_term"}, indent=2)
 
         return await _offload(_impl)
 
@@ -3429,6 +3703,78 @@ try:
         return json.dumps(payload, indent=2, default=str)
 
     @mcp.tool()
+    async def memory_status() -> str:
+        """Report the calling key memory-write capability - the cheap
+        capability probe for automated memory writers (gateway distiller,
+        harness shims).
+
+        Answers ONLY about the CURRENT caller (the identity already resolved
+        from the presented X-API-Key / D15 registry - no arguments, no cross-
+        identity oracle). Report-only by construction: no unlock-cache write,
+        no password-throttle consumption, no dataset mutation.
+
+        Returns JSON:
+          memory_available - a memory dataset resolves for this caller
+          dataset          - its name (null when none)
+          writable         - the caller may WRITE it (D26 mode rw)
+          unlocked         - no password, password saved with the selection,
+                             or already in the unlock cache
+          detail           - short human string when unavailable
+
+        A writer calls this BEFORE spending model tokens on a summary;
+        memory_available && writable && unlocked predicts add_memory success
+        (the residual failure modes are storage errors, not ACL).
+        """
+        out: dict[str, Any] = {
+            "memory_available": False,
+            "dataset": None,
+            "writable": False,
+            "unlocked": False,
+            "detail": "",
+        }
+        try:
+            ds_name = _resolve_memory_dataset(None)
+        except Exception as exc:
+            out["detail"] = str(exc)[:200]
+            return json.dumps(out)
+        out["dataset"] = ds_name
+        out["memory_available"] = True
+        try:
+            _require_dataset_acl(ds_name)
+            _require_dataset_write(ds_name)
+            out["writable"] = True
+        except Exception as exc:
+            out["detail"] = str(exc)[:200]
+            return json.dumps(out)
+        try:
+            # unlocked is best-effort: a dataset with no password is trivially
+            # open; otherwise a saved selection password or an unlock-cache hit
+            # answers WITHOUT touching the throttle. DatasetManager
+            # construction needs the embedder env (model-serving config) and
+            # is deliberately NOT a prerequisite for a capability probe — a
+            # dm failure leaves unlocked unknown (None) and the writer
+            # attempts the real add_memory, which re-checks everything.
+            try:
+                dm = get_manager()
+                has_pw = dm.has_password(ds_name)
+            except Exception:
+                out["detail"] = "dataset manager unavailable; unlock state unknown"
+                out["unlocked"] = None
+                return json.dumps(out)
+            if not has_pw:
+                out["unlocked"] = True
+            else:
+                ident = _current_key_identity()
+                saved = _access.selection_password(ident, ds_name)
+                if saved or _is_unlocked(ds_name) is not None:
+                    out["unlocked"] = True
+                else:
+                    out["detail"] = "password-protected dataset is locked for this caller"
+        except Exception as exc:
+            out["detail"] = str(exc)[:200]
+        return json.dumps(out)
+
+    @mcp.tool()
     async def add_memory(
         text: str,
         image: str | None = None,
@@ -3500,15 +3846,32 @@ try:
                 )
             _resolve_and_unlock(dm, ds_name, pw)
 
-            # A session-history memory is replaced in place: delete any prior
-            # chunks for this session so the store keeps ONE current history
-            # per session instead of accumulating copies on every re-flush.
+            # SUPERSEDE IN PLACE (2026-10-14): a re-written memory of the same
+            # kind REPLACES this session's previous one instead of appending a
+            # second copy. Covers BOTH kinds:
+            #
+            #   * session_history -- the original behaviour: a re-flushed raw
+            #     transcript keeps ONE current history per session.
+            #   * project-summary -- THE FIX. The gateway distiller writes
+            #     distilled sessions as project-summary, and the old gate
+            #     (`kind == "session_history"`) was therefore FALSE for every
+            #     one of them. A conversation that went quiet and later
+            #     continued was re-distilled and its new summary APPENDED, so
+            #     the store grew one memory per resume (live evidence: session
+            #     3baae9d4d58e765b held two summaries 27 minutes apart; the
+            #     2026-10-14 curation pass found ~87 such pairs).
+            #
+            # Only the SAME kind is superseded, so a summary never deletes a
+            # history and vice versa. Memories with no session_id (curated
+            # fact-cards, hand-written notes) are never touched -- there is no
+            # session to supersede within.
             sid = meta.get("session_id")
-            if meta.get("kind") == "session_history" and sid:
+            _kind = str(meta.get("kind") or "")
+            if sid and _kind in ("session_history", "project-summary"):
                 try:
-                    dm.delete_session_history(ds_name, str(sid))
+                    dm.delete_session_memories(ds_name, str(sid), (_kind,))
                 except Exception as exc:
-                    raise ToolError(f"Failed to replace existing session history: {exc}") from exc
+                    raise ToolError(f"Failed to replace existing memory: {exc}") from exc
 
             # Build the document(s).  In MultimodalRAG._to_documents every
             # non-'text' key becomes Qdrant payload metadata, so the

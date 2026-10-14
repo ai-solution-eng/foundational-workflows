@@ -117,6 +117,19 @@ spec:
               {{- end }}
             - name: QDRANT_PVC_SIZE
               value: {{ .Values.persistence.qdrant.size | quote }}
+            {{- if .Values.shortTermMemory.enabled }}
+            # Short-term memory (STM): the create/end tools plus the salt used
+            # to mint non-guessable dataset names.  An UNSET salt makes those
+            # routes refuse loudly (503) rather than mint guessable names --
+            # the hashed name is defense-in-depth, so a silent empty salt
+            # would quietly remove it.
+            - name: RAG_STM_NAME_SALT
+              value: {{ .Values.shortTermMemory.nameSalt | quote }}
+            - name: RAG_STM_DEFAULT_TTL_HOURS
+              value: {{ .Values.shortTermMemory.defaultTtlHours | quote }}
+            - name: RAG_STM_MAX_TTL_HOURS
+              value: {{ .Values.shortTermMemory.maxTtlHours | quote }}
+            {{- end }}
             - name: CONFIG_DIR
               # The user-owned model Secret dir goes LAST: the watcher
               # (model_config.apply_config_dirs) merges dirs in order, later
@@ -356,6 +369,19 @@ spec:
               {{- else }}
               value: ""
               {{- end }}
+            {{- if .Values.shortTermMemory.enabled }}
+            # Short-term memory (STM): the create/end tools plus the salt used
+            # to mint non-guessable dataset names.  An UNSET salt makes those
+            # routes refuse loudly (503) rather than mint guessable names --
+            # the hashed name is defense-in-depth, so a silent empty salt
+            # would quietly remove it.
+            - name: RAG_STM_NAME_SALT
+              value: {{ .Values.shortTermMemory.nameSalt | quote }}
+            - name: RAG_STM_DEFAULT_TTL_HOURS
+              value: {{ .Values.shortTermMemory.defaultTtlHours | quote }}
+            - name: RAG_STM_MAX_TTL_HOURS
+              value: {{ .Values.shortTermMemory.maxTtlHours | quote }}
+            {{- end }}
             - name: CONFIG_DIR
               # The user-owned model Secret dir goes LAST: the watcher
               # (model_config.apply_config_dirs) merges dirs in order, later

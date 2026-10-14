@@ -1,0 +1,64 @@
+# ST-MEM smoke test: proves the full write -> list -> reap -> verify loop against
+# the REAL API. Creates one entry with ttl 0 (immediately expired), confirms the
+# reaper removes it, and confirms the run is then empty. Safe to delete.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: stmem-smoke
+  namespace: mm-rag
+  labels:
+    app.kubernetes.io/name: stmem-reaper
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: stmem-reaper
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: smoke
+          image: python:3.12-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "=== 1. write an immediately-expired entry (ttl 0) ==="
+              python3 /stmem/stmem.py write --run smoke-1 --agent smoke --step 1 --ttl-hours 0 --text "smoke test entry - must be reaped"
+              echo "=== 2. list (expect 1 row) ==="
+              python3 /stmem/stmem.py list --run smoke-1
+              echo "=== 3. reap --dry-run (expect to_delete=1) ==="
+              python3 /stmem/stmem.py reap --dry-run
+              echo "=== 4. reap for real ==="
+              python3 /stmem/stmem.py reap
+              echo "=== 5. list again (expect NO rows) ==="
+              python3 /stmem/stmem.py list --run smoke-1
+              echo "=== SMOKE OK ==="
+          env:
+            - name: STMM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rag-platform-keys
+                  key: RAG_API_KEY
+          envFrom:
+            - secretRef:
+                name: stmem-reaper-secrets
+          volumeMounts:
+            - name: script
+              mountPath: /stmem
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: script
+          configMap:
+            name: stmem-reaper-script

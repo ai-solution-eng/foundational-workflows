@@ -641,17 +641,55 @@ def test_rest_client_key_denied_admin_surface_and_create(monkeypatch):
     assert resp.status_code == 200
 
 
-def test_rest_named_acl_key_cannot_create_datasets(monkeypatch):
+def test_rest_named_acl_key_can_create_datasets(monkeypatch):
+    """2026-10 configurable-create (D1/D27): a named-ACL key MAY create.
+    This test previously PINNED the old behaviour (named key -> 403), which
+    was exactly the user-reported bug ("It also complained about ACLs for a
+    user api key. People should be allowed to create datasets generally.").
+    Creation is no longer an operator-only power: the dataset is owned by
+    its creator and reaches nobody else.  The DENIED path still exists and
+    is pinned in test_rest_create_denied_when_knob_off below."""
     monkeypatch.setattr(api, "_RAG_API_KEY", "deployment-key")
     monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key")
     monkeypatch.setenv(cr.ACLS_ENV, "alice:reports")
     ran = []
     resp = asyncio.run(_call_mw(_FakeRequest("/api/datasets", _hdrs("alice-key"), method="POST"), ran))
-    assert resp.status_code == 403
-    assert "cannot create datasets" in json.loads(resp.body)["detail"]
+    assert resp.status_code == 200 and len(ran) == 1, "create must NOT be denied for a named-ACL key"
     # GET list is fine (it is filtered, not denied)
     resp = asyncio.run(_call_mw(_FakeRequest("/api/datasets", _hdrs("alice-key")), ran))
     assert resp.status_code == 200
+
+
+def test_rest_create_denied_when_knob_off(monkeypatch, tmp_path):
+    """The deployment knob RAG_DATASETS_CREATE_ALLOWED=0 restores the old
+    operator-only create policy for every identity without an override."""
+    monkeypatch.setattr(api, "_RAG_API_KEY", "deployment-key")
+    monkeypatch.setenv("DATA_PATH", str(tmp_path))
+    monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key")
+    monkeypatch.setenv(cr.ACLS_ENV, "alice:reports")
+    monkeypatch.setenv("RAG_DATASETS_CREATE_ALLOWED", "0")
+    ran = []
+    resp = asyncio.run(_call_mw(_FakeRequest("/api/datasets", _hdrs("alice-key"), method="POST"), ran))
+    assert resp.status_code == 403
+    assert "creation is not permitted" in json.loads(resp.body)["detail"]
+
+
+def test_rest_create_per_user_override_beats_knob_off(monkeypatch, tmp_path):
+    """The per-user can_create_datasets=True override beats a knob-off
+    deployment default (the three-level decision, level 1 wins)."""
+    from multimodal_rag.utils import admin_registry as ar
+
+    monkeypatch.setattr(api, "_RAG_API_KEY", "deployment-key")
+    monkeypatch.setenv("DATA_PATH", str(tmp_path))
+    monkeypatch.setenv("RAG_ACCESS_STORE", "1")  # the overlay follows this knob
+    monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key")
+    monkeypatch.setenv(cr.ACLS_ENV, "alice:reports")
+    monkeypatch.setenv("RAG_DATASETS_CREATE_ALLOWED", "0")
+    ar.mint_client("alice", datasets=["reports"], key="alice-key")
+    ar.set_client_flags("alice", can_create_datasets=True)
+    ran = []
+    resp = asyncio.run(_call_mw(_FakeRequest("/api/datasets", _hdrs("alice-key"), method="POST"), ran))
+    assert resp.status_code == 200 and len(ran) == 1, "per-user override must beat the deployment default"
 
 
 def test_rest_registry_no_key_is_not_an_acl_bypass(monkeypatch):

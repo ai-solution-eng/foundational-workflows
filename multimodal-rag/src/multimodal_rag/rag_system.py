@@ -15,6 +15,7 @@ from typing import Any, NamedTuple
 import numpy as np
 
 import multimodal_rag.utils.bm25 as bm25_lane
+from multimodal_rag.stm_lifetime import stamp_point_times
 from multimodal_rag.utils import contextualizer
 from multimodal_rag.utils.general_tools import (
     cosine_sim,
@@ -1869,6 +1870,50 @@ class MultimodalRAG:
         return docs
 
     @staticmethod
+    def _stamp_point_lifetimes(
+        docs: list[Document],
+        dataset_lifetime: int | None,
+        now: int,
+    ) -> None:
+        """Server-stamp the short-term-memory lifetime fields onto stored points.
+
+        stmem/PLAN sections 4.2 and 2.3.  The SERVER — never the client —
+        decides when a point was created and when it dies.  A writer with a
+        skewed clock could otherwise shorten or lengthen its own entries'
+        lives, and could simply POST an ``expires_at`` far in the future to
+        outlive the dataset it was written into.  So every stamp is computed
+        here, from the server clock, and merged OVER whatever the document
+        carried:
+
+            lifetime    the EFFECTIVE lifetime (min of point and dataset)
+            created_at  the server clock reading for this ingest
+            expires_at  created_at + lifetime, or None when infinite
+
+        All three keys are overwritten unconditionally: a client-supplied
+        ``created_at``/``expires_at`` never survives, and a client-supplied
+        ``lifetime`` is replaced by the EFFECTIVE value — the raw per-document
+        request value is deliberately not persisted, because the only lifetime
+        worth storing is the one the reaper will actually act on.
+
+        Both lifetimes ``None`` (every dataset that predates this feature) is
+        the default path: the stamp is still written so the payload always
+        says what it is, and ``expires_at=None`` is simply never matched by the
+        reaper's numeric Range filter — existing data stays immortal twice
+        over.
+
+        In-place on purpose: this runs for every stored point (twins and chunk
+        splits included) and must never copy the media-heavy dicts it touches.
+        """
+        for doc in docs:
+            doc.metadata.update(
+                stamp_point_times(
+                    now=now,
+                    point_lifetime=doc.metadata.get("lifetime"),
+                    dataset_lifetime=dataset_lifetime,
+                )
+            )
+
+    @staticmethod
     def _from_documents(docs: list[Document]) -> list[str | dict[str, Any]]:
         result: list[str | dict[str, Any]] = []
         for doc in docs:
@@ -2021,15 +2066,24 @@ class MultimodalRAG:
         documents: Sequence[str | dict[str, Any]],
         deduplicate: bool = True,
         dedup_threshold: float | None = None,
+        dataset_lifetime: int | None = None,
         **kwargs,
     ) -> list[str]:
-        """Sync wrapper around :meth:`aadd_to_vector_store`."""
+        """Sync wrapper around :meth:`aadd_to_vector_store`.
+
+        ``dataset_lifetime`` is the target dataset's STM lifetime in seconds
+        (None = infinite) and is always supplied by the caller that owns the
+        dataset — see :meth:`DatasetManager.add_documents`.  It is named
+        explicitly rather than swept into ``**kwargs`` because ``**kwargs`` is
+        forwarded verbatim to the vector store's upsert.
+        """
         return sync_wrapper_safe(
             self.aadd_to_vector_store,
             dict(
                 documents=documents,
                 deduplicate=deduplicate,
                 dedup_threshold=dedup_threshold,
+                dataset_lifetime=dataset_lifetime,
                 **kwargs,
             ),
         )
@@ -2344,6 +2398,7 @@ class MultimodalRAG:
         documents: Sequence[str | dict[str, Any]],
         deduplicate: bool = True,
         dedup_threshold: float | None = None,
+        dataset_lifetime: int | None = None,
         **kwargs,
     ) -> list[str]:
         """Embed and add documents to the vector store.
@@ -2367,6 +2422,13 @@ class MultimodalRAG:
             Cosine similarity threshold above which a document is
             considered a duplicate (0.0 – 1.0).  When ``None`` (the
             default), falls back to ``self.dedup_threshold``.
+        dataset_lifetime:
+            Short-term-memory lifetime (seconds, ``None`` = infinite) of the
+            dataset these documents are being written INTO.  Supplied by the
+            dataset-owning caller, never by the request body.  It is a hard
+            CAP on every document's own ``lifetime`` (PLAN section 2.2:
+            ``min(point, dataset)``), and both ``None`` means the points are
+            immortal — the shape of every dataset that predates this feature.
         """
         if dedup_threshold is None:
             dedup_threshold = self.dedup_threshold
@@ -2589,6 +2651,21 @@ class MultimodalRAG:
 
             # ── 2. Build Document payloads ──────────────────────────────────
             sub_docs = self._to_documents(all_docs)
+
+            # ── 2a. Server-stamp the STM lifetime fields ─────────────────────
+            # LAST point before the payload is built, so the stamp covers
+            # every point this call will actually store: the preprocessed
+            # docs AND their twins (twins copy the parent's metadata, so they
+            # inherit the same lifetime), including docs produced by the
+            # audio/image chunk splitters.  After dedup, so no stamp is
+            # computed for a document that is about to be dropped.
+            #
+            # The clock is read HERE, per sub-batch, rather than once for the
+            # whole call: a long ingest can straddle minutes, and a point's
+            # created_at should be the moment its payload was built.
+            # int(time.time()) — not time.monotonic() — because the value is
+            # persisted and compared against the reaper's wall clock.
+            self._stamp_point_lifetimes(sub_docs, dataset_lifetime, int(time.time()))
 
             # ── 2b. Deduplicate ─────────────────────────────────────────────
             if deduplicate and sub_embs:

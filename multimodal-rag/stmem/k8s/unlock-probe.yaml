@@ -1,0 +1,74 @@
+# Probe: characterize the REST unlock path as an ADMIN (platform key).
+# Uses a deliberately WRONG password so nothing is actually unlocked (no state change).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: unlock-probe
+  namespace: mm-rag
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: probe
+          image: python:3.12-alpine
+          command: ["python3", "-c"]
+          args:
+            - |
+              import json, os, urllib.request, urllib.error
+              api = os.environ["API"].rstrip("/")
+              key = os.environ.get("RAG_API_KEY", "")
+              H = {"X-RAG-Api-Key": key, "Content-Type": "application/json"}
+
+              def call(method, path, body=None):
+                  data = json.dumps(body).encode() if body is not None else None
+                  req = urllib.request.Request(api + path, data=data, method=method, headers=H)
+                  try:
+                      with urllib.request.urlopen(req, timeout=20) as r:
+                          return r.status, r.read().decode()[:300]
+                  except urllib.error.HTTPError as e:
+                      return e.code, e.read().decode()[:300]
+                  except Exception as e:
+                      return -1, f"{type(e).__name__}: {e}"
+
+              print("[probe] admin key present:", bool(key))
+              st, body = call("GET", "/api/datasets")
+              print("[probe] GET /api/datasets ->", st)
+              names = []
+              try:
+                  names = [d.get("name") for d in json.loads(body).get("datasets", [])]
+              except Exception:
+                  print("      body:", body[:200])
+              print("[probe] datasets visible:", len(names))
+              print("[probe] francesco-memory in list:", "francesco-memory" in names)
+              for n in names:
+                  if "francesco" in (n or "").lower() or "andrew" in (n or "").lower():
+                      st2, b2 = call("GET", f"/api/datasets/{n}")
+                      print(f"[probe]   {n}: GET -> {st2} has_password={('password' in b2.lower())}")
+                      print(f"           {b2[:180]}")
+              print()
+              print("=== UNLOCK probes (WRONG password on purpose) ===")
+              for name in ["francesco-memory", "andrew-memory"]:
+                  for ttl in [1800, 0]:
+                      st3, b3 = call("POST", f"/api/datasets/{name}/unlock", {"password": "__deliberately_wrong__", "ttl": ttl})
+                      print(f"[probe] unlock {name} ttl={ttl} -> HTTP {st3}: {b3[:200]}")
+              print()
+              print("=== SELECT probe (WRONG password; should be refused) ===")
+              st4, b4 = call("POST", "/api/datasets/francesco-memory/select", {"password": "__deliberately_wrong__"})
+              print(f"[probe] select francesco-memory -> HTTP {st4}: {b4[:200]}")
+          env:
+            - name: API
+              value: http://rag-mcp-server-api.mm-rag.svc.cluster.local:80
+            - name: RAG_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rag-platform-keys
+                  key: RAG_API_KEY
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
