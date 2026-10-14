@@ -43,7 +43,7 @@ replicaCount: 4
 image:
   # Packaged with the chart — leave as-is unless you built your own image.
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v5.8.0
+  tag: v5.8.1
   pullPolicy: IfNotPresent
 
 qdrant:
