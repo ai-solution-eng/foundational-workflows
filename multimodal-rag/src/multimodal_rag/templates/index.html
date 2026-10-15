@@ -1270,22 +1270,8 @@ async function downloadBackup() {
   if (!selectedDataset) return;
   const pw = datasetPasswords[selectedDataset] || '';
   const url = `/api/datasets/${selectedDataset}/export` + (pw ? `?password=${encodeURIComponent(pw)}` : '');
-  const headers = authHeaders();
-  toast('Preparing backup…');
-  try {
-    const res = await fetch(url, { headers });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const blob = await res.blob();
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `${selectedDataset}-export.tar.gz`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(a.href);
-  } catch (e) {
-    toast(e.message, 'error');
-  }
+  const headers = { ...authHeaders(), ...passwordHeader() };
+  await downloadBlob(url, headers, `${selectedDataset}-export.tar.gz`, 'Preparing backup…');
 }
 
 async function downloadDocuments(format = 'md') {
@@ -1294,20 +1280,36 @@ async function downloadDocuments(format = 'md') {
   const url = `/api/datasets/${selectedDataset}/documents/download?format=${format}`
     + (pw ? `&password=${encodeURIComponent(pw)}` : '');
   const headers = { ...authHeaders(), ...passwordHeader() };
-  toast('Preparing download…');
+  const ext = format === 'jsonl' ? 'jsonl' : 'md';
+  await downloadBlob(url, headers, `${selectedDataset}-documents.${ext}`, 'Preparing download…');
+}
+
+// Shared download path for both backup buttons (2026-10-15: the Backup button
+// surfaced raw "NetworkError when attempting to fetch resource"). A fetch that
+// the edge answers with a login redirect (expired oauth2-proxy session) dies
+// BEFORE any status code reaches this code — Firefox reports it as a bare
+// NetworkError. A top-level reload re-enters the SSO redirect chain and
+// restores the session, so guide the user there instead of showing a cryptic
+// network message.
+async function downloadBlob(url, headers, filename, preparingMsg) {
+  toast(preparingMsg);
   try {
     const res = await fetch(url, { headers });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const blob = await res.blob();
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `${selectedDataset}-documents.${format === 'jsonl' ? 'jsonl' : 'md'}`;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(a.href);
   } catch (e) {
-    toast(e.message, 'error');
+    if (e instanceof TypeError) {
+      toast('Network error — your sign-in session may have expired. Reload the page to sign in again, then retry.', 'error');
+    } else {
+      toast(e.message, 'error');
+    }
   }
 }
 
@@ -2423,9 +2425,29 @@ async function pollHealth() {
       <div style="height:6px;background:var(--border);border-radius:3px;margin-bottom:8px;overflow:hidden">
         <div style="width:${Math.min(qpvc.used_percent,100)}%;height:100%;background:${qpvc.used_percent > 80 ? 'var(--red)' : (qpvc.used_percent > 50 ? 'var(--accent)' : 'var(--green)')};transition:width .5s"></div>
       </div>` : '';
+    // 2026-10-15: per-peer rows ALWAYS render when a raft cluster is live —
+    // a peer that disappears from the /cluster response must be visible as a
+    // missing row (expectedReplicas) rather than silently shrinking the table.
+    const qExpectedReplicas = qcluster && qcluster.expected_replicas ? qcluster.expected_replicas : null;
+    const qPeerRows = (qcluster && qcluster.enabled && qcluster.replicas && qcluster.replicas.length)
+      ? qcluster.replicas.map((r) => {
+          const c = r.status === 'ok' ? 'var(--green)' : (r.status === 'unreachable' ? 'var(--red)' : 'var(--yellow)');
+          return `<tr>
+            <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${c};margin-right:6px"></span>${escHtml(r.host || ('peer ' + ((r.index || 0) + 1)))}</td>
+            <td style="text-align:right">${r.shards} shard${r.shards === 1 ? '' : 's'}</td>
+            <td style="text-align:right">${r.local_points != null ? Number(r.local_points).toLocaleString() : '—'}</td>
+            <td style="text-align:right">${r.used_bytes != null ? formatBytes(r.used_bytes) : '—'}</td>
+          </tr>`;
+        }).join('')
+      : '';
+    const qDegraded = (qcluster && qcluster.enabled && qExpectedReplicas && qcluster.replicas && qcluster.replicas.length < qExpectedReplicas)
+      ? `<div style="color:var(--yellow);font-size:.78rem;margin:4px 0">⚠ cluster degraded — ${qcluster.replicas.length} of ${qExpectedReplicas} peers in raft</div>`
+      : '';
     const qclusterRows = (qcluster && qcluster.enabled && qcluster.replicas && qcluster.replicas.length) ? `
-        <tr><td>Replicas</td><td style="text-align:right">${qcluster.replicas.length}</td></tr>
-        <tr><td>Shards</td><td style="text-align:right">${qcluster.total_shards}</td></tr>` : '';
+        ${qDegraded}
+        <tr><td colspan="4" style="padding-top:6px;font-weight:500">Peers</td></tr>
+        <tr><td style="font-size:.72rem;color:var(--text-muted)"></td><td style="text-align:right;font-size:.72rem;color:var(--text-muted)">shards</td><td style="text-align:right;font-size:.72rem;color:var(--text-muted)">local points</td><td style="text-align:right;font-size:.72rem;color:var(--text-muted)">used</td></tr>
+        ${qPeerRows}` : '';
     document.getElementById('health-qdrant').innerHTML = `
       <div style="font-weight:500;margin-bottom:6px;font-size:.85rem">Qdrant — <span style="color:${qdColor}">${qd.status}</span></div>
       ${qdPvcBar}

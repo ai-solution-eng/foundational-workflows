@@ -4731,9 +4731,20 @@ def _documents_download_stream(dm: DatasetManager, name: str, fmt: str):
                 default=str,
                 ensure_ascii=False,
             )
-        # Markdown: heading from source/title, then the text, then media refs
+        # Markdown: heading from source/title, then the text, then media refs.
+        # 2026-10-15: the heading now always carries the document id and, for
+        # memories, the session id — the 2026-10-14 curation pass could not
+        # dedupe from a md backup because neither was rendered (the ids are
+        # what delete_memory / dataset_delete_documents consume, and the
+        # session id is what the gateway supersede-in-place gate matches on).
         heading = meta.get("source") or meta.get("title") or doc.get("id", "")
         extras = []
+        if doc.get("id") is not None:
+            extras.append(f"id {doc['id']}")
+        if meta.get("session_id"):
+            extras.append(f"session {meta['session_id']}")
+        if meta.get("memory_ts"):
+            extras.append(f"ts {meta['memory_ts']}")
         if meta.get("page") not in (None, ""):
             extras.append(f"page {meta['page']}")
         if meta.get("kind"):
@@ -5333,6 +5344,19 @@ def _parse_size_bytes(raw: str) -> int | None:
     return int(val * mult)
 
 
+def _qdrant_expected_replicas() -> int | None:
+    """Configured Qdrant StatefulSet size (QDRANT_REPLICAS env, rendered from
+    values qdrant.replicas).  None when unset (single-node / older chart) --
+    the UI only compares when a number exists."""
+    raw = os.environ.get("QDRANT_REPLICAS", "").strip()
+    if not raw:
+        return None
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return None
+
+
 def _peer_host_label(uri: str) -> str:
     """Best-effort human label for a Qdrant peer URI (e.g. ``qdrant-0``)."""
     try:
@@ -5395,6 +5419,26 @@ def _qdrant_cluster_replicas() -> "list[dict[str, Any]]":
                     label = f"peer-{pid}"
                 replicas.append({"host": label, "shards": ps, "uri": uri})
             replicas.sort(key=lambda r: int(m.group(1)) if (m := re.search(r"(\d+)$", r["host"])) else -1)
+            # Per-peer readiness (2026-10-15): the UI must distinguish a
+            # healthy 3-peer cluster from a degraded one — a peer that drops
+            # from the raft response is invisible today (the page then shows
+            # fewer rows with no signal).  readyz against each peer's
+            # pod-ordinal DNS name; a failed probe reads "unreachable", not
+            # silent omission.  1.5s budget x3 worst-case ~4.5s, under the
+            # 5s client timeout of the /cluster call above.
+            for r in replicas:
+                m2 = re.search(r"(\d+)$", r["host"])
+                if not m2:
+                    r["status"] = "unknown"
+                    continue
+                try:
+                    rz = client.get(
+                        f"http://{qhost}-{m2.group(1)}.{qhost}:{qport}/readyz",
+                        timeout=1.5,
+                    )
+                    r["status"] = "ok" if rz.status_code == 200 else f"http-{rz.status_code}"
+                except Exception:
+                    r["status"] = "unreachable"
             return replicas
     except Exception:
         logger.debug("Suppressed exception", exc_info=True)
@@ -5412,6 +5456,13 @@ def _qdrant_replica_usage(
     ``indexed_vectors_size`` + ``payload_data_size`` per segment.  Returns
     ``{host: used_bytes}`` for the replicas that answered; failures and nodes
     without detail telemetry are simply omitted.
+
+    2026-10-15: the same pass also records per-peer LOCAL point counts into
+    _QDRANT_TELEMETRY_CACHE["points"] ({host: int}, from each shard's local
+    points_count) so the admin page can show where a collection's points
+    actually live -- the aggregate total_points says nothing about shard
+    spread.  Cache shape stays backward-compatible: the points map is
+    additive and simply absent on older cache entries.
     """
     now = time.time()
     if now - _QDRANT_TELEMETRY_CACHE["ts"] <= _QDRANT_TELEMETRY_TTL:
@@ -5420,6 +5471,7 @@ def _qdrant_replica_usage(
         import httpx2
 
         usage: dict[str, int] = {}
+        points: dict[str, int] = {}
         for r in replicas:
             host = r.get("host", "")
             if not host:
@@ -5434,6 +5486,7 @@ def _qdrant_replica_usage(
                     inner = cols.get("collections") if isinstance(cols, dict) else None
                     items = inner.values() if isinstance(inner, dict) else (inner if isinstance(inner, list) else [])
                     total = 0
+                    local_points = 0
                     for cinfo in items:
                         if not isinstance(cinfo, dict):
                             continue
@@ -5444,10 +5497,12 @@ def _qdrant_replica_usage(
                             if isinstance(local, dict):
                                 total += int(local.get("vectors_size_bytes") or 0)
                                 total += int(local.get("payloads_size_bytes") or 0)
+                                local_points += int(local.get("points_count") or 0)
                     usage[host] = total
+                    points[host] = local_points
             except Exception:
                 logger.debug("Suppressed exception", exc_info=True)
-        _QDRANT_TELEMETRY_CACHE.update({"ts": now, "usage": usage})
+        _QDRANT_TELEMETRY_CACHE.update({"ts": now, "usage": usage, "points": points})
         return dict(usage)
     except Exception:
         logger.debug("Suppressed exception", exc_info=True)
@@ -5555,6 +5610,7 @@ def _collect_health_stats() -> dict[str, Any]:
                             "replicas": [],
                             "total_shards": 0,
                             "per_replica_capacity_bytes": _parse_size_bytes(QDRANT_PVC_SIZE),
+                            "expected_replicas": _qdrant_expected_replicas(),
                         }
                     else:
                         peers = result.get("peers") or {}
@@ -5604,15 +5660,24 @@ def _collect_health_stats() -> dict[str, Any]:
                         # payload sizes ≈ used bytes (excludes WAL/meta).
                         if replicas:
                             _usage = _qdrant_replica_usage(replicas, qhost, qport)
+                            _points = dict(_QDRANT_TELEMETRY_CACHE.get("points") or {})
                             for _r in replicas:
                                 _u = _usage.get(_r["host"])
                                 if _u is not None:
                                     _r["used_bytes"] = _u
+                                if _r["host"] in _points:
+                                    _r["local_points"] = _points[_r["host"]]
+                                # status comes from _qdrant_cluster_replicas (readyz); default for entries that predate it
+                                _r.setdefault("status", "unknown")
                         cluster_info = {
                             "enabled": True,
                             "replicas": replicas,
                             "total_shards": sum(peer_shards.values()),
                             "per_replica_capacity_bytes": _parse_size_bytes(QDRANT_PVC_SIZE),
+                            # configured StatefulSet size: lets the UI flag a
+                            # degraded raft (peers < expected) instead of
+                            # silently rendering fewer rows
+                            "expected_replicas": _qdrant_expected_replicas(),
                         }
     except Exception:
         logger.debug("Suppressed exception", exc_info=True)
