@@ -48,8 +48,9 @@ import json
 import logging
 import os
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from multimodal_rag import stm_lifetime as _lifetime
 
@@ -215,8 +216,7 @@ class ReapReport:
             f"datasets={self.datasets} swept={self.swept} skipped={self.skipped} "
             f"scanned={self.scanned} reaped={self.reaped} kept={self.kept} "
             f"malformed={self.malformed} delete_failures={self.delete_failures} "
-            f"truncated={self.truncated} errors={len(self.errors)}"
-            + (" dry_run=True" if self.dry_run else "")
+            f"truncated={self.truncated} errors={len(self.errors)}" + (" dry_run=True" if self.dry_run else "")
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -251,7 +251,9 @@ def _require_now(value: Any) -> int:
     instead of silently reaping against a nonsense deadline.
     """
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"now must be an integer unix timestamp, got {type(value).__name__}")
+        # TRY004 suppressed -- see stm_lifetime.validate_lifetime: the STM
+        # validators publish ONE exception type (ValueError) on purpose.
+        raise ValueError(f"now must be an integer unix timestamp, got {type(value).__name__}")  # noqa: TRY004
     if value < 0:
         raise ValueError(f"now must be >= 0, got {value}")
     return value
@@ -387,9 +389,7 @@ def _deadline_passed(deadline: float | None) -> bool:
     return deadline is not None and time.monotonic() >= deadline
 
 
-def _delete_batch(
-    client: Any, collection: str, ids: Sequence[Any], result: ReapResult, *, dry_run: bool
-) -> None:
+def _delete_batch(client: Any, collection: str, ids: Sequence[Any], result: ReapResult, *, dry_run: bool) -> None:
     """Delete one batch.  NEVER raises (invariant 5).
 
     A failed batch is recorded and the caller keeps going: the points stay in
@@ -412,9 +412,7 @@ def _delete_batch(
     except Exception as exc:
         result.delete_failures += 1
         result.errors.append(f"delete of {len(ids)} point(s) failed: {exc!r}")
-        logger.warning(
-            "[%s] %s: delete of %d point(s) failed: %s", REAPER_NAME, result.dataset, len(ids), exc
-        )
+        logger.warning("[%s] %s: delete of %d point(s) failed: %s", REAPER_NAME, result.dataset, len(ids), exc)
         return
     result.reaped += len(ids)
 
@@ -481,9 +479,7 @@ def reap_dataset(
         # Invariant 4: two independent hard stops, plus the cursor guard below.
         if result.batches >= max_batches:
             result.truncated = True
-            result.notes.append(
-                f"{name}: page cap ({max_batches}) reached -- remainder deferred to the next sweep"
-            )
+            result.notes.append(f"{name}: page cap ({max_batches}) reached -- remainder deferred to the next sweep")
             break
         if _deadline_passed(deadline):
             result.truncated = True
@@ -527,9 +523,7 @@ def reap_dataset(
                 result.kept += 1
                 if verdict.reason == "malformed-expires-at":
                     result.malformed += 1
-                logger.debug(
-                    "[%s] %s: keep point %r (%s)", REAPER_NAME, name, _point_id(point), verdict.reason
-                )
+                logger.debug("[%s] %s: keep point %r (%s)", REAPER_NAME, name, _point_id(point), verdict.reason)
 
         _delete_batch(client, collection, doomed, result, dry_run=dry_run)
 
@@ -545,9 +539,7 @@ def reap_dataset(
         seen_offsets.add(key)
 
     if result.malformed:
-        result.notes.append(
-            f"{name}: {result.malformed} point(s) with an unprovable expiry were KEPT (invariant 3)"
-        )
+        result.notes.append(f"{name}: {result.malformed} point(s) with an unprovable expiry were KEPT (invariant 3)")
     return result
 
 
@@ -599,9 +591,7 @@ def reap_once(
             # level -- the per-point guarantee is inside reap_dataset).
             report.errors.append(f"dataset {name!r}: unexpected {type(exc).__name__}: {exc}")
             logger.exception("[%s] dataset %r raised", REAPER_NAME, name)
-            report.results.append(
-                ReapResult(dataset=str(name), errors=[f"unexpected {type(exc).__name__}: {exc}"])
-            )
+            report.results.append(ReapResult(dataset=str(name), errors=[f"unexpected {type(exc).__name__}: {exc}"]))
             continue
         report.results.append(result)
         report.errors.extend(f"{name}: {err}" for err in result.errors)
@@ -679,9 +669,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="report what WOULD be deleted and delete nothing (recommended first run)",
     )
-    parser.add_argument(
-        "--json", action="store_true", help="emit one JSON report line instead of the log summary"
-    )
+    parser.add_argument("--json", action="store_true", help="emit one JSON report line instead of the log summary")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

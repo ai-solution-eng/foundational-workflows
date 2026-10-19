@@ -125,19 +125,14 @@ def test_invariant_1_enumeration_real_meta_untouchable(real_meta):
             assert not point_selected and not dataset_selected
             continue
         if "lifetime" not in meta or meta.get("lifetime") is None:
-            assert not point_selected, (
-                f"dataset {name!r} has no lifetime yet the point reaper selected it"
-            )
-            assert not dataset_selected, (
-                f"dataset {name!r} has no lifetime yet the dataset reaper selected it"
-            )
+            assert not point_selected, f"dataset {name!r} has no lifetime yet the point reaper selected it"
+            assert not dataset_selected, f"dataset {name!r} has no lifetime yet the dataset reaper selected it"
             untouched.append(name)
         # decision-level cross-check: every point in an unselected dataset is kept
         if not point_selected:
             verdict = sl.reap_decision({"expires_at": 1}, meta.get("lifetime") if meta else None, NOW)
             assert verdict.reap is False, f"point in {name!r} would be reaped despite immortal dataset"
-    print(f"\n[invariant 1] enumerated {len(metas)} dataset(s) under {root}; "
-          f"untouchable (no lifetime): {untouched}")
+    print(f"\n[invariant 1] enumerated {len(metas)} dataset(s) under {root}; untouchable (no lifetime): {untouched}")
 
 
 def test_invariant_1_pre_stm_meta_shape_is_the_default(real_meta):
@@ -302,6 +297,7 @@ def test_invariant_7_api_password_gate_has_no_admin_bypass():
     body = api_src[start : end if end != -1 else start + 4000]
     assert "is_admin" not in body, "the password gate must have NO admin bypass"
 
+
 def test_file_ingest_applies_the_dataset_cap(tmp_path, monkeypatch):
     """END-TO-END: a FILE ingested into a finite-lifetime dataset is capped.
 
@@ -316,18 +312,16 @@ def test_file_ingest_applies_the_dataset_cap(tmp_path, monkeypatch):
     test seeds points directly instead of going through ingest. So the WRITER
     half of the composition was unpinned. This test drives the real ingest.
     """
-    import json
     import sys
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
-    from multimodal_rag.dataset_manager import _CAP_REQUIRED
-
     # The structural guard: a caller that FORGETS the cap must raise rather
     # than silently store immortal points.  This is the second half of the
     # pin -- it fails if anyone restores the '= None' default.
     import inspect
 
     from multimodal_rag import dataset_manager as dm_mod
+    from multimodal_rag.dataset_manager import _CAP_REQUIRED
 
     sig = inspect.signature(dm_mod.DatasetManager._add_file_processed)
     assert sig.parameters["dataset_lifetime"].default is _CAP_REQUIRED, (
@@ -368,7 +362,6 @@ def test_file_ingest_cap_guard_raises_when_forgotten():
     A missing argument must raise, because None is a legal lifetime value
     (an immortal dataset) and so cannot double as 'caller forgot'.
     """
-    import inspect
     import sys
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
@@ -380,8 +373,4 @@ def test_file_ingest_cap_guard_raises_when_forgotten():
     except TypeError as exc:
         assert "dataset_lifetime" in str(exc)
     else:
-        raise AssertionError(
-            "_add_file_processed accepted a missing dataset_lifetime; the "
-            "cap can be forgotten again"
-        )
-
+        raise AssertionError("_add_file_processed accepted a missing dataset_lifetime; the cap can be forgotten again")

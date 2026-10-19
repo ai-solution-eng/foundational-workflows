@@ -276,6 +276,23 @@ def _self_mint_on(monkeypatch) -> None:
     monkeypatch.setenv(ar.SELF_MINT_ENV, "1")
 
 
+#: P0-1 (audit 2026-10-16): the proxy-identity credential now needs a POSITIVE
+#: enforcing-proxy assertion.  These tests exercise the D24 proof source, so
+#: they configure the operator signal and send it — the bare-header shape is
+#: pinned as REFUSED in test_guard_proxy_identity_requires_the_assertion.
+_PROXY_SIGNAL = "unit-test-edge-signal"
+
+
+def _proxy_headers(name: str) -> dict:
+    """The D24 edge-authenticated shape WITH the P0-1 assertion."""
+    return {"X-Auth-Request-User": name, "X-Enforcing-Proxy": _PROXY_SIGNAL}
+
+
+def _proxy_on(monkeypatch) -> None:
+    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    monkeypatch.setenv("RAG_ENFORCING_PROXY_SIGNAL", _PROXY_SIGNAL)
+
+
 # ===========================================================================
 # 1 · Registry unit matrix (no HTTP)
 # ===========================================================================
@@ -675,15 +692,32 @@ def test_guard_jwt_for_another_identity_is_not_proof(monkeypatch, jwks_server):
 
 
 def test_guard_proxy_identity_proof_source(monkeypatch):
-    """With RAG_TRUST_PROXY_IDENTITY confirming an enforcing proxy, the
-    proxy-injected identity header equal to the bound name is the proof:
-    (identity, 'proxy-identity') — the edge authentication vouches."""
+    """With RAG_TRUST_PROXY_IDENTITY confirming an enforcing proxy AND the
+    P0-1 assertion present, the proxy-injected identity header equal to the
+    bound name is the proof: (identity, 'proxy-identity') — the edge
+    authentication vouches."""
     _self_mint_on(monkeypatch)
-    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    _proxy_on(monkeypatch)
     identity = cr.Identity(kind="client", name="alice", datasets=frozenset())
-    ident, source = _call_direct(api._require_self_mint, identity, {"X-Auth-Request-User": "alice"})
+    ident, source = _call_direct(api._require_self_mint, identity, _proxy_headers("alice"))
     assert source == "proxy-identity"
     assert ident.name == "alice"
+
+
+def test_guard_proxy_identity_requires_the_assertion(monkeypatch):
+    """P0-1: the SAME bound identity + a bare X-Auth-Request-User (no
+    enforcing-proxy assertion) is NOT SSO proof — the guard 403s with the
+    key-carry message.  This is the audited escalation cut at the source:
+    without it, a spoofed header minted a durable key carrying the victim's
+    grants."""
+    _self_mint_on(monkeypatch)
+    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    monkeypatch.delenv("RAG_ENFORCING_PROXY_SIGNAL", raising=False)
+    identity = cr.Identity(kind="client", name="alice", datasets=frozenset())
+    with pytest.raises(api.HTTPException) as excinfo:
+        _call_direct(api._require_self_mint, identity, {"X-Auth-Request-User": "alice"})
+    assert excinfo.value.status_code == 403
+    assert "not a power an API key carries" in excinfo.value.detail
 
 
 def test_guard_opaque_key_is_never_proof(monkeypatch):
@@ -707,12 +741,12 @@ def test_direct_mint_blocked_maps_to_403(monkeypatch):
     only reachable directly).  The trust flag supplies the SSO proof (the
     guard's proof check precedes the registry write)."""
     _self_mint_on(monkeypatch)
-    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    _proxy_on(monkeypatch)
     ar.mint_client("bob")
     ar.set_client_flags("bob", blocked=True)
     identity = cr.Identity(kind="client", name="bob", datasets=frozenset())
     with pytest.raises(api.HTTPException) as excinfo:
-        _call_direct(api.api_access_self_mint, identity, {"X-Auth-Request-User": "bob"})
+        _call_direct(api.api_access_self_mint, identity, _proxy_headers("bob"))
     assert excinfo.value.status_code == 403
     assert "blocked" in excinfo.value.detail
 
@@ -722,11 +756,11 @@ def test_direct_mint_existing_key_without_rotate_maps_to_409(monkeypatch):
     escape — the confirm guard survives the direct endpoint path (the trust
     flag supplies the SSO proof past the guard)."""
     _self_mint_on(monkeypatch)
-    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    _proxy_on(monkeypatch)
     ar.mint_client("rich", datasets=["a"])
     identity = cr.Identity(kind="client", name="rich", datasets=frozenset())
     with pytest.raises(api.HTTPException) as excinfo:
-        _call_direct(api.api_access_self_mint, identity, {"X-Auth-Request-User": "rich"})
+        _call_direct(api.api_access_self_mint, identity, _proxy_headers("rich"))
     assert excinfo.value.status_code == 409
     assert "rotate" in excinfo.value.detail
 
@@ -736,10 +770,10 @@ def test_direct_rotate_over_existing_key_succeeds(monkeypatch):
     → 200-shaped result (rotated True, full material, grants untouched) —
     proving the 409 above is the rotate flag's doing, not the entry's."""
     _self_mint_on(monkeypatch)
-    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    _proxy_on(monkeypatch)
     ar.mint_client("rich", datasets=["a"])
     identity = cr.Identity(kind="client", name="rich", datasets=frozenset())
-    result = _call_direct(api.api_access_self_mint, identity, {"X-Auth-Request-User": "rich"}, body={"rotate": True})
+    result = _call_direct(api.api_access_self_mint, identity, _proxy_headers("rich"), body={"rotate": True})
     assert result["status"] == "ok" and result["rotated"] is True
     assert result["key"]
     assert ar.own_key_view("rich")["datasets"] == ["a"]
@@ -750,10 +784,10 @@ def test_direct_view_invalid_name_maps_to_400(monkeypatch):
     reachable only through a trusted proxy header, never a verified JWT) →
     HTTP 400 on the owner view."""
     _self_mint_on(monkeypatch)
-    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    _proxy_on(monkeypatch)
     identity = cr.Identity(kind="client", name="bad name!", datasets=frozenset())
     with pytest.raises(api.HTTPException) as excinfo:
-        _call_direct(api.api_access_own_key, identity, {"X-Auth-Request-User": "bad name!"})
+        _call_direct(api.api_access_own_key, identity, _proxy_headers("bad name!"))
     assert excinfo.value.status_code == 400
     assert "client name" in excinfo.value.detail
 
@@ -762,10 +796,10 @@ def test_direct_mint_invalid_name_maps_to_400(monkeypatch):
     """The mint handler maps the same ValueError → 400 (the name is
     validated before any entry is written — no partial state)."""
     _self_mint_on(monkeypatch)
-    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    _proxy_on(monkeypatch)
     identity = cr.Identity(kind="client", name="bad name!", datasets=frozenset())
     with pytest.raises(api.HTTPException) as excinfo:
-        _call_direct(api.api_access_self_mint, identity, {"X-Auth-Request-User": "bad name!"})
+        _call_direct(api.api_access_self_mint, identity, _proxy_headers("bad name!"))
     assert excinfo.value.status_code == 400
 
 
@@ -779,9 +813,9 @@ def test_rest_proxy_identity_source(rest_client, monkeypatch, jwks_server):
     the view works with NO key and NO JWT, source proxy-identity."""
     _setup_key(jwks_server)
     _self_mint_on(monkeypatch)
-    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    _proxy_on(monkeypatch)
     monkeypatch.setenv(cr.ACLS_ENV, "alice:ds1")
-    r = rest_client.get("/api/access/key", headers={"X-Auth-Request-User": "alice"})
+    r = rest_client.get("/api/access/key", headers=_proxy_headers("alice"))
     body = r.json()
     assert r.status_code == 200
     assert body["source"] == "proxy-identity" and body["identity"] == "alice"
@@ -806,11 +840,11 @@ def test_rest_proxy_name_mismatch_binds_the_proxy_name_not_the_jwt(rest_client, 
     carol's own entry — never the JWT holder's."""
     key = _setup_key(jwks_server)
     _self_mint_on(monkeypatch)
-    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    _proxy_on(monkeypatch)
     monkeypatch.setenv(cr.ACLS_ENV, "alice:ds1")
     r = rest_client.get(
         "/api/access/key",
-        headers={**_alice_headers(key), "X-Auth-Request-User": "carol"},
+        headers={**_alice_headers(key), **_proxy_headers("carol")},
     )
     assert r.status_code == 200
     body = r.json()
@@ -838,9 +872,9 @@ def test_whoami_proxy_identity_source_resolves(rest_client, jwks_server, monkeyp
     the SPA into paste mode and hid the card."""
     _setup_key(jwks_server)
     _self_mint_on(monkeypatch)
-    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    _proxy_on(monkeypatch)
     monkeypatch.setenv(cr.ACLS_ENV, "alice:ds1")
-    body = rest_client.get("/api/oidc-session", headers={"X-Auth-Request-User": "alice"}).json()
+    body = rest_client.get("/api/oidc-session", headers=_proxy_headers("alice")).json()
     assert body["authenticated"] is True
     assert body["identity"] == "alice"
     assert body["source"] == "proxy-identity"

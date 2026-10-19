@@ -115,7 +115,7 @@ def test_dim_mismatch_still_raises_under_alias():
     _expect_mismatch(dm)
 
 
-def test_missing_fingerprint_records_and_passes():
+def test_missing_fingerprint_records_and_passes() -> None:
     calls: list[str] = []
     dm = _make_guard_dm(_fp8_embedder(alias=OLD_NAME), None)
     dm._write_embedder_fingerprint = lambda name: calls.append(name)  # type: ignore[method-assign]

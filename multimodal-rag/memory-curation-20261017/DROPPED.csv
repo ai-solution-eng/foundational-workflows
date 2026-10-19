@@ -1,0 +1,442 @@
+memory_id,reason,chars,preview
+04cf14a6-381b-445c-a2b5-ccca5a5607d1,empty,0,
+10acd032-c9e0-4cf7-abd4-200a3100f0ce,empty,0,
+19c2a665-ec42-4566-bedc-7e866e87b56e,empty,0,
+1f04c20b-a3e5-4d45-81a0-7cf3e3ac1212,empty,0,
+21d3d72b-e420-4ebe-8571-6d188820920f,empty,0,
+2f2a70bf-8579-492f-9d5b-2ed3c65936d6,empty,0,
+2f2f5430-dd60-41dc-8ac2-156443786b60,empty,0,
+3011ab28-4f27-4a12-aa4a-6c5c1b682d7c,empty,0,
+32b150ac-fccd-43d2-87ae-b548c8836d2a,empty,0,
+3c53e7fd-69a0-4db6-8b3f-ac9ff0a8a816,empty,0,
+51689cea-9ca8-445e-b1e6-6679ecd8fbaf,empty,0,
+5b797632-a9ca-48cf-8b0b-82fce5a429b6,empty,0,
+5d922270-7fb6-4fe0-b466-da796d0a0de7,empty,0,
+67e3d4d8-1c33-4a62-9325-88bf46fab932,empty,0,
+70144820-711a-4771-8dc3-a32e02d694ca,empty,0,
+75faeb92-819d-4cf8-b4a0-ded46069ec4c,empty,0,
+90c91e4a-b141-407f-8d57-d62e24f20a72,empty,0,
+91e0e343-484a-4943-9d71-8bd8ce12f5ad,empty,0,
+94ebfac2-1bf5-44c6-9049-31593a9a2d9c,empty,0,
+95fd2749-7956-4ec6-af79-d494239f1279,empty,0,
+aa1467c5-a13e-4810-9093-15cc803f2499,empty,0,
+b2055c90-af99-4494-bd30-966368cc67b9,empty,0,
+b53d1880-1d77-4759-8d7b-0e7b530c10cb,empty,0,
+b90eb931-df1f-406d-b05c-91753d84e77e,empty,0,
+c3983925-669d-40d6-a3fd-dec8dfdf033a,empty,0,
+c8abc878-683a-4394-bbda-95019a837638,empty,0,
+d90ac990-dac2-47bc-bda1-44b6be4cf63e,empty,0,
+e0d10ee7-741d-4907-96a0-cee191c7bfa5,empty,0,
+e7f171be-673e-4c2f-87c3-3ce202d4cac4,empty,0,
+efc714f3-2bbc-488c-8af6-0c4182dbfd7c,empty,0,
+f1bebdd2-53b9-4328-9394-8b89cab1299a,empty,0,
+fa396cf5-c249-47c1-995c-43a51e623e40,empty,0,
+fdd8527f-f0db-47d3-b015-e2f82586eb0f,empty,0,
+ffd59a93-6de8-46b9-a7d1-392466b28fbf,empty,0,
+021f3fd8-1cc7-4bb4-a850-c8a6e03f0f5b,index-only stub,102,"[MEMORY INDEX | project: dsh-opencode-tooling | file: session-log.md | topics: dsh, opencode, tooling]"
+054ac49d-6da1-42c8-961c-0fc7a7625833,index-only stub,2248,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] MultimodalRAG pcai_utils merge verification + upstream patch (2026-08-31, commit 57417bb). VERDICT on the"
+05962dbb-979d-409f-882e-041fbcb55176,index-only stub,88,"[MEMORY INDEX | project: sqlhandler | type: fact-card | topics: sqlhandler, sql, duckdb]"
+0af38fed-887c-4d8b-babb-d1a20a3ae654,index-only stub,2048,"[MEMORY INDEX | project: pcai-llm-gateway | type: fact-card | topics: mcp-auth, gateway, mm-rag, sqlhandler, gotchas] MCP GATEWAY AUTH POSTURE (2026-10-05, live on G2, verified green): (1) Removed the"
+0f9d479a-b240-4c78-8772-ed96689cb8bc,index-only stub,3585,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] WAVE-2 IMPLEMENTATION COMPLETE (2026-09, HPE PCAI fleet) — all 4 slices built on the wave-1 trees, indepe"
+11b875ba-f4a2-4ff1-af4d-ecad408c2f6b,index-only stub,2503,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] MultimodalRAG remediation wave 2 (2026-10-02 evening) — considerations implemented after Andrew approved "
+11d7f68c-fd1f-4916-9f7b-34d641cdea2f,index-only stub,2101,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] MultimodalRAG input-handling fix verification (post-fix working tree). ALL VERIFIED GREEN: static (compil"
+14fa28a7-9b64-4beb-84e5-5e086e8bb484,index-only stub,2050,"[MEMORY INDEX | project: mlis-platform | type: fact-card | topics: mlis, platform, kubernetes] DshChart state (2026-09-04, chart v0.1.16): DECIDED — standardize on SINGLE-USER mode: one chart release "
+174b6f7e-d365-413b-88d2-ba7c3e067e4a,index-only stub,2050,"[MEMORY INDEX | project: pcai-llm-gateway | type: decision | topics: relay, r4, dsh, update-strategy] r4 PERSISTED AS A COMMIT (2026-10-09, follows the r4-shipped card): user asked whether the work co"
+17f142fb-436a-4acf-a875-9462a3ca61c1,index-only stub,2227,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] DeepSeek-V4.1-Flash (MLIS KServe deploy, project-user-andrew-bydlon, 4xH200, SGLang preview image lmsyso"
+1bf870e6-f554-4f06-9ac4-b8f4cf451caf,index-only stub,2440,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] francesco-memory bm25 REBUILD COMPLETED 2026-09-11 (~15:52Z) via the app's NATIVE IMPORT path, after a li"
+1e05d8d4-4ad5-41c7-ab84-f9ca292a4ec0,index-only stub,2427,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] DeepSeek-V4.1-Flash redeploy status (2026-10-02): RELEASE TRIGGER FIRED — SGLang v0.5.21 (pushed Oct 1) "
+206f7fb3-f7ba-4fbb-addd-63e9cdd37086,index-only stub,150,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stmem, verifier, agent-teams, ttl-hours, overflowerror, reaper, delta-review]"
+24091e97-9a0b-442b-ac42-a308d3d80503,index-only stub,2907,"[MEMORY INDEX | project: pcai-llm-gateway | type: fact-card | topics: gateway, audit, subagents] PCAI_LLM multi-agent improvement audit (2026-10-03, repo @ 912a6a6): 7 subagent reports fused into .scr"
+25be8352-2e3c-487f-9a95-e94f72e9a595,index-only stub,2574,"[MEMORY INDEX | project: mlis-platform | type: fact-card | topics: mlis, platform, kubernetes] pcai-llm-gateway session outcome (2026-09-24, workspace /home/andrew/Code/HPE/PCAI_LLM): Andrew approved "
+26529076-bc67-4260-8729-54fc09f5d065,index-only stub,3793,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] IMPLEMENTATION-REVIEWS COMPLETE (2026-09, HPE PCAI fleet): six per-package code-verified build-plan revie"
+2759bc44-db1d-48ee-a8de-8ea81d15b6fd,index-only stub,89,"[MEMORY INDEX | project: pcai-llm-gateway | type: fact-card | topics: gateway, llm, pcai]"
+27abb8ef-1635-4d8f-b644-c564cbc0bfd3,index-only stub,93,"[MEMORY INDEX | project: benchmarks-perf | type: fact-card | topics: benchmarks, performance]"
+2a2c90e2-4ad7-460d-9561-11d9528173c3,index-only stub,2166,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] sproket 5.3 script hardened from the buddy's GLM-5.2 Dynamo compose ops lessons (2026-09-11): added --in"
+2e42d6e5-94ca-49cf-8022-a6c52773319f,index-only stub,202,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: autonomous-agent-audit, deepseek-subagent, secret-scan, hardlinker, responses-api, sglang, memory-ingestion, cross-validatio"
+2e832800-1368-4354-a6b5-5810582cc341,index-only stub,117,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, verification, 421, transport-security, oom]"
+2fe93d1c-a3d5-4f70-a2ab-f49613122df4,index-only stub,2052,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] MultimodalRAG audit remediation (2026-10-02 afternoon, same day as the audit): all P0s + actionable P1s F"
+3018aab8-a48a-4214-829b-8ab6350c8e40,index-only stub,135,"[MEMORY INDEX | project: dsh-opencode-tooling | type: session-summary | topics: approvals, answerers, web-ui, sandbox, skills, dsh-cli]"
+302c1a07-6474-4257-839d-b394ca876896,index-only stub,3188,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] MultimodalRAG post-deploy round (2026-08-31, commit c040712, user answered 12 recommendations point-by-po"
+3073b940-a55f-46d5-abd7-7f426cb3d25c,index-only stub,191,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: security-audit, performance-review, budget-admission-gate, asyncpg, sql-placeholder-bug, wave-review, test-harness]"
+355ffe2a-bd36-4ddf-b745-8f2c878b902f,index-only stub,1520,"[MEMORY INDEX | project: pcai-llm-gateway | type: fact-card | topics: gateway, relay, dsh, cordis, mcp] SUPERSEDES the client-side half of the 2026-09-21 DSH x gateway tool-calling failure matrix (202"
+36140d48-622d-4ea9-a643-8b14df9dd429,index-only stub,181,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: security-hardening, secret-scan, hardlinker, responses-api, subagents, cross-validation, memory-pipeline]"
+361cfa6f-5c96-45b0-b159-d4d39ae021bd,index-only stub,2299,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] GLM-5.3-Flash image upstream-drift audit (2026-09-10, verified live): The DEPLOYED glm-53-flash predicto"
+36c7da4a-df7f-4458-a1ae-0ae0158a451f,index-only stub,2595,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] GLM-5.3-Flash HiCache fix — contributor & image landscape (2026-09-07): PR #38212 author ormandj is NOT "
+39aafda2-8960-42fa-aab5-a769f8e79e0b,index-only stub,2136,"[MEMORY INDEX | project: general | type: fact-card | topics: general] Ubuntu 24.04 (noble) → 26.04.1 (resolute) release upgrade, done 2026-09-21 via the ml4w port kit script `~/Code/HPE/scratch_worksp"
+3d7f1805-1a3d-427a-9c44-cf69986c6ac3,index-only stub,196,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: autonomous-audit, deepseek-subagent, secret-scan, responses-api, sglang, memory-pipeline, hardlinker, replication-dedup]"
+40c1953c-2082-4082-ba35-f0418a62fda1,index-only stub,164,"[MEMORY INDEX | project: deployments | type: session-summary | topics: documentation, hardlinker, secret-scan, version-bump, mirror-sync, jwt-secrets, memory-scrub]"
+4235db4f-23b9-4a5b-adff-716338bacb52,index-only stub,168,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline, pod-cleanup, kyverno-finalizer, hpa-duplicates, g2-deployment, rag-dataset]"
+44f5859a-c348-4f72-92d2-51c06ecdc10c,index-only stub,200,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline, pod-cleanup, kyverno-finalizer, memory-deduplication, hpa-duplicates, rag-dataset, distillation-scheduling]"
+45446014-0bae-4f59-a80b-05db15219135,index-only stub,109,"[MEMORY INDEX | project: glm-sglang-serving | file: session-log.md | topics: glm, sglang, h200, serving, gpu]"
+46500c96-cc78-4a8a-85ce-0c337371afe9,index-only stub,186,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: deepseek-agent, security-scan, secret-scanning, hardlinker, cross-validation, performance-review, helm-values]"
+46988b8c-f0a5-409c-8d04-ea69fb45a933,index-only stub,120,"[MEMORY INDEX | project: general | type: session-summary | topics: admin-keys, api-keys, key-splitting, troubleshooting]"
+482a90f2-4477-4f17-adc7-7b16e5661231,index-only stub,197,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: subagent-deployment, short-term-memory, reaper-cronjob, admin-unlock, backup-verification, ttl-handling, gateway-compaction]"
+483c025b-c85f-45ce-91dc-4ee60865193a,index-only stub,171,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: helm, 401, invalid-api-key, kubernetes-secret, jwt, pcai-serving, rag-mcp-server, troubleshooting]"
+48bda831-d2a3-47b8-9350-fe7cfe614cf9,index-only stub,2347,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] v2 L3 image VERIFIED end-to-end (2026-09-15): pulled ghcr.io/ai-solution-eng/glm53-flash-hicache-l3:v2.0"
+48ffdd3e-771c-416d-bf6d-18b841c6ea26,index-only stub,187,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: autonomous-audit, deepseek-subagent, secret-scan, hardlinker, responses-api, memory-pipeline, cross-validation]"
+493365bf-6e45-4da1-b186-e83d2e027812,index-only stub,2132,"[MEMORY INDEX | project: sqlhandler | type: fact-card | topics: sqlhandler, sql, duckdb] Self-improving SQL agent loop — FULLY BUILT in /home/andrew/Code/HPE/design/sql-lessons/ (increments 1-4 comple"
+49abb30b-1527-44ae-a663-1451e662cc90,index-only stub,171,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, shoe-print-metrics, cuml, rapids, gpu-acceleration, random-forest, sklearn-accel, conda-setup]"
+4ad2851b-0886-4731-899a-647e7ec17963,index-only stub,2572,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] MultimodalRAG idle-flush REVERTED (2026-08-31, commit 28d34b1) — convicted by clean A/B on v3.1.6 (first "
+4b0d11bf-e287-4244-b711-75705c717848,index-only stub,149,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, shoe-print-metrics, cuml, gpu, random-forest, similarity-metrics, conda]"
+4b7189c3-1898-426d-83ed-93ea65666456,index-only stub,2056,"[MEMORY INDEX | project: pcai-llm-gateway | type: decision | topics: relay, r4.1, dsh, ui-rendering] DSH r4.1 SHIPPED (2026-10-08, commit 538b24caa2 on top of r4's e2f857a043; fixes the two defects fr"
+4b801988-637a-4963-83a4-1522c1e8914a,index-only stub,2121,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] GLM-5.3-Flash HiCache L3 (storage tier) is STRUCTURALLY UNAVAILABLE — verified at code level 2026-09-11 "
+4d852684-abc1-45de-9891-899b1c9b16a4,index-only stub,2634,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, mcp, k8s] MCP fleet remediation session 2026-09-21 (follow-up to the verification audit). OUTCOMES: (1) nemoclaw ACCEPTED-AS-I"
+4da68af9-bbf0-403b-8e7f-2337af7b160c,index-only stub,2335,"[MEMORY INDEX | project: dsh-opencode-tooling | type: fact-card | topics: dsh, opencode] DshChart v0.1.18 (2026-09-04) — ""frontend doesn't load"" ROOT CAUSE + fix: the live pod's token-watch (inline no"
+4f305f1b-98d9-4169-8c6c-80aa2179cd5b,index-only stub,149,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-writes, kubernetes, debug-pods, upgrade, postgres, gateway-deploy]"
+4f799154-4997-4aab-a67d-44dd71d1f5aa,index-only stub,207,"[MEMORY INDEX | project: dsh-opencode-tooling | type: session-summary | topics: deepseek-harness, update-preflight, update-dsh-script, git-commit, preset-drift, session-repair, teammate-routing, pi-ai"
+4faca616-79f5-4df3-a982-f36849ff2a20,index-only stub,210,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, dataset-lifetimes, cronjob-reaper, kubernetes-secrets, admin-unlock, backup-download, cross-ver"
+500f91cc-b322-44d3-a5e6-cb544b10f87a,index-only stub,200,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: supersede-fix, gateway-deployment, zombie-pods, kyverno-policy, off-peak-gate, alert-rules, prometheus, memory-distillation]"
+50603882-cade-4627-a6d1-d9daf15095b2,index-only stub,170,"[MEMORY INDEX | project: general | type: session-summary | topics: microbiome-volatility, literature-review, searxng, europepmc, workbench, read-only-sandbox, kubectl-cp]"
+51a75006-aab9-4e49-917b-e79d753f82c6,index-only stub,3261,"[MEMORY INDEX | project: pcai-llm-gateway | type: fact-card | topics: v2.0.2, alias-split, qwen-fix] PCAI_LLM v2.0.2 RELEASE STATE (2026-10-04 ~14:20, UNCOMMITTED, suite 1175 green, ruff+mypy clean 43"
+51e291f1-aecc-4023-b2b5-cc8427dee037,index-only stub,130,"[MEMORY INDEX | project: general | type: session-summary | topics: admin-keys, session-title-generation, key-management, api-keys]"
+523829ed-31dd-46b3-a37b-f085bcbfc8ec,index-only stub,158,"[MEMORY INDEX | project: mlis-platform | type: session-summary | topics: dataset-permissions, sso, acl, cron-jobs, short-term-memory, agent-teams, deployment]"
+5279cfe6-8af0-47f3-8289-c5e331d1be75,index-only stub,193,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: deepseek-audit, autonomous-fixes, secret-scan, hardlinker, responses-api, sglang, memory-ingestion, cross-validation]"
+530f65be-a7fd-4861-877b-2d0cd1127de4,index-only stub,175,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stmem, verification, cross-validation, swarm-memory, reaper-cronjob, mutation-testing, ensure-dataset]"
+54f5ea5c-334e-473e-9989-9cded957fa81,index-only stub,162,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: rate-limiting, cached-tokens, tokens-per-minute, throttling, model-selection-dropdown]"
+567e53ad-4762-4c65-9b26-ecec251374c1,index-only stub,191,"[MEMORY INDEX | project: dsh-opencode-tooling | type: session-summary | topics: dsh-update, update-dsh-sh, externalized-plugins, preset-drift, rollback, build-artifacts, version-0.2.1-alpha2]"
+5745e8ce-f2a7-4dc4-9477-0f37d3f8a4cb,index-only stub,177,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline, gateway-deployment, hpa-duplicates, rag-dataset, k8s-cleanup, prometheus-monitoring]"
+58a490a2-7588-4a92-9ff9-7ac3f39448cc,index-only stub,165,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, cuml, gpu-acceleration, random-forest, similarity-metrics, conda-setup, shoe-print-data]"
+5985c1c4-a113-4944-8792-67dc62eca54c,index-only stub,142,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: helm, 401, api-key, rag-mcp-server, kubernetes, secrets, troubleshooting]"
+5a29907d-416f-48c2-a8df-0b448a0ea7b2,index-only stub,184,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: dataset-creation-permissions, sso, acls, admin-config, short-term-memory, agent-teams, deployment-verification]"
+5a50df73-1a77-4638-8364-b3fcf3b26c16,index-only stub,179,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: cached-tokens, rate-limits, tokens-per-second, model-dropdown, helm-deploy, values-yaml, release-2.5.0]"
+5a52ec6b-b5da-42c1-adf9-3f70e3b0805d,index-only stub,183,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-writes, gateway-upgrade, duplicate-memories, hpa, postgres, g2-values, stray-pods, e2e-verification]"
+5b1254f6-61a8-433f-87cf-7a2176f68ad6,index-only stub,2943,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, mcp, k8s] FLEET PLAN FINAL STATE (2026-09-13 ~20:40 — PLAN COMPLETE, goal closed). All 7 waves done + verified (B2-B7, zero te"
+5b518e55-58b1-4b38-b0a2-625242af7626,index-only stub,2879,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] VERIFIED WORKING RECIPE (2026-09-14, 19:34 Ready): DeepSeek-V4.1-Flash on 4xH200 (pcai-se-scs05, KServe "
+5c134015-1ea0-4b73-8ad7-08a029b57749,index-only stub,199,"[MEMORY INDEX | project: dsh-opencode-tooling | type: session-summary | topics: dsh-update, update-dsh-script, plugin-externalization, preset-drift, session-memory-plugins, build-artifacts, rollback]"
+5c4a9d93-5e3a-4f0e-9bb9-ad5fac56badb,index-only stub,208,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, stmem-reaper, dataset-lifetimes, kubernetes-secrets, admin-backup, cron-scheduling, cross-verif"
+5cdde994-338f-4a8d-9491-1405d8cc51ee,index-only stub,156,"[MEMORY INDEX | project: general | type: session-summary | topics: fleet-drift, hardlinks, helm-charts, gitignore, secret-scan, pcai-solutions, mirror-sync]"
+5eb4b76a-6d73-44d4-bc49-8404e4ffca75,index-only stub,190,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline, deduplication, hpa-duplicates, rag-dataset-update, deployment-verification, opencode-integration]"
+5ff7a5e2-9a33-4174-a51a-097e4ec81a08,index-only stub,138,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: mcp, ezapp-deploy, 502, list-tools, llm-gateway, kubernetes, api-key]"
+600c6f48-dc51-44d8-a906-81773e8dea0a,index-only stub,150,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stm,short-term-memory,reaper,qdrant,helm,agent-teams,task-2,lifetime-algebra]"
+61aa7739-0674-44ad-8cb0-cad4bf168c52,index-only stub,159,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: helm, 401-auth, api-key-expiry, kubernetes-secrets, values-yaml, troubleshooting, jwt]"
+62192517-fb4f-42a4-bc2a-8443eaa007ee,index-only stub,2059,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, mcp, roadmap] MCP-fleet expansion research run (2026-10, Deepseek subagent + repo-scout teammate, consolidated in session). NE"
+6318c576-ad28-4981-a52a-bfd7e5ae679e,index-only stub,175,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline,pod-cleanup,hpa-dedup,g2-cluster,finalizer-stuck-pods,rag-dataset,prometheus-rules]"
+64271b54-bb88-4c6f-8373-1930d3ee0bd0,index-only stub,83,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, mcp, k8s]"
+64c3fe6a-f155-480b-9b0c-400ac3012ea6,index-only stub,2621,"[MEMORY INDEX | project: sqlhandler | type: fact-card | topics: sqlhandler, sql, duckdb] SQLhandler v1.1.0 external-DB attach + prometheus-mcp v0.1.0 built (2026-09-08): SQLhandler gains read-only Pos"
+656132eb-21d4-4867-8a0c-8040161d2d06,index-only stub,167,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline,k8s-deployment,duplicate-memories,hpa-replicas,rag-dataset,supersede-logic]"
+65d72958-b213-493d-93e6-44e695fd08d4,index-only stub,2547,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, mcp, k8s] MCP fleet global verification 2026-09-21 (~18:20 UTC), full matrix PASS with caveats. CALLING SURFACE: flat {server}"
+672367b0-6639-4d2f-8c7f-40bf022440a4,index-only stub,2243,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] MLIS predictor memory-alert ladder (2026-09-26, drafted+validated, NOT yet deployed): Platform rule ""Con"
+677e606b-2ad4-4870-84fb-7fd07a63038d,index-only stub,207,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: deepseek-subagent-audit, secret-scan-gate, hardlinker, responses-api, sglang, memory-dedup, auto-memory-policies, cross-vali"
+67f90101-3ebf-466c-ab35-ef1d9659e74a,index-only stub,164,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: mcp, ezapp-deploy, list-tools, 502, dns-rebinding, transport-security, kubernetes, llm-gateway]"
+68ef1f41-f289-40ee-8c1c-0fe7e8d4327f,index-only stub,184,"[MEMORY INDEX | project: deployments | type: session-summary | topics: model-architecture, glm-5.3-flash, deepseek-4.1-flash, kimi-delta-attention, layer-layout, ptc-presentation-mode]"
+6a02fdda-5d6d-4884-a080-0a85db25759c,index-only stub,2512,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] MultimodalRAG input-handling audit fixes LANDED (working tree, uncommitted as of 2026-09-03 session). New"
+6a6cd24d-e6e2-4883-a274-fbdd8af48909,index-only stub,158,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, shoeprint, similarity-metrics, cuml, gpu, random-forest, conda, batch-processing]"
+6ae82cdb-84ea-49ac-bf1d-bf4b4d03f284,index-only stub,160,"[MEMORY INDEX | project: general | type: session-summary | topics: microbiome,volatility,literature-search,human-health,research-intro,file-transfer,kubectl-cp]"
+6b60e98f-e0e3-4c60-87c1-a8b8593f2d60,index-only stub,173,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline, deduplication, k8s-deployment, rag-dataset, prometheus, hpa-replicas, supersede]"
+6be0b3b9-dbf9-43c6-bd0e-4144663e1113,index-only stub,171,"[MEMORY INDEX | project: dsh-opencode-tooling | type: session-summary | topics: agent-teams, spawn-teammate, model-pinning, ptc-mode, skills, harness-update, build-deploy]"
+6c0c5734-a932-44ea-859a-add4ede16683,index-only stub,153,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: helm, 401-unauthorized, api-key, jwt-expiry, kubernetes-secret, troubleshooting]"
+6c309694-12d1-4bf0-8a36-7e28387c5694,index-only stub,69,[MEMORY INDEX | project: general | type: fact-card | topics: general]
+6d9591a2-2db5-40b8-8151-69e869cc58ba,index-only stub,179,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stm-lifetime, wave2-cross-validation, execution-review, mutation-testing, dataset-manager, reaper, pytest]"
+6dde2456-8b53-4524-8b27-5b41762926cf,index-only stub,169,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: postgres-schema-drift, distiller, silent-failure, rca-verification, memory-pipeline, k8s-ops]"
+6e7e531f-fbf8-4d8b-abee-2e4fd722354e,index-only stub,2688,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] DeepSeek-V4.1-Flash seed catalog entry — FINAL (2026-09-14): single entry `seed-h200-deepseek-v41-flash`"
+6ec5d3be-47f4-47ed-9d08-2ca6a2cecc94,index-only stub,147,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: dot-diagram, architecture, litellm, pcai-llm-gateway, mcp, sql, visualization]"
+6f71b830-cd0c-4197-abc6-52a07a156908,index-only stub,200,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, stmem-reaper, kubernetes-deployment, dataset-lifetime, mcp-server, secrets, cross-verification]"
+6ff4933d-91cd-416f-bbbf-a24dd1f743be,index-only stub,166,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: memory-curation, deduplication, distiller-outage, mcp-tools, session-summaries, data-cleanup]"
+70cba71a-e1b2-46ba-b605-1d58b2c46f3f,index-only stub,186,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: security-audit, deepseek-subagent, secret-scan, hardlinker, responses-api, memory-ingestion, cross-validation]"
+71c64104-2968-4ef5-9e58-274308412b79,index-only stub,220,"[MEMORY INDEX | project: deployments | type: session-summary | topics: prometheus-alert-remediation, kubernetes-patching, helm-release-inspection, otel-collector, logbook-loki, langfuse-clickhouse, hi"
+72f14e6c-ee6a-4e74-8a37-eeec1b371147,index-only stub,194,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: deepseek-agent-audit, security-scan, hardlinker, responses-api, memory-dedup, memory-ingest, cross-validation, sglang]"
+73cf54f3-925d-46d1-b2db-00ccf4e8628c,index-only stub,164,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: mcp, ezapp-deploy, 502, list-tools, dns-rebinding, kubernetes, llm-gateway, transport-security]"
+74cd3c72-0e9e-4f1a-9fd3-a01d0ba2f3fa,index-only stub,168,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stmem, factual-integrity-review, cross-validation, reaper-cronjob, dataset-api, subagent-teams]"
+75ae452d-5f37-4036-b4dd-7d556f46c433,index-only stub,203,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: deepseek-agent-scan, cross-validation, secret-scan, hardlinker, responses-api, memory-dedup, memory-pipeline, autonomous-fix"
+76dbd617-c268-4c1f-9ae3-7df28ddb08cd,index-only stub,147,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: dot-diagram, readme, mcp-groups, litellm, pcai-llm-gateway, rag, architecture]"
+77da4310-e833-4649-85a1-9554cf7b6960,index-only stub,146,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: rate-limiting, cached-tokens, tokens-per-minute, throttling, api-keys]"
+781fa713-4e9d-4457-9ab8-00827b4e66b7,index-only stub,2935,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] MultimodalRAG audit-round-2 fixes IMPLEMENTED 2026-08-31 (4 commits on master, rollback tag checkpoint-pr"
+79f3de5d-da26-4924-bdc6-ba5ec2bdedc7,index-only stub,183,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, dataset-lifetimes, stmem-reaper, kubernetes, admin-unlock, cross-verification]"
+7b393316-6726-4ed7-be86-589163504b05,index-only stub,169,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-write, gateway-redeploy, kubernetes-debugging, postgres, diagnostic-jobs, pod-cleanup]"
+7c3378dc-5a5c-4a87-909d-fa10f87c3797,index-only stub,153,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, shoe-print-similarity, random-forest, cuml, gpu-acceleration, rapids, conda]"
+7c657ab2-0d13-46b1-bd4b-1454d856b08d,index-only stub,182,"[MEMORY INDEX | project: general | type: session-summary | topics: shoe-print-similarity, random-forest, cuml, gpu-acceleration, metrics-recalculation, conda-environment, fish-shell]"
+7e30264d-bc9c-4024-8d65-da5fe45f3209,index-only stub,204,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, stmem-reaper, dataset-lifetime, cron-scheduling, kubernetes-secrets, admin-api-key, rag-mcp-ser"
+7e3813ac-a423-4012-b8f9-52f1cff41af9,index-only stub,141,"[MEMORY INDEX | project: general | type: session-summary | topics: shoe-print, similarity-metrics, random-forest, csv, datasets, parallelism]"
+7e72370e-90ee-4f6b-ad69-ad5e1cbe5dba,index-only stub,206,"[MEMORY INDEX | project: deployments | type: session-summary | topics: prometheus-alerts, kubernetes-remediation, g2-cluster, otel-collector, helm-release-secret, spark-job-cleanup, model-deployment-m"
+7e9f447d-638d-4b70-8a13-d1ef31b32dab,index-only stub,149,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: dot-diagram, readme, mcp-architecture, litellm, pcai-llm-gateway, graphviz, rag]"
+7fcd5d27-eb0e-4b60-9a02-d9f1261d33c1,index-only stub,2102,"[MEMORY INDEX | project: sqlhandler | type: fact-card | topics: sqlhandler, sql, duckdb] Self-improving SQL agent — increment 1 IMPLEMENTED in /home/andrew/Code/HPE. Toromont system prompt found at pc"
+802d2cf1-f16d-4612-828a-f7b361d1f3ee,index-only stub,96,"[MEMORY INDEX | project: pcai-llm-gateway | type: fact-card | topics: gateway, audit, subagents]"
+8180e7fa-dfc7-4876-bec5-b11fcbc1a700,index-only stub,152,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, shoe-print, cuml, gpu-acceleration, metrics-regen, random-forest, rapidsai]"
+8197b9eb-7b2d-4675-ad49-370fb902797d,index-only stub,3844,"[MEMORY INDEX | project: pcai-llm-gateway | type: fact-card | topics: load-aware-cascade, ttft-gate, v1.10] PCAI_LLM v1.10 feature wave (2026-10-04, UNCOMMITTED; suite 1015→1106, ruff+mypy clean 43 fi"
+82850448-2f69-4334-83bc-b7fb5883e38e,index-only stub,143,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: admin-keys, key-rotation, chargeback, usage-ledger, admin-api, RCA]"
+82861b69-5136-48e7-9bc8-0501138c4418,index-only stub,158,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: helm, 401-invalid-api-key, kubernetes-secrets, jwt-expiry, rag-mcp-server, debugging]"
+82ad3ff9-b74a-4f4d-b4be-fcdaaacbe92a,index-only stub,168,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, shoe-print-metrics, cuml, gpu-acceleration, random-forest, conda-setup, similarity-metrics]"
+8353807e-5abe-443a-ae07-b97f91e740c3,index-only stub,182,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-curation, andrew-memory, dedupe, hpa-duplicate-distills, list-memories-cap, mm-rag, stub-summaries]"
+8371783f-3d70-4cf9-9359-31e6c8b8b594,index-only stub,2129,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] Sweep #4 (2026-09-17, 3 days post-sweep #3; k8s MCP tools RESTORED — full sweep). Prometheus core PERFEC"
+84479134-3a69-45b5-afb8-862d58029e14,index-only stub,176,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: security-audit, subagents, memory-deduplication, secret-scan, hardlinker, responses-api, deployment]"
+855be4b1-02d5-411d-912d-59e29f1c3b40,index-only stub,2525,"[MEMORY INDEX | project: benchmarks-perf | type: fact-card | topics: benchmarks, performance] ModelBenchmarker audit (2026-08, /home/andrew/Code/HPE/ModelBenchmarker) — top findings: (1) HIGH: utils/p"
+8579d2a4-15d4-4b3a-bd63-2cd2725bd9e4,index-only stub,185,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: security-audit, subagents, hardlinker, secret-scan, responses-api, sglang, memory-pipeline, cross-validation]"
+86b10490-52c7-4f70-a989-e3eec3d96f11,index-only stub,195,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: security-audit, subagents, secret-scan, hardlinker, responses-api, memory-deduplication, memory-pipeline, helm-upgrade]"
+86f830c8-8f94-4d43-9a41-fc771a51b18a,index-only stub,3628,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, verification, 421, transport-security, oom] FLEET POST-DEPLOY VERIFICATION (2026-10-05, after Andrew deployed all wave servers"
+8753aa46-ae43-44e6-8cff-faadbb8c23c1,index-only stub,187,"[MEMORY INDEX | project: dsh-opencode-tooling | type: session-summary | topics: skill-installation, codex-skills, tarball-inspection, sandbox-escalation, skills-tarball, prometheus-sweep]"
+8781f2da-194f-4ccc-b70a-e2e3f0ed0607,index-only stub,2156,"[MEMORY INDEX | project: sqlhandler | type: fact-card | topics: sqlhandler, sql, duckdb] HPE workspace shared-file hardlink architecture (verified 2026-08-31): `pcai_utils/` is the single source of tr"
+87caa6fa-7d9c-4b83-9537-c0679d98be24,index-only stub,167,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline, gateway-deployment, hpa-duplicates, rag-dataset, g2-values, k8s-namespace]"
+88818498-d40e-4dd9-9606-2a524c90060b,index-only stub,174,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: deepseek-subagent, cross-validation, secret-scan, hardlinker, responses-api, memory-dedup, sglang]"
+88a001c9-d044-4c7a-9f12-3401ecfa23bf,index-only stub,181,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: deepseek-agent, security-scan, cross-validation, hardlinker, secret-scan, autonomous-fixes, tool-calling]"
+8a1d3942-3511-4c70-aae8-2bd640364e6d,index-only stub,2074,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] httpx→httpx2 migration of the HPE fleet completed 2026-09 (late Sept). End state: ALL live code/tests/man"
+8b796d11-b16e-4618-aed6-1ce61b57fa5d,index-only stub,173,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stmem, agent-client, code-review, cross-validation, wire-format, subagent-review, short-term-memory]"
+8ba71338-9411-4d09-b676-b5a22c002a97,index-only stub,177,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, stm-reaper, helm-cronjob, dataset-manager, task-claiming, phase-1, safety-invariants]"
+8bdb37f9-6b5e-43bf-ad00-6cf8cb2bfd54,index-only stub,2170,"[MEMORY INDEX | project: sqlhandler | type: fact-card | topics: sqlhandler, sql, duckdb] SQLhandler HPA/requests right-sizing (2026-09-28): HPA CPU Utilization targets compare average CPU against the "
+8c7fb76c-1cb9-4815-ae43-1e32e8266f15,index-only stub,4243,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, mcp, k8s, improvement-wave] MCP FLEET IMPROVEMENT WAVE (2026-10-04, complete, uncommitted — Andrew hardlinks+pushes after sess"
+8cd49abd-5ace-4920-87b5-45d488cc3bb2,index-only stub,178,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline, hpa-duplication, k8s-pod-cleanup, rag-dataset, gateway-deploy, prometheus-monitoring]"
+8d0294d8-bd90-4646-8e6e-4d840320dc37,index-only stub,170,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: cached-tokens, rate-limiting, token-budgets, model-dropdown, helm-deploy, values-yaml, v2.5.0]"
+8dc72884-ee9f-4413-9aa8-e9d48168216b,index-only stub,141,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, shoe-print, similarity-metrics, random-forest, cuml, gpu, conda]"
+8ded968a-87ad-409d-b2dc-4282ce14345e,index-only stub,203,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: security-audit, secret-scan, hardlinker, deepseek-subagent, cross-validation, autonomous-fixes, helm-values, repo-improvemen"
+8f9fe815-ee57-4ee1-bede-0da606ff3650,index-only stub,164,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-write-failure, gateway, postgres, kubernetes-probe-jobs, distillation, debugging]"
+91a9f679-ed0f-47a0-82b3-9800656c2b10,index-only stub,94,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant]"
+92028544-02c5-4185-bf9d-92d3e16f9a79,index-only stub,2918,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] ModelBenchmarker memory-estimator (2026-09-24): new package src/model_benchmarker/memory_model/ (gpus.py"
+921726cc-5e41-4083-95f0-dc0ef54a5272,index-only stub,2242,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] andrew-memory store bloat postmortem + sweep (2026-09-09): the store hit 1,044 docs but only ~196 were cu"
+92315265-9059-4727-a773-c5ab4afd2612,index-only stub,176,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, swarm-scratchpad, memory-design, cross-validation, subagent-teams, ttl]"
+92d8a018-ff6e-403a-90b2-85ebb35df91e,index-only stub,165,"[MEMORY INDEX | project: general | type: session-summary | topics: cuml, rapids, gpu-setup, conda, sklearn-compatibility, shoeprint-metrics, random-forest, solemate]"
+93c23a93-6fcf-4d8f-b889-13aa33e98b88,index-only stub,137,"[MEMORY INDEX | project: general | topics: shoe-print-similarity,solemate,random-forest,metrics-computation,dataset-csvs,cpu-parallelism]"
+943b59b1-4e13-4062-9b10-35586c575e9c,index-only stub,2507,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] G2 LIVE TEST of the input-handling rollout (mm-rag ns, 4 replicas, image v3.5.2 = functionally the 3.5.1 "
+96062ccd-0d15-4953-a0d4-3a597e98c59e,index-only stub,213,"[MEMORY INDEX | project: dsh-opencode-tooling | type: session-summary | topics: dsh-update, update-dsh-sh, harness-update-skill, git-commit-preflight, preset-drift, pi-ai-relay-patch, sandbox-limits, "
+9608df2e-fefa-4f93-9bf2-90f997cf0380,index-only stub,2108,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] MultimodalRAG v3.0.0 DEPLOYED SUCCESSFULLY 2026-08-31 (commit 8c75ab0 docs sync). Cluster mm-rag namespac"
+97074ac7-26d0-49d8-98de-525ef8c67bbc,index-only stub,140,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: dot-diagram, llm-gateway, litellm, mcp-routing, graphviz, image-export]"
+982deac4-af58-4b77-aa24-44a12d5cf899,index-only stub,179,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-curation, mm-rag, deduplication, andrew-memory, dual-replica, memory-distiller, markdown-export]"
+98cf162e-e288-4aa5-93ba-fe81029dbf9d,index-only stub,186,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, dataset-lifetime, reaper-cron, memory-backup, kubernetes-secrets, access-control]"
+99693ae0-585c-40bd-909f-4f7731ae184d,index-only stub,184,"[MEMORY INDEX | project: multimodalag | type: session-summary | topics: short-term-memory, execution-completeness-review, stmem, negative-testing, pytest, read-only-review, team-tasks]"
+99aaf748-d4ef-42dc-880d-f7da3566de84,index-only stub,157,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: dot-diagram, graphviz, pcai-llm-gateway, litellm, model-sql-model-flow, png-export, svg]"
+99db383e-f2da-4f16-af1f-e179211ce57e,index-only stub,101,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, mcp, k8s, improvement-wave]"
+9a74c935-2895-4ca0-87e3-b80c47323b10,index-only stub,3060,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, mcp, k8s] FLEET PLAN STATE (2026-09-13 ~19:45; supersedes earlier). Waves 0-5 COMPLETE+VERIFIED (B2-B5 zero technical FAILs); "
+9a74de3c-f08f-4ca9-8a50-ab9710225f01,index-only stub,4405,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, mcp, k8s] FLEET PLAN EXECUTION STATE (2026-09-13, HPE workspace /home/andrew/Code/HPE). Plan: FLEET-EXECUTION-PLAN-2026-09.md "
+9a99e9e2-0657-4510-b7ff-e34c5eaf34af,index-only stub,192,"[MEMORY INDEX | project: dsh-opencode-tooling | type: session-summary | topics: skills-install, dsh-harness, sandbox-escalation, approval-policy, tarball-validation, dsh-web, skills-directory]"
+9c2b9dac-c40e-40d2-b987-eb8d1353f20f,index-only stub,2052,"[MEMORY INDEX | project: pcai-llm-gateway | type: decision | topics: relay, r4, dsh, tool-visibility] DSH r4 relay rendering SHIPPED (2026-10-08, supersedes the 2026-10-07 disable): relayed gateway MC"
+9d260a73-c12f-4f49-8a93-951aef991e0f,index-only stub,151,"[MEMORY INDEX | project: general | type: session-summary | topics: cuml, gpu-acceleration, random-forest, similarity-metrics, solemate, conda, sklearn]"
+9eeb1ff2-8f65-4976-ad38-d2cea0311b50,index-only stub,107,"[MEMORY INDEX | project: pcai-llm-gateway | type: fact-card | topics: load-aware-cascade, ttft-gate, v1.10]"
+a1ab0a4f-1ffb-44ee-b47c-c0814fa7c77d,index-only stub,2434,"[MEMORY INDEX | project: general | type: fact-card | topics: general] Palmetto GBA hosted trial — CARD use-case intel (from user-provided internal doc ""Medical Review use case.docx"" in _clear_workspac"
+a3911f06-3a91-4579-b5a1-8dbf3e0d8e8e,index-only stub,174,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, stm-surface, task-3, api-server, mcp-server, catalog-filtering, teammate-briefing]"
+a4ea4fac-06e0-4c32-961e-3a3e4a8d782f,index-only stub,215,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-distiller, canonical-distill, lease-duplicates, check-sql-schema, mutation-testing, v2.6.0-release, applygate-jobs, s"
+a74a5a6f-f0cd-4c48-81f6-b3a692637b04,index-only stub,95,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu]"
+a74b1a28-ab16-4461-8340-b73c88eb75e9,index-only stub,158,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stm, storage-lifetime, dataset-manager, ingest-stamping, team-task, interface-freeze]"
+a7b59fec-e07b-44af-be8e-fcbcf6c8f897,index-only stub,2095,"[MEMORY INDEX | project: pcai-llm-gateway | type: fact-card | topics: gateway, llm, pcai] PCAI LLM Gateway — ADMIN CONSOLE built (user request: admin page behind the API key, key management + profile "
+a9d36047-78b1-46ca-a26c-e6689f76f26d,index-only stub,137,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: kubectl,secrets,deployment,helm,mcp-api-keys,rotation,g2-values]"
+aa35e84a-d744-425f-9e62-5d494b0d8710,index-only stub,159,"[MEMORY INDEX | project: general | type: session-summary | topics: cuml, gpu-acceleration, random-forest, similarity-metrics, solemate, conda, rapids, sklearn]"
+aa6fb557-5327-49d6-a24a-9c65827bec71,index-only stub,2699,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, mcp, k8s] MCP NETWORK ZONE SHIPPED (fleet decision 2026-09, Andrew's security themes: gateway+frontends reach MCPs in-cluster;"
+ab0c96ee-e4c5-4f14-a29b-625eb344d352,index-only stub,163,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stmem, agent-client, code-review, wire-format, brief-truncation, cross-validation, task-4]"
+ab88bf1b-e642-4557-b29f-b836131e00ca,index-only stub,155,"[MEMORY INDEX | project: general | type: session-summary | topics: cuml, gpu-setup, shoe-print-metrics, random-forest, conda, solemate, similarity-metrics]"
+ab99a3c4-332f-4c83-926f-5f9b846da9fa,index-only stub,88,"[MEMORY INDEX | project: sqlhandler | type: fact-card | topics: sqlhandler, sql, duckdb]"
+ac3248ec-8210-4947-aa4f-1c03bfd0acc7,index-only stub,177,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline, pod-finalizer, kyverno-scheduler, hpa-duplicates, rag-dataset-update, g2-deployment]"
+ad1ad89a-a283-4998-a32b-4d8f9431e6c5,index-only stub,193,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: deepseek-agent-audit, cross-validation, secret-scan, responses-api, memory-dedup, memory-pipeline, subagent-spawning]"
+adc008b2-4b0b-4486-83cb-3a3a50d1704b,index-only stub,177,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-distiller, verification, sql-defects, duplicates, mutation-testing, silent-failures, postgres]"
+ae53da8f-c3b3-4ecc-b871-77446b832304,index-only stub,148,"[MEMORY INDEX | project: general | type: session-summary | topics: repo-cleanup, scratch-dirs, venv-management, mypy-ruff-caches, disk-space, conda]"
+b019cd64-3418-449f-acb4-79f0f6d9a254,index-only stub,169,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: cached-tokens,rate-limits,token-budgets,model-dropdown,helm-release,kubernetes-rollout,2.5.0]"
+b0a38aae-8675-407a-953a-b6cf6eebe220,index-only stub,170,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: cross-validation, wave-2, code-review, factual-integrity, overflow-hardening, pytest, team-tasks]"
+b0f1182c-34d0-4bbf-9929-a3d056c611f8,index-only stub,192,"[MEMORY INDEX | project: dsh-opencode-tooling | type: session-summary | topics: skills-install, dsh-harness, sandbox-escalation, fail-closed-approval, skill-loader, hot-reload, tarball-safety]"
+b0f59918-07eb-441f-bb0b-7f4836799364,index-only stub,171,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, shoe-print-similarity, metrics-recalculation, random-forest, csv-generation, gpu-acceleration]"
+b1a0b577-d1b9-41a5-9c37-d296cdaf1070,index-only stub,100,"[MEMORY INDEX | project: pcai-llm-gateway | type: fact-card | topics: v2.0.2, alias-split, qwen-fix]"
+b469cd61-16ca-45c2-8be9-a85ddfa862f8,index-only stub,131,"[MEMORY INDEX | project: benchmarks-perf | type: session-summary | topics: oidc-sso, secrets, env-vars, security, modelbenchmarker]"
+b56607af-fd99-4285-8dff-a5c0a3f1fbd4,index-only stub,165,"[MEMORY INDEX | project: deployments | type: session-summary | topics: prometheus, alerts, kubernetes-remediation, helm, otel-collector, memory-limits, logbook-loki]"
+b5f22b1e-2b7c-46c0-9054-8cc1224910bb,index-only stub,164,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: secret-scan, hardlinker, false-positives, contextvar-tokens, sha256-digests, fleet-scanner]"
+b737b9a7-e595-44a6-974c-423954f54818,index-only stub,2748,"[MEMORY INDEX | project: dsh-opencode-tooling | type: fact-card | topics: dsh, multimodalrag, oauth2-proxy, images] DSH × RAG inline-image root cause — CORRECTED + source-verified (2026-10-06, superse"
+b7d74644-7b95-44df-a891-04eaf4cca5e3,index-only stub,189,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, dataset-lifetime, cronjob-reaper, kubernetes-secrets, rag-mcp-server, memory-design]"
+b80edf84-0158-416d-accc-9233ce2dc454,index-only stub,2937,"[MEMORY INDEX | project: sqlhandler | type: fact-card | topics: sqlhandler, sql, duckdb] Toromont work-order RAG setup (cluster tr7-0211), full dataset + caching picture. Three MCP endpoints: ezpresto"
+b8187cb9-d995-4b4c-868a-2f7e1c7d3c4e,index-only stub,162,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline, pod-cleanup, finalizers, hpa-duplication, rag-dataset, deploy-verify]"
+b8d663a7-4ad4-45d1-b974-35cd1f683d0e,index-only stub,147,"[MEMORY INDEX | project: general | type: session-summary | topics: repo-cleanup, scratch-dirs, venv-management, mypy-cache, ruff-cache, disk-space]"
+b950a52e-ddf8-4daa-88e7-92ab2391797a,index-only stub,152,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: helm, 401-auth, invalid-api-key, kubernetes-secrets, rag-mcp-server, debugging]"
+b963f717-1230-4589-8bc7-45f3761e677a,index-only stub,170,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: architecture-diagram, graphviz, mcp-fleet, litellm-comparison, tool-relay, whiteboard, readme]"
+ba5aa0c1-e969-40a4-8beb-f2aaf2eb69ce,index-only stub,3469,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, mcp, k8s] FLEET PLAN STATE UPDATE (2026-09-13 ~16:50, supersedes earlier snapshot where conflicting). Waves 0-3 COMPLETE + ver"
+bb3c0155-d8dc-4ea5-8ce6-b70e77f987c4,index-only stub,184,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stmem, verification, swarm-memory, reaper-cronjob, adversarial-testing, mutation-testing, overflow-bug, task-7]"
+bc822812-2a64-475d-849f-902e0c829e5c,index-only stub,189,"[MEMORY INDEX | project: mlis-platform | type: session-summary | topics: dataset-creation-permissions, sso, acl, api-key, cron-jobs, short-term-memory, agent-teams, deployment-verification]"
+be299530-5134-43a2-b569-9ffc6457127d,index-only stub,2483,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] ModelBenchmarker memory-estimate tool (2026-09-24): new package src/model_benchmarker/memory_model/ (gpu"
+beb8262e-906e-4c45-bcda-428c98a19e0d,index-only stub,191,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, dataset-lifetimes, stmem-reaper, cronjob, kubernetes-deployment, mcp-server, api-keys]"
+bec45f92-7c98-4797-a65f-3c8e77efd85e,index-only stub,165,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: mcp-server, 502-list-tools, kubernetes, llm-gateway, dns-rebinding, transport-security, api-key]"
+bedf156c-f2c8-49d0-bb9a-eba3ce2e21f8,index-only stub,185,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-writes, gateway-redeploy, kubernetes-pods, g2-cluster, kubectl-debugging, diagnostic-jobs, verify-job]"
+bfb83ba2-5858-4e9d-ac23-d5f6ba3b5385,index-only stub,131,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: kubernetes,pod-health,triage,probes,distill-jobs,istio]"
+c2755ae1-bc14-43d2-81eb-7740f5a658d4,index-only stub,150,"[MEMORY INDEX | project: general | type: session-summary | topics: session-titling, microbiome, literature-search, research-writing, plant-microbiome]"
+c28d90d0-0478-4b4e-bf01-3edd8892e5f9,index-only stub,182,"[MEMORY INDEX | project: dsh-opencode-tooling | type: session-summary | topics: skills-install, dsh-harness, sandbox-escalation, approval-flow, skills-tarball, codex-skills, dsh-web]"
+c3047bc6-da4e-426a-a8a8-31362fed7eb6,index-only stub,164,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: helm, 401-unauthorized, api-key, kubernetes-secrets, debugging, hot-reload, rag-mcp-server]"
+c46566b7-384b-48e6-b044-72dc69835857,index-only stub,88,"[MEMORY INDEX | project: dsh-opencode-tooling | type: fact-card | topics: dsh, opencode]"
+c9d897fd-46c1-4ed9-b43d-cfffa36ac6e6,index-only stub,2098,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] MultimodalRAG default apiKey shipped (2026-08-31, commit 3bc2d96). USER chose ""default + auto-wire UI/fil"
+ca3b9f7c-5079-4b5a-93fa-36afbdba9598,index-only stub,175,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: helm-chart, 401-invalid-api-key, pcai-serving-tokens, version-upgrade, secrets-migration, values-file]"
+ca53b57f-d14c-4f8f-8419-9ab62e007780,index-only stub,141,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: rate-limiting, cached-tokens, token-budget, throttling, api-keys]"
+cafbcc4a-8d72-44bc-9f08-7f81079e95fe,index-only stub,200,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, dataset-lifetime, stmem-reaper, kubernetes-cron, api-keys, backup-download, cross-verification]"
+cd31400a-b009-4f2c-8e8f-3eb8c6378a5e,index-only stub,94,"[MEMORY INDEX | project: mlis-platform | type: fact-card | topics: mlis, platform, kubernetes]"
+ce6ad75f-3b79-4e02-8a68-dc170075b8e5,index-only stub,162,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: hardlinker, secret-scan, fleet-drift, hardlink-mesh, bugfix, pcai_utils, gate-failure]"
+cef64383-57f4-48c1-8832-a3708e37e1a2,index-only stub,162,"[MEMORY INDEX | project: mlis-platform | type: session-summary | topics: short-term-memory, agent-teams, dataset-creation, sso, acls, cron-ingestion, permissions]"
+cf2afd62-1d54-4503-8cfb-a0a41d0d0d11,index-only stub,174,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline, pod-cleanup, hpa-duplicates, finalizer-stuck-pods, rag-dataset, prometheus-rules]"
+cfc7f661-7350-4f29-8358-3fb295e2341b,index-only stub,5501,"[MEMORY INDEX | project: sqlhandler | type: fact-card | topics: sqlhandler, sql, duckdb] WAVES 3+4 IMPLEMENTATION COMPLETE (2026-09, HPE PCAI fleet) — ALL 11 slices done, independently verified (suite"
+d040ef2c-e67d-4f09-af5e-7bc1f39823d0,index-only stub,176,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline, pod-cleanup, finalizers, kyverno-mutation, g2-cluster, hpa-duplicates, rag-dataset]"
+d22fce93-478d-4bbf-8016-002faa4214d9,index-only stub,153,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, shoe-print-similarity, random-forest, cuml, rapids, gpu-acceleration, conda]"
+d4ab9fe9-faec-4dbd-8494-8b89d72c7bcf,index-only stub,124,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: kubectl, deployment, secrets, mcp-keys, key-generation]"
+d4aeac03-df07-4dd0-8c1b-2fc552673b30,index-only stub,2391,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] SOLVED — the multiturn cache mystery (2026-09-15, benchmark_chat.py source read + worker logs): TWO COMP"
+d7496052-6781-4438-b138-993df1317722,index-only stub,2089,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, mcp, k8s] DSH/PTC tool-registry gotcha (deepseek-harness at ~/Projects/deepseek-harness): The model-facing system-prompt tool "
+d80411d6-11db-40de-9c98-f181f6ec03d1,index-only stub,2210,"[MEMORY INDEX | project: pcai-llm-gateway | type: fact-card | topics: audit-final, deny-rows, scope-mode] PCAI_LLM audit FINAL (2026-10-03, all 9 reports fused; FUSED-AUDIT-2026-10-03.md §H + FINAL CO"
+d83ccd32-d0a0-4c7d-843e-814db60bc704,index-only stub,180,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: secret-scan, hardlinker, deepseek-agent, subagents, responses-api, sglang, cross-validation, repo-audit]"
+da50b25e-d865-43ce-8c43-a7d098096b3b,index-only stub,3451,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] MultimodalRAG v5.4.0→5.4.1 day (2026-10-02, session-d69677fc) — the complete arc in one entry. AUDIT: 5 p"
+da6b46a0-da7b-4492-9128-51d4e8df155c,index-only stub,165,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, shoe-print-similarity, metrics-recalculation, random-forest, gpu-acceleration, datasets]"
+dc78daf9-0cb3-42ba-851c-221f36e8ff0b,index-only stub,140,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: mcp, ezapp-deploy, 502, list-tools, kubernetes, llm-gateway, debugging]"
+def991d6-b511-473e-bd8f-64c2771d8dba,index-only stub,154,"[MEMORY INDEX | project: deployments | type: session-summary | topics: prometheus, alerting, networkpolicy, loki, kubernetes, resource-tuning, g2-cluster]"
+e046b5c3-3bae-408b-837b-afee14020c8b,index-only stub,177,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: deepseek-agent, security-scan, secret-scan, hardlinker, cross-validation, autonomous-fixes, pcai_llm]"
+e0b6385d-12ec-4c13-9e81-ec66394060c0,index-only stub,138,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: ezapp-deploy, mcp, 502, list-tools, kubernetes, llm-gateway, api-key]"
+e1d0eb80-980a-4964-9263-8a14499f835e,index-only stub,204,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: deepseek-subagent-audit, cross-validation, secret-scan, hardlinker, responses-api, memory-dedup, memory-ingest, skill-author"
+e25b5de4-ebec-4620-b80d-97b2c080b7ec,index-only stub,183,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, data-lifetime, cron-reaper, kubernetes-deployment, dataset-design, mcp-server]"
+e2901aa0-e563-4137-8490-86d5d5652ab8,index-only stub,177,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline, pod-cleanup, hpa-duplicates, finalizer-stuck, redeployment, rag-dataset, g2-cluster]"
+e2cbd88e-dc03-4134-8b41-e6801a64f0e4,index-only stub,161,"[MEMORY INDEX | project: general | type: session-summary | topics: cuml, gpu-acceleration, random-forest, similarity-metrics, solemate, environment-setup, conda]"
+e2d6974b-93fb-494c-97b1-c5de41a692a1,index-only stub,187,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: autonomous-audit, deepseek-subagent, cross-validation, secret-scan, hardlinker, responses-api, memory-pipeline]"
+e2f33d56-9f9d-46cb-9773-da7996ee0c40,index-only stub,183,"[MEMORY INDEX | project: dsh-opencode-tooling | type: session-summary | topics: skills-install, tarball-inspection, dsh-harness, sandbox-escalation, skill-overwrite-diff, file-policy]"
+e5471915-d083-4550-9477-843fb97bd57b,index-only stub,2503,"[MEMORY INDEX | project: sqlhandler | type: fact-card | topics: sqlhandler, sql, duckdb] SQLhandler 1.4.0 (workspace ~/Code/HPE/SQLhandler): added a semantic-view (semantic-catalog) BROWSER EDITOR wit"
+e54cb211-c5cc-4e01-9159-9f366847095b,index-only stub,163,"[MEMORY INDEX | project: general | type: session-summary | topics: microbiome, literature-search, volatility, human-health, kubectl, file-transfer, research-intro]"
+e5df75bd-ef98-486e-83ff-5c2b4deea99c,index-only stub,94,"[MEMORY INDEX | project: mlis-platform | type: fact-card | topics: mlis, platform, kubernetes]"
+e5ea5db9-b299-4e22-8bb0-fca391514473,index-only stub,2302,"[MEMORY INDEX | project: sqlhandler | type: fact-card | topics: sqlhandler, sql, duckdb] SQLhandler-vs-EzPresto demo state on G2 (pcai-se-ai-application), 2026-09-23: (1) The ezpresto 'minio' catalog "
+e70a5f74-ba74-4229-be5f-b3a12da6ed85,index-only stub,162,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stmem, unit-tests, reaper, pytest, agent-swarm, task-1, task-6, task-8, mutation-testing]"
+e7715533-3b30-43a6-a66f-5c1c23a48505,index-only stub,3032,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] MultimodalRAG input-handling audit (v3.4.0 working tree, commit 239b39c). CONFIRMED FINDINGS: (1) HIGH — "
+e797bce4-306c-4668-ae35-f7beb892e77b,index-only stub,1045,"[MEMORY INDEX | project: dsh-opencode-tooling | type: gotcha | topics: dsh, ptc, run_code, mcp, json, quoting] GOTCHA (DSH PTC sessions, 2026-10-11, hit ~15x in one session): run_code scripts that han"
+e7eddaf9-0a26-4427-aad7-276a5fb39f8b,index-only stub,124,"[MEMORY INDEX | project: deployments | type: session-summary | topics: kubectl, kubernetes, deployment, secrets, app-deploy]"
+e93b6a78-d268-4af2-bbb6-c8bed6bbd5f9,index-only stub,2528,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] ModelBenchmarker fixes applied 2026-08-27 (user decisions: hardcoded JWTs in pcai_models.py stay — user "
+e9cf71cd-3cb5-4980-9012-f45299e40e6e,index-only stub,170,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, cuml, gpu-acceleration, random-forest, similarity-metrics, conda, sklearn, checkpoint-resume]"
+ea92678a-588f-4f63-b15c-ff09484a47ad,index-only stub,187,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: deepseek-agent-scan, security-audit, secret-scan, hardlinker, responses-api, memory-dedup, auto-memory, skills]"
+ecc5a840-6eec-496f-a5ed-0650f6640d32,index-only stub,2521,"[MEMORY INDEX | project: mlis-platform | type: fact-card | topics: mlis, platform, kubernetes] USER FEATURE DECISIONS 2026-09 (HPE PCAI fleet, recorded in scratch_workspace/feature-ideas-2026-09/DECIS"
+ecf4c787-77f3-4ca3-8e86-61d408749f97,index-only stub,150,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, cuml, gpu-acceleration, random-forest, similarity-metrics, rapids, conda]"
+ed1ce0eb-6b46-4419-9653-54d35bc1998e,index-only stub,188,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: cross-validation, wave-2, execution-completeness, expires-at, mutation-testing, stmem-interface-freeze, team-tasks]"
+edf09456-3331-496b-bcd9-9e2cd36caefa,index-only stub,147,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, shoeprint, metrics-regen, random-forest, icp, cuml-gpu, checkpointing]"
+eedfca65-aebe-4955-ab3b-e6fbd59c6409,index-only stub,149,"[MEMORY INDEX | project: general | type: session-summary | topics: shoe-print, similarity-metrics, random-forest, solemate, csv-generation, annacode]"
+ef60cd58-1579-4910-ab16-9fa52d3c7f18,index-only stub,2898,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] MultimodalRAG PCAI cluster overlay + chart fix (2026-08-31, commit 55dcd4e). USER'S CLUSTER VALUES (deplo"
+ef785f97-2500-41ee-bfb8-b8377cff4ea3,index-only stub,164,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: ezapp-deploy, mcp, kubernetes, 502, list-tools, dns-rebinding, transport-security, llm-gateway]"
+ef96a336-f9f9-4a69-b6d0-aaa0cc91b0b1,index-only stub,152,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: rate-limiting, cached-tokens, token-budgets, model-dropdown, throttling, ui]"
+f04093e4-0597-4e21-8061-b4998a065dff,index-only stub,179,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: rate-limits, cached-tokens, prompt-tokens, token-budgets, model-dropdown, throttling, usage-accounting]"
+f0510beb-f0ba-4b63-9d37-f9953c1cebd1,index-only stub,138,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: kubernetes, mcp-service, api-key, llm-gateway, list-tools, 502-error]"
+f112dfda-d112-46b8-a079-62a37ef49bb4,index-only stub,165,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stm,dataset-lifetime,point-lifetime,access-control,oidc,clients-registry,admin-registry,d27]"
+f25f9d34-6fad-41fc-ab04-09bf401bba47,index-only stub,181,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, data-lifetimes, cron-reaper, kubernetes-secrets, admin-backup, memory-panel]"
+f2c6984e-5cb7-4bb2-854b-5c957d65f4eb,index-only stub,208,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-teams, security-tests, sso-dataset-creation, stm-reaper, helm-charts, mutation-testing, kubernetes-dep"
+f2d9d3c4-b16b-4f96-903e-8d565e639629,index-only stub,196,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline, k8s-pod-cleanup, memory-dedup, hpa-duplication, rag-dataset, prometheus-rules, deployment-verification]"
+f30c145b-cac3-49b0-a578-d6c39f766d78,index-only stub,188,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: mcp-self-service, entitlements, tool-relay-grant-mode, sso-profiles, security-fix, helm-values, routes_mcp_self]"
+f40dd9e7-5084-4245-a20c-ec6e1f6fb81b,index-only stub,2381,"[MEMORY INDEX | project: mcp-fleet | type: fact-card | topics: mcp-fleet, mcp, k8s] K8S-MCP 421 ""Invalid Host header"" incident (v0.1.2, found while testing the user's new MCP connection): requests car"
+f414619d-f746-4bce-bcd9-b614e41b80e5,index-only stub,2106,"[MEMORY INDEX | project: sqlhandler | type: fact-card | topics: sqlhandler, sql, duckdb] Deliverable: Toromont Hosted Trial AI Deployment Summary PDF at /home/andrew/Code/HPE/Toromont_AI_Deployment_Su"
+f433c268-f810-493b-9d65-be6b05fa8bed,index-only stub,155,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: dot-diagram, architecture, mcp-fleet, litellm, tool-relay, call-flow, graphviz]"
+f4f4cde0-01a4-49eb-b390-d47cd5af6f8f,index-only stub,178,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: security-audit, subagents, secret-scan, responses-api, memory-ingestion, cross-validation, hardlinker]"
+f537f7f7-0dbf-4a7f-af76-d76b9a5ac597,index-only stub,192,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, dataset-lifetime, reaper-cronjob, admin-unlock, mm-rag, kubernetes, cross-verification]"
+f59ce016-343b-4bac-bcf5-8ec382f9a3f6,index-only stub,159,"[MEMORY INDEX | project: glm-sglang-serving | type: session-summary | topics: glm-5.3-flash, sglang, docker-image, hicache-v3, upstream-pr-watch, kserve, ghcr]"
+f618be0e-edfd-4e41-a408-1bfc180663e7,index-only stub,194,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-pipeline, pod-cleanup, finalizer-stuck, hpa-duplication, supersede, rag-dataset, mutating-webhooks, g2-cluster]"
+f68500f5-0957-4dbb-9b05-69cf92293302,index-only stub,186,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: memory-recording, gateway-sweep, dsh-distiller-plugin, unprocessable-payloads, session-persistence, debugging]"
+f68f2b15-6ced-4230-be59-6b4563cbfab1,index-only stub,185,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: security-audit, deepseek-subagent, cross-validation, secret-scan, hardlinker, responses-api, memory-pipeline]"
+f6f685e7-9240-4779-8eab-188fa5de3661,index-only stub,195,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, dataset-lifetime, reaper-cronjob, kubernetes-secrets, mm-rag, deepseek-glm-agents, backup]"
+f7684487-2f84-48ed-a709-a01b20800878,index-only stub,181,"[MEMORY INDEX | project: mlis-platform | type: session-summary | topics: solemate, shoe-print-similarity-metrics, random-forest, cuml, gpu-acceleration, rtx-4090, conda-environment]"
+f788a5b2-e1f3-49b7-994b-bd0cf9de40c2,index-only stub,168,"[MEMORY INDEX | project: general | type: session-summary | topics: cuml, gpu-acceleration, similarity-metrics, random-forest, solemate, conda, sklearn-version-conflict]"
+f7fb31bc-468d-46de-8598-c04c03599a73,index-only stub,2348,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] SUSPECTED CORRECTNESS BUG in v2 L3 path (found 2026-09-15 tracing sprocket log flood ""HiCacheFile rank N"
+f848d490-c3c4-4ac4-8cc5-559ba87a52f7,index-only stub,175,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: cached-tokens, rate-limits, token-budgets, model-dropdown, release-2.5.0, helm-deploy, values-yaml]"
+f8bff975-0618-4485-aed1-9dbc73ba8547,index-only stub,174,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: short-term-memory, agent-swarm, dataset-lifetimes, stmem-reaper, kubernetes-cronjob, mm-rag, secrets]"
+f8f34289-c218-4902-acf5-bc6951c4b96e,index-only stub,180,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stmem, short-term-memory, factual-integrity-review, cross-review, reaper-cronjob, agent-teams, dataset-api]"
+f9324e7c-cff4-4ae6-a9fe-6539d9ca0b36,index-only stub,153,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: readme-diagram, graphviz-dot, mcp-architecture, litellm, pcai-gateway, request-flow]"
+f9699bbd-c4e9-444c-b3bb-2b9fe0038d9a,index-only stub,160,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stm, tests, safety-invariants, lifetime-algebra, mutation-checking, team-tasks, reaper]"
+fa04cfa0-8478-4f78-a9a8-a1c14d58bcfd,index-only stub,115,"[MEMORY INDEX | project: dsh-opencode-tooling | type: fact-card | topics: dsh, multimodalrag, oauth2-proxy, images]"
+fa10a486-caa9-4319-9b23-bf8a2588f918,index-only stub,2148,"[MEMORY INDEX | project: multimodalrag | type: fact-card | topics: multimodalrag, rag, qdrant] MultimodalRAG idle early-flush for embedding query batchers (2026-08-31, commit dc45b0e, delivered as pca"
+fa56064a-727e-4fd9-b715-efb87f8977fe,index-only stub,189,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: deepseek-subagent, security-scan, secrets-remediation, responses-api, memory-dedup, hardlinker, cross-validation]"
+fa92af45-945c-4a7f-a8b4-64311a1b5291,index-only stub,2776,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] DeepSeek-V4.1-Flash on 4xH200 (project-user-andrew-bydlon, SGLang preview dev-dsv41 digest sha256:4a5d13"
+fae2f4e5-b6d4-41f4-822a-73e2a6b43ef8,index-only stub,2553,"[MEMORY INDEX | project: glm-sglang-serving | type: fact-card | topics: glm, sglang, h200, gpu] DSv4.1-Flash v0.5.21 deploy state 2026-10-02 ~10:15 ET (ISvc deepseek-v41-flash-offload, scs04, pod ...5"
+faf7a8ec-ef5f-4fd9-be66-c34c2dbcf29d,index-only stub,155,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: kubernetes, service-discovery, mcp, llm-gateway, api-key, list-tools, troubleshooting]"
+fbd91b5e-0ba5-4439-97d6-68ed98249858,index-only stub,148,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stmem, reaper, task-9, delta-verification, overflowerror, ttl, agent-teams]"
+fc819b47-47ff-4265-a41c-7aa2f258fe37,index-only stub,150,"[MEMORY INDEX | project: benchmarks-perf | type: session-summary | topics: oidc-sso, secret-hiding, hardlink, env-vars, glm-config, model-benchmarker]"
+fd4e9142-b72e-4845-82d1-1b0df4306680,index-only stub,156,"[MEMORY INDEX | project: general | type: session-summary | topics: solemate, similarity-metrics, cuml, gpu-acceleration, random-forest, rapids, conda-setup]"
+fd638299-ea7d-478b-9120-e0fbd2d6d852,index-only stub,105,"[MEMORY INDEX | project: pcai-llm-gateway | type: fact-card | topics: audit-final, deny-rows, scope-mode]"
+ffa200f6-fd75-4960-a379-49e6d441cd20,index-only stub,2969,"[MEMORY INDEX | project: mlis-platform | type: fact-card | topics: mlis, platform, kubernetes] PCAI LLM Gateway — SPORKET-MODEL AUDIT (2026-09, user-requested verification): 2 independent audit subage"
+0531d1b2-db07-480f-9610-47dc20f7d7eb,no-op session,491,"[MEMORY INDEX | project: general | type: session-summary | topics: empty-session, nonce-only]  ## What we did No substantive work was performed. The session contains only a nonce identifier (`nonce-17"
+154cf128-e555-44f1-9559-d8c382984902,no-op session,501,"[MEMORY INDEX | project: general | type: session-summary | topics: placeholder, no-content, connectivity-check]  ## What we did No substantive work was performed. The session consisted solely of the u"
+172fc24d-0d06-4acd-b22a-1e571fe43f82,no-op session,413,[MEMORY INDEX | project: general | type: session-summary | topics: empty-session]  ## What we did No substantive work was performed. The session transcript contains only a nonce identifier (`nonce-aut
+19dacf22-0e8f-4b47-a904-29762ffe12a4,no-op session,466,"[MEMORY INDEX | project: general | type: session-summary | topics: connectivity-test, no-op-session]  ## What we did Session contained a single user message (""Say OK"") with no substantive work perform"
+26d1edb7-3ecf-4b8d-8fb9-b1228a96f87f,no-op session,690,"[MEMORY INDEX | project: general | type: session-summary | topics: empty-session, nonce]  ## What we did The transcript contains no work content. The only text present is a nonce identifier string: `n"
+2afa9908-e7ca-4d93-a4d8-bd81ca89ff58,no-op session,603,"[MEMORY INDEX | project: general | type: session-summary | topics: empty-session, nonce-only]  ## What we did No substantive work was performed. The session transcript contains only a nonce identifier"
+36d4b923-5602-4883-97bc-e046e4fc147a,no-op session,482,[MEMORY INDEX | project: general | type: session-summary | topics: empty-session]  ## What we did No substantive work was performed. The session transcript contains only a nonce identifier (`nonce-3-2
+412b3e5b-25c1-4dde-819f-2215c0786b8b,no-op session,412,"[MEMORY INDEX | project: general | type: session-summary | topics: empty-session, greeting]  ## What we did No work was performed. The session consisted solely of a greeting exchange (""hi"") with no ta"
+49c74550-c429-45c8-a68a-80185844ed56,no-op session,749,"[MEMORY INDEX | project: general | type: session-summary | topics: session-start, no-work, nonce-identifier]  ## What we did No substantive work was performed. The session contains only a single user "
+523ae893-dfd3-4cbf-9dfe-f632089f16a3,no-op session,401,"[MEMORY INDEX | project: general | type: session-summary | topics: empty-session, nonce]  ## What we did No substantive work was performed. The session contained only a nonce string (`nonce-1-23112`) "
+665e70f8-d074-4070-8528-61aee6d9bd0a,no-op session,472,"[MEMORY INDEX | project: general | type: session-summary | topics: empty-session, nonce]  ## What we did  No substantive work performed. The session contained only a single nonce string (`nonce-2-1435"
+681d0dcf-caa8-47cf-a660-a76075058e11,no-op session,572,"[MEMORY INDEX | project: general | type: session-summary | topics: empty-session, no-content]  ## What we did No substantive work was performed. The session transcript contains only a nonce identifier"
+745655dc-6c8b-40ce-b2a5-63012d3e141f,no-op session,558,"[MEMORY INDEX | project: general | type: session-summary | topics: empty-session, no-content]  ## What we did No substantive work was performed. The transcript contains only a nonce identifier (`nonce"
+9537cfd4-129a-4135-8821-1d6489e0f44b,no-op session,612,[MEMORY INDEX | project: general | type: session-summary | topics: empty-session]  ## What we did No substantive work was captured in this session. The transcript contains only a nonce identifier (`no
+a18f7615-207b-49f8-aa09-4ecffe4a563f,no-op session,626,"[MEMORY INDEX | project: general | type: session-summary | topics: empty-session, no-content]  ## What we did No substantive work was performed. The session transcript contains only a nonce identifier"
+ab24a48b-e5c2-4a07-9762-26b627591dc6,no-op session,562,"[MEMORY INDEX | project: general | type: session-summary | topics: empty-session, no-content]  ## What we did No substantive work was performed. The session transcript contains only a nonce identifier"
+c4ca0f98-283a-4e2b-a639-8ffe446fdc28,no-op session,916,"[MEMORY INDEX | project: general | type: session-summary | topics: empty-session, no-content]  ## What we did No substantive work was performed in this session. The transcript contains only a single u"
+ca1c1afb-8f48-4093-9928-2edf2d857f42,no-op session,978,"[MEMORY INDEX | project: dsh-opencode-tooling | type: session-summary | topics: dsh, update, patches, readiness, release-prep]  ## What we did The user opened the session with a single question: ""I'd "
+f0cbced3-57e5-4f9a-a256-7d832cc33553,no-op session,904,"[MEMORY INDEX | project: general | type: session-summary | topics: empty-session, nonce]  ## What we did No substantive coding work occurred. The only content in the session is a single user message c"
+00e590af-cf02-4dc2-b26e-b904ebdb0714,orphan fragment,21,readForm/prefillForm.
+051f8808-24fc-487d-9a4a-88fff28cc9d0,orphan fragment,3,19.
+0651ccbe-6d14-43b8-acaa-3d1912838e8a,orphan fragment,7,against
+0a4fdff1-b5f2-4872-b00d-02707eefaa8b,orphan fragment,23,MCP grants + MCP scope.
+0b26f47a-20d4-4810-8609-84fb117c12f0,orphan fragment,12,to the user.
+0c94be50-4ce5-4b6d-8625-58de53b3202a,orphan fragment,59,## 2026-09-24 → 09-29 — monorepo hygiene + MCP NETWORK ZONE
+0eb732e4-ea9e-40ca-8a12-a6c805ee6a00,orphan fragment,32,image digest-pinned as rollback.
+0fb3a3dd-c48f-4ffb-b933-ae64ecd3bb2e,orphan fragment,14,predates them.
+158af260-44ef-43be-9e0c-f95dd2809a4d,orphan fragment,8,catalog.
+16b62f6b-6b1e-4ed0-945e-dd2a54c5a9a3,orphan fragment,32,(Routing section + admin table).
+17a986e3-7598-4087-b988-f00cc2449d65,orphan fragment,33,## Gotchas (learned the hard way)
+1ad24f8c-abb6-4f1e-bfbf-457730a202a2,orphan fragment,16,## Key decisions
+3241c83d-6d83-4636-84e3-de3ff25cb69a,orphan fragment,38,than auto-revoke). Ships next rebuild.
+3cfebf23-d9e1-4c92-8247-e4a023ac7909,orphan fragment,16,for regressions.
+402e1c7d-2760-43c4-8485-38b8ba5c3b7e,orphan fragment,78,"## Companion distill (same wave, second pass — merged during dedup 2026-10-11)"
+4dc16964-2571-4d65-bb6a-9b42562f46e7,orphan fragment,16,emit flat dicts.
+525231ea-6369-4211-94c8-025306013850,orphan fragment,25,seat — user-run kubectl).
+55ed8b06-952c-4f09-945c-dac325a619f1,orphan fragment,46,## What exists — the decision ladder (D15–D25)
+5a9b7fb4-0a63-4bf3-97f8-23f6e8a46527,orphan fragment,11,too coarse.
+5b8e5cb4-c1fe-4c0e-baba-f3dd992c7693,orphan fragment,7,format.
+60621224-ce3e-44db-b6fe-9e9ce830e63f,orphan fragment,5,line.
+615f8fb4-9cdb-4cdb-991d-f9e58c481d47,orphan fragment,47,"## What exists (image inventory, chronological)"
+62fdfda8-1428-4077-9d41-2862c10172fd,orphan fragment,40,to a different handler expecting 'ids').
+6502c553-28d7-4975-bff0-a7c56c8302e9,orphan fragment,13,a bottleneck.
+77fe7050-c1da-4537-91a1-08eb7a515ff9,orphan fragment,24,real keys before deploy.
+78039b4d-eda9-40c6-ada2-c39464716cc9,orphan fragment,70,## 2026-09-12/13 — FLEET AUDIT + EXECUTION PLAN (the 7-wave hardening)
+7ba31441-c13a-4f16-93dd-c0dc76f3e59f,orphan fragment,40,CMD passes explicit flag so unaffected).
+7fdad269-60cc-4e2c-8832-32df8aec2a30,orphan fragment,14,## What we did
+82aaba88-1c35-4e0e-a50c-8f89f10f195b,orphan fragment,10,## Gotchas
+8f1ad6ef-4b00-4b4f-b1bc-10f90e5e0b32,orphan fragment,12,other users.
+930de93b-d772-49c6-98bc-8d9c955a5d6d,orphan fragment,47,## Earlier performance decisions still in force
+9c81629f-704b-438e-bf6b-a56b204d21cd,orphan fragment,23,UTC) after the key fix.
+a4b043ff-028b-4d27-9b01-c5dc6da25886,orphan fragment,25,rest of roadmap approved.
+a6b08518-5495-4b64-a30f-0df42738a368,orphan fragment,14,## What exists
+b86c7b52-cab9-40a5-a7c7-b6f27e3877fd,orphan fragment,25,## What exists (timeline)
+bbc4b09a-f4ef-4f85-8b22-732dca70249a,orphan fragment,22,design decisions hold.
+be7334e3-7199-4b75-b95f-5f3953dc4a44,orphan fragment,17,that also worked.
+ca085f82-9a57-494d-9bef-c1399ab7b5d6,orphan fragment,11,(harmless).
+cab50a43-a894-4cd4-8427-8fd1e6513447,orphan fragment,44,## The wins (each: change → measured result)
+d888424f-7b63-4418-ad4e-e16fc8b52772,orphan fragment,11,full cycle.
+db104ca4-a4ce-45c4-ad53-f0a17d813cde,orphan fragment,20,fleet-wide defaults.
+e1812c8a-3c2f-4dc4-a434-69999d33931e,orphan fragment,13,allowed FQDN.
+e4463fdc-2f48-4b8f-a5dc-e624c593d386,orphan fragment,8,missing.
+e624d2f9-522c-4abf-b596-450e9f681641,orphan fragment,14,Q4 deliveries.
+e6d3a500-6f3b-4c43-8d72-c86e0532c286,orphan fragment,7,alerts.
+e778f97f-b049-4871-bb0b-c1d7ad319111,orphan fragment,7,passes.
+e902dd3c-0863-4ecc-9f26-3b8b6134b9ac,orphan fragment,28,## Key decisions & rationale
+ec990baf-6394-4579-b400-b9258297efc0,orphan fragment,34,## Gateway-side MCP auth mechanics
+eea61239-854e-4acd-8004-5d4960bd8333,orphan fragment,32,multi-mmap warning to disappear.
+f554cced-2b8e-4d04-bc41-0df1abcb2090,orphan fragment,13,live release.
+f768bacb-d569-4c20-b851-15bbe0341597,orphan fragment,7,0.1.15.
+fc9b36fd-c143-48d7-bc1a-1e10124ee36f,orphan fragment,26,exclusion already decided.
+ff3e2b87-880e-4eb2-b468-601cfb75733e,orphan fragment,38,## Version history arc (v3.x → v5.4.1)
+01b28a4d-c5a6-4541-a11c-f125adcb1510,"probe/test, no work",3864,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: route-probe, deepseek-harness, model-endpoint, subagent-verification, pcai-llm]  ## What we did Single-turn route probe of t"
+52cac864-0ace-4a2a-9da7-8d6241f1babf,"probe/test, no work",2704,"[MEMORY INDEX | project: dsh-opencode-tooling | type: session-summary | topics: agent-forking, message-routing, multi-agent, workspace-sharing, probe-test]  ## What we did Issued a **fork-route-probe*"
+7b12cffb-0470-4647-a78b-8fedfd4cc33b,"probe/test, no work",3181,"[MEMORY INDEX | project: dsh-opencode-tooling | type: session-summary | topics: subagent-fork, routing-probe, send-message, deepseek-harness, model-identification]  ## What we did  Ran a fork-route pr"
+84fc7e21-1740-4041-8034-2e0755abd1d5,"probe/test, no work",3048,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: model-probe,subagent-routing,harness-diagnostics,ptc-mode]  ## What we did  Single-turn diagnostic probe. A subagent named `"
+c4688031-d40d-462b-b9a2-31e7cd12dbcc,"probe/test, no work",2784,"[MEMORY INDEX | project: mcp-fleet | type: session-summary | topics: route-inherit-probe,agent-messaging,parent-child,sub-agent,send-message]  ## What we did  This was a minimal session: a system prom"
+db9e6426-0e7f-41d2-9c70-d451bb650bc7,"probe/test, no work",1667,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: subagent-probe, routing-test, deepseek-harness, no-code-work]  ## What we did  A sub-agent was spawned under parent agent `s"
+ff05c409-1208-49a2-b5fd-1746128df733,"probe/test, no work",3632,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: route-inherit-probe, subagent-delegation, model-identity, harness-runtime, pcai-llm]  ## What we did  Ran a **route-inherit "
+0c1b2fc1-03ce-4c79-9c6a-c09546c0e616,session-title stub,104,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Quick Testing Session"
+2d11b299-eaa7-40ea-8f8c-74ee096581d9,session-title stub,112,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Writing a Story About Wizards"
+4541244c-9dd2-4d64-9fcd-a79d9ee725d5,session-title stub,116,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Fix and Stabilize Memory Pipeline"
+45b1c7e7-fac7-4266-aa16-3466eefb69d5,session-title stub,111,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Writing a Wizard Short Story"
+49d1fd05-9bcc-4288-883e-eeeaccde5fcc,session-title stub,114,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Deepseek calls misrouted to GLM"
+55a3958c-1bf4-4ecc-b12f-0ba291d0915f,session-title stub,118,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Preventing memory index auto-writes"
+5c372720-b3c6-469d-9cfc-fb9a127f0297,session-title stub,122,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Debug DeepSeek gateway routing fallback"
+605d0543-a310-4242-8354-a820534bca1a,session-title stub,122,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Resolve hardlinker secret scan failures"
+7559ff48-ec46-4359-bf04-2efa86eb8fac,session-title stub,112,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Remove unused embedding model"
+765d804d-2ad3-42b3-b06d-58492293f9f5,session-title stub,108,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Short Story About Wizards"
+778ec093-1159-4b3e-bec0-baa924539977,session-title stub,114,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Sub-route probe agent messaging"
+7ec4a58a-2e77-4bbf-8ee5-532228e67a6a,session-title stub,112,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Fix secret scan gate failures"
+8c8381df-a0ae-4a68-b784-b001087c249e,session-title stub,124,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Diagnosing LLM Reasoning Repetition Issue"
+944db8a4-a5a1-4daf-b608-3364391510a3,session-title stub,115,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Writing 10 Wizard Story Chapters"
+9749fdc7-fa2c-4db8-ba48-645084a78390,session-title stub,127,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Título de sesión de pruebas unitarias ST-MEM"
+98afdfbe-f950-47f3-9cd7-8a3b6f41e565,session-title stub,115,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  TPM limit increases for API keys"
+9ca42aa4-6d28-4c2a-a8f0-2795d74227e7,session-title stub,108,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Model Identity Probe Test"
+a310dc2a-58f5-4f48-b5c6-9e2d79da745b,session-title stub,113,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Fix Memory Dataset Duplication"
+a3a9ef42-6d8e-4269-978c-a0c2a95e47c3,session-title stub,115,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Avoiding Unwanted Memory Entries"
+aa80cce4-49c1-4d9e-96e0-6f8aa80cd889,session-title stub,120,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Cordis Patch for Reasoning Repetition"
+aed5f334-5d47-472e-a9ba-b9cbccc87386,session-title stub,132,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Rebuild memory dataset and dedupe recent memories"
+b7de34db-47af-4612-a703-00e88d35b5ab,session-title stub,122,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Diagnosing repetitive reasoning in LLMs"
+c6183a4d-cb0e-49dc-bfd8-be8ce3eda785,session-title stub,122,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Fix secret scan gate blocking hardlinks"
+ce732d14-a8d6-4f44-baeb-e9660310a60e,session-title stub,118,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Memory Pipeline Fix and Pod Cleanup"
+e62ad082-1c58-46fb-b106-ec87a4c7dad5,session-title stub,110,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Ten Chapters About a Wizard"
+ee1b537e-5b45-4f02-9393-57ab181abbdb,session-title stub,122,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Fix Deepseek misrouting in PCAI gateway"
+f5f884c2-d7b1-47bd-a0dd-580a35397c6e,session-title stub,126,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  README diagram for MCP gateway architecture"
+f9eb3235-fccf-4bb6-9cc5-3d9d73779640,session-title stub,108,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Okta Verify on Arch Linux"
+fe08db94-f53e-4ae6-8087-cb4a8fa3b72c,session-title stub,112,"[MEMORY INDEX | project: general | type: session-summary | topics: session, misc]  Agent Swarm Short-Term Memory"
+1b8de4ae-cfcf-46a5-83c1-d9912bed5346,title-gen meta-task,2857,"[MEMORY INDEX | project: general | type: session-summary | topics: sub-agent-fork, title-generation, mcp-orchestration, probe-test]  ## What we did - Session consisted of a single title-generation req"
+2ed54c14-13ab-43b4-8d30-62c037f4cb70,title-gen meta-task,2236,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: route-probe, health-check, llm-endpoint, connectivity-test]  ## What we did Performed a minimal **route probe** against an L"
+453bb077-8c41-4e4b-8ef8-0e05345ddb44,title-gen meta-task,1305,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: routing, deepseek, glm, llm-gateway, session-title]  ## What we did  Session consisted solely of a title-generation request."
+51e291f1-aecc-4023-b2b5-cc8427dee037,title-gen meta-task,1526,"[MEMORY INDEX | project: general | type: session-summary | topics: admin-keys, session-title-generation, key-management, api-keys] ## What we did This session transcript contains only the assistant's "
+65507fba-9f5e-48d4-b828-73036385b441,title-gen meta-task,2759,"[MEMORY INDEX | project: pcai-llm-gateway | type: session-summary | topics: routing-audit, deepseek, glm, gateway, task-claim]  ## What we did This session was a **title-generation meta-task** only. T"
+7dfcf902-0c3e-4578-946e-e45c5e02cbe1,title-gen meta-task,1566,"[MEMORY INDEX | project: multimodalrag | type: session-summary | topics: stmem, verification, agent-swarm, task-7, ensure-dataset, deepseek-review]  ## What we did This transcript contains no coding w"
+97b7279b-fab4-46f2-85e4-38d4d1a3918a,title-gen meta-task,1952,"[MEMORY INDEX | project: general | type: session-summary | topics: helm-values, formatting, headers, name-email, fran, one-line]  ## What we did The transcript as provided contains only a meta-task: g"

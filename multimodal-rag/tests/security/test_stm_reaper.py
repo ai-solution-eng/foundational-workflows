@@ -32,18 +32,16 @@ Run::
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-sys.path.insert(0, os.environ.get("STM_SRC_OVERRIDE")
-                or str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, os.environ.get("STM_SRC_OVERRIDE") or str(Path(__file__).resolve().parents[2] / "src"))
 
-from multimodal_rag import stm_lifetime as sl
 
-pytest.importorskip("multimodal_rag.stm_reaper",
-                    reason="T3's stm_reaper.py has not landed yet (task-3)")
+pytest.importorskip("multimodal_rag.stm_reaper", reason="T3's stm_reaper.py has not landed yet (task-3)")
 
-from multimodal_rag.stm_reaper import reap_dataset, reap_once  # noqa: E402
+from multimodal_rag.stm_reaper import reap_dataset, reap_once
 
 NOW = 2_000_000_000
 H = 3600
@@ -61,7 +59,7 @@ class _FakeCollection:
     scroll (with a deliberately ugly pagination mode) and delete-by-ids.
     """
 
-    def __init__(self, points, *, scroll_fn=None, delete_fail_ids=()):
+    def __init__(self, points: Any, *, scroll_fn: Any = None, delete_fail_ids: Any = ()) -> None:
         # points: list of (id, payload_dict)
         self.points = list(points)
         self.deleted: list[list] = []
@@ -69,14 +67,12 @@ class _FakeCollection:
         self.scroll_fn = scroll_fn  # (points, offset, limit) -> (points, next_offset)
         self.delete_fail_ids = set(delete_fail_ids)
 
-    def scroll(self, coll, limit=10, offset=None, scroll_filter=None,
-               with_payload=True, with_vectors=False):
+    def scroll(self, coll, limit=10, offset=None, scroll_filter=None, with_payload=True, with_vectors=False):
         self.scroll_calls.append({"offset": offset, "limit": limit})
         if self.scroll_fn is not None:
             return self.scroll_fn(self.points, offset, limit, self)
         # simple in-memory "filter": candidate selector = any point whose
         # metadata.expires_at is a number < now (what the Range filter does)
-        import qdrant_client.models as qm
 
         now = None
         for cond in getattr(scroll_filter, "must", []) or []:
@@ -107,8 +103,6 @@ class _FakeCollection:
         ids = list(points_selector.points)
         failed = [i for i in ids if i in self.delete_fail_ids]
         if failed:
-            from qdrant_client import exceptions as _exc
-
             self.delete_fail_calls = getattr(self, "delete_fail_calls", 0) + 1
             raise RuntimeError(f"qdrant delete failed for {failed!r}")
         self.deleted.append(ids)
@@ -183,14 +177,16 @@ def _pt(expires_at, pid=None, **extra):
 def test_invariant_3_malformed_point_does_not_abort_sweep():
     """Expired, malformed, and immortal points coexist: the expired ones are
     reaped even though a hostile point sits in the middle of the scroll."""
-    coll = _FakeCollection([
-        _pt(NOW - 100, "good1"),
-        _pt("not-a-number", "malformed1"),
-        _pt(None, "immortal1"),
-        _pt(NOW - 50, "good2"),
-        _pt({"deep": {"junk": [1]}}, "malformed2"),
-        _pt(NOW - 1, "good3"),
-    ])
+    coll = _FakeCollection(
+        [
+            _pt(NOW - 100, "good1"),
+            _pt("not-a-number", "malformed1"),
+            _pt(None, "immortal1"),
+            _pt(NOW - 50, "good2"),
+            _pt({"deep": {"junk": [1]}}, "malformed2"),
+            _pt(NOW - 1, "good3"),
+        ]
+    )
     dm = _DmStub({"ds": _meta(lifetime=6 * H)}, {"ds": coll})
     report = reap_once(dm, now=NOW)
     # every WELL-FORMED expired point was deleted, malformed ones kept
@@ -229,9 +225,7 @@ def test_invariant_4_repeating_cursor_terminates():
     dm = _DmStub({"ds": _meta(lifetime=H)}, {"ds": coll})
     report = reap_once(dm, now=NOW)
     # TERMINATION (the invariant): the first repeated cursor stops the sweep.
-    assert len(coll.scroll_calls) == 2, (
-        "the sweep must stop at the FIRST repeated cursor, not loop"
-    )
+    assert len(coll.scroll_calls) == 2, "the sweep must stop at the FIRST repeated cursor, not loop"
     assert report.truncated is True
     assert any("repeating" in n for r in report.results for n in r.notes)
     # A hostile server can make the module re-delete the same ids before the

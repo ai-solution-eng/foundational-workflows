@@ -472,6 +472,18 @@ _SOURCE_SCAN_PAYLOAD_KEYS: tuple[str, ...] = ("metadata.source", "metadata.origi
 _SOURCE_SCAN_TEXT_PAYLOAD_KEY = "page_content"
 
 
+def _source_scan_payload_selector(include_page_content: bool = False) -> Any:
+    """``PayloadSelectorInclude`` form of :func:`_source_scan_payload_keys`.
+
+    The include form is what the Qdrant client needs for a projected scroll;
+    building it here keeps ``_stored_sources`` and ``_prune_sources`` on one
+    definition of the keys a source scan needs.
+    """
+    from qdrant_client.models import PayloadSelectorInclude
+
+    return PayloadSelectorInclude(include=_source_scan_payload_keys(include_page_content))
+
+
 def _source_scan_payload_keys(include_page_content: bool = False) -> list[str]:
     """Key list for ``scroll_documents(..., payload_keys=...)`` source scans.
 
@@ -492,6 +504,46 @@ def _source_scan_payload_keys(include_page_content: bool = False) -> list[str]:
 # re-read and re-parse the whole file for every file (same O(n²) pattern).
 _ingested_hashes_cache: dict[Path, tuple[int, set[str]]] = {}
 _ingested_hashes_cache_lock = threading.Lock()
+
+# Deferred ingest-dedup writes (audit 2026-10-16, P2) — the exact pattern
+# ``_hash_index_dirty`` above already uses for .hashes.json.  The batch
+# consumer calls _mark_ingested once per successfully embedded FILE, and each
+# call rewrote the whole JSON (and took the cross-process lock) — O(n²)
+# bytes and O(n²) NFS writes for an n-file batch.  _mark_ingested instead
+# records the hash here; _flush_ingested_hash_writes() merges the dirty set
+# into the on-disk file ONCE per batch, under the same lock discipline.
+#
+# Crash semantics (same as .hashes.json): a process that dies before the
+# flush loses only dedup ENTRIES — the vectors are already stored, so the
+# worst case is a later re-upload re-embedding a file that was already
+# ingested (benign duplicate work), never corruption or data loss.
+_ingested_hashes_dirty: dict[Path, set[str]] = {}
+_ingested_hashes_dirty_lock = threading.Lock()
+
+
+def _flush_ingested_hash_writes() -> None:
+    """Persist all deferred ingest-dedup hashes (merge, not clobber).
+
+    Re-reads the on-disk set under the dataset's cross-process lock so hashes
+    written by another pod during our batch survive the merge.
+    """
+    with _ingested_hashes_dirty_lock:
+        dirty = dict(_ingested_hashes_dirty)
+        _ingested_hashes_dirty.clear()
+    for hashes_path, updates in dirty.items():
+        if not updates:
+            continue
+        with _cross_process_lock(hashes_path.with_suffix(".lock")):
+            hashes = _load_ingested_hashes(hashes_path)
+            if updates <= hashes and hashes_path.exists():
+                continue  # every hash already on disk (another pod's flush)
+            hashes |= updates
+            hashes_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = hashes_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(sorted(hashes)), encoding="utf-8")
+            os.replace(tmp, hashes_path)
+            with _ingested_hashes_cache_lock:
+                _ingested_hashes_cache[hashes_path] = (hashes_path.stat().st_mtime_ns, hashes)
 
 
 def _load_ingested_hashes(p: Path) -> set[str]:
@@ -1578,8 +1630,18 @@ def _truncate_audio_file(path: Path, max_seconds: float = 60.0) -> Path:
         with contextlib.suppress(OSError):
             tmp.unlink(missing_ok=True)
         logger.debug("Audio truncation failed", exc_info=True)
+        # Truncation FAILED: the sibling may be absent or half-written, so
+        # the caller must keep using the original path.
+        return path
 
-    return path
+    # SUCCESS (audit 2026-10-16, P1-4): the sibling is now the truncated
+    # copy and MUST be returned.  This used to fall through to ``return
+    # path``, which made every caller treat a successful truncation as
+    # "nothing to do" -- the documented 60s ASR cap was a no-op, and
+    # staging/transcribe/repair all kept handing the ORIGINAL oversized
+    # audio to the ASR endpoint (the payload-cap failure this function
+    # exists to prevent).
+    return truncated
 
 
 def _split_audio_segments(
@@ -1909,6 +1971,7 @@ class DatasetManager:
         created_by: "str | None" = None,
         lifetime: "int | None" = None,
         kind: "str | None" = None,
+        chunk: "dict[str, Any] | None" = None,
     ) -> dict[str, Any]:
         """Create a new dataset.
 
@@ -2023,6 +2086,13 @@ class DatasetManager:
         rrf_meta = self._sanitize_rrf_meta(rrf)
         if rrf_meta is not None:
             meta["rrf"] = rrf_meta
+        # Per-dataset chunk overrides (feature: per-dataset chunk size).
+        # OMITTED when empty: an absent "chunk" key IS "inherit the
+        # embedder model", which keeps every dataset created without an
+        # explicit override byte-identical to a pre-feature meta.
+        chunk_meta = self._sanitize_chunk_meta(chunk)
+        if chunk_meta:
+            meta["chunk"] = chunk_meta
         # Short-term memory (stmem/PLAN section 4.1).  ``lifetime`` is stored
         # for EVERY create, ``None`` included: the explicit null is the
         # "immortal" stamp, and it keeps every post-STM meta self-describing
@@ -2819,6 +2889,29 @@ class DatasetManager:
                     meta.pop("rrf", None)
                 else:
                     meta["rrf"] = rrf_meta
+            # Per-dataset chunk overrides (feature: per-dataset chunk size).
+            # MERGE semantics: a PATCH carrying any subset of the four keys
+            # updates only those keys, so the panel can send one field at a
+            # time.  An explicit null clears that override; an EMPTY object
+            # (or one that sanitizes to nothing) removes the stored block
+            # entirely, restoring "inherit the embedder model".  The cached
+            # RAG is invalidated because the splitter is baked into the
+            # processors built from these values.  Affects NEW ingests only
+            # - Recreate is the adoption path for existing files.
+            if "chunk" in updates:
+                chunk_meta = self._sanitize_chunk_meta(updates["chunk"])
+                merged = dict(meta.get("chunk") or {})
+                for key in self._CHUNK_META_KEYS:
+                    if not isinstance(updates["chunk"], dict):
+                        break
+                    if key in updates["chunk"] and updates["chunk"][key] is None:
+                        merged.pop(key, None)
+                merged.update(chunk_meta)
+                if merged:
+                    meta["chunk"] = merged
+                else:
+                    meta.pop("chunk", None)
+                caption_changed = True
             self._write_meta(name, meta)
         # Rebuild the cached RAG so the new caption flags take effect now.
         if caption_changed:
@@ -2877,9 +2970,10 @@ class DatasetManager:
         """
         rag = self._get_rag(dataset_name)
         mpk = rag.embedder.mm_processor_kwargs
-        chunk_size = rag.embedder.chunk_size
-        chunk_overlap = rag.embedder.chunk_overlap
-        text_splitter = rag.embedder.text_splitter
+        # Per-dataset chunk overrides (feature: per-dataset chunk size)
+        # resolve to the model defaults when the dataset stores none, so
+        # the no-override path is unchanged.
+        chunk_size, chunk_overlap, text_splitter = self._resolve_chunk_params(dataset_name, rag)
         # Short-term memory: the dataset's lifetime is resolved ONCE here and
         # threaded down to every store call the file path makes (see
         # _add_file_processed).  Resolving it at the entry point rather than at
@@ -2969,8 +3063,20 @@ class DatasetManager:
 
         rag = self._get_rag(dataset_name)
         mpk = rag.embedder.mm_processor_kwargs
-        chunk_size = rag.embedder.chunk_size
-        chunk_overlap = rag.embedder.chunk_overlap
+        # Token-count splitter for the batch path.  Without this, every
+        # text-type file that falls through to _add_file_processed (text,
+        # table, office, html, notebook, ebook, log — and every non-media
+        # member of an archive) was silently chunked by CHARACTERS while the
+        # identical file uploaded via add_file was chunked by TOKENS.  The
+        # single-file path resolves this in _resolve_chunk_params; the batch
+        # path must do the same so both surfaces agree on chunk boundaries.
+        #
+        # The resolved size/overlap MUST be the ones passed to the processors:
+        # the splitter is built for the resolved budget and the processors
+        # gate on their own chunk_size.  Passing the model default while
+        # handing over a splitter built for a per-dataset override would make
+        # the two disagree (the override silently half-applied).
+        chunk_size, chunk_overlap, text_splitter = self._resolve_chunk_params(dataset_name, rag)
         # Short-term memory: resolved once per batch and threaded into BOTH
         # store paths below (the batched media/PDF consumer and the direct
         # per-filetype handler), so no file-ingested point can escape the
@@ -3224,7 +3330,12 @@ class DatasetManager:
                             dst_str,
                             chunk_size=chunk_size,
                             chunk_overlap=chunk_overlap,
-                            text_splitter=rag.embedder.text_splitter,
+                            # Use the RESOLVED splitter, not the model's cached
+                            # one: chunk_size/chunk_overlap above come from the
+                            # resolved pair, so a per-dataset override would
+                            # otherwise be measured against a splitter built
+                            # for a different budget.
+                            text_splitter=text_splitter,
                             ocr=self._get_ocr_enabled(dataset_name),
                         ):
                             pdf_batch.append(chunk)
@@ -3399,6 +3510,7 @@ class DatasetManager:
                             mpk,
                             chunk_size,
                             chunk_overlap,
+                            text_splitter=text_splitter,
                             original_name=fname,
                             dataset_lifetime=dataset_lifetime,
                         )
@@ -3553,15 +3665,24 @@ class DatasetManager:
             t.join(timeout=30)
 
         # -- Flush remaining batch and shut down consumer -----------------------
-        if batch_docs:
-            _queue_batch(batch_docs, batch_files_list)
-        batch_queue.put(None)  # sentinel
-        consumer_thread.join()
-
-        # Persist the batch's deferred .hashes.json entries — one merged
-        # write under the cross-process lock instead of a full index rewrite
-        # per stored file (O(n²) NFS I/O on large batches).
-        _flush_hash_index_writes()
+        # The deferred-write flushes live in a ``finally`` so a failure while
+        # draining the pipeline (a dead consumer, a join timeout) still
+        # persists the entries the batch already earned — the crash window is
+        # then a hard process kill, not any ordinary exception.
+        try:
+            if batch_docs:
+                _queue_batch(batch_docs, batch_files_list)
+            batch_queue.put(None)  # sentinel
+            consumer_thread.join()
+        finally:
+            # Persist the batch's deferred .hashes.json entries — one merged
+            # write under the cross-process lock instead of a full index
+            # rewrite per stored file (O(n²) NFS I/O on large batches).
+            _flush_hash_index_writes()
+            # Same treatment for .ingested_hashes.json (audit 2026-10-16, P2):
+            # _mark_ingested ran once per embedded file, each rewriting the
+            # whole set under the cross-process lock.
+            _flush_ingested_hash_writes()
 
         # If the consumer thread crashed, propagate the error
         if consumer_error[0] is not None:
@@ -3909,11 +4030,10 @@ class DatasetManager:
         # Uses the model's ``code_chunk_size`` / ``code_chunk_overlap``
         # (typically 8192/512) so that functions and document structures
         # stay intact.  A matching ``code_text_splitter`` is used when
-        # available.
+        # available.  A per-dataset code override (if stored) wins over the
+        # model value; otherwise this is exactly the old behaviour.
         if file_type in _STRUCTURED_TYPES:
-            chunk_size = rag.embedder.code_chunk_size
-            chunk_overlap = rag.embedder.code_chunk_overlap
-            text_splitter = rag.embedder.code_text_splitter
+            chunk_size, chunk_overlap, text_splitter = self._resolve_chunk_params(dataset_name, rag, structured=True)
 
         if source_url:
             # URL-based file: process from temp, use original URL as source, no PVC copy
@@ -4600,18 +4720,30 @@ class DatasetManager:
                 except OSError:
                     pass
                 file_type = _classify_file(str(tier1))
+                # The artifact each branch produces: image/video rewrite the
+                # *_preprocessed sibling the candidate scan keyed on, but
+                # _truncate_audio_file writes a *_truncated sibling instead
+                # (audit 2026-10-16, P1-4 follow-up).  Comparing the result
+                # against `preproc` unconditionally made the audio branch
+                # structurally unable to report a repair — it always fell to
+                # the "failed validation" arm even on a clean truncation.
                 if file_type == "image":
                     result = _preprocess_image_file(tier1)
+                    artifact = preproc
                 elif file_type == "video":
                     result = _preprocess_video_file(tier1)
+                    artifact = preproc
                 elif file_type == "audio":
                     result = _truncate_audio_file(tier1, max_seconds=60.0)
+                    artifact = result if result != tier1 else preproc
                 else:
                     result = tier1
-                if result != tier1 and result == preproc and ok(preproc):
-                    record["regenerated_bytes"] = preproc.stat().st_size
+                    artifact = preproc
+                if result != tier1 and result == artifact and ok(artifact):
+                    record["preprocessed"] = str(artifact)
+                    record["regenerated_bytes"] = artifact.stat().st_size
                     repaired.append(record)
-                    logger.info("Repaired broken preprocessed media: %s", preproc.name)
+                    logger.info("Repaired broken preprocessed media: %s", artifact.name)
                 else:
                     record["reason"] = (
                         "preprocess returned the original (no transcode needed, or the original's "
@@ -4658,23 +4790,50 @@ class DatasetManager:
                     if isinstance(v, str) and v.startswith("file://") and v[7:] in candidates:
                         return True
             return False
-        # QdrantVectorStore — one bounded scroll per source (limit 1).
+        # QdrantVectorStore — one bounded scroll per source, checking the SAME
+        # key set the InMemory branch above checks (audit 2026-10-16, P2).
+        # The caller passes tier-1/tier-2 ARTIFACT paths (a file and its
+        # ``*_preprocessed`` sibling) while the store may reference such a
+        # path only through a ``preprocessed_*`` / ``original_*`` payload key
+        # — the shape every ingest path writes (``doc["preprocessed_image"]
+        # = f"file://{dst}"``).  Matching on ``metadata.source`` alone was
+        # blind to those, so a surviving point could keep a reference to a
+        # file this guard then deleted (dangling media for the reranker/VLM,
+        # the UI and any later repair pass).
         try:
-            from qdrant_client.models import FieldCondition, Filter, MatchValue
+            from qdrant_client.models import FieldCondition, Filter, MatchAny
 
             client = vs._client  # type: ignore[attr-defined]
             coll = vs.collection_name  # type: ignore[attr-defined]
-            for s in sources:
-                points, _ = client.scroll(
-                    coll,
-                    limit=1,
-                    with_payload=False,
-                    with_vectors=False,
-                    filter=Filter(must=[FieldCondition(key="metadata.source", match=MatchValue(value=s))]),
+            # Tier refs are stored as file:// URLs; compare on the stripped
+            # path so a plain-path argument matches its stored ref.
+            want = {s.removeprefix("file://") for s in sources}
+            # Explicit list[...] annotation: the inferred list[FieldCondition]
+            # is invariant, so it does not satisfy Filter.should's wider
+            # element union. Widening the ELEMENT type keeps the append below
+            # valid while matching what qdrant actually accepts.
+            conditions: list[Any] = [
+                FieldCondition(key="metadata.source", match=MatchAny(any=sorted(want))),
+            ]
+            for key in (
+                "preprocessed_image",
+                "preprocessed_video",
+                "preprocessed_audio",
+                "original_image",
+                "original_video",
+                "original_audio",
+            ):
+                conditions.append(
+                    FieldCondition(key=f"metadata.{key}", match=MatchAny(any=sorted(f"file://{s}" for s in want)))
                 )
-                if points:
-                    return True
-            return False
+            points, _ = client.scroll(
+                coll,
+                limit=1,
+                with_payload=False,
+                with_vectors=False,
+                scroll_filter=Filter(should=conditions),
+            )
+            return bool(points)
         except Exception:
             logger.warning("Could not verify file references — keeping file (conservative)")
             return True
@@ -4747,11 +4906,23 @@ class DatasetManager:
             client = vs._client  # type: ignore[attr-defined]
             coll = vs.collection_name  # type: ignore[attr-defined]
 
-            for doc_id in doc_ids:
-                client.set_payload(
+            # ONE batched call (audit 2026-10-16, P2): this looped a call per
+            # point id, so clearing the key for a file's N chunks cost N round
+            # trips for one logical update — the selector takes a list.
+            #
+            # delete_payload, not set_payload({key: None}): a JSON null is a
+            # PRESENT value, so the old form left the key in the payload
+            # entirely (verified against the pinned client — the reference was
+            # never actually removed).  The key is the DOTTED PATH, because
+            # delete_payload removes TOP-LEVEL keys only: passing the bare
+            # ``original_image`` is a silent no-op against the nested
+            # ``metadata`` mapping this codebase writes (also verified).
+            clean_ids = [str(d) for d in doc_ids if str(d).strip()]
+            if clean_ids:
+                client.delete_payload(
                     collection_name=coll,
-                    payload={tier1_key: None},
-                    points=[doc_id],
+                    keys=[f"metadata.{tier1_key}"],
+                    points=clean_ids,
                 )
         except Exception:
             logger.debug("Failed to remove %s from Qdrant payloads", tier1_key, exc_info=True)
@@ -5136,9 +5307,14 @@ class DatasetManager:
         NEW summary instead of replacing the old one, and a conversation
         resumed after a quiet window accumulated one memory per resume --
         live evidence: session 3baae9d4d58e765b carried two summaries 27
-        minutes apart. The ``source`` label is useless for attribution here
-        (mm-rag hardcodes ``source: "opencode:memory"`` on every add_memory,
-        gateway writes included).
+        minutes apart. Attribution by ``source`` was impossible at the time:
+        mm-rag hardcoded ``source: "opencode:memory"`` on every add_memory,
+        gateway writes included (FIXED 2026-10-17 -- the caller's
+        ``metadata["source"]`` now wins and an undeclared writer records
+        ``"unknown:memory"``). Even so, superseding by KIND rather than by
+        source is the correct rule here: the kind identifies what the memory
+        IS, while source identifies who wrote it, and a re-distill from a
+        different writer must still replace the stale summary.
 
         Returns the number of points deleted.
         """
@@ -5293,22 +5469,48 @@ class DatasetManager:
         scroll_filter = Filter(
             should=[FieldCondition(key="metadata.source", match=MatchPrefix(prefix=p)) for p in prefixes]
         )
-        out: set[str] = set()
         # Source-only projection (perf quick-win #3): ``["metadata"]`` used to
         # pull every key under it — including the multi-MB base64 media
         # values — for each of up to a million points.  Nested keys are
         # supported by ``PayloadSelectorInclude``, so ask for just the
-        # canonical source.  ``_prune_sources`` has the same waste with
-        # ``with_payload=True``; it should follow (not edited here).
-        for _, payload in self.scroll_documents(
-            dataset_name,
-            scroll_filter,
-            limit=1_000_000,
-            payload_keys=_source_scan_payload_keys(),
-        ):
-            src = (payload.get("metadata") or {}).get("source")
-            if src:
-                out.add(str(src).rstrip("/"))
+        # canonical source.
+        #
+        # STREAMED, not materialised (audit 2026-10-16, P2): this used to
+        # call ``scroll_documents(..., limit=1_000_000)``, which accumulates
+        # every page into one Python list before returning — an O(limit)
+        # allocation of (id, payload) tuples on a large corpus, for a result
+        # the caller only ever reads as a set of strings.  It also silently
+        # TRUNCATED at the cap, and a truncated set feeds ``force_names``
+        # (dataset_manager sync), which then re-downloads and re-embeds
+        # objects that were already stored.  Iterating page by page keeps
+        # peak memory to one page and removes the cap.
+        # check_embedder=False: this scan reads payloads only (it embeds
+        # nothing), and the sync path must keep working on a dataset whose
+        # embedder fingerprint no longer matches the configured embedder.
+        rag = self._get_rag(dataset_name, check_embedder=False)
+        vs = rag.vector_store
+        if vs is None or isinstance(vs, dict):
+            return set()
+        client = vs._client  # type: ignore[attr-defined]
+        coll = vs.collection_name  # type: ignore[attr-defined]
+        out: set[str] = set()
+        offset: int | str | None = None
+        with_payload = _source_scan_payload_selector()
+        while True:
+            pts, offset = client.scroll(
+                coll,
+                limit=1024,
+                offset=offset,
+                scroll_filter=scroll_filter,
+                with_payload=with_payload,
+                with_vectors=False,
+            )
+            for pt in pts:
+                src = ((pt.payload or {}).get("metadata") or {}).get("source")
+                if src:
+                    out.add(str(src).rstrip("/"))
+            if offset is None:
+                break
         return out
 
     def _prune_sources(self, dataset_name: str, prefixes: list[str], expected: set[str]) -> dict[str, Any]:
@@ -5333,7 +5535,7 @@ class DatasetManager:
           env-overridable for operators who deliberately want an aggressive
           prune.
         """
-        from qdrant_client.models import FieldCondition, Filter, MatchPrefix, PayloadSelectorInclude, PointIdsList
+        from qdrant_client.models import FieldCondition, Filter, MatchPrefix, PointIdsList
 
         rag = self._get_rag(dataset_name)
         vs = rag.vector_store
@@ -5361,7 +5563,8 @@ class DatasetManager:
                 # form projects exactly what the guards consume
                 # (metadata.source + page_content; nested keys verified
                 # against qdrant-client 1.19 by the _stored_sources fix).
-                with_payload=PayloadSelectorInclude(include=_source_scan_payload_keys(include_page_content=True)),
+                # Shared with _stored_sources so the two scans cannot drift.
+                with_payload=_source_scan_payload_selector(include_page_content=True),
                 with_vectors=False,
             )
             for pt in pts:
@@ -5571,6 +5774,174 @@ class DatasetManager:
         """Read the OCR fallback flag from dataset metadata (default False)."""
         meta = self._read_meta(dataset_name) or {}
         return bool(meta.get("ocr", False))
+
+    # ------------------------------------------------------------------
+    # Per-dataset chunk-size overrides (base + code/structured).
+    #
+    # Chunk size is otherwise a GLOBAL property of the embedder model
+    # (chunk_size / code_chunk_size on the model config, chart values).
+    # These four meta keys let ONE dataset deviate without touching the
+    # deployment: a memory/notes dataset wants large chunks (a whole
+    # curated document in one vector, so its header travels with every
+    # hit), while a code-search dataset wants the model default.
+    #
+    # ABSENT = INHERIT.  Nothing is written at create time unless the
+    # caller explicitly asked for an override, so every existing dataset
+    # (and every dataset created without these fields) keeps behaving
+    # exactly as before this feature.
+    #
+    # Chunk size is baked at INGEST: changing it never re-chunks stored
+    # content (content-hash dedup would skip the re-embed anyway).
+    # Recreate is the adoption path, exactly as for contextual.
+    # ------------------------------------------------------------------
+
+    #: meta key -> embedder attribute it overrides (same names by design)
+    _CHUNK_META_KEYS: "tuple[str, ...]" = (
+        "chunk_size",
+        "chunk_overlap",
+        "code_chunk_size",
+        "code_chunk_overlap",
+    )
+
+    @staticmethod
+    def _clamp_chunk_value(value: Any, field: str, minimum: int) -> int:
+        """Validate one chunk-size/overlap value, returning a plain int.
+
+        None/empty mean "no override" and are handled by the caller (key
+        presence), never here.
+
+        Wrong TYPE raises TypeError (TRY004: an invalid type is a
+        TypeError, not a ValueError); an out-of-range VALUE raises
+        ValueError.  BOTH REST boundaries catch the pair and answer
+        HTTP 400, so the distinction is for callers, not for the status
+        code - see api_create_dataset / api_update_dataset.
+        """
+        if isinstance(value, bool):
+            # bool is an int subclass - reject explicitly rather than
+            # turning True into a 1-token chunk.
+            raise TypeError(f"{field} must be an integer, not a boolean")
+        try:
+            ivalue = int(value)
+        except (TypeError, ValueError):
+            raise TypeError(f"{field} must be an integer") from None
+        if ivalue < minimum:
+            raise ValueError(f"{field} must be >= {minimum}")
+        return ivalue
+
+    @classmethod
+    def _sanitize_chunk_meta(cls, updates: Any) -> "dict[str, int]":
+        """Normalize a create/PATCH chunk-override payload to the stored shape.
+
+        Accepts a dict holding any subset of the four keys.  A None value
+        is dropped (the idiomatic "clear this override" spelling), unknown
+        keys are ignored for forward compatibility, and the result may be
+        empty - which means "store nothing, inherit the model".  Chunk
+        sizes are clamped to >= 1 and overlaps to >= 0.  A non-dict payload
+        raises TypeError (invalid type, per TRY004); the REST boundaries
+        catch it and answer HTTP 400.
+        """
+        if updates is None:
+            return {}
+        if not isinstance(updates, dict):
+            raise TypeError("chunk overrides must be an object")
+        out: dict[str, int] = {}
+        for key in cls._CHUNK_META_KEYS:
+            if key not in updates:
+                continue
+            raw = updates[key]
+            if raw is None:
+                continue
+            minimum = 0 if key.endswith("_overlap") else 1
+            out[key] = cls._clamp_chunk_value(raw, key, minimum)
+        return out
+
+    def _chunk_overrides(self, dataset_name: str) -> "dict[str, int]":
+        """The dataset's stored chunk overrides, or {} (inherit everything).
+
+        Read FRESH from meta.json on every ingest - setting an override
+        later must apply to subsequent ingests, and the parsed meta is
+        already cached under an mtime/size stamp, so this is a dict lookup
+        rather than an extra file read.
+        """
+        meta = self._read_meta(dataset_name) or {}
+        stored = meta.get("chunk")
+        if not isinstance(stored, dict):
+            return {}
+        out: dict[str, int] = {}
+        for key in self._CHUNK_META_KEYS:
+            raw = stored.get(key)
+            if raw is None:
+                continue
+            try:
+                out[key] = self._clamp_chunk_value(raw, key, 0 if key.endswith("_overlap") else 1)
+            except ValueError:
+                # A corrupt stored value must fail CLOSED (inherit the
+                # model), never abort an ingest.
+                logger.warning(
+                    "Ignoring invalid stored chunk override %s=%r for dataset %r",
+                    key,
+                    raw,
+                    dataset_name,
+                )
+        return out
+
+    def _resolve_chunk_params(self, dataset_name: str, rag: Any, *, structured: bool = False) -> "tuple[int, int, Any]":
+        """Resolve (chunk_size, chunk_overlap, text_splitter) for one ingest.
+
+        Resolution order: the dataset's stored override for the relevant
+        family (base vs code/structured) -> the embedder model's value.
+        When an override is present the splitter is rebuilt to match it,
+        because the model's cached splitter carries its own baked-in chunk
+        size and would otherwise silently defeat the override on the
+        oversized-paragraph fallback path.
+        """
+        overrides = self._chunk_overrides(dataset_name)
+        if structured:
+            base_size = getattr(rag.embedder, "code_chunk_size", 8192)
+            base_overlap = getattr(rag.embedder, "code_chunk_overlap", 512)
+            size = overrides.get("code_chunk_size", base_size)
+            overlap = overrides.get("code_chunk_overlap", base_overlap)
+            model_splitter = getattr(rag.embedder, "code_text_splitter", None)
+        else:
+            base_size = getattr(rag.embedder, "chunk_size", 2048)
+            base_overlap = getattr(rag.embedder, "chunk_overlap", 256)
+            size = overrides.get("chunk_size", base_size)
+            overlap = overrides.get("chunk_overlap", base_overlap)
+            model_splitter = getattr(rag.embedder, "text_splitter", None)
+
+        if size == base_size and overlap == base_overlap:
+            # No effective override - use the model's splitter untouched,
+            # keeping the no-override path byte-identical to before.
+            return size, overlap, model_splitter
+
+        # An overlap >= the chunk size would make the character fallback
+        # rewind and never advance (the same 80 % cap the processors
+        # apply), so clamp it here once.
+        overlap = min(overlap, int(size * 0.8))
+        return size, overlap, self._splitter_for(size, overlap, model_splitter)
+
+    @staticmethod
+    def _splitter_for(chunk_size: int, chunk_overlap: int, model_splitter: Any) -> Any:
+        """Build a splitter matching an override, or fall back to the model's.
+
+        Returns the model splitter unchanged when it is already sized for
+        this budget, and None (character-based chunking) when the tokenizer
+        is unavailable - mirroring the model's own fallback.
+        """
+        if model_splitter is not None and (
+            getattr(model_splitter, "chunk_size", None) == chunk_size
+            and getattr(model_splitter, "chunk_overlap", None) == chunk_overlap
+        ):
+            return model_splitter
+        if model_splitter is None:
+            return None
+        try:
+            from multimodal_rag.utils.token_text_splitter import TokenTextSplitter
+
+            return TokenTextSplitter.from_bundled(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        except Exception:
+            logger.debug("Could not rebuild splitter for chunk override", exc_info=True)
+            return None
 
     # ------------------------------------------------------------------
     # Per-dataset weighted-RRF defaults (feature: weighted RRF, dataset-
@@ -6106,23 +6477,55 @@ class DatasetManager:
         return self._dataset_dir(dataset_name) / "files" / _INGESTED_HASHES_FILE
 
     def _is_ingested(self, dataset_name: str, file_hash: str) -> bool:
-        """True if *file_hash* was already successfully ingested here."""
-        return file_hash in _load_ingested_hashes(self._ingested_hashes_path(dataset_name))
+        """True if *file_hash* was already successfully ingested here.
+
+        Consults the DEFERRED dirty set as well as the on-disk file: within a
+        batch, a file marked moments ago has not reached disk yet, and a
+        duplicate of it later in the same batch must still be recognised as
+        already ingested (otherwise the deferral would change batch semantics
+        rather than just its I/O shape).
+        """
+        p = self._ingested_hashes_path(dataset_name)
+        with _ingested_hashes_dirty_lock:
+            pending = _ingested_hashes_dirty.get(p)
+        if pending and file_hash in pending:
+            return True
+        return file_hash in _load_ingested_hashes(p)
 
     def _mark_ingested(self, dataset_name: str, file_hash: str) -> None:
-        """Record *file_hash* as successfully ingested for *dataset_name*."""
+        """Record *file_hash* as successfully ingested for *dataset_name*.
+
+        DEFERRED (audit 2026-10-16, P2): the hash joins an in-process dirty set
+        and reaches disk once per batch via :func:`_flush_ingested_hash_writes`
+        (called from ``add_files_batch``), instead of rewriting the whole
+        ``.ingested_hashes.json`` — and taking the cross-process lock — once
+        per file.  ``add_files_batch`` calls this once per embedded file, so
+        the old shape was O(n²) bytes of JSON and O(n²) NFS writes for an
+        n-file batch; this is the same fix .hashes.json already carries.
+
+        Single-file callers are not inside a batch flush, so they persist
+        immediately through :meth:`_flush_ingested_hashes_now` — the deferral
+        is an optimisation for the batch loop, never a correctness
+        dependency.
+        """
         p = self._ingested_hashes_path(dataset_name)
-        with _cross_process_lock(p.with_suffix(".lock")):
-            hashes = _load_ingested_hashes(p)
-            if file_hash in hashes and p.exists():
-                return
-            hashes.add(file_hash)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(sorted(hashes)), encoding="utf-8")
-            os.replace(tmp, p)
-            with _ingested_hashes_cache_lock:
-                _ingested_hashes_cache[p] = (p.stat().st_mtime_ns, hashes)
+        with _ingested_hashes_dirty_lock:
+            _ingested_hashes_dirty.setdefault(p, set()).add(file_hash)
+
+    def _flush_ingested_hashes_now(self, dataset_name: str) -> None:
+        """Persist any deferred ingest-dedup hashes for ONE dataset immediately.
+
+        Used by the single-file ingest paths (which are not wrapped by the
+        batch flush) so a crash cannot lose their dedup entry.
+        """
+        p = self._ingested_hashes_path(dataset_name)
+        with _ingested_hashes_dirty_lock:
+            updates = _ingested_hashes_dirty.pop(p, set())
+        if not updates:
+            return
+        with _ingested_hashes_dirty_lock:
+            _ingested_hashes_dirty[p] = updates
+        _flush_ingested_hash_writes()
 
     def _clear_ingested_hashes(self, dataset_name: str) -> None:
         """Forget every ingest-dedup hash for *dataset_name*.
@@ -6132,6 +6535,11 @@ class DatasetManager:
         them all as "already ingested".
         """
         p = self._ingested_hashes_path(dataset_name)
+        # Pending (deferred) hashes belong to the OLD collection: flushing them
+        # after a recreate would resurrect exactly the entries this clear just
+        # dropped, leaving the rebuilt collection skipping every file.
+        with _ingested_hashes_dirty_lock:
+            _ingested_hashes_dirty.pop(p, None)
         with _cross_process_lock(p.with_suffix(".lock")):
             try:
                 if p.exists():
@@ -6230,9 +6638,16 @@ class DatasetManager:
                     logger.warning("Could not update watched-source state %s", p, exc_info=True)
 
     def _finish_ingest(self, dataset_name: str, content_hash: str | None, result: dict[str, Any]) -> dict[str, Any]:
-        """Mark *content_hash* ingested when the result stored vectors, then return it."""
+        """Mark *content_hash* ingested when the result stored vectors, then return it.
+
+        Persists IMMEDIATELY: this is the single-file ingest path (not wrapped
+        by ``add_files_batch``'s deferred flush), so leaving the hash in the
+        dirty set until some later batch would make a crash lose the dedup
+        entry for a file that is already stored.
+        """
         if content_hash and result.get("stored_ids"):
             self._mark_ingested(dataset_name, content_hash)
+            self._flush_ingested_hashes_now(dataset_name)
         return result
 
     # ------------------------------------------------------------------
@@ -6295,9 +6710,20 @@ class DatasetManager:
             logger.debug("BM25 df decrement failed", exc_info=True)
 
     def _forget_bm25_texts(self, dataset_name: str, texts: list[str]) -> None:
-        """Decrement the BM25 df stats by *texts* (locked, best-effort)."""
+        """Decrement the BM25 df stats by *texts* (locked, best-effort).
+
+        Counts through ``bm25_lane.indexable_term_counts`` — the SAME
+        placeholder-stripping rule the ingest side counted with (audit
+        2026-10-16, P1-7).  Counting the raw ``page_content`` here subtracted
+        terms the ingest never added (placeholder tokens like "image" /
+        "description", which DO exist in ``df`` from other documents' real
+        text), so every delete/prune/reap pushed df and ``total_len`` down
+        and inflated idf (always positive).  ``indexable_term_counts`` also
+        makes the skipped-empty case implicit: a bare-placeholder chunk yields
+        no terms and therefore no decrement, exactly as it added none.
+        """
         try:
-            term_maps = [bm25_lane.term_counts(t) for t in texts if t]
+            term_maps = [bm25_lane.indexable_term_counts(t) for t in texts if t]
             if term_maps:
                 bm25_lane.forget_documents(self._bm25_stats_path(dataset_name), term_maps)
         except Exception:

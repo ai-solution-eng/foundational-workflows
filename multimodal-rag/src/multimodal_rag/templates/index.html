@@ -89,6 +89,11 @@
     color: var(--text); font-size: 0.9rem; font-family: inherit;
   }
   input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  /* Checkboxes/radios must not inherit the text-input box model above: the
+     100% width + 10px padding made the .sel-check checkboxes in the Access
+     tab balloon to the padded-button height of their flex row (the "giant
+     blue checkbox" glitch on locked datasets). Text fields keep the rule. */
+  input[type="checkbox"], input[type="radio"] { width: auto; padding: 0; margin: 0; }
   textarea { resize: vertical; min-height: 80px; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.85rem; }
   .btn {
     display: inline-flex; align-items: center; gap: 6px;
@@ -728,6 +733,17 @@
       <span id="ds-contextual-cost" style="display:none;font-size:.8rem;color:var(--text-muted);margin-left:24px"></span>
     </div>
     <div class="form-group" style="margin-top:10px">
+      <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400" title="Optional per-dataset chunk sizes, in TOKENS. Leave blank to inherit the embedder model config (the default). Affects future uploads only - Recreate to re-chunk existing files.">
+        Chunking overrides (optional) — blank inherits the model config
+      </label>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <input type="number" id="ds-chunk-size" step="1" min="1" placeholder="text size" title="Tokens per chunk for plain text/Markdown. Blank = embedder model default." style="width:110px">
+        <input type="number" id="ds-chunk-overlap" step="1" min="0" placeholder="text overlap" title="Overlap tokens between text chunks. Blank = embedder model default." style="width:110px">
+        <input type="number" id="ds-code-chunk-size" step="1" min="1" placeholder="code size" title="Tokens per chunk for code/JSON/XML/YAML. Blank = model code default." style="width:110px">
+        <input type="number" id="ds-code-chunk-overlap" step="1" min="0" placeholder="code overlap" title="Overlap tokens between code chunks. Blank = model code default." style="width:110px">
+      </div>
+    </div>
+    <div class="form-group" style="margin-top:10px">
       <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:400" title="Weighted-RRF defaults for this dataset (hybrid text search only). Rank-space tilt, NOT a score multiplier: a higher weight makes that lane's rank positions count more (trust the order, not the magnitude). Applies only when a search carries no explicit override; multimodal (vector-only) queries ignore weights. Leave blank for the global default.">
         RRF weights (optional) — dense / sparse / k
       </label>
@@ -856,10 +872,11 @@
 
   <!-- Selected dataset info -->
   <div class="card" id="selected-info" style="display:none">
-    <div class="card-header">
-      <h2 id="selected-name"></h2>
-      <div style="display:flex;gap:8px">
-        <button class="btn btn-outline btn-sm" onclick="showDocs()">Documents</button>
+    <div class="card-header" style="flex-direction:column;align-items:flex-start;gap:10px">
+      <h2 id="selected-name" style="margin:0"></h2>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-outline btn-sm" onclick="toggleDocList()">Documents</button>
+        <button class="btn btn-outline btn-sm" onclick="toggleDatasetSettings()" title="Show or hide the dataset configuration panel (ingest flags, RRF defaults, visibility)">Configuration</button>
         <button class="btn btn-outline btn-sm" onclick="recreateDataset()" title="Drops the indexed vectors and re-embeds the original files from disk with the currently configured embedder">Recreate</button>
         <button class="btn btn-outline btn-sm" onclick="downloadBackup()" title="Download the full dataset backup (.tar.gz: metadata + documents + files)">Backup</button>
         <button class="btn btn-outline btn-sm" onclick="downloadDocuments('md')" title="Download every document in this dataset as one readable Markdown file (no binary files; scripts can also use ?format=jsonl)">Download Docs</button>
@@ -872,11 +889,16 @@
         style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem">
       <button class="btn btn-primary btn-sm" onclick="saveDescription()">Save</button>
     </div>
+    <!-- Documents list (showDocs) — restored 2026-10-15: the div was dropped in the
+         distiller-integration snapshot while showDocs() kept referencing it, so
+         the Documents button silently no-op'd. -->
+    <div id="doc-list" style="margin-top:12px"></div>
     <!-- D23 (UX, table form 2026-10): dataset settings as aligned columns —
      control | state | meaning — three groups, one Save button.
      saveDatasetAll() applies the three PATCHes in order; per-section
      failures are named in one combined result line. -->
-    <div style="margin-top:12px;border:1px solid var(--border);border-radius:6px;padding:12px 14px;background:var(--surface-2)">
+    <!-- 2026-10-15: collapsible — hidden by default (it pushed the documents list far below the fold); toggled by the header Configuration button. -->
+    <div id="dataset-settings-panel" style="display:none;margin-top:12px;border:1px solid var(--border);border-radius:6px;padding:12px 14px;background:var(--surface-2)">
       <div style="font-size:.78rem;font-weight:600;color:var(--text-muted);margin-bottom:2px;letter-spacing:.03em">DATASET SETTINGS</div>
       <div style="font-size:.72rem;color:var(--text-muted);margin-bottom:10px">Ingest rows affect <b>future uploads</b> only; RRF and Public apply immediately.</div>
 
@@ -902,6 +924,28 @@
             <td style="padding:6px 0;white-space:nowrap"><label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="edit-contextual" title="Contextual retrieval (ingest-time document context per chunk) for NEW uploads to this dataset. Affects new ingests only - Recreate to re-contextualize existing files." style="margin:0;vertical-align:middle">Contextual retrieval</label></td>
             <td style="padding:6px 12px;color:var(--text);font-weight:500">Chunk context</td>
             <td style="padding:6px 0;color:var(--text-muted);font-size:.78rem">document context per chunk — Recreate applies retroactively</td>
+          </tr>
+
+          <tr><td colspan="3" style="padding:10px 0 4px;font-weight:600;border-bottom:1px solid var(--border)">Chunking <span style="font-weight:400;color:var(--text-muted);font-size:.72rem">— blank = inherit the model config · Recreate applies retroactively</span></td></tr>
+          <tr>
+            <td style="padding:6px 0;white-space:nowrap"><label style="display:inline-flex;align-items:center;gap:8px"><span style="min-width:120px">Chunk size</span><input type="number" id="edit-chunk-size" step="1" min="1" placeholder="inherit" title="Tokens per chunk for plain text/Markdown in THIS dataset. Blank inherits the embedder model default. Affects NEW uploads only - Recreate to re-chunk existing files." style="width:90px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem"></label></td>
+            <td style="padding:6px 12px;color:var(--text);font-weight:500">Text chunk size</td>
+            <td style="padding:6px 0;color:var(--text-muted);font-size:.78rem">tokens per chunk for text/Markdown · blank = model default</td>
+          </tr>
+          <tr>
+            <td style="padding:6px 0;white-space:nowrap"><label style="display:inline-flex;align-items:center;gap:8px"><span style="min-width:120px">Chunk overlap</span><input type="number" id="edit-chunk-overlap" step="1" min="0" placeholder="inherit" title="Overlap tokens between consecutive text chunks. Blank inherits the embedder model default. Clamped to 80% of the chunk size." style="width:90px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem"></label></td>
+            <td style="padding:6px 12px;color:var(--text);font-weight:500">Text overlap</td>
+            <td style="padding:6px 0;color:var(--text-muted);font-size:.78rem">overlap between chunks · clamped to 80% of chunk size</td>
+          </tr>
+          <tr>
+            <td style="padding:6px 0;white-space:nowrap"><label style="display:inline-flex;align-items:center;gap:8px"><span style="min-width:120px">Code chunk size</span><input type="number" id="edit-code-chunk-size" step="1" min="1" placeholder="inherit" title="Tokens per chunk for code/JSON/XML/YAML in THIS dataset. Blank inherits the model code_chunk_size (typically 8192, so functions stay intact)." style="width:90px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem"></label></td>
+            <td style="padding:6px 12px;color:var(--text);font-weight:500">Code chunk size</td>
+            <td style="padding:6px 0;color:var(--text-muted);font-size:.78rem">code/JSON/XML/YAML · blank = model code default</td>
+          </tr>
+          <tr>
+            <td style="padding:6px 0;white-space:nowrap"><label style="display:inline-flex;align-items:center;gap:8px"><span style="min-width:120px">Code overlap</span><input type="number" id="edit-code-chunk-overlap" step="1" min="0" placeholder="inherit" title="Overlap tokens between consecutive code chunks. Blank inherits the model code_chunk_overlap (typically 512)." style="width:90px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-size:.85rem"></label></td>
+            <td style="padding:6px 12px;color:var(--text);font-weight:500">Code overlap</td>
+            <td style="padding:6px 0;color:var(--text-muted);font-size:.78rem">overlap between code chunks · blank = model code default</td>
           </tr>
 
           <tr><td colspan="3" style="padding:10px 0 4px;font-weight:600;border-bottom:1px solid var(--border)">Reciprocal Rank Fusion (RRF) <span style="font-weight:400;color:var(--text-muted);font-size:.72rem">— hybrid search defaults · query-time, immediate</span></td></tr>
@@ -1109,10 +1153,24 @@ async function createDataset() {
   if (denseEl && denseEl.value.trim() !== '') rrf.dense_weight = parseFloat(denseEl.value);
   if (sparseEl && sparseEl.value.trim() !== '') rrf.sparse_weight = parseFloat(sparseEl.value);
   if (kEl && kEl.value.trim() !== '') rrf.k = parseInt(kEl.value, 10);
+  // Per-dataset chunk overrides: blank fields are OMITTED entirely (not sent
+  // as null), so the created dataset simply inherits the embedder model —
+  // the same meta shape as every dataset created before this feature.
+  const chunk = {};
+  for (const [elId, key] of [
+    ['ds-chunk-size', 'chunk_size'],
+    ['ds-chunk-overlap', 'chunk_overlap'],
+    ['ds-code-chunk-size', 'code_chunk_size'],
+    ['ds-code-chunk-overlap', 'code_chunk_overlap'],
+  ]) {
+    const el = document.getElementById(elId);
+    if (el && el.value.trim() !== '') chunk[key] = parseInt(el.value, 10);
+  }
   input.disabled = true;
   try {
     const body = { name, caption_with_asr: captionWithAsr, caption_with_vlm: captionWithVlm, keep_originals: keepOriginals, ocr: ocr, contextual: contextual };
     if (Object.keys(rrf).length) body.rrf = rrf;
+    if (Object.keys(chunk).length) body.chunk = chunk;
     if (desc) body.description = desc;
     if (pw) body.password = pw;
     await api('POST', '/api/datasets', body);
@@ -1121,6 +1179,9 @@ async function createDataset() {
     document.getElementById('ds-desc').value = '';
     document.getElementById('ds-password').value = '';
     for (const el of [denseEl, sparseEl, kEl]) { if (el) el.value = ''; }
+    for (const id of ['ds-chunk-size', 'ds-chunk-overlap', 'ds-code-chunk-size', 'ds-code-chunk-overlap']) {
+      const el = document.getElementById(id); if (el) el.value = '';
+    }
     await listDatasets();
     selectDataset(name);
   } catch (e) {
@@ -1242,7 +1303,26 @@ async function selectDataset(name) {
   if (eDense) eDense.value = storedRrf.dense_weight !== undefined && storedRrf.dense_weight !== null ? storedRrf.dense_weight : '';
   if (eSparse) eSparse.value = storedRrf.sparse_weight !== undefined && storedRrf.sparse_weight !== null ? storedRrf.sparse_weight : '';
   if (eK) eK.value = storedRrf.k !== undefined && storedRrf.k !== null ? storedRrf.k : '';
+  // Per-dataset chunk overrides: show the stored values; BLANK means the
+  // dataset inherits the embedder model config (the default for every
+  // dataset that never set one).
+  const storedChunk = (d.chunk && typeof d.chunk === 'object') ? d.chunk : {};
+  for (const [elId, key] of [
+    ['edit-chunk-size', 'chunk_size'],
+    ['edit-chunk-overlap', 'chunk_overlap'],
+    ['edit-code-chunk-size', 'code_chunk_size'],
+    ['edit-code-chunk-overlap', 'code_chunk_overlap'],
+  ]) {
+    const el = document.getElementById(elId);
+    if (el) el.value = storedChunk[key] !== undefined && storedChunk[key] !== null ? storedChunk[key] : '';
+  }
+  // Collapsible panels (2026-10-15): a newly selected dataset starts with
+  // both the documents list and the configuration panel collapsed.
   document.getElementById('doc-list').innerHTML = '';
+  const _dl = document.getElementById('doc-list');
+  if (_dl) _dl.style.display = 'none';
+  const _sp = document.getElementById('dataset-settings-panel');
+  if (_sp) _sp.style.display = 'none';
 
   // If dataset is password-protected and we don't have a password yet, prompt
   if (d.has_password && !datasetPasswords[name]) {
@@ -2099,6 +2179,31 @@ async function searchDataset() {
 // Documents list
 // -----------------------------------------------------------------------
 
+// 2026-10-15: the Documents button now TOGGLES the documents list. It used to
+// render into #doc-list, but that div was dropped when the dataset settings
+// panel was added — the button silently no-op'd. The list renders directly
+// under the description row; selecting another dataset collapses it.
+function toggleDocList() {
+  if (!selectedDataset) return;
+  const container = document.getElementById('doc-list');
+  if (!container) return;
+  const visible = container.style.display !== 'none';
+  if (visible) {
+    container.style.display = 'none';
+    return;
+  }
+  container.style.display = 'block';
+  showDocs();
+}
+
+// Collapsible dataset settings panel (Configuration button in the header).
+function toggleDatasetSettings() {
+  const panel = document.getElementById('dataset-settings-panel');
+  if (!panel) return;
+  const visible = panel.style.display !== 'none';
+  panel.style.display = visible ? 'none' : 'block';
+}
+
 async function showDocs() {
   if (!selectedDataset) return;
   const container = document.getElementById('doc-list');
@@ -2199,6 +2304,43 @@ async function saveRrfDefaults() {
   }
 }
 
+// Per-dataset chunk overrides (PATCH /api/datasets/{name} {"chunk": …}).
+// A BLANK field means "inherit the embedder model" — it is sent as an
+// explicit null so the stored override is CLEARED, not left stale.  This is
+// what keeps the feature opt-in: a dataset that never sets a value behaves
+// exactly like one created before the feature existed.
+// Chunk size is baked at INGEST — Recreate is what re-chunks old files.
+async function saveChunkOverrides() {
+  if (!selectedDataset) return;
+  const fields = [
+    ['edit-chunk-size', 'chunk_size'],
+    ['edit-chunk-overlap', 'chunk_overlap'],
+    ['edit-code-chunk-size', 'code_chunk_size'],
+    ['edit-code-chunk-overlap', 'code_chunk_overlap'],
+  ];
+  const chunk = {};
+  let any = false;
+  for (const [elId, key] of fields) {
+    const el = document.getElementById(elId);
+    if (!el) continue;
+    const raw = el.value.trim();
+    if (raw === '') { chunk[key] = null; }
+    else { chunk[key] = parseInt(raw, 10); any = true; }
+  }
+  try {
+    await api('PATCH', '/api/datasets/' + selectedDataset, { chunk: chunk }, undefined, passwordHeader());
+    toast(any ? 'Chunk overrides applied (affects new uploads; Recreate to re-chunk)' : 'Chunk overrides cleared (inheriting model defaults)');
+    const d = datasets.find(x => x.name === selectedDataset);
+    if (d) {
+      const stored = {};
+      for (const k of Object.keys(chunk)) if (chunk[k] !== null) stored[k] = chunk[k];
+      if (Object.keys(stored).length) d.chunk = stored; else delete d.chunk;
+    }
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
 async function saveDescription() {
   if (!selectedDataset) return;
   const desc = document.getElementById('desc-edit').value.trim();
@@ -2259,6 +2401,7 @@ async function saveDatasetAll() {
   window.toast = function () {};
   try {
     await run('flags', saveDatasetSettings);
+    await run('chunking', saveChunkOverrides);
     await run('RRF defaults', saveRrfDefaults);
     await run('public', savePublicFlag);
   } finally {
@@ -4434,6 +4577,7 @@ function renderAdminDatasets() {
       </div>
       <div class="dataset-actions">
         <button class="btn btn-outline btn-sm" onclick="adminTogglePublic(this)" data-name="${escHtml(d.name)}" data-want="${d.public ? '0' : '1'}" title="${d.public ? 'Unpublish — granted keys only again' : 'Publish GLOBAL — every minted key can read/search it'}">${d.public ? '🌐 Unpublish' : '🌐 Publish'}</button>
+        ${d.has_password ? `<button class="btn btn-outline btn-sm" onclick="adminResetPassword(this)" data-name="${escHtml(d.name)}" title="Lost-password recovery: set a fresh password, or remove protection so the dataset can be read/deleted through the normal gates">Reset password…</button>` : ''}
         <button class="btn btn-danger btn-sm" onclick="adminDeleteDataset(this)" data-name="${escHtml(d.name)}">Delete</button>
       </div>
     </div>`;
@@ -4476,6 +4620,37 @@ async function adminDeleteDataset(btn) {
   } catch (e) {
     btn.disabled = false;
     toast(e.message, 'error');
+  }
+}
+
+// Lost-password recovery (admin-only): POST /api/admin/datasets/{name}/reset-password.
+// Sets a fresh password, or removes protection entirely so the dataset becomes
+// readable/deletable through the normal gates. The action is audit-logged
+// server-side; the confirm names exactly what will happen before it does.
+async function adminResetPassword(btn) {
+  const name = btn.dataset.name;
+  if (!name) return;
+  const choice = prompt(
+    'Password recovery for "' + name + '"\n\n' +
+    'Type a NEW password to set it, or the word REMOVE (uppercase) to strip protection entirely.\n' +
+    'This action is audit-logged. Cancel to abort.');
+  if (choice === null) return;
+  const removing = choice === 'REMOVE';
+  if (!removing && !choice) { toast('Cancelled \u2014 empty input is neither a password nor REMOVE', 'error'); return; }
+  btn.disabled = true;
+  try {
+    const res = await api('POST', '/api/admin/datasets/' + encodeURIComponent(name) + '/reset-password',
+      removing ? {} : { new_password: choice });
+    toast(removing
+      ? ('Password removed from "' + name + '" \u2014 it is now unprotected')
+      : ('New password set for "' + name + '"'));
+    if (removing) delete datasetPasswords[name];
+    await listDatasets();
+    renderAdminDatasets();
+  } catch (e) {
+    toast(e.message || 'Reset failed', 'error');
+  } finally {
+    btn.disabled = false;
   }
 }
 </script>
@@ -4583,7 +4758,7 @@ function pvcCard(title, pvc, note) {
       <div style="width:${Math.min(pct,100)}%;height:100%;background:${color};transition:width .5s"></div>
     </div>
     <table style="width:100%;font-size:.82rem">
-      <tr><td style="padding:3px 0;color:var(--text-muted)">Total</td><td style="text-align:right">${formatBytes(pvc.total_bytes)}</td></tr>
+      <tr><td style="padding:3px 0;color:var(--text-muted)">Total</td><td style="text-align:right">${formatBytes(pvc.total_bytes)}${pvc.per_replica_capacity_bytes && pvc.replica_count > 1 ? ` <span style="font-size:.72rem;color:var(--text-muted)">(${pvc.replica_count} × ${formatBytes(pvc.per_replica_capacity_bytes)})</span>` : ''}</td></tr>
       <tr><td style="padding:3px 0;color:var(--text-muted)">Used</td><td style="text-align:right">${formatBytes(pvc.used_bytes)}</td></tr>
       <tr><td style="padding:3px 0;color:var(--text-muted)">Free</td><td style="text-align:right">${formatBytes(pvc.free_bytes)}</td></tr>
       <tr><td style="padding:3px 0;color:var(--text-muted)">Utilization</td><td style="text-align:right;color:${color}">${pct}%</td></tr>
@@ -4595,8 +4770,45 @@ function pvcCard(title, pvc, note) {
 function statsPvcSection(s) {
   const file = pvcCard('File Storage PVC', s && s.storage_pvc,
     'PVC mounted at /data — uploaded files (images, videos, audio, PDFs)');
-  const qd = pvcCard('Qdrant DB PVC', s && s.qdrant_pvc,
-    'Qdrant StatefulSet PVC — vector index & payloads');
+  // Qdrant cluster card (2026-10-15): totals are SUMMED across the peers
+  // (each peer has its own RWO PVC), and a per-replica breakdown renders
+  // under the summary — shard spread + per-peer used bytes, same data the
+  // admin health card carries. No more "25 GB total" for a 3x25 GB cluster.
+  const qp = s && s.qdrant_pvc;
+  let qd = '';
+  if (qp) {
+    const n = qp.replica_count || (qp.per_replica ? qp.per_replica.length : null);
+    const each = qp.per_replica_capacity_bytes;
+    const note = n
+      ? `Qdrant cluster — ${n} replica PVC${n === 1 ? '' : 's'}${each ? ` · ${formatBytes(each)} each` : ''} (sharded, RF=1 — not mirrored)`
+      : 'Qdrant StatefulSet PVC — vector index & payloads';
+    qd = pvcCard('Qdrant DB PVC', qp, note);
+    const rows = qp.per_replica && qp.per_replica.length;
+    if (rows) {
+      // Per-replica table: real PVC name (data-<sts>-<ordinal>), shards,
+      // local points and actual disk usage per replica — the kubelet-style
+      // view (2026-10-15): used bytes come from Qdrant per-segment
+      // info.disk_usage_bytes, i.e. real blocks on disk.
+      const peerRows = qp.per_replica.map((r) => {
+        const c = r.status === 'ok' ? 'var(--green)' : (r.status === 'unreachable' ? 'var(--red)' : 'var(--yellow)');
+        return `<tr>
+          <td style="padding:3px 0;color:var(--text-muted);word-break:break-all"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${c};margin-right:6px"></span>${escHtml(r.pvc || r.host || ('peer ' + ((r.index || 0) + 1)))}</td>
+          <td style="text-align:right">${r.shards != null ? r.shards : '—'}</td>
+          <td style="text-align:right">${r.local_points != null ? Number(r.local_points).toLocaleString() : '—'}</td>
+          <td style="text-align:right">${r.used_bytes != null ? formatBytes(r.used_bytes) : '—'}</td>
+        </tr>`;
+      }).join('');
+      const peerTable = `<div style="margin-top:-6px;padding:0 16px 12px">
+        <table style="width:100%;font-size:.75rem;color:var(--text-muted)">
+          <tr><td></td><td style="text-align:right;font-size:.68rem">shards</td><td style="text-align:right;font-size:.68rem">points</td><td style="text-align:right;font-size:.68rem">used</td></tr>
+          ${peerRows}
+        </table>
+      </div>`;
+      // inject the peer table INTO the qd card, before its closing footer
+      const anchor = qd.lastIndexOf('<div style="font-size:.72rem');
+      qd = anchor >= 0 ? qd.slice(0, anchor) + peerTable + qd.slice(anchor) : qd + peerTable;
+    }
+  }
   if (!file && !qd) return '';
   return `<div style="margin-top:18px;display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px">${file}${qd}</div>`;
 }

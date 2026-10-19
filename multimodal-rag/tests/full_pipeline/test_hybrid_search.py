@@ -627,7 +627,7 @@ def test_hybrid_search_disabled_by_env_forces_dense_only():
         rig.close()
 
 
-def test_unsupported_fusion_degrades_gracefully():
+def test_unsupported_fusion_degrades_gracefully() -> None:
     """A backend without the fusion API: one loud fallback, then dense-only."""
     rig = _HybridRig()
     try:
@@ -635,14 +635,14 @@ def test_unsupported_fusion_degrades_gracefully():
         shapes: list[bool] = []  # per query_batch_points call: fusion request?
         real = rig.client.query_batch_points
 
-        def flaky(**kwargs):
+        def flaky(**kwargs: Any) -> Any:
             reqs = kwargs.get("requests") or []
             shapes.append(any(getattr(r, "prefetch", None) for r in reqs))
             if len(shapes) == 1:
                 raise ValueError("Fusion RRF is not supported by this backend")
             return real(**kwargs)
 
-        rig.client.query_batch_points = flaky  # type: ignore[method-assign]
+        rig.client.query_batch_points = flaky  # type: ignore[method-assign, assignment]
         results = asyncio.run(rig.store.asimilarity_search_with_relevance_scores("some text", 5))
         assert len(results) == 1, "first (unsupported) attempt must fall back and still return results"
         assert rig.store._fusion_supported is False
@@ -954,7 +954,7 @@ def _write_rrf_meta(dm: DatasetManager, name: str, rrf: dict[str, Any] | None) -
     dm._write_meta(name, meta)
 
 
-def test_rrf_meta_sanitize_clamps_like_the_api_slices():
+def test_rrf_meta_sanitize_clamps_like_the_api_slices() -> None:
     """create/PATCH meta payload clamps exactly like the REST/MCP slices:
     weights [0,10] rounded to 3 decimals, k [1,1000]; unknown keys dropped;
     a payload reducing to the global default stores NOTHING."""
@@ -1115,7 +1115,7 @@ def test_update_dataset_rrf_patch_validates_and_clears():
         rig.close()
 
 
-def test_create_dataset_stamps_rrf_defaults_from_env_when_enabled():
+def test_create_dataset_stamps_rrf_defaults_from_env_when_enabled() -> None:
     """RAG_RRF_DEFAULT enabled → NEW datasets are create-time stamped with
     the parsed dense/sparse[/k]; the request body's explicit rrf wins."""
     rig = _HybridRig()
@@ -1361,9 +1361,10 @@ def test_rest_create_dataset_body_rrf_flows_and_validates():
             rrf: Any = None,
             contextual: bool = False,
             created_by: str | None = None,  # D23 ownership stamp (passed through)
+            chunk: Any = None,  # per-dataset chunk overrides (passed through)
         ) -> dict[str, Any]:
             DatasetManager._validate_name(name)
-            self.seen.append({"name": name, "rrf": rrf})
+            self.seen.append({"name": name, "rrf": rrf, "chunk": chunk})
             return {"name": name}
 
     stub = _StubDM()
@@ -1419,7 +1420,7 @@ def _rest_search_dm(rig: _HybridRig) -> Any:
     return dm
 
 
-def test_rest_top_level_rrf_block_agrees_with_first_entry():
+def test_rest_top_level_rrf_block_agrees_with_first_entry() -> None:
     """GET /api/datasets/{name}/search: the top-level ``rrf`` block mirrors
     the first entry's block (the source of truth for what was actually
     applied).  Wave-1 bug: it re-derived ``applied`` from the per-doc
@@ -1482,7 +1483,7 @@ def test_rest_top_level_rrf_block_agrees_with_first_entry():
         rig.close()
 
 
-def test_rest_top_level_rrf_block_absent_without_override():
+def test_rest_top_level_rrf_block_absent_without_override() -> None:
     """No override requested → no top-level ``rrf`` key at all (byte-identical
     default, the k-default-trap discipline)."""
     from multimodal_rag import api_server
@@ -1530,7 +1531,7 @@ def test_rest_top_level_rrf_block_absent_without_override():
         rig.close()
 
 
-def test_rest_top_level_rrf_block_false_on_dense_degraded():
+def test_rest_top_level_rrf_block_false_on_dense_degraded() -> None:
     """Override requested but the lane degraded to dense-only (hybrid off) →
     the top-level block reports applied=false honestly (never label dense
     results with weights)."""
@@ -1583,7 +1584,7 @@ def test_rest_top_level_rrf_block_false_on_dense_degraded():
         rig.close()
 
 
-def test_rest_post_search_top_level_rrf_block_agrees():
+def test_rest_post_search_top_level_rrf_block_agrees() -> None:
     """POST /api/datasets/{name}/search carries the same agreement: the
     body-override path's top-level block mirrors the first entry."""
     from multimodal_rag import api_server
@@ -1626,7 +1627,7 @@ def test_rest_post_search_top_level_rrf_block_agrees():
         rig.close()
 
 
-def test_rest_top_level_rrf_block_false_for_default_equal_override():
+def test_rest_top_level_rrf_block_false_for_default_equal_override() -> None:
     """A present-but-default override (1.0/1.0, no k) executes the DEFAULT
     fusion form (k-default-trap discipline) and stamps nothing — both blocks
     must honestly report applied=false while echoing the parameters."""

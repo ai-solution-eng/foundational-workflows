@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from typing import Any, NoReturn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
@@ -143,7 +144,7 @@ def test_mp4_validator_accepts_healthy_file():
 # ---------------------------------------------------------------------------
 
 
-def test_concurrent_preprocess_writers_leave_valid_output():
+def test_concurrent_preprocess_writers_leave_valid_output() -> None:
     """Two transcodes racing on one output path must end with a VALID file.
 
     This is the exact production failure: two replicas preprocessing the same
@@ -380,7 +381,7 @@ def test_repair_reports_webm_stub_as_expected_failure():
 # ---------------------------------------------------------------------------
 
 
-def test_store_file_copy_is_atomic_and_retryable():
+def test_store_file_copy_is_atomic_and_retryable() -> None:
     """A crash mid-copy must never expose a partial file at the final path.
 
     ``_store_file`` used to run ``shutil.copy2(source, dest)`` straight onto
@@ -402,12 +403,12 @@ def test_store_file_copy_is_atomic_and_retryable():
         real_copy2 = _shutil.copy2
         copied_to: list[str] = []
 
-        def _half_copy_then_crash(src_arg, dst_arg, *args, **kwargs):
+        def _half_copy_then_crash(src_arg: Any, dst_arg: Any, *args: Any, **kwargs: Any) -> NoReturn:
             Path(dst_arg).write_bytes(payload[: len(payload) // 2])  # torn write
             copied_to.append(Path(dst_arg).name)
             raise OSError("simulated crash mid-copy")
 
-        _shutil.copy2 = _half_copy_then_crash
+        _shutil.copy2 = _half_copy_then_crash  # type: ignore[assignment]  # copy2 is an overloaded builtin
         try:
             raised = False
             try:

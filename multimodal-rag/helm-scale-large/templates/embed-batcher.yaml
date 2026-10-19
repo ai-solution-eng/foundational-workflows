@@ -1,3 +1,4 @@
+{{- if .Values.embedBatcher.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -139,3 +140,4 @@ spec:
     - name: http
       port: {{ .Values.embedBatcher.port }}
       targetPort: {{ .Values.embedBatcher.port }}
+{{- end }}

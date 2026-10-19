@@ -472,7 +472,7 @@ def test_federated_filters_reach_every_dataset():
     assert {r["dataset"] for r in payload["results"]} == {"alpha", "beta"}
 
 
-def test_federated_merged_rerank_single_pass():
+def test_federated_merged_rerank_single_pass() -> None:
     """One rerank pass over the MERGED pool (not per dataset), truncating to
     reranker_top_k, keeping the dataset labels and the embedding scores."""
     rigs = [
@@ -614,7 +614,7 @@ def test_rest_federated_search_errors_are_per_dataset():
         raise AssertionError("malformed datasets must raise HTTPException(400)")
 
 
-def test_rest_federated_search_single_merged_rerank():
+def test_rest_federated_search_single_merged_rerank() -> None:
     rigs = [_DatasetRig("alpha", []), _DatasetRig("beta", [])]
     dm = _StubDM(rigs)
 

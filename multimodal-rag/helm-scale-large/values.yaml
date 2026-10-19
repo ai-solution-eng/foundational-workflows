@@ -55,14 +55,19 @@ replicaCount: 4
 
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v5.8.2
+  tag: v5.9.5
   pullPolicy: IfNotPresent
 
 qdrant:
+  # Startup-probe budget for a qdrant node: failureThreshold x periodSeconds(5).
+  # 240 x 5s = 20 min. A cold join replays the raft log over NFS and can far
+  # exceed the old 150s (30 x 5s), which killed the pod mid-catch-up
+  # (2026-10-17 incident). Raise for very large collections.
+  startupProbeFailureThreshold: 240
   replicas: 3
   image:
     repository: qdrant/qdrant
-    tag: v1.19.0
+    tag: v1.19.2
     pullPolicy: IfNotPresent
   grpcPort: 6334
   httpPort: 6333
@@ -227,6 +232,12 @@ antiAffinity:
 
 # Extra env vars for BOTH containers — pass-through for env-only knobs:
 # MEMORY_DATASET, RAG_MEMORY_PASSWORD, INGEST_ALLOW_S3_BUCKETS, HTTPS_PROXY, etc.
+#
+# PERFORMANCE KNOBS live here too, by design: ~31 ingest/serve tuning envs
+# (RAG_INGEST_CONCURRENCY, RAG_MAX_BODY_BYTES, STAGING_TTL, RAG_BM25_K,
+# RAG_BM25_B, RAG_BM25_FLUSH_CALLS, RAG_BM25_FLUSH_SECONDS, RAG_CACHE_MAX, ...)
+# are deliberately NOT plumbed as values keys — they are settable ONLY via
+# extraEnv. Scope decision 2026-10-16 (audit P2).
 extraEnv: {}
 
 # ============================================================================
@@ -252,7 +263,25 @@ security:
   mediaAllowPathPrefixes: /data/datasets:/data/staging
   pwMaxFailures: 10
   pwFailWindow: 300
-  trustProxyIdentity: true
+  # D24 proxy-identity trust: accept X-Auth-Request-*/X-Email/X-User headers as
+  # an identity credential. DEFAULT FALSE (P0-1 remediation 2026-10-16): these
+  # headers are attacker-settable on any direct call that bypasses the gateway
+  # AuthorizationPolicy. Set true ONLY for deployments whose EVERY network path
+  # to the app traverses an enforcing oauth2-proxy (pair with
+  # networkPolicy.enabled so ClusterIP callers cannot impersonate).
+  trustProxyIdentity: false
+  # P0-1 positive assertion (Zone A, 2026-10-16): when set, the app requires
+  # every proxy-identity request to carry X-Enforcing-Proxy == THIS value
+  # (constant-time compare) — proof that an enforcing proxy fronts the app.
+  # The operator MUST wire the ingress/gateway to inject the header on EVERY
+  # request (oauth2-proxy --custom-headers / Istio AuthorizationPolicy header
+  # injection); an unwired proxy simply loses the proxy-identity feature
+  # (fail closed — the app never trusts a bare spoofable name).
+  # DEFAULT EMPTY = disabled: the D21 forwarded-OIDC-token assertion is the
+  # only accepted proof instead. This value is proof material — prefer a
+  # Secret pipeline (modelSecrets.existingSecret style) over a committed
+  # values file if your tooling allows it.
+  enforcingProxySignal: ''
   # Self-service dataset selection on /access (saved per identity); effective
   # access = operator ACL ∪ selections. Useful only with mcp.apiKeyClients.
   accessStore: true
@@ -260,7 +289,11 @@ security:
   accessDenySelect: ''
   # SSO self-mint (read per request): an SSO identity mints/rotates a key for its
   # OWN registry identity, carrying exactly its existing access. Inert without SSO.
-  accessSelfMint: true
+  # DEFAULT FALSE (P0-1 remediation 2026-10-16): opt-in per deployment — the
+  # default-ON posture let a spoofed proxy identity mint a durable key (P0-1
+  # escalation chain). Requires oidc.enabled or trustProxyIdentity AND
+  # accessStore to do anything at all.
+  accessSelfMint: false
   # May ordinary users (SSO / named API keys) create datasets? Default true: a
   # dataset is owned by whoever created it and reaches nobody else until an
   # operator grants it. Set false for admin-only creation. A per-user override
@@ -335,8 +368,14 @@ backups:
 # Short-term memory (STM): session-scoped, self-expiring datasets for agent
 # swarms.  A dataset created with a lifetime, every entry stamped with a
 # server-computed expires_at, and a CronJob that deletes EXPIRED POINTS.
-# PHASE 1 ONLY: nothing in this feature deletes a DATASET (see
-# deleteDatasetsOnExpiry below).
+# PHASE 1 ONLY: nothing in this feature deletes a DATASET — the reaper deletes
+# expired POINTS only (the Phase-2 dataset-deletion gate was never implemented
+# and its values key was removed 2026-10-16 — audit dead-key sweep).
+# Seconds a cron tick waits for qdrant /readyz before failing the tick
+# (2026-10-17 incident: a tick that touched a half-joined cluster
+# panicked the raft leader).  1800 = 30 minutes.  The next tick
+# retries; ticks never run concurrently (concurrencyPolicy: Forbid).
+cronQdrantReadyTimeoutSeconds: 1800
 shortTermMemory:
   enabled: false
   # Lifetime of a dataset created without an explicit ttl, in hours.
@@ -351,11 +390,9 @@ shortTermMemory:
   # file.  Unset => the create/end routes answer 503 (fail-loud, nothing is
   # minted) rather than minting guessable names.
   nameSalt: ''
-  # PHASE 2 GATE — leave false.  true would let the reaper delete short_term
-  # DATASETS at end of life; that ships only once the backup path is proven
-  # end-to-end and the password-protected-dataset decision is made (PLAN
-  # section 5).  The Phase 1 reaper reaps points and never a dataset.
-  deleteDatasetsOnExpiry: false
+  # (The former deleteDatasetsOnExpiry key was removed 2026-10-16: a Phase-2
+  # gate nothing in the app reads — the reaper reaps POINTS and never a
+  # dataset. Reintroduce the key only together with the app-side gate.)
 
 # Watched S3 sources (opt-in reconciler CronJob): each tick POSTs every source's
 # prefixes to batch-urls with sync=true. s3:// DIRECTORY URLs only; >=1 prefix.
@@ -380,6 +417,9 @@ service:
 ezua:
   enabled: true
   virtualService:
+    # false unrenders the VirtualService (no browser path) while ezua.enabled
+    # keeps driving every other gate (configmap MEDIA_BASE_URL included).
+    enabled: true
     endpoint: rag-mcp-server.${DOMAIN_NAME}
     istioGateway: istio-system/ezaf-gateway
     timeout: 300s
@@ -389,3 +429,26 @@ ezua:
     enabled: true
     namespace: istio-system
     providerName: oauth2-proxy
+
+# Ingress allowlist (kubernetes.io/metadata.name ns selectors): once enabled,
+# anything unmatched is DENIED (egress unrestricted). Defaults OFF — the
+# default render ships no NetworkPolicy (byte-identical to the baseline).
+networkPolicy:
+  enabled: false
+  sameNamespace: true
+  # Client namespaces allowed to call IN-CLUSTER. Add the Prometheus scrape ns —
+  # an unlisted ServiceMonitor ns dies SILENTLY (check targets).
+  authorizedClients:
+    namespaces: []
+  # The ezaf-gateway (browser) path stays ON so the VS routes keep working.
+  allowEzafGatewayIngress: true
+  ingressGatewayNamespace: istio-system
+  # Edge pods carry app=istio-ingressgateway (ezaf-gateway is the Gateway CR
+  # name, not a pod label) — do not "fix" this back.
+  ingressGatewayLabels:
+    app: istio-ingressgateway
+  # Node-originated kubelet probes / port-forward.  NEVER 0.0.0.0/0 with an
+  # empty probeExceptCidrs — the render FAILS on that combination (guard in
+  # templates/networkpolicy.yaml).
+  probeCidrs: []
+  probeExceptCidrs: []

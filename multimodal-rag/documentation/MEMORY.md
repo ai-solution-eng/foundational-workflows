@@ -18,10 +18,22 @@ stores memories via a separate distillation LLM. Raw transcripts are never store
 | **Recall trigger** | Model calls `search_memory` MCP tool (proactive, per `AGENTS.md`) | `inlet()` filter auto-searches at conversation start |
 | **Transport** | MCP (streamable-http, stateless) | REST API (direct HTTP from filter) |
 | **Dataset/password** | resolved server-side from the identity's ★ binding + saved selection (D16); legacy `{env:}` headers still supported | HMAC-derived from SSO `__user__` (or shared valve) |
-| **Provenance** | `source: "opencode:memory"` | `source: "openwebui:memory"` |
+| **Provenance** | `source: "opencode:memory"` (stamped by the plugin) | `source: "openwebui:memory"` |
 
 Both paths land in the same Qdrant collection via `DatasetManager.add_documents`. Near-duplicates are auto-skipped at cosine ≥ `RAG_DEDUP_THRESHOLD` (default `0.995`).
 
+---
+
+## 1b. Short-term memory (session datasets)
+
+Distinct from the long-term store above: **short-term memory** gives an agent session a private, auto-expiring dataset for scratch state — nothing is curated, nothing is shared, and the whole dataset disappears at end of life. Opt-in via chart `shortTermMemory.enabled: true` (requires `shortTermMemory.nameSalt` — treat it as key material).
+
+- **Create:** MCP `create_short_term_memory(session_id, ttl_seconds?, name?)` or `POST /api/short-term-memory`. The minted name (`stm-…`, derived non-guessably from the session id) is HIDDEN from every catalog listing — keep it; it is the only handle. Default lifetime 6h, hard cap 24h (`shortTermMemory.maxTtlHours`).
+- **Use:** the normal memory tools work once the dataset is named — `add_memory(text, dataset_name="stm-…")`, `search_dataset`, `dataset_add_documents`.
+- **End:** MCP `end_short_term_memory(dataset_name)` or `DELETE /api/short-term-memory/{name}` (creator or admin only).
+- **Expire:** the `stm-reaper` CronJob deletes expired POINTS every 15 min (Phase 1); datasets themselves are only removed by an explicit `end_*` call until the Phase-2 gate (`shortTermMemory.deleteDatasetsOnExpiry`) ships.
+
+Long-term memory is never written to a short-term dataset: the ★ binding resolves to a durable dataset, and STM datasets are passwordless + hidden, so they can never become someone's long-term store by accident.
 ---
 
 ## 2. Setup — opencode
@@ -148,11 +160,17 @@ Point both clients at the same dataset name + password:
 
 ### Provenance
 
-Memories carry a `source` field so you can tell them apart:
-- opencode → `"source": "opencode:memory"`
-- OWUI → `"source": "openwebui:memory"`
+Memories carry a `source` field recording **which client wrote them**. The value is supplied by the WRITER in `metadata.source`; the server stores it verbatim and never invents one:
 
-Recall currently surfaces memories from both apps (no `source` filter at search time). If cross-app recall becomes noisy, a server-side search filter on `source` is a small follow-up — not needed today.
+- opencode → `"source": "opencode:memory"` (the `session-memory-logger` plugin stamps it)
+- OWUI → `"source": "openwebui:memory"`
+- DSH → `"source": "dsh:memory"` (its `session-memory-logger` plugin stamps it)
+- gateway distiller → `"source": "gateway:distiller"`
+- no source declared → `"source": "unknown:memory"`
+
+> **Fixed 2026-10-17.** `add_memory` used to hardcode `source: "opencode:memory"` on every write and then drop the caller's own value (the carry-through loop skipped keys already in the base). Every memory in every store — the gateway distiller's and DSH's included — therefore claimed to be opencode's. A label that is always the same string cannot attribute anything, so it silently defeated per-writer filtering and audit. Now the caller's `metadata.source` wins, and an undeclared writer is recorded as `unknown:memory` rather than mislabelled. **Memories written before that date still carry the old value and cannot be re-attributed** — treat `source` on pre-2026-10-17 memories as unreliable.
+
+Recall currently surfaces memories from all clients (no `source` filter at search time). If cross-client recall becomes noisy, a server-side search filter on `source` is a small follow-up — not needed today.
 
 ---
 

@@ -734,6 +734,74 @@ def test_rest_unlock_client_id_registry_priority(monkeypatch):
         cr.reset_current_identity(token)
 
 
+def test_federated_search_keeps_the_anonymous_identity(monkeypatch):
+    """P1-1 (audit 2026-10-16): the guard was inverted —
+    ``identity = current_identity() if registry_configured() else None`` threw
+    away the fail-closed D20 ${B}__anonymous__${B} identity (which exists PRECISELY
+    when the registry is NOT configured), so an unauthenticated caller read
+    every dataset federated while being 403ed by name.
+
+    Pinned through the handler: on an unconfigured deployment the middleware
+    binds __anonymous__ with only MEMORY_DATASET, and the fan-out must honour
+    that single-dataset world.
+    """
+    import inspect
+
+    import multimodal_rag.utils.access_store as acc
+
+    src = inspect.getsource(api._federated_rest_search)
+    assert "if _clients_registry.registry_configured() else None" not in src, (
+        "the inverted registry_configured() guard is back — the anonymous identity would be discarded"
+    )
+    assert "identity = _clients_registry.current_identity()" in src
+
+    # Behavioural: resolve_federated_targets with the anonymous identity
+    # sees only its MEMORY_DATASET grant.
+    from multimodal_rag.rag_system import resolve_federated_targets
+
+    class _FakeDM:
+        def list_datasets(self):
+            return [{"name": "public-a"}, {"name": "public-b"}, {"name": "memory-ds"}]
+
+        def get_dataset(self, name, sync_count=False):
+            return {"name": name}
+
+        def has_password(self, name):
+            return False
+
+    anon = cr.Identity(kind="client", name="__anonymous__", datasets=frozenset({"memory-ds"}))
+    token = cr.set_current_identity(anon)
+    try:
+        allowed = lambda name: acc.dataset_allowed(cr.current_identity(), name)
+        targets, skipped, _ = resolve_federated_targets(_FakeDM(), "all", None, allowed)
+        assert targets == ["memory-ds"], targets
+        assert {s["dataset"] for s in skipped} == {"public-a", "public-b"}
+    finally:
+        cr.reset_current_identity(token)
+
+
+def test_federated_search_handler_uses_bound_identity(list_client, monkeypatch):
+    """The same contract through the real REST stack: on an unconfigured
+    deployment the handler binds the anonymous identity, and the fan-out it
+    computes is the memory-dataset-only world (the pre-fix code passed
+    ``allowed=None`` = no enforcement, i.e. every dataset)."""
+    monkeypatch.setattr(api, "_RAG_API_KEY", "")
+    for var in (cr.CLIENTS_ENV, cr.ACLS_ENV, "RAG_ACCESS_STORE", "MEMORY_DATASET"):
+        monkeypatch.delenv(var, raising=False)
+    seen = {}
+
+    async def _fake_federated(dm, datasets, q, **kwargs):
+        seen["identity"] = cr.current_identity()
+        return {"results": [], "skipped": [], "errors": []}
+
+    monkeypatch.setattr(api, "_federated_rest_search", _fake_federated)
+    r = list_client.post("/api/search", json={"datasets": "all", "q": "x"})
+    assert r.status_code == 200
+    ident = seen.get("identity")
+    assert ident is not None, "the D20 anonymous identity must survive to the handler"
+    assert ident.name == "__anonymous__"
+
+
 def test_rest_federated_search_filters_targets(monkeypatch):
     """POST /api/search fan-out honours the ACL via resolve_federated_targets."""
     from multimodal_rag.rag_system import resolve_federated_targets

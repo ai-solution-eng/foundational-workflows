@@ -470,7 +470,7 @@ def test_watched_state_pruned_source_is_forgotten():
     assert set(state) == {u.rstrip("/") for u in EXPANDED[:2]}
 
 
-def test_watched_state_lock_serialises_writers():
+def test_watched_state_lock_serialises_writers() -> None:
     """Concurrent state updates (two reconcilers/pods) both land — the
     fcntl lock guards the read→modify→write."""
     import threading
@@ -630,7 +630,7 @@ if __name__ == "__main__":
 # other's canonical URL.
 
 
-def test_sync_passes_canonical_source_map_keyed_by_tmp_path():
+def test_sync_passes_canonical_source_map_keyed_by_tmp_path() -> None:
     """add_urls_batch(sync=True) must hand add_files_batch a source map with
     one entry per download, each tmp_path mapped to ITS OWN canonical URL."""
     rs = _Restore()
@@ -650,8 +650,13 @@ def test_sync_passes_canonical_source_map_keyed_by_tmp_path():
             rs.patch(dm, "_stored_sources", lambda ds, prefixes: set())
 
             def _capture_batch(
-                ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None
-            ):
+                ds_name: Any,
+                file_entries: Any,
+                progress_callback: Any = None,
+                batch_score: float = 128.0,
+                force_names: Any = None,
+                source_urls: Any = None,
+            ) -> dict[str, Any]:
                 recorded["entries"] = list(file_entries)
                 recorded["source_urls"] = dict(source_urls or {})
                 return {"status": "ok", "file_count": len(file_entries), "files": []}
@@ -674,7 +679,7 @@ def test_sync_passes_canonical_source_map_keyed_by_tmp_path():
     assert len(smap) == len(EXPANDED)
 
 
-def test_sync_source_map_survives_same_basename_across_prefixes():
+def test_sync_source_map_survives_same_basename_across_prefixes() -> None:
     """THE F1 collision case: two prefixes holding the same object name in
     one sync must produce two DISTINCT canonical sources — tmp_path keys make
     the collision impossible (the basename key collapsed both to one)."""
@@ -711,8 +716,13 @@ def test_sync_source_map_survives_same_basename_across_prefixes():
             rs.patch(dm, "_stored_sources", lambda ds, prefixes: set())
 
             def _capture_batch(
-                ds_name, file_entries, progress_callback=None, batch_score=128.0, force_names=None, source_urls=None
-            ):
+                ds_name: Any,
+                file_entries: Any,
+                progress_callback: Any = None,
+                batch_score: float = 128.0,
+                force_names: Any = None,
+                source_urls: Any = None,
+            ) -> dict[str, Any]:
                 recorded["entries"] = list(file_entries)
                 recorded["source_urls"] = dict(source_urls or {})
                 return {"status": "ok", "file_count": len(file_entries), "files": []}

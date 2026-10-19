@@ -61,13 +61,13 @@ def test_tracker_in_memory_lifecycle():
     assert tracker.get(jid) is None
 
 
-def test_tracker_mirrors_to_redis_when_available():
+def test_tracker_mirrors_to_redis_when_available() -> None:
     """With a fake Redis, a second tracker instance (simulating another
     worker/pod) can still read the job created by the first."""
     _no_redis()
 
     class _FakeRedis:
-        def __init__(self):
+        def __init__(self) -> None:
             self.store: dict[str, str] = {}
 
         def set(self, key, value, ex=None):

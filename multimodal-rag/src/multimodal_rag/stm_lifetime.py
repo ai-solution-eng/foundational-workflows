@@ -40,7 +40,8 @@ reading of a ratified plan; see stmem/INTERFACE-FREEZE.md.
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping, NamedTuple
+from collections.abc import Mapping
+from typing import Any, NamedTuple
 
 __all__ = [
     "I64_MAX",
@@ -91,22 +92,25 @@ def validate_lifetime(value: Any, *, field: str = "lifetime") -> int | None:
     if value is None:
         return None
     if isinstance(value, bool):
-        raise ValueError(f"{field} must be a positive integer number of seconds or None, got bool")
+        # TRY004 suppressed: a TypeError here would ESCAPE the
+        # `except ValueError` in validate_stored_lifetime and break its
+        # documented never-raises (fail-closed) guarantee. One exception type
+        # is the contract.
+        raise ValueError(f"{field} must be a positive integer number of seconds or None, got bool")  # noqa: TRY004
     if isinstance(value, float):
         if not math.isfinite(value) or not value.is_integer():
             raise ValueError(f"{field} must be a whole number of seconds, got {value!r}")
         value = int(value)
     if not isinstance(value, int):
-        raise ValueError(
-            f"{field} must be a positive integer number of seconds or None, "
-            f"got {type(value).__name__}"
+        # TRY004 suppressed -- see the bool branch above: validate_stored_lifetime
+        # catches ValueError only, so the type gate must stay ValueError.
+        raise ValueError(  # noqa: TRY004
+            f"{field} must be a positive integer number of seconds or None, got {type(value).__name__}"
         )
     if value <= 0:
         raise ValueError(f"{field} must be > 0 seconds (use None for infinite), got {value}")
     if value > I64_MAX:
-        raise ValueError(
-            f"{field} of {value} seconds exceeds the signed 64-bit range Qdrant can index"
-        )
+        raise ValueError(f"{field} of {value} seconds exceeds the signed 64-bit range Qdrant can index")
     return value
 
 
@@ -125,7 +129,9 @@ def validate_stored_lifetime(value: Any, *, field: str = "lifetime") -> int | No
 def _require_timestamp(value: Any, *, field: str) -> int:
     """Return *value* as a non-negative int unix timestamp.  Raises otherwise."""
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{field} must be an integer unix timestamp, got {type(value).__name__}")
+        # TRY004 suppressed -- see validate_lifetime: one exception type is the
+        # contract these validators publish.
+        raise ValueError(f"{field} must be an integer unix timestamp, got {type(value).__name__}")  # noqa: TRY004
     if value < 0:
         raise ValueError(f"{field} must be >= 0, got {value}")
     if value > I64_MAX:

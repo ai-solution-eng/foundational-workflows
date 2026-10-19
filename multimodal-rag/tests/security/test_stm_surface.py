@@ -184,7 +184,10 @@ def test_create_mints_frozen_name_shape(surface):
     r = _post_stm(client, {"X-API-Key": "alice-key"}, session_id="swarm-abc")
     assert r.status_code == 200, r.text
     body = r.json()
-    expected = "stm-" + base64.b32encode(hmac.new(b"unit-test-salt", b"swarm-abc", hashlib.sha256).digest()).decode()[:16].lower()
+    expected = (
+        "stm-"
+        + base64.b32encode(hmac.new(b"unit-test-salt", b"swarm-abc", hashlib.sha256).digest()).decode()[:16].lower()
+    )
     assert body["dataset"] == expected
     meta = dm._read_meta(expected)
     assert meta is not None
@@ -623,19 +626,45 @@ def test_mcp_create_mints_and_stamps_no_password(mcp_env):
     _mcp_end(call, name)
 
 
-def test_mcp_create_enforces_star_grant(mcp_env, monkeypatch):
-    """F1: bob (named ACL, no '*') is REFUSED on MCP exactly as on REST.
-    The gate is the create=manage rule, not a REST-only nicety."""
+def test_mcp_create_uses_the_shared_create_predicate(mcp_env, monkeypatch):
+    """P2-4 (audit 2026-10-16): MCP create carries the SAME three-level
+    decision as REST (``access_store.identity_may_create_datasets``), not the
+    retired "*"-in-ACL rule that drifted in both directions.
+
+    Pinned here (the REST twin is test_create_three_level_gate):
+      1. a named-ACL key (no '*') CAN create — the old MCP-only refusal was
+         the drift, and the product ruling is that creation is not an
+         operator-only power;
+      2. RAG_DATASETS_CREATE_ALLOWED=0 refuses it (the deployment knob);
+      3. a per-user can_create_datasets=True override beats the knob off.
+    """
+    from multimodal_rag.utils import admin_registry as ar
+
     call, dm = mcp_env
     monkeypatch.setenv(cr.CLIENTS_ENV, "bob:bob-key")
     monkeypatch.setenv(cr.ACLS_ENV, "bob:some-other-ds")
     ident = cr.resolve_presented(["bob-key"])
     token = cr.set_current_identity(ident)
     try:
-        status, text = _mcp_create(call)
+        # 1 · named ACL, default knob → allowed (parity with REST).
+        status, text = _mcp_create(call, "parity-1")
+        assert status == "ok", text
+        assert dm.created, "a named-ACL key must create on MCP exactly as on REST"
+
+        # 2 · deployment knob OFF → refused, nothing minted.
+        monkeypatch.setenv("RAG_DATASETS_CREATE_ALLOWED", "0")
+        before = len(dm.created)
+        status, text = _mcp_create(call, "parity-2")
         assert status == "error"
-        assert "cannot create datasets" in text
-        assert not dm.created
+        assert "creation is not permitted" in text
+        assert len(dm.created) == before
+
+        # 3 · per-user override beats the knob off.
+        monkeypatch.setenv("RAG_ACCESS_STORE", "1")
+        ar.mint_client("bob", datasets=["some-other-ds"])
+        ar.set_client_flags("bob", can_create_datasets=True)
+        status, text = _mcp_create(call, "parity-3")
+        assert status == "ok", text
     finally:
         cr.reset_current_identity(token)
 
@@ -794,6 +823,7 @@ def test_mcp_create_ttl_over_cap_refused(mcp_env):
     assert "exceeds the deployment cap" in text
     assert not dm.created
 
+
 def test_mcp_create_collision_does_not_echo_the_minted_name(mcp_env):
     """F6 parity: the MCP 409-twin must NOT echo the minted name.
 
@@ -815,4 +845,3 @@ def test_mcp_create_collision_does_not_echo_the_minted_name(mcp_env):
     # ...and the original dataset is untouched.
     assert name in dm.metas
     _mcp_end(call, name)
-

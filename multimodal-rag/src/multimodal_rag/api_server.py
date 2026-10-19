@@ -613,6 +613,89 @@ def _unlock_cache_del(dataset: str, cid: str) -> bool:
         return _UNLOCK_CACHE.pop((dataset, cid), None) is not None
 
 
+def _unlock_cache_del_all(dataset: str) -> int:
+    """Revoke EVERY caller's unlock of *dataset* (Redis when configured).
+
+    P1-8 (audit 2026-10-16): the admin password reset must actually revoke
+    live unlocks, and the per-client-id delete is not enough — the client ids
+    are caller-derived (D10/D15) and unbounded, so "the ids we know about"
+    would silently miss the ones that matter (a caller who has not made a
+    request since the last process start).  This is the purge-all path that
+    mirrors the per-id delete; the D10 unlock-cache key layout is
+    ``unlock:{dataset}:{cid}``, so the purge is a SCAN by prefix (Redis) or a
+    key-scan of the in-process dict.  Returns the number of entries removed.
+    """
+    prefix = _unlock_cache_key(dataset, "")
+    r = _get_redis()
+    if r is not None:
+        removed = 0
+        try:
+            cursor = 0
+            while True:
+                cursor, keys = r.scan(cursor=cursor, match=prefix + "*", count=500)
+                if keys:
+                    removed += int(r.delete(*keys) or 0)
+                if cursor == 0:
+                    break
+            return removed
+        except Exception:
+            # A Redis failure must not report success (the caller logs it).
+            return removed
+    with _UNLOCK_CACHE_LOCK:
+        stale = [k for k in _UNLOCK_CACHE if k[0] == dataset]
+        for k in stale:
+            _UNLOCK_CACHE.pop(k, None)
+        return len(stale)
+
+
+def _clear_selection_passwords(dataset: str) -> int:
+    """Clear saved D16 selection passwords for *dataset* across identities.
+
+    P1-8 (audit 2026-10-16): a saved selection password is an implicit
+    unlock (``_require_dataset_password`` step 0), so an admin password
+    reset that only revoked unlock-cache entries left the OLD grant alive
+    through the store.  Iterates the store directory and rewrites each
+    identity file through the access store's own locked mutate path (fcntl +
+    atomic replace), dropping ONLY the saved password — the selection itself,
+    its write-mode stamp and the exclusion list are untouched, so this
+    revokes a proof without changing anyone's world.
+
+    Returns the number of identities changed.  Fail-soft: a store that is
+    off, missing, or unreadable simply reports 0 (the reset itself already
+    succeeded; the caller logs).
+    """
+    from multimodal_rag.utils import access_store as _acc
+
+    if not _acc.store_enabled():
+        return 0
+    try:
+        store_dir = _acc._store_dir()
+        files = sorted(store_dir.glob("*.json"))
+    except Exception:
+        return 0
+    changed = 0
+    for path in files:
+        identity = path.stem  # _identity_filename() strips the "key:" prefix
+        hit = {"v": False}
+
+        def _drop_pw(doc: dict, _hit=hit) -> bool:
+            entry = (doc.get("datasets") or {}).get(dataset)
+            if not isinstance(entry, dict) or not entry.get("password"):
+                return False
+            entry["password"] = ""
+            _hit["v"] = True
+            return True
+
+        try:
+            _acc._mutate(identity, _drop_pw)
+        except Exception:
+            logger.debug("selection-password purge skipped for %s", path.name, exc_info=True)
+            continue
+        if hit["v"]:
+            changed += 1
+    return changed
+
+
 # ---------------------------------------------------------------------------
 # Password-failure throttling (brute-force mitigation)
 # ---------------------------------------------------------------------------
@@ -651,6 +734,20 @@ def _pw_reset_failures(cid: str) -> None:
 
 
 def _check_pw_throttle(cid: str) -> None:
+    """Refuse when *cid*'s bucket is exhausted.
+
+    P2-3 (audit 2026-10-16) — the bucket is keyed by the D10 client id
+    (``_unlock_client_id``): a registry key's ``key:<name>``, else the
+    trusted proxy identity / XFF chain when RAG_TRUST_PROXY_IDENTITY is on,
+    else the SOCKET PEER.  The peer fallback means every caller behind one
+    NAT/gateway shares a bucket, so an attacker's failures can 429 a victim
+    who holds the correct password — the coupling the audit flagged as a
+    deliberate operator trade-off (per-user buckets need a trustworthy
+    caller id, and the only alternative to the header is the peer).  The
+    P0-1 remediation makes the header trustworthy again by pairing it with
+    an enforcing-proxy assertion; this coupling is NOT a bug to "fix" by
+    dropping the throttle.
+    """
     if _pw_failure_count(cid) >= _PW_MAX_FAILURES:
         raise HTTPException(429, "Too many password attempts — try again later.")
 
@@ -836,12 +933,89 @@ _RAG_API_KEY = os.environ.get("RAG_API_KEY", "")
 # or bypass the brute-force throttle.
 _TRUST_PROXY_IDENTITY = os.environ.get("RAG_TRUST_PROXY_IDENTITY", "").lower() in ("1", "true", "yes")
 
+# P0-1 (audit 2026-10-16): the trust flag alone is NOT a precondition — the
+# proxy's identity headers are ordinary, attacker-settable headers on any
+# path that reaches the pod without traversing the edge (the audited chart
+# selected the istio-ingressgateway pod, not the app pods, so a direct
+# ClusterIP call never passed through the AuthorizationPolicy, and the flag
+# defaulted ON).  A proxy-identity CREDENTIAL — the D24 candidate that maps a
+# bare name straight to a registry identity, its grants, and (via
+# _require_self_mint) a durable minted key — therefore additionally requires
+# a POSITIVE assertion that an enforcing proxy is really in front:
+#
+#   1. RAG_ENFORCING_PROXY_SIGNAL=<value> — an operator-set proof string
+#      (helm: security.enforcingProxySignal) that the ingress/gateway config
+#      injects on EVERY request as X-Enforcing-Proxy.  A request that does
+#      not carry it is refused the proxy-identity candidate; an operator who
+#      has not wired the injection simply loses the feature (fail closed).
+#   2. or the D21 forwarded OIDC token (X-Auth-Request-Access-Token) — the
+#      same request proving the edge realm authenticated it.  A co-present
+#      INVALID token is NOT evidence: the JWT must actually verify
+#      (oidc_identity.verify_forwarded_proxy_assertion) — otherwise any
+#      caller could pair a garbage token with a spoofed name.
+#
+# The D10 unlock-cache / throttle identity (a bucket-scoping hint that
+# resolves no identity, grant, or credential) keeps the flag alone.
+_ENFORCING_PROXY_SIGNAL_ENV = "RAG_ENFORCING_PROXY_SIGNAL"
+#: The header the operator's ingress must inject with the signal value.
+_PROXY_ASSERTION_HEADER = "X-Enforcing-Proxy"
 
-def _trust_proxy_identity() -> bool:
+
+def _trust_proxy_identity(request: "Request | None" = None) -> bool:
     """RAG_TRUST_PROXY_IDENTITY, read PER REQUEST (the house convention —
     a config change needs no restart; D24 reads this for the proxy-identity
-    credential candidate, so the flag must not be frozen at import)."""
-    return os.environ.get("RAG_TRUST_PROXY_IDENTITY", "").strip().lower() in ("1", "true", "yes")
+    credential candidate, so the flag must not be frozen at import).
+
+    P0-1: with *request* provided the flag alone is no longer sufficient —
+    the proxy-identity CREDENTIAL additionally requires a positive
+    enforcing-proxy assertion (:func:``_enforcing_proxy_precondition``).
+    Callers that only scope the D10 unlock cache / throttle by a header
+    value (``_request_identity``) keep the plain flag: that path resolves
+    no identity, grant, or credential.
+    """
+    if os.environ.get("RAG_TRUST_PROXY_IDENTITY", "").strip().lower() not in ("1", "true", "yes"):
+        return False
+    if request is None:
+        return True
+    return _enforcing_proxy_precondition(request)
+
+
+def _enforcing_proxy_precondition(request: "Request | None" = None, claimed_name: "str | None" = None) -> bool:
+    """P0-1: is there a POSITIVE signal that an enforcing proxy fronts us?
+
+    ``RAG_ENFORCING_PROXY_SIGNAL`` set → the request must carry it (the
+    operator's ingress injects the value; a caller cannot know it).  When no
+    signal is configured, the D21 forwarded OIDC access token is accepted as
+    the assertion ONLY when it fully verifies AND resolves to *claimed_name*
+    itself — a garbage token proves nothing, and an attacker holding a valid
+    token of their OWN cannot vouch for a spoofed victim name (the audited
+    escalation paired exactly that pair).  Both branches fail closed, so a
+    bare X-Auth-Request-User never resolves a credential.
+    """
+    if request is None:
+        return False
+    expected = os.environ.get(_ENFORCING_PROXY_SIGNAL_ENV, "").strip()
+    if expected:
+        import hmac as _hmac
+
+        presented = (request.headers.get(_PROXY_ASSERTION_HEADER) or "").strip()
+        return bool(presented) and _hmac.compare_digest(presented, expected)
+    try:
+        from multimodal_rag.utils import oidc_identity
+
+        token = (request.headers.get("X-Auth-Request-Access-Token") or "").strip()
+        if token[:7].lower() == "bearer ":
+            token = token[7:].strip()
+        if not token or not oidc_identity.is_jwt_format(token):
+            return False
+        ident = oidc_identity.resolve_jwt(token)
+        if ident is None:
+            return False  # invalid/expired/blocked/unverifiable — no assertion
+        if claimed_name is None:
+            return True
+        return str(getattr(ident, "name", "") or "") == str(claimed_name).strip()
+    except Exception:
+        return False  # a broken verification sidecar can never assert a proxy
 
 
 # Periodic embedder liveness monitor.  The embedder is the only required
@@ -890,7 +1064,6 @@ _PUBLIC_ENDPOINT_NAMES = frozenset(
         "index",
         "manage",
         "access",  # per-user key page (self-authenticating; no key injected)
-        "api_serve_file",  # dataset media (password/token protected)
         "api_staging_serve",  # staged media (short-lived ids)
         "api_oidc_session",  # D21 whoami: identity preview only, never a grant
         "api_stats",  # D23 read-only stats: identity-filtered, no secrets —
@@ -899,6 +1072,16 @@ _PUBLIC_ENDPOINT_NAMES = frozenset(
         # empty-world shape).
     }
 )
+
+# P0-2 (audit 2026-10-16): `api_serve_file` used to sit in the public set
+# above, so the middleware returned BEFORE the D20 fail-closed branch and
+# before `_rag_acl_path_denial` — an ACL-denied key (and an unauthenticated
+# caller) read any dataset's bytes.  Media serving is not PUBLIC, it is
+# SELF-AUTHORIZING: the handler owns the decision (media token / dataset
+# password / D15 identity ACL), and the middleware only BINDS the presented
+# identity when there is one so the handler can enforce that ACL.  A
+# credential-less `<img>` fetch is never 401'd here.
+_SELF_AUTHORIZING_ENDPOINT_NAMES = frozenset({"api_serve_file"})
 
 
 def _is_public_path(path: str, endpoint: Any = None) -> bool:
@@ -909,6 +1092,42 @@ def _is_public_path(path: str, endpoint: Any = None) -> bool:
         if name in _PUBLIC_ENDPOINT_NAMES:
             return True
     return False
+
+
+def _is_self_authorizing_path(path: str, endpoint: Any = None) -> bool:
+    """P0-2: routes whose handler authorizes the request itself (never the
+    middleware), but which still want the caller's identity bound when one
+    resolves — matched by endpoint name, exactly like the public set."""
+    if endpoint is None:
+        return False
+    return getattr(endpoint, "__name__", None) in _SELF_AUTHORIZING_ENDPOINT_NAMES
+
+
+def _bind_presented_identity(request: "Request") -> Any:
+    """Bind the request's presented credential for a self-authorizing route.
+
+    Same precedence as the main auth path (deployment key → registry
+    key/JWT/proxy identity, D19/D21/D24) but WITHOUT the 401 and without the
+    path ACL pre-check: the handler decides.  Returns the contextvar reset
+    token, or None when nothing resolved (or when the deployment key is
+    presented on a registry-less deployment — the main path binds no identity
+    there either, byte-identically).
+    """
+    if not _clients_registry.registry_configured():
+        return None
+    import secrets
+
+    presented = _presented_pairs(request)
+    if _RAG_API_KEY:
+        for key, _via in presented:
+            if key and secrets.compare_digest(key, _RAG_API_KEY):
+                return _clients_registry.set_current_identity(
+                    _clients_registry.Identity(kind="admin", name=None, datasets=None)
+                )
+    identity = _clients_registry.resolve_presented([k for k, _ in presented], [via for _, via in presented])
+    if identity is None:
+        return None
+    return _clients_registry.set_current_identity(identity)
 
 
 # ---------------------------------------------------------------------------
@@ -1070,6 +1289,17 @@ def _rag_acl_path_denial(path: str, method: str, identity) -> "str | None":
                 return _clients_registry.DatasetAccessDenied(
                     f"Dataset '{name}' is read-only for this API key (a ro grant cannot be written — D26)."
                 ).args[0]
+    if method == "DELETE" and path.startswith("/api/short-term-memory/"):
+        # D26 gap (audit 2026-10-16): DELETE /api/short-term-memory/{name} is a
+        # dataset DELETION, but it lives outside /api/datasets/... so the
+        # path-shaped write gate above never matched it — a ro-only key could
+        # destroy an STM dataset it may only read.  Same shape rule as the
+        # dataset root: the {name} segment itself is the write.
+        stm_name = urllib.parse.unquote(path[len("/api/short-term-memory/") :]).rstrip("/")
+        if stm_name and "/" not in stm_name and not _access_store.dataset_write_allowed(identity, stm_name):
+            return _clients_registry.DatasetAccessDenied(
+                f"Dataset '{stm_name}' is read-only for this API key (a ro grant cannot be written — D26)."
+            ).args[0]
     return None
 
 
@@ -1115,16 +1345,28 @@ def _presented_pairs(request: Request) -> "list[tuple[str, str]]":
     # confirmed (RAG_TRUST_PROXY_IDENTITY), the proxy-injected identity
     # headers ARE the credential — the gateway authenticated the user at the
     # edge (oauth2-proxy AuthorizationPolicy) and overwrites these headers on
-    # EVERY request; the app cannot be reached with attacker-set values.
+    # EVERY request.
+    #
+    # P0-1 (audit 2026-10-16) — the PRECONDITION this block used to assert in
+    # a comment is now ENFORCED: "the app cannot be reached with attacker-set
+    # values" was false on the shipped charts (the AuthorizationPolicy
+    # selected the ingress-gateway pod, not the app pods, so a direct
+    # ClusterIP call carried attacker-set values straight through, with the
+    # flag defaulting ON).  The proxy-identity candidate is therefore only
+    # collected when the request ALSO carries a positive enforcing-proxy
+    # assertion — RAG_ENFORCING_PROXY_SIGNAL matched in X-Enforcing-Proxy, or
+    # a forwarded OIDC token that verifies AND resolves to the same name
+    # (see _enforcing_proxy_precondition).  A bare X-Auth-Request-User with
+    # no such assertion contributes NOTHING (fail closed).
+    #
     # Candidate source "proxy-identity": the identity NAME (not a token) —
     # resolve_presented maps it straight to the registry identity
-    # (fail-closed, never admin, lowest precedence).  Absent headers (a
-    # direct/non-proxied caller) contribute nothing — fail closed.
+    # (fail-closed, never admin, lowest precedence).
     if _trust_proxy_identity():
         proxied_user = (
             request.headers.get("X-Auth-Request-Preferred-Username") or request.headers.get("X-Auth-Request-User") or ""
         ).strip()
-        if proxied_user:
+        if proxied_user and _enforcing_proxy_precondition(request, proxied_user):
             presented.append((proxied_user, "proxy-identity"))
     return presented
 
@@ -1268,6 +1510,18 @@ async def _api_key_auth(request: Request, call_next):
                 break
     if _is_public_path(request.url.path, endpoint):
         return await call_next(request)
+    if _is_self_authorizing_path(request.url.path, endpoint):
+        # P0-2: media serving keeps its pre-D20 reachability (the <img> tag
+        # flow carries a dataset password or media token, never a key) but the
+        # caller's identity is bound when one resolves, so the handler can
+        # apply the D15/D16 ACL on top.  No 401 here, and no path-level ACL
+        # pre-check — api_serve_file owns the decision.
+        reset_handle = _bind_presented_identity(request)
+        try:
+            return await call_next(request)
+        finally:
+            if reset_handle is not None:
+                _clients_registry.reset_current_identity(reset_handle)
     if unconfigured:
         # Ratified default posture (2026-09-24, D20): an unconfigured
         # deployment is FAIL-CLOSED, not open.  Bind an anonymous
@@ -1342,6 +1596,115 @@ async def _api_key_auth(request: Request, call_next):
             finally:
                 _clients_registry.reset_current_identity(reset_handle)
     return JSONResponse({"detail": "Missing or invalid API key"}, status_code=401)
+
+
+# ---------------------------------------------------------------------------
+# Security response headers (audit 2026-10-16, P2-6).
+#
+# The app shipped NO security headers at all: no MIME-sniffing protection, no
+# framing protection on the HTML pages (which embed the deployment key in a
+# meta tag when the legacy key mode is active — api_server index()), no
+# referrer policy on the media/download routes that carry a signed
+# ``?token=`` in the URL.  Those are exactly the browser-side threats the
+# file-serving code already takes seriously (it forces ``attachment`` for
+# non-media types and refuses to render SVG inline).
+#
+# Defaults are ON but every header is env-overridable, and the whole
+# middleware can be disabled (``RAG_SECURITY_HEADERS=0``) for a deployment
+# that sets them at the ingress instead.  Read per request (house convention:
+# a config change needs no restart).
+#
+# Deliberately NOT included: CORS.  The SPA is same-origin and the API is not
+# meant for cross-origin browser use, so the safe default is "no CORS
+# headers"; a cross-origin allowlist would be a separate, deliberate feature
+# (``RAG_CORS_ALLOW_ORIGINS`` below opts in explicitly, default empty = off).
+# Also deliberately absent: ``Strict-Transport-Security`` — HSTS on an
+# HTTP-served in-cluster deployment is a footgun, and at the edge the gateway
+# owns TLS policy.
+# ---------------------------------------------------------------------------
+
+_SECURITY_HEADERS_DEFAULT = {
+    # A crafted upload must never be sniffed into an active type.  The
+    # serving routes already force attachment for non-media, but nosniff
+    # closes the gap for anything a browser would otherwise reinterpret.
+    "x-content-type-options": "nosniff",
+    # No page in this app frames another; DENY is the strict, correct value.
+    # (SAMEORIGIN would allow a same-origin embed, which nothing uses.)
+    "x-frame-options": "DENY",
+    # Signed media URLs carry a token in the query string — never leak it to
+    # a third-party origin via the Referer header.
+    "referrer-policy": "no-referrer",
+}
+
+
+def _security_headers_enabled() -> bool:
+    """True when the response-header middleware runs (default ON).
+
+    Opt out with ``RAG_SECURITY_HEADERS=0`` (e.g. an ingress that already
+    injects the full set).  Read per request so a flip needs no restart.
+    """
+    raw = os.environ.get("RAG_SECURITY_HEADERS", "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _security_header_values() -> "dict[str, str]":
+    """The header set to apply, from env with the defaults above.
+
+    Per-header override env vars follow the ``RAG_SECURITY_HEADER_*`` pattern;
+    an empty value removes that header.  Values are used verbatim — these are
+    operator-controlled, never request-derived, so no escaping is involved.
+    """
+    out: dict[str, str] = {}
+    for name, default in _SECURITY_HEADERS_DEFAULT.items():
+        env_name = "RAG_SECURITY_HEADER_" + name.replace("-", "_").upper()
+        raw = os.environ.get(env_name)
+        value = default if raw is None else raw.strip()
+        if value:
+            out[name] = value
+    return out
+
+
+def _cors_allow_origins() -> "list[str]":
+    """The CORS allowlist, empty (CORS off) unless explicitly configured.
+
+    ``RAG_CORS_ALLOW_ORIGINS`` is a comma-separated origin list; unset or
+    empty means NO CORS headers are emitted (today's behaviour, and the safe
+    default — a browser on another origin cannot read responses).
+    """
+    raw = os.environ.get("RAG_CORS_ALLOW_ORIGINS", "").strip()
+    if not raw:
+        return []
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+@app.middleware("http")
+async def _security_headers_middleware(request: Request, call_next):
+    """Attach the security headers to every response (audit 2026-10-16, P2-6).
+
+    Registered LAST so it is the OUTERMOST wrapper (Starlette applies
+    middleware in reverse registration order): the headers are then added on
+    the way out for EVERY response, including the ones the auth middleware
+    and the body-cap middleware return directly (401/403/413) — those are
+    exactly the responses a browser renders.
+
+    ``setdefault`` semantics: a handler that sets its own value (none does
+    today) wins, so this never clobbers a route-specific decision.
+    """
+    response = await call_next(request)
+    if not _security_headers_enabled():
+        return response
+    for name, value in _security_header_values().items():
+        if name not in response.headers:
+            response.headers[name] = value
+    origins = _cors_allow_origins()
+    if origins:
+        # Echo only an allowlisted origin — never a wildcard with
+        # credentials, and never the raw request Origin unchecked.
+        origin = request.headers.get("origin", "")
+        if origin in origins:
+            response.headers.setdefault("access-control-allow-origin", origin)
+            response.headers.setdefault("vary", "Origin")
+    return response
 
 
 @app.middleware("http")
@@ -1762,6 +2125,23 @@ async def api_create_dataset(body: dict[str, Any] = Body(...)):
             raise HTTPException(400, str(e))
     else:
         rrf_meta = _rrf_default_meta_from_env()
+    # Per-dataset chunk overrides (feature: per-dataset chunk size).
+    # OMITTED entirely -> nothing is stored and the dataset inherits the
+    # embedder model config (the pre-feature behaviour).  A supplied object
+    # is validated here so a bad value is a 400, not a silent store.
+    body_chunk = body.get("chunk")
+    if body_chunk is not None and not isinstance(body_chunk, dict):
+        raise HTTPException(400, "Field 'chunk' must be an object")
+    try:
+        # Validation is a pure classmethod on DatasetManager, so it is
+        # invoked on the CLASS: a test double standing in for the manager
+        # does not have to mirror it.
+        chunk_meta = DatasetManager._sanitize_chunk_meta(body_chunk)
+    except (TypeError, ValueError) as e:
+        # TypeError = wrong type (TRY004 raises TypeError for invalid
+        # types), ValueError = out-of-range value.  Both are caller
+        # errors: 400, never a 500.
+        raise HTTPException(400, str(e))
     try:
         loop = asyncio.get_running_loop()
         meta = await loop.run_in_executor(
@@ -1778,6 +2158,7 @@ async def api_create_dataset(body: dict[str, Any] = Body(...)):
                 rrf=rrf_meta,
                 contextual=bool(contextual),
                 created_by=_creator_name_for_request(),
+                chunk=chunk_meta or None,
             ),
         )
         return {"status": "ok", "dataset": meta}
@@ -1892,8 +2273,7 @@ async def api_create_short_term_memory(body: dict[str, Any] = Body(...)):
         if ttl > max_h * 3600:
             raise HTTPException(
                 400,
-                f"ttl_seconds={ttl} exceeds the deployment cap of {max_h}h "
-                f"(chart values shortTermMemory.maxTtlHours)",
+                f"ttl_seconds={ttl} exceeds the deployment cap of {max_h}h (chart values shortTermMemory.maxTtlHours)",
             )
     override = body.get("name")
     if override is not None:
@@ -2935,7 +3315,9 @@ async def api_admin_grant_client(name: str, request: Request, body: dict[str, An
     # actually present.  A body with none of the four fields is still a
     # 400 (nothing to do).
     if datasets is None and oidc_field is None and blocked_field is None and can_create_field is None:
-        raise HTTPException(400, "Provide 'datasets' (a list), 'oidc' (a string), 'blocked' (a bool), or 'can_create_datasets' (a bool)")
+        raise HTTPException(
+            400, "Provide 'datasets' (a list), 'oidc' (a string), 'blocked' (a bool), or 'can_create_datasets' (a bool)"
+        )
     if datasets is not None and not isinstance(datasets, list):
         raise HTTPException(400, "Field 'datasets' must be a list of dataset names")
     if oidc_field is not None and (not isinstance(oidc_field, str)):
@@ -3184,6 +3566,41 @@ def _annotate_acl_granted(datasets: list) -> None:
             ds["acl_granted"] = True
 
 
+def _unlock_cache_present_many(datasets: "list[str]", cid: str) -> "set[str]":
+    """The subset of *datasets* this caller currently has unlocked.
+
+    Reads the SAME store :func:`_unlock_cache_get` reads (Redis when
+    configured, the in-process dict otherwise) so ``GET /api/datasets``
+    reports the caller's REAL unlock state on a multi-replica deployment.
+    The previous raw ``(name, cid) in _UNLOCK_CACHE`` membership test only
+    ever saw unlocks created by THIS process, so every Redis-backed replica
+    reported ``unlocked: false`` for a dataset the caller had genuinely
+    unlocked elsewhere (audit 2026-10-16, P2-2).
+
+    One MGET when Redis is available (a listing can be long); the in-memory
+    path reuses :func:`_unlock_cache_get` so expiry handling is byte-identical
+    to what a real read would decide.
+    """
+    if not datasets:
+        return set()
+    r = _get_redis()
+    if r is not None:
+        keys = [_unlock_cache_key(name, cid) for name in datasets]
+        try:
+            mget = getattr(r, "mget", None)
+            if callable(mget):
+                values = mget(keys)
+            else:  # a client without MGET — one GET each
+                values = [r.get(k) for k in keys]
+            return {name for name, val in zip(datasets, values) if val is not None}
+        except Exception:
+            # Same posture as _unlock_cache_get: a broken Redis read means
+            # "no cached unlock" — never a stale in-process answer that a
+            # real read would contradict.
+            return set()
+    return {name for name in datasets if _unlock_cache_get(name, cid) is not None}
+
+
 @app.get("/api/datasets")
 async def api_list_datasets(
     request: Request,
@@ -3205,9 +3622,12 @@ async def api_list_datasets(
     if not cursor and not limit:
         datasets = await loop.run_in_executor(sync_pool, dm.list_datasets)
         cid = _unlock_client_id(request)
-        with _UNLOCK_CACHE_LOCK:
-            for ds in datasets:
-                ds["unlocked"] = (ds["name"], cid) in _UNLOCK_CACHE
+        # P2-2: ask the SHARED unlock store (Redis when configured), not the
+        # in-process dict — a poll landing on another replica must report the
+        # unlock that replica's neighbour granted.
+        unlocked = _unlock_cache_present_many([str(ds.get("name", "")) for ds in datasets], cid)
+        for ds in datasets:
+            ds["unlocked"] = str(ds.get("name", "")) in unlocked
         datasets, _acl_hidden = _rag_acl_filter_datasets(datasets, catalog=catalog)
         _annotate_public(datasets)
         _annotate_acl_granted(datasets)
@@ -3220,9 +3640,9 @@ async def api_list_datasets(
         raise HTTPException(400, str(exc))
     datasets = page["datasets"]
     cid = _unlock_client_id(request)
-    with _UNLOCK_CACHE_LOCK:
-        for ds in datasets:
-            ds["unlocked"] = (ds["name"], cid) in _UNLOCK_CACHE
+    unlocked = _unlock_cache_present_many([str(ds.get("name", "")) for ds in datasets], cid)
+    for ds in datasets:
+        ds["unlocked"] = str(ds.get("name", "")) in unlocked
     datasets, _acl_hidden = _rag_acl_filter_datasets(datasets, catalog=catalog)
     _annotate_public(datasets)
     _annotate_acl_granted(datasets)
@@ -3453,22 +3873,62 @@ async def _stats_body(identity) -> dict[str, Any]:
                     "used_percent": round(q_usage.used / q_usage.total * 100, 1),
                 }
             else:
-                qd_total = _parse_size_bytes(os.environ.get("QDRANT_PVC_SIZE", ""))
+                # Qdrant DB PVC summary for a SHARDED cluster (2026-10-15 fix):
+                # each peer holds its own RWO PVC of QDRANT_PVC_SIZE, so the
+                # cluster total is per-replica capacity x peer count — the old
+                # code compared the SUMMED used bytes against ONE replica's
+                # capacity (371 MB used vs 25 GB total on a 3x25 GB cluster),
+                # understating utilization ~3x and hiding the per-peer spread.
+                qd_each = _parse_size_bytes(os.environ.get("QDRANT_PVC_SIZE", ""))
                 replicas = _qdrant_cluster_replicas()
                 replica_usage = _qdrant_replica_usage(
                     replicas, os.environ.get("QDRANT_HOST", ""), os.environ.get("QDRANT_PORT", "6333")
                 )
                 qd_used = sum(replica_usage.values())
+                peer_count = len(replicas) or (_qdrant_expected_replicas() or 1)
+                qd_total = qd_each * peer_count if qd_each else None
+                # Real PVC names for the per-replica table: the StatefulSet's
+                # volumeClaimTemplate mounts as data-<sts-name>-<ordinal>,
+                # and the replica host label IS <sts-name>-<ordinal>.
+                for _r in replicas:
+                    _r["pvc"] = f"data-{_r['host']}"
+                # Merge per-replica used bytes + local point counts into the
+                # replica rows (2026-10-15 fix): the raw cluster rows carry
+                # only host/shards/status, so the UI rendered "—" for both
+                # columns even when telemetry had answered — the summed
+                # total above came from the same data.
+                _points = dict(_QDRANT_TELEMETRY_CACHE.get("points") or {})
+                for _r in replicas:
+                    _u = replica_usage.get(_r["host"])
+                    if _u is not None:
+                        _r["used_bytes"] = _u
+                    if _r["host"] in _points:
+                        _r["local_points"] = _points[_r["host"]]
                 if qd_total and qd_used:
+                    # full card only when BOTH capacity and a nonzero used
+                    # arrived (2026-10-15 hotfix: a zero used must not hide
+                    # the card — fall through to the rows-only shape)
                     qdrant_pvc = {
                         "total_bytes": qd_total,
                         "used_bytes": qd_used,
                         "free_bytes": max(qd_total - qd_used, 0),
                         "used_percent": round(qd_used / qd_total * 100, 1),
+                        # per-peer capacity so the UI can show "3 x 25 GB"
+                        "per_replica_capacity_bytes": qd_each,
+                        "replica_count": peer_count,
                         "replicas": dict(replica_usage),
+                        # full replica rows from the cluster API (host, shards,
+                        # readyz status, used_bytes, local_points) — same shape
+                        # /api/admin/health's cluster block carries
+                        "per_replica": replicas,
                     }
                 elif replica_usage:
-                    qdrant_pvc = {"used_bytes": qd_used, "replicas": dict(replica_usage)}
+                    qdrant_pvc = {
+                        "used_bytes": qd_used,
+                        "replica_count": peer_count,
+                        "replicas": dict(replica_usage),
+                        "per_replica": replicas,
+                    }
         except Exception:
             qdrant_pvc = None
 
@@ -3514,6 +3974,13 @@ async def api_update_dataset(
 ):
     """Update dataset metadata (e.g. description).
 
+    Accepts a ``chunk`` object for per-dataset chunk-size overrides
+    (feature: per-dataset chunk size): any subset of ``chunk_size``,
+    ``chunk_overlap``, ``code_chunk_size``, ``code_chunk_overlap``.  A null
+    value clears that one override; an empty object clears them all,
+    restoring the "inherit the embedder model" default.  Overrides affect
+    NEW ingests only — Recreate re-chunks existing files.
+
     Password-protected datasets require the ``X-Dataset-Password`` header
     (or a cached unlock) — metadata changes must not be possible for
     callers who cannot read the dataset.
@@ -3526,8 +3993,11 @@ async def api_update_dataset(
         return {"status": "ok", "updated": name}
     except FileNotFoundError:
         raise HTTPException(404, f"Dataset '{name}' not found")
-    except ValueError as exc:
-        # Includes the admin-only 'public' key rejection (fail loud, not 500).
+    except (TypeError, ValueError) as exc:
+        # ValueError: the admin-only 'public' key rejection and chunk
+        # range errors (fail loud, not 500).  TypeError: a chunk override
+        # of the wrong TYPE (TRY004 raises TypeError for invalid types).
+        # Both are caller errors -> 400.
         raise HTTPException(400, str(exc))
 
 
@@ -4129,9 +4599,19 @@ async def api_search_multimodal(
     if query is None:
         raise HTTPException(400, "Field 'query' is required (string or dict)")
     password = body.get("password") or None
+    # P1-10: the GET twin declares these via Query(ge=, le=) and the
+    # federated POST /api/search validates them the same way — this handler
+    # was the odd one out and passed raw JSON straight into Qdrant, so a
+    # string crashed pydantic (500) and a negative/zero raised Qdrant's
+    # "limit value -5 is invalid" (500), while 10**9 was forwarded verbatim
+    # as an unbounded limit.  Same bounds and same 400 shape as the twins.
     top_k = body.get("top_k", 10)
-    use_reranker = body.get("use_reranker", False)
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or not 1 <= top_k <= 100:
+        raise HTTPException(400, "Field 'top_k' must be an integer between 1 and 100")
     reranker_top_k = body.get("reranker_top_k", 3)
+    if not isinstance(reranker_top_k, int) or isinstance(reranker_top_k, bool) or not 1 <= reranker_top_k <= 50:
+        raise HTTPException(400, "Field 'reranker_top_k' must be an integer between 1 and 50")
+    use_reranker = bool(body.get("use_reranker", False))
     rrf = _rrf_params_from_request(body.get("dense_weight"), body.get("sparse_weight"), body.get("k"))
 
     # Query-time SSRF guard: remote media URLs in the query are fetched
@@ -4306,7 +4786,16 @@ async def _federated_rest_search(
     # D15/D16: a registry-key identity's ACL ∪ self-selections restricts the
     # fan-out (skipped with a note, exactly like a password lock).
     # None = no enforcement.
-    identity = _clients_registry.current_identity() if _clients_registry.registry_configured() else None
+    #
+    # P1-1 (audit 2026-10-16): this read `... if registry_configured() else
+    # None` — inverted logic.  The fail-closed D20 `__anonymous__` identity
+    # exists PRECISELY on the unconfigured deployment, and the guard threw it
+    # away, so an unauthenticated caller read every dataset federated while
+    # being 403'd by name.  Use the BOUND identity whenever one exists
+    # (anonymous included); the middleware binds None only when there is no
+    # registry world to enforce, where "no enforcement" is the ratified
+    # single-user default.
+    identity = _clients_registry.current_identity()
     allowed = None
     if identity is not None and not identity.is_admin:
         allowed = lambda name: _access_store.dataset_allowed(identity, name)
@@ -4840,9 +5329,53 @@ async def api_serve_file(
     token is also accepted via ``?t=`` — LLM-generated markdown occasionally
     truncates ``token`` to ``t``, and verifying the short alias keeps those
     links working.
+
+    P0-2 (audit 2026-10-16): this route is no longer in the middleware's
+    PUBLIC set — the middleware only BINDS the presented identity for it.
+    The authorization decision is made here, in this order:
+
+      1. **D15/D16 identity ACL** — when a registry identity is bound, a
+         dataset outside its world is refused (403) BEFORE any password or
+         token is looked at.  Media serving is not an ACL bypass.
+      2. **Media token** — a valid HMAC token still fully authorises its own
+         file (the <img> flow carries no key, and the token was minted
+         through an authorized call).
+      3. **Dataset password / D16 saved password / unlock cache** — the
+         original gate, unchanged.
+
+    On an UNCONFIGURED deployment the middleware binds no identity and step
+    1 is skipped entirely: password/token-protected datasets behave exactly
+    as before (the ratified D20 posture), credential-less fetches of
+    passwordless datasets included — the legacy single-user flow, unchanged.
+
+    On a CONFIGURED (multi-user) deployment a request that presents NO
+    credential at all is refused (403): the same caller is 401'd by the
+    middleware on every other dataset route, and leaving media open let an
+    unauthenticated stranger read every passwordless dataset's bytes (the
+    audit's second reproduction).  Browsers still reach this route through a
+    media token (the SPA mints one before rendering media), the dataset
+    password, or a session cookie the browser attaches automatically.
     """
     if not token and t:
         token = t
+    # P0-2 step 1: the identity ACL, when an identity exists.  Deliberately
+    # BEFORE the token check: a media token is minted by an authorized call
+    # for a caller who already passed this gate, so this only ever refuses
+    # callers that were never allowed in the first place.
+    identity = _clients_registry.current_identity()
+    if identity is not None and not identity.is_admin and not _access_store.dataset_allowed(identity, name):
+        raise HTTPException(
+            403,
+            f"Dataset '{name}' is not permitted for this API key (dataset ACLs are configured — D15).",
+        )
+    presented_pw = password or x_dataset_password or None
+    if identity is None and not token and not presented_pw and _clients_registry.registry_configured():
+        raise HTTPException(
+            403,
+            "Authentication required to fetch dataset media on this deployment — present a media "
+            f"token (POST /api/datasets/{name}/media-token), the dataset password, or an "
+            "authenticated session.",
+        )
     dm = await get_manager_async()
     if token:
         # A media token fully authorises this specific file — no password check.
@@ -4850,7 +5383,7 @@ async def api_serve_file(
             raise HTTPException(403, "Invalid or expired media token")
     else:
         try:
-            await _require_dataset_password(dm, name, password or x_dataset_password or None, request)
+            await _require_dataset_password(dm, name, presented_pw, request)
         except FileNotFoundError:
             raise HTTPException(404, f"Dataset '{name}' not found")
 
@@ -5375,12 +5908,22 @@ def _peer_host_label(uri: str) -> str:
 # health endpoint is polled every 10s.
 _QDRANT_TELEMETRY_CACHE: dict[str, Any] = {"ts": 0.0, "usage": {}}
 _QDRANT_TELEMETRY_TTL = 60.0
+# Replica/shard discovery is now one /cluster call + one
+# /collections/{name}/cluster call per collection + one readyz probe per peer
+# (2026-10-15 fix for the "0 shd" rendering) — cached briefly so the Stats
+# tab, the admin health poll and multiple UI users don't each re-issue the
+# full fan-out.
+_QDRANT_CLUSTER_CACHE: dict[str, Any] = {"ts": 0.0, "replicas": []}
+_QDRANT_CLUSTER_TTL = 30.0
 
 
 def _qdrant_cluster_replicas() -> "list[dict[str, Any]]":
     """Per-replica shard placement from Qdrant's /cluster API (the same
     discovery /api/admin/health performs inline), ordered by pod ordinal.
     Best-effort: [] on any failure (cluster disabled, unreachable)."""
+    now = time.time()
+    if now - _QDRANT_CLUSTER_CACHE["ts"] <= _QDRANT_CLUSTER_TTL:
+        return [dict(r) for r in _QDRANT_CLUSTER_CACHE["replicas"]]
     import httpx2
 
     qhost = os.environ.get("QDRANT_HOST", "")
@@ -5396,19 +5939,32 @@ def _qdrant_cluster_replicas() -> "list[dict[str, Any]]":
             if result.get("status") != "enabled":
                 return []
             peers = result.get("peers") or {}
+            # Shard placement comes from the per-collection
+            # /collections/{name}/cluster endpoint — the /cluster response's
+            # "collections" map is EMPTY in practice, so the old code counted
+            # zero shards for every peer and the stats page rendered "0 shd"
+            # (2026-10-15 fix; same approach /api/admin/health uses).
             peer_shards: dict[str, int] = {}
-            for cinfo in (
-                (result.get("collections") or {}).values() if isinstance(result.get("collections"), dict) else []
-            ):
-                if not isinstance(cinfo, dict):
-                    continue
-                for sh in cinfo.get("shards") or []:
-                    if not isinstance(sh, dict):
+            base = f"http://{qhost}:{qport}"
+            try:
+                coll_resp = client.get(f"{base}/collections")
+                col_names = (coll_resp.json().get("result") or {}).get("collections") or []
+                for col in col_names:
+                    name = col.get("name") if isinstance(col, dict) else None
+                    if not name:
                         continue
-                    pid = sh.get("peer_id")
-                    if pid is not None:
-                        key = str(pid)
-                        peer_shards[key] = peer_shards.get(key, 0) + 1
+                    cc = client.get(f"{base}/collections/{name}/cluster")
+                    c_res = cc.json().get("result") or {}
+                    self_pid = str(c_res.get("peer_id", ""))
+                    for sh in c_res.get("local_shards") or []:
+                        peer_shards[self_pid] = peer_shards.get(self_pid, 0) + 1
+                    for sh in c_res.get("remote_shards") or []:
+                        pid = sh.get("peer_id") if isinstance(sh, dict) else None
+                        if pid is not None:
+                            key = str(pid)
+                            peer_shards[key] = peer_shards.get(key, 0) + 1
+            except Exception:
+                logger.debug("Suppressed exception", exc_info=True)
             replicas: list[dict[str, Any]] = []
             for pid in sorted(peers.keys(), key=lambda p: str(p)):
                 ps = peer_shards.get(str(pid), 0)
@@ -5439,6 +5995,7 @@ def _qdrant_cluster_replicas() -> "list[dict[str, Any]]":
                     r["status"] = "ok" if rz.status_code == 200 else f"http-{rz.status_code}"
                 except Exception:
                     r["status"] = "unreachable"
+            _QDRANT_CLUSTER_CACHE.update({"ts": now, "replicas": [dict(r) for r in replicas]})
             return replicas
     except Exception:
         logger.debug("Suppressed exception", exc_info=True)
@@ -5452,10 +6009,16 @@ def _qdrant_replica_usage(
 ) -> dict[str, int]:
     """Best-effort used bytes per replica host from Qdrant telemetry.
 
-    Each node's telemetry lists only its own ``local`` shard segments; sum
-    ``indexed_vectors_size`` + ``payload_data_size`` per segment.  Returns
-    ``{host: used_bytes}`` for the replicas that answered; failures and nodes
-    without detail telemetry are simply omitted.
+    Each node's telemetry lists only its own ``local`` shard segments.  The
+    per-segment ``info.disk_usage_bytes`` is the segment's ACTUAL on-disk
+    footprint (vectors + payloads + payload index as real blocks) — the
+    primary measure (2026-10-15: the previous sum used the shard-level
+    ``vectors_size_bytes``/``payloads_size_bytes`` ESTIMATES, which exclude
+    the payload index and other disk overhead and undercounted a 3-replica
+    cluster by ~3x vs kubelet ground truth).  Servers whose telemetry
+    carries no per-segment detail fall back to the estimate fields.
+    Returns ``{host: used_bytes}`` for the replicas that answered; failures
+    and nodes without detail telemetry are simply omitted.
 
     2026-10-15: the same pass also records per-peer LOCAL point counts into
     _QDRANT_TELEMETRY_CACHE["points"] ({host: int}, from each shard's local
@@ -5485,8 +6048,12 @@ def _qdrant_replica_usage(
                     cols = res.get("collections") or {}
                     inner = cols.get("collections") if isinstance(cols, dict) else None
                     items = inner.values() if isinstance(inner, dict) else (inner if isinstance(inner, list) else [])
-                    total = 0
-                    local_points = 0
+                    total = 0  # per-segment disk_usage_bytes sum
+                    seg_est = 0  # per-segment vectors+payloads ESTIMATE sum
+                    fallback = 0  # shard-level ESTIMATE sum
+                    have_segments = False
+                    seg_points_total = 0
+                    shard_points_total = 0
                     for cinfo in items:
                         if not isinstance(cinfo, dict):
                             continue
@@ -5494,12 +6061,42 @@ def _qdrant_replica_usage(
                             if not isinstance(sh, dict):
                                 continue
                             local = sh.get("local")
-                            if isinstance(local, dict):
-                                total += int(local.get("vectors_size_bytes") or 0)
-                                total += int(local.get("payloads_size_bytes") or 0)
-                                local_points += int(local.get("points_count") or 0)
-                    usage[host] = total
-                    points[host] = local_points
+                            if not isinstance(local, dict):
+                                continue
+                            shard_points_total += int(local.get("points_count") or 0)
+                            # Shard-level ESTIMATES (exclude the payload
+                            # index) — fallback when the server's telemetry
+                            # detail level carries no per-segment info.
+                            fallback += int(local.get("vectors_size_bytes") or 0)
+                            fallback += int(local.get("payloads_size_bytes") or 0)
+                            for seg in local.get("segments") or []:
+                                if not isinstance(seg, dict):
+                                    continue
+                                info = seg.get("info")
+                                if not isinstance(info, dict):
+                                    continue
+                                have_segments = True
+                                # actual on-disk blocks of this segment
+                                # (vectors + payloads + payload index) —
+                                # absent/0 on some server versions
+                                total += int(info.get("disk_usage_bytes") or 0)
+                                seg_est += int(info.get("vectors_size_bytes") or 0)
+                                seg_est += int(info.get("payloads_size_bytes") or 0)
+                                seg_points_total += int(info.get("num_points") or 0)
+                    # per-segment point counts are the reliable source; the
+                    # shard-level field is absent on some server versions
+                    points[host] = seg_points_total if have_segments else shard_points_total
+                    # Tiered used-bytes pick (2026-10-15 hotfix): a segment
+                    # list that carries disk_usage_bytes=0/absent must NOT
+                    # zero the card — v1.19.0 omits the field entirely, so
+                    # prefer real disk bytes, then per-segment estimates,
+                    # then the shard-level estimates.
+                    if total > 0:
+                        usage[host] = total
+                    elif have_segments and seg_est > 0:
+                        usage[host] = seg_est
+                    else:
+                        usage[host] = fallback
             except Exception:
                 logger.debug("Suppressed exception", exc_info=True)
         _QDRANT_TELEMETRY_CACHE.update({"ts": now, "usage": usage, "points": points})
@@ -5979,6 +6576,114 @@ async def api_set_dataset_public_creator(
     return {"status": "ok", **result}
 
 
+@app.post("/api/admin/datasets/{name}/reset-password")
+async def api_admin_reset_dataset_password(
+    name: str,
+    request: Request,
+    body: dict[str, Any] = Body(...),
+):
+    """Recover a password-protected dataset whose password was LOST.
+
+    ADMIN-ONLY (deployment keys; the middleware 403s registry-client keys on
+    /api/admin/*): this deliberately reverses the standing rule that a
+    dataset password protects the user's data FROM the operator.  It exists
+    solely for the recovery case — the owner forgot the password and can no
+    longer unlock or delete the dataset, leaving it permanently orphaned.
+    Every call is audit-logged with the acting identity and the action taken.
+
+    Body: {"new_password": "…"} to set a fresh password, or {} /
+    {"new_password": null} to remove protection entirely (the dataset
+    becomes password-free; anyone granted access can then read it or delete
+    it through the normal ownership gate).  An empty STRING is refused
+    (422) — use null to remove, never "".
+
+    Effects on the other surfaces, all query-time:
+      * the per-replica has_password TTL cache (30s) and meta cache expire /
+        mtime-invalidate on their own — no restart, and the change is visible
+        on every replica within one TTL window;
+      * EVERY live unlock of this dataset is revoked (:func:``_unlock_cache_del_all``
+        — Redis SCAN by prefix / in-process purge), so a caller that had
+        unlocked the old password must prove the NEW one on its next request
+        (P1-8, audit 2026-10-16: the previous docstring claimed this and the
+        handler only deleted the ACTING identity's entry, so a third party's
+        unlock kept serving reads after a reset);
+      * saved D16 selection passwords for this dataset are cleared for every
+        identity that selected it (P1-8): without that, the /access saved
+        password — which is an implicit unlock — kept the old grant alive.
+    """
+    # Defense in depth on top of the /api/admin/* middleware.  The middleware
+    # is the universal gate (client keys 403 on /api/admin/*); this explicit
+    # check applies when the D15 registry is ON (an identity is bound per
+    # request).  With the registry OFF a correct deployment key reaches the
+    # handler WITHOUT a bound identity (the middleware's fast path) —
+    # demanding one here would 403 the very key this route exists for.
+    if _clients_registry.registry_configured():
+        _require_admin_identity()
+    raw = body.get("new_password") if isinstance(body, dict) else None
+    if isinstance(raw, str) and raw == "":
+        raise HTTPException(422, "Use null to REMOVE the password — an empty string is not a password")
+    new_password: str | None = str(raw) if raw else None
+    dm = await get_manager_async()
+    loop = asyncio.get_running_loop()
+    try:
+        # Verify the target EXISTS before touching it (set_password would
+        # FileNotFoundError anyway; this gives the route a clean 404 without
+        # having invalidated caches as a side effect of a failed call).
+        await loop.run_in_executor(sync_pool, dm.get_dataset, name, False)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Dataset '{name}' not found")
+    had_password = await loop.run_in_executor(sync_pool, dm.has_password_fresh, name)
+    await loop.run_in_executor(sync_pool, lambda: dm.set_password(name, new_password))
+    # Safety net: belt-and-braces cache invalidation (the TTL/meta caches
+    # would recover on their own, but do not make the admin wait 30s).
+    try:
+        dm._invalidate_has_password(name)
+    except Exception:
+        logger.debug("Suppressed exception", exc_info=True)
+    # P1-8 (audit 2026-10-16): a reset must actually REVOKE what the old
+    # password bought.  Two grants survived it before this:
+    #   * every live unlock-cache entry for this dataset — not just the acting
+    #     identity's (the handler used to delete exactly one client id, so a
+    #     third party's cached unlock kept serving reads);
+    #   * the D16 saved selection passwords, which act as implicit unlocks
+    #     (step 0 of _require_dataset_password).
+    # Both are blocking I/O (a Redis SCAN / per-identity file rewrites under
+    # fcntl) — off the event loop.  Failures are loud in the log but do not
+    # fail the reset: the password IS changed at that point, and reporting an
+    # error would invite a retry that changes nothing.
+    revoked = 0
+    try:
+        revoked = await loop.run_in_executor(sync_pool, _unlock_cache_del_all, name)
+    except Exception:
+        logger.warning("Unlock revocation failed for '%s' after a password reset", name, exc_info=True)
+    cleared = 0
+    try:
+        cleared = await loop.run_in_executor(sync_pool, _clear_selection_passwords, name)
+    except Exception:
+        logger.warning("Selection-password purge failed for '%s' after a password reset", name, exc_info=True)
+    identity = _clients_registry.current_identity()
+    actor = getattr(identity, "name", None) or "unknown"
+    action = "SET" if new_password else "REMOVED"
+    logger.warning(
+        "ADMIN PASSWORD RESET: identity '%s' %s the password of dataset '%s' (had_password=%s, unlocks_revoked=%s, selection_passwords_cleared=%s) via /api/admin/datasets/%s/reset-password",
+        actor,
+        action,
+        name,
+        had_password,
+        revoked,
+        cleared,
+        name,
+    )
+    return {
+        "status": "ok",
+        "dataset": name,
+        "action": "set" if new_password else "removed",
+        "had_password": had_password,
+        "unlocks_revoked": revoked,
+        "selection_passwords_cleared": cleared,
+    }
+
+
 @app.post("/api/admin/datasets/{name}/migrate-tier-schema")
 async def api_migrate_tier_schema(
     name: str,
@@ -6314,9 +7019,7 @@ def _whoami_flags() -> dict:
     except AttributeError:
         # SSO-CREATE-A predicate not deployed yet: refuse to guess (a wrong
         # guess greys out a working button or shows a broken one).
-        raise RuntimeError(
-            "create predicate missing: SSO-CREATE-A (identity_may_create_datasets) is not deployed"
-        )
+        raise RuntimeError("create predicate missing: SSO-CREATE-A (identity_may_create_datasets) is not deployed")
     memory = None
     try:
         memory = _access_store.memory_dataset_for(identity, None)

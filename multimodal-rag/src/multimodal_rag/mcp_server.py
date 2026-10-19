@@ -35,11 +35,13 @@ from multimodal_rag.rag_system import (
     MultimodalRAG,
     _arerank_with,
     _media_payloads_needed,
+    lane_rank_scores,
     merge_federated_results,
     resolve_federated_targets,
 )
 from multimodal_rag.utils import access_store as _access
 from multimodal_rag.utils import clients_registry as _clients
+from multimodal_rag.utils import media_hash
 from multimodal_rag.utils.logging_utils import logging, setup_logger
 from multimodal_rag.utils.mcp_auth import UNIVERSAL_API_KEYS_ENV, ApiKeyAuthMiddleware
 from multimodal_rag.vector_store import RrfParams
@@ -619,8 +621,27 @@ _AUTH_IDENTITY_HEADERS = (
 # a caller impersonate another user's unlock-cache entry (and its cached
 # plaintext password) or rotate identities to bypass the password-failure
 # throttle.  They are therefore only honoured when RAG_TRUST_PROXY_IDENTITY
-# is set (helm: security.trustProxyIdentity, default true) — i.e. when the
-# operator confirms an enforcing proxy sits in front of this server.
+# is set (helm: security.trustProxyIdentity — chart default FALSE since the
+# P0-1 remediation, 2026-10-16) — i.e. when the operator confirms an
+# enforcing proxy sits in front of this server.
+#
+# SCOPE (P0-1, audit 2026-10-16): on THIS surface the headers only ever scope
+# the D10 unlock cache and the password-failure throttle (``_client_id_ctx`` →
+# ``_unlock_client_id``).  The MCP auth middleware resolves identities from real
+# credentials alone (``presented_keys_with_source`` — X-API-Key / Authorization
+# / the forwarded OIDC token), so there is no MCP equivalent of REST's D24
+# proxy-identity CREDENTIAL and no impersonation grant to gate here.  If one
+# is ever added it MUST carry the REST server's positive enforcing-proxy
+# assertion (api_server._enforcing_proxy_precondition), never the flag alone.
+#
+# P2-3 (audit 2026-10-16): with the flag OFF, ``_unlock_client_id`` falls back
+# to the socket peer, so ONE attacker's password failures exhaust the bucket
+# shared by every caller behind that peer (a NAT / the gateway pod) — the
+# victim's CORRECT password then 429s.  That coupling is a deliberate,
+# documented trade-off (per-caller buckets need a trustworthy caller id, and
+# the only alternative to the header is the peer).  An operator who wants
+# per-user buckets sets trustProxyIdentity AND wires the enforcing-proxy
+# assertion, which is what makes the header trustworthy again.
 _TRUST_PROXY_IDENTITY = os.environ.get("RAG_TRUST_PROXY_IDENTITY", "").lower() in ("1", "true", "yes")
 
 
@@ -916,6 +937,40 @@ class _RagClientAuthMiddleware(ApiKeyAuthMiddleware):
             _clients.reset_current_identity(token)
 
 
+def _dataset_dir_roots() -> "list[tuple[str, str]]":
+    """Reverse index (P1-2): (dataset_name, realpath) for every dataset dir.
+
+    Module-level so the pure half is unit-testable; the tool factory has an
+    identical nested copy it closes over (same body, same semantics).
+    """
+    root = os.path.join(os.environ.get("DATA_PATH", "/data"), "datasets")
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    return [(name, os.path.realpath(os.path.join(root, name))) for name in names if not name.startswith(".")]
+
+
+def _dataset_for_local_path(resolved: str) -> "str | None":
+    """The dataset whose directory contains *resolved*, or None (P1-2).
+
+    Longest matching root wins — see the tool-body docstring for why (a
+    nested dataset must be governed by its OWN ACL).
+    """
+    best: str | None = None
+    best_len = -1
+    for name, root in _dataset_dir_roots():
+        if (resolved == root or resolved.startswith(root + os.sep)) and len(root) > best_len:
+            best, best_len = name, len(root)
+    return best
+
+
+#: Aliases the tool-factory bodies delegate to — the factory defines nested
+#: functions of the SAME names (closure scoping would otherwise recurse).
+_dataset_dir_roots_module = _dataset_dir_roots
+_dataset_for_local_path_module = _dataset_for_local_path
+
+
 def _protected_streamable_path(path: str) -> bool:
     """Protected-path predicate for the ``streamable-http`` transport.
 
@@ -1020,6 +1075,12 @@ def _resolve_session_id(existing: str | None = None) -> str | None:
 # ---------------------------------------------------------------------------
 
 _MEMORY_MAX_TOKENS_DEFAULT = 8192
+
+# The `source` recorded when a caller supplies no writer identity.  The server
+# cannot know who wrote a memory, so an unattributed write says so.  Before
+# 2026-10-17 every memory was stamped "opencode:memory" unconditionally, which
+# was true for opencode and a lie for every other writer.
+_MEMORY_SOURCE_UNATTRIBUTED = "unknown:memory"
 
 
 def _memory_max_tokens() -> int:
@@ -1455,32 +1516,144 @@ def _prefer_preprocessed_media(doc: Any) -> Any:
     return d
 
 
-def _escape_markdown_attr(value: str) -> str:
-    """Neutralize characters that could break out of a markdown/HTML context.
+# --- Markdown-inert emission (audit 2026-10-16, P1-11) ---------------------
+# The search formatter hands an LLM ready-to-paste markdown built from
+# UNTRUSTED text: stored payload URLs (source / original_source, which an
+# uploader controls) and upload filenames.  The tool then instructs the model
+# to reproduce that markdown verbatim, so a crafted filename or source URL
+# becomes a prompt-injection / markup channel:
+#
+#   url      = ".../x.jpg?token=t)![phish](https://evil.example/p.png"
+#   emitted  = ![x.jpg](...token=t)![phish](https://evil.example/p.png)
+#
+#   filename = "**IGNORE PREVIOUS INSTRUCTIONS**"
+#   emitted  = - [PDF **IGNORE PREVIOUS INSTRUCTIONS**](...)
+#
+# Two independent neutralizations below: the LABEL is made single-line and
+# markdown-inert (every escapable punctuation char is backslash-escaped, so
+# emphasis can never render), and the link TARGET is percent-encoded so
+# parens / whitespace / angle brackets cannot terminate the destination or
+# escape the surrounding HTML attribute.
 
-    ``alt`` / link labels and URLs can contain user-controlled filenames
-    (``]()\"``, newlines).  Escaping keeps a crafted dataset filename from
-    injecting markup/XSS when a frontend renders the tool's suggested
-    markdown.  Like ``html.escape``, ``&<>"`` are encoded; ``]`` ``[`` ``(``
-    are stripped so they cannot close a markdown link early.
+# Every escapable character, built without literals: CommonMark says any
+# ASCII punctuation may be backslash-escaped, and escaping it makes the
+# character render LITERALLY.  Backslash itself is included so an attacker
+# cannot pre-escape their own way out of _sanitize_markdown_label, and the
+# backtick is included so a filename cannot open a code span.
+_MD_ESCAPE_CHAR = chr(92)  # the backslash itself
+_MD_LABEL_ESCAPE = frozenset(_MD_ESCAPE_CHAR + chr(96) + "*_{}[]()#+-.!|<>~" + chr(34) + chr(39))
+
+# Characters kept RAW in a link target: everything a URL legitimately needs.
+# Notably ABSENT -> percent-encoded: space, "(" ")" (they close the markdown
+# destination), "<" ">" (they close the HTML attribute), quotes, backslash,
+# and "[" "]".  "%" is kept safe so an already-encoded URL is not
+# double-encoded; a literal %29 stays text and is inert in both markdown
+# and HTML, so it is not a breakout path.
+_MD_URL_SAFE = "/:?#@!$&*+,;=-._~%"
+
+# Reduced profile for INLINE plain-text spans (the "[Source: ...]" citation
+# line).  It escapes only the characters that can CLOSE the surrounding
+# construct or OPEN a new one — brackets, parens, emphasis markers, backticks,
+# angle brackets — so an ordinary filename stays readable (underscore and
+# asterisk ARE in this set and get backslash-escaped — they render literally,
+# so "report_v2.pdf" displays identically but can no longer open emphasis;
+# "Q3-final.pdf" passes through unchanged) while "](", "**", a code span or
+# an HTML tag all stay inert.  Escaped characters render literally, so the
+# VISIBLE text is unchanged; only the raw markdown is.
+_MD_INLINE_ESCAPE = frozenset(_MD_ESCAPE_CHAR + chr(96) + "*_[]()<>" + chr(34) + chr(39))
+
+
+def _sanitize_markdown_label(value: Any, max_len: int = 60) -> str:
+    """Return *value* as a single-line, markdown-inert label.
+
+    Used for every label derived from untrusted text (upload filenames,
+    payload ``source`` paths, URL basenames).  Steps, in order:
+
+    1. ALL whitespace (newlines and tabs included) collapsed to single
+       spaces and the result trimmed - a label is one line, always;
+    2. HTML-escaped for the attribute contexts the audio line uses;
+    3. every escapable punctuation char backslash-escaped so it renders
+       literally.
+
+    Step 3 is what makes ``**IGNORE PREVIOUS INSTRUCTIONS**`` inert: it
+    still reads as text to a human, but no renderer turns it into emphasis,
+    and it can never close the ``[label](url)`` construct early.
     """
-    value = html.escape(value, quote=True)
-    for ch in ("[", "]", "(", ")"):
-        value = value.replace(ch, "")
-    return value
+    text = " ".join(str(value if value is not None else "").split())
+    text = html.escape(text, quote=True)
+    escaped = "".join((_MD_ESCAPE_CHAR + ch) if ch in _MD_LABEL_ESCAPE else ch for ch in text)
+    return escaped[:max_len]
+
+
+def _sanitize_markdown_inline(value: Any) -> str:
+    """Single-line, construct-inert plain text for an inline span.
+
+    The reduced profile of :func:`_sanitize_markdown_label`, for text that is
+    NOT a link label or destination but sits inside a bracketed citation.
+    Two deliberate differences from the label profile:
+
+    * the escape set is smaller (:data:`_MD_INLINE_ESCAPE`) so ordinary
+      punctuation in a filename is not rewritten;
+    * NO HTML-escaping — the span is markdown/plain text, never an HTML
+      attribute, and escaping ``&`` would corrupt a query string an LLM might
+      copy out of the citation.  ``<`` and ``>`` are in the escape set, and a
+      backslash-escaped ``<`` cannot open an HTML tag, so tag injection is
+      closed without touching entities.
+    """
+    text = " ".join(str(value if value is not None else "").split())
+    return "".join((_MD_ESCAPE_CHAR + ch) if ch in _MD_INLINE_ESCAPE else ch for ch in text)
+
+
+def _sanitize_markdown_url(url: Any) -> str:
+    """Percent-encode a link TARGET so it cannot break out of its context.
+
+    Escapes whitespace, parentheses, angle brackets, quotes and backslashes
+    while leaving the URL structure (``scheme://host/path?query#frag``) and
+    any existing percent-encoding intact - so a signed ``?token=`` URL keeps
+    working byte-for-byte, and a filename carrying a paren or an angle
+    bracket is transported as %29 / %3C instead of ending the destination.
+
+    Non-strings (and empty values) degrade to an empty string rather than
+    raising - the call sites have already filtered to http(s) strings.
+    """
+    from urllib.parse import quote
+
+    if not isinstance(url, str) or not url:
+        return ""
+    return quote(url, safe=_MD_URL_SAFE)
+
+
+def _escape_markdown_attr(value: str) -> str:
+    """Back-compat alias for :func:_sanitize_markdown_label.
+
+    Kept because it is the documented name for "make this label safe"; the
+    implementation now also neutralizes newlines and emphasis (the previous
+    version only HTML-escaped and STRIPPED [](), so a newline or a
+    ``**...**`` filename still landed as live markdown - audit P1-11).
+    """
+    return _sanitize_markdown_label(value)
 
 
 def _media_alt_label(url: str, fallback: str) -> str:
     """Derive a clean, escaped ``alt`` label from a media URL.
 
-    The *path basename only* is used — the query string (``?token=…``) is
+    The *path basename only* is used - the query string (``?token=...``) is
     deliberately dropped so an LLM copying the suggested markdown never sees
-    a truncated ``…JPG?t`` fragment to echo into a broken URL.
+    a truncated ``...JPG?t`` fragment to echo into a broken URL.  The
+    basename is untrusted (it is an upload filename), so it goes through
+    :func:_sanitize_markdown_label.
     """
-    from urllib.parse import urlsplit
+    from urllib.parse import unquote, urlsplit
 
     basename = urlsplit(url).path.rsplit("/", 1)[-1] if url else ""
-    return _escape_markdown_attr((basename or fallback)[:60])
+    # The basename arrives percent-encoded (it came out of a URL); decode
+    # once so the label shows the human filename, then re-neutralize it.
+    if basename:
+        try:
+            basename = unquote(basename)
+        except Exception:
+            pass
+    return _sanitize_markdown_label(basename or fallback)
 
 
 # ---------------------------------------------------------------------------
@@ -1517,24 +1690,24 @@ _MAX_QUERY_EMB_CACHE = max(1, int(os.environ.get("QUERY_EMB_CACHE_MAX", "4096"))
 _MAX_FILE_HASH_CACHE = max(1, int(os.environ.get("FILE_HASH_CACHE_MAX", "4096")))
 _MAX_ASR_TRANSCRIPT_CACHE = max(1, int(os.environ.get("ASR_TRANSCRIPT_CACHE_MAX", "512")))
 
-_file_hash_cache: dict[str, str] = {}
-_file_hash_cache_lock = threading.Lock()
+# P2 (audit 2026-10-16, zone C's utils/media_hash.py): this used to be a
+# PATH-keyed dict, so a file REPLACED at the same path (a re-upload, a
+# regenerated *_preprocessed sibling, a repair pass) kept serving the old
+# digest forever — stale query-vector / media cache hits with no invalidation
+# hook anywhere.  The shared hasher keys on (path, st_mtime_ns, st_size), so a
+# rewrite is a MISS by construction and needs no invalidation call.  The
+# delegation keeps this module's env knob (FILE_HASH_CACHE_MAX) as the bound.
+_file_hasher = media_hash.StatKeyedFileHasher(max_entries=_MAX_FILE_HASH_CACHE)
 
 
 def _hash_file(path: str) -> str:
-    """SHA-256 of *path* (cached per path so repeat calls are free)."""
-    with _file_hash_cache_lock:
-        cached = _file_hash_cache.get(path)
-    if cached is not None:
-        return cached
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while chunk := f.read(65536):
-            h.update(chunk)
-    digest = h.hexdigest()
-    with _file_hash_cache_lock:
-        _bounded_cache_put(_file_hash_cache, path, digest, _MAX_FILE_HASH_CACHE)
-    return digest
+    """SHA-256 of *path*, stat-keyed and LRU-bounded.
+
+    Delegates to the shared :mod:`multimodal_rag.utils.media_hash` hasher
+    (audit 2026-10-16 P2).  ``OSError`` (missing/unreadable file) propagates
+    exactly as the inline implementation's ``open()`` did.
+    """
+    return _file_hasher.digest(path)
 
 
 def _collect_cacheable_paths(query_dict: Any) -> list[tuple[str, str]]:
@@ -2066,7 +2239,17 @@ def _format_retrieval_result(
             src = doc.get("source", "")
             page = doc.get("page", "")
             if src or page:
-                ref = f"[Source: {src}" + (f", Page: {page}" if page else "") + "]"
+                # P1-11 (same class, third emission site): the stored source
+                # URL is untrusted text landing in the context block.  Only
+                # the BLOCK-BREAKOUT primitive is neutralized here — a raw
+                # newline would end the citation and open an arbitrary new
+                # markdown block.  Full punctuation escaping is deliberately
+                # NOT applied: it would rewrite every ordinary citation
+                # (\`report_v2.pdf\` -> \`report\_v2\.pdf\`) for no security gain,
+                # since a citation is plain text, not a link destination.
+                ref_src = _sanitize_markdown_inline(src)
+                ref_page = _sanitize_markdown_inline(page)
+                ref = f"[Source: {ref_src}" + (f", Page: {ref_page}" if ref_page else "") + "]"
                 text = f"{ref}\n{text}" if text else ref
             # Memories carry git/session provenance (injected by the
             # opencode memory-provenance plugin). Surface it as a short
@@ -2196,7 +2379,10 @@ def _format_retrieval_result(
             if isinstance(url, str) and url.startswith(("http://", "https://")):
                 src = r.get("source") or r.get("original_source") or ""
                 alt = _media_alt_label(url, f"matched image {i + 1}")
-                image_md_lines.append(f"![{alt}]({url})")
+                # P1-11: the TARGET is percent-encoded so a crafted filename
+                # (parens / spaces / angle brackets) cannot close the
+                # destination and splice a second link into the output.
+                image_md_lines.append(f"![{alt}]({_sanitize_markdown_url(url)})")
     if image_md_lines:
         context += (
             "\n\nMatched images — include these markdown image links "
@@ -2227,9 +2413,12 @@ def _format_retrieval_result(
             if isinstance(url, str) and url.startswith(("http://", "https://")):
                 src = r.get("source") or r.get("original_source") or ""
                 alt = _media_alt_label(url, f"matched audio {i + 1}")
+                # P1-11: one sanitized target serves BOTH contexts — the
+                # HTML attribute (quotes/angle brackets percent-encoded, so
+                # the attribute cannot be escaped) and the markdown link.
+                safe_url = _sanitize_markdown_url(url)
                 audio_md_lines.append(
-                    f'<audio controls preload="none" src="{html.escape(url, quote=True)}" title="{alt}"></audio>\n'
-                    f"([🎧 {alt}]({url}))"
+                    f'<audio controls preload="none" src="{safe_url}" title="{alt}"></audio>\n([🎧 {alt}]({safe_url}))'
                 )
     if audio_md_lines:
         context += (
@@ -2251,11 +2440,14 @@ def _format_retrieval_result(
         # Strip the uuid prefix for readability
         import re
 
-        label = re.sub(r"^[0-9a-f]{32}_", "", label)[:60]
+        label = re.sub(r"^[0-9a-f]{32}_", "", label)
         page = r.get("page")
         if page:
             label += f" (p. {page})"
-        doc_link_lines.append(f"- [📄 {_escape_markdown_attr(label)}]({src})")
+        # P1-11: the label is sanitized AFTER the page suffix (so the suffix
+        # cannot be used to smuggle anything either) and the target is
+        # percent-encoded like the media links above.
+        doc_link_lines.append(f"- [📄 {_sanitize_markdown_label(label)}]({_sanitize_markdown_url(src)})")
     if doc_link_lines:
         context += (
             "\n\nMatched documents — include these links in your response "
@@ -2576,9 +2768,22 @@ def _merge_federated_sections(
     # The context is grouped per dataset (stable, readable); the structured
     # results array is the ranking — score-ordered across datasets (score is
     # the reranker score when the merged rerank ran, else the retrieval
-    # score: cosine on dense-only lanes, RRF fusion on hybrid ones).  Stable
-    # sort: ties keep the dataset order.
-    merged_results.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
+    # score: cosine on dense-only lanes, RRF fusion on hybrid ones).
+    #
+    # That re-sort must be LANE-AWARE (audit 2026-10-16, P1-3): grouping the
+    # pool per dataset discards the global order merge_federated_results just
+    # computed, so this line re-ranks the whole pool — and a raw score sort
+    # would re-mix an RRF sum (rank arithmetic, bounded by the lane count)
+    # with a dense cosine.  Each entry carries the lane it came from in
+    # ``score_kind``, so rank the entries within their lane and order by
+    # lane-local rank, exactly as the merge does.  Stable throughout: ties
+    # keep the dataset order, and a single-lane pool is byte-identical to the
+    # historical score sort.
+    _lane_ranks = lane_rank_scores(
+        [(str(r.get("score_kind") or "cosine"), float(r.get("score", 0.0))) for r in merged_results]
+    )
+    _lane_order = sorted(range(len(merged_results)), key=lambda i: _lane_ranks[i], reverse=True)
+    merged_results = [merged_results[i] for i in _lane_order]
 
     if not formatted:
         sections.append("No results found in any dataset.")
@@ -3209,17 +3414,23 @@ try:
             if not isinstance(session_id, str) or not session_id.strip():
                 raise ToolError("session_id must be a non-empty string.")
             session = session_id.strip()
-            # F1: create = MANAGE.  The same D15 gate the REST route carries
-            # (api_server._rag_acl_path_denial): a named-ACL key without "*"
-            # must not mint datasets outside its grant on EITHER surface.
+            # The bound identity drives the create gate below AND the
+            # creator-only self-selection grant at the end of this body.
             ident = _current_key_identity()
-            if (
-                ident is not None
-                and not ident.is_admin
-                and "*" not in (ident.datasets or frozenset())
-            ):
+            # Create = MANAGE, and the decision is the SHARED three-level
+            # predicate the REST route and the middleware gate call
+            # (access_store.identity_may_create_datasets: per-user
+            # can_create_datasets override → RAG_DATASETS_CREATE_ALLOWED →
+            # identity-shape rules).  P2-4 (audit 2026-10-16): this used to
+            # re-implement a retired "*"-in-ACL rule whose comment claimed
+            # parity with REST — the two surfaces drifted in BOTH directions
+            # (a named-ACL key was refused here and allowed there; a knob-off
+            # deployment refused there and allowed here).  ONE predicate, no
+            # second copy to drift.
+            if not _access.identity_may_create_datasets(_current_key_identity()):
                 raise ToolError(
-                    "Dataset ACLs are configured (D15): this API key cannot create datasets."
+                    "Dataset creation is not permitted for this identity "
+                    "(see RAG_DATASETS_CREATE_ALLOWED and the per-user can_create_datasets override)."
                 )
             default_h, max_h = _stm_ttl_config()
             ttl = ttl_seconds
@@ -3228,8 +3439,7 @@ try:
                     raise ToolError("ttl_seconds must be a positive whole number of seconds.")
                 if ttl > max_h * 3600:
                     raise ToolError(
-                        f"ttl_seconds={ttl} exceeds the deployment cap of {max_h}h "
-                        "(shortTermMemory.maxTtlHours)."
+                        f"ttl_seconds={ttl} exceeds the deployment cap of {max_h}h (shortTermMemory.maxTtlHours)."
                     )
             override = str(name).strip() if name else None
             if name is not None and not override:
@@ -3256,9 +3466,7 @@ try:
                 # branch the key to another session's memory.  Refuse WITHOUT
                 # the name — a genuine owner already has it from its own
                 # create response, so nothing legitimate is lost.
-                raise ToolError(
-                    "A short-term-memory dataset already exists for this session_id."
-                ) from exc
+                raise ToolError("A short-term-memory dataset already exists for this session_id.") from exc
             except ValueError as exc:
                 raise ToolError(str(exc)) from exc
             granted = False
@@ -3811,6 +4019,15 @@ try:
             "session_id": "abc123"}``.  ``session_id`` auto-populates from the
             request header / env when omitted; the opencode provenance plugin
             injects git/session fields automatically (explicit keys win).
+
+            ``metadata["source"]`` is the WRITER IDENTITY — the client names
+            itself (opencode sends ``"opencode:memory"``, DSH sends
+            ``"dsh:memory"``, the gateway distiller sends
+            ``"gateway:distiller"``).  The server cannot know who called it, so
+            it never invents a value: an omitted source is stored as
+            ``"unknown:memory"``.  (Before 2026-10-17 this was hardcoded to
+            ``"opencode:memory"`` for every writer, so the field was useless for
+            attribution.)  Other metadata keys are carried through verbatim.
         dataset_name:
             Optional — resolved from the ``X-Memory-Dataset`` header or
             ``MEMORY_DATASET`` env when omitted.  The model usually does NOT
@@ -3884,7 +4101,21 @@ try:
             if not chunks:
                 chunks = [""]
 
-            base: dict[str, Any] = {"source": "opencode:memory"}
+            # WRITER IDENTITY, NOT A DEFAULT (2026-10-17).  `source` used to be
+            # hardcoded to "opencode:memory" here, which was true for opencode
+            # and a LIE for every other writer: the gateway distiller sends
+            # metadata.source="gateway:distiller", DSH's plugin sends
+            # "dsh:memory", and this function DROPPED both — the carry-through
+            # loop below skips keys already present in `base`, and `source`
+            # always was.  So every memory in the store, whichever harness
+            # wrote it, recorded "opencode:memory".  A provenance label that is
+            # always the same string is not provenance; it is decoration, and
+            # it silently defeats any per-writer filter or audit built on it.
+            #
+            # The writer knows who it is; the server does not.  So the caller's
+            # value wins, and a write that declares nothing is labelled as
+            # unattributed rather than mislabelled.
+            base: dict[str, Any] = {"source": str(meta.get("source") or "").strip() or _MEMORY_SOURCE_UNATTRIBUTED}
             if image:
                 base["image"] = image
             if video:
@@ -3902,9 +4133,12 @@ try:
                 sid = meta.get("session_id")
                 if sid:
                     base["session_id"] = sid
-                # Carry any other metadata keys through verbatim.
+                # Carry any other metadata keys through verbatim.  `source`
+                # is listed explicitly because it is CONSUMED above (it is the
+                # writer identity) — it must never fall through as a stray
+                # metadata key as well.
                 for k, v in meta.items():
-                    if k not in ("kind", "tags", "session_id") and k not in base:
+                    if k not in ("kind", "tags", "session_id", "source") and k not in base:
                         base[k] = v
 
             docs: list[str | dict[str, Any]] = []
@@ -4458,6 +4692,61 @@ try:
     # _check_unlocked_or_password, the D15 dataset ACL, and the same events
     # (upload history) — one source of truth, no re-implementation.
 
+    def _dataset_dir_roots() -> "list[tuple[str, str]]":
+        """(dataset_name, realpath) for every dataset directory on disk.
+
+        P1-2 (audit 2026-10-16): MEDIA_ALLOW_PATH_PREFIXES is a PATH
+        allowlist, not an ACL — it spans every tenant's datasets/ tree, so it
+        never was a substitute for the per-dataset check.  This is the
+        reverse index (root -> dataset name) the ACL gate below needs; built
+        per call (a directory listing of DATA_PATH/datasets, no NFS content
+        reads) so a dataset created a moment ago is honoured immediately.
+        """
+        # Thin delegation to the module-level helper (one implementation; the
+        # module copy exists so tests can reach the pure half).
+        return _dataset_dir_roots_module()
+
+    def _dataset_for_local_path(resolved: str) -> "str | None":
+        """The dataset whose directory contains *resolved*, or None.
+
+        Delegates to the module-level helper (one implementation; the
+        LONGEST matching root wins there).
+        """
+        return _dataset_for_local_path_module(resolved)
+
+    def _require_local_path_acl(resolved: str) -> None:
+        """Apply the target dataset's ACL to a LOCAL media path (P1-2).
+
+        Called after the MEDIA_ALLOW_PATH_PREFIXES check on every tool that
+        reads a local file by path (describe_media / transcribe_audio /
+        _mcp_ingest_local_path / dataset_replace_document).  Before this, an
+        ACL-denied key could hand another tenant's dataset file to the VLM or
+        copy it into its own dataset: the prefix check passed because the
+        file IS under datasets/.
+
+        Semantics:
+          * no bound registry identity (D15/D20-inactive, single-user
+            deployments) -> nothing to enforce: the prefix policy alone, the
+            byte-identical legacy behaviour;
+          * the file is not inside any dataset directory -> nothing to
+            enforce (staging and operator-configured prefixes);
+          * otherwise the dataset must be in the caller's ACL ∪ selections
+            (D15/D16) — fail closed.  The refusal names the dataset the
+            caller already had to type, so it is not an existence oracle.
+        """
+        ident = _current_key_identity()
+        if ident is None or ident.is_admin:
+            return
+        ds = _dataset_for_local_path(resolved)
+        if ds is None:
+            return
+        if _access.dataset_allowed(ident, ds):
+            return
+        raise ToolError(
+            f"Local path belongs to dataset '{ds}', which is not permitted for this API key "
+            "(dataset ACLs/selections are configured)."
+        )
+
     def _mcp_ingest_local_path(raw: str) -> str:
         """Validate one local ingest path against the media-path allowlist.
 
@@ -4484,6 +4773,9 @@ try:
             )
         if not os.path.isfile(resolved):
             raise ToolError(f"Local path '{cleaned}' does not exist (or is not a file).")
+        # P1-2: the prefix allowlist is not an ACL — when the file lives in a
+        # dataset directory, that dataset's ACL applies for this identity.
+        _require_local_path_acl(resolved)
         return resolved
 
     def _mcp_add_file(dm: "DatasetManager", dataset_name: str, path: str) -> dict[str, Any]:
@@ -4823,6 +5115,10 @@ try:
             # prefixes (previously this only skipped preprocessing, so the
             # file was still read by the model endpoint).
             raise ToolError(f"Media path is outside MEDIA_ALLOW_PATH_PREFIXES: {path}")
+        # P1-2: a path inside another tenant's dataset directory passes the
+        # prefix check by construction — apply that dataset's ACL too, so the
+        # VLM/ASR never receives bytes this identity may not read.
+        _require_local_path_acl(os.path.realpath(path))
 
         from pathlib import Path
 
@@ -4896,6 +5192,14 @@ try:
                 _media_url_to_displayable,
             )
             from multimodal_rag.utils.general_tools import sync_wrapper_safe
+
+            # P1-2: apply the target dataset's ACL to a LOCAL path FIRST —
+            # before the model check, before any read — so an ACL-denied key
+            # can never hand another tenant's file to the VLM (the prefix
+            # allowlist alone spans every tenant's datasets/ tree).
+            _local = media_url.removeprefix("file://")
+            if _local.startswith("/") and os.path.exists(_local):
+                _require_local_path_acl(os.path.realpath(_local))
 
             # Query-time SSRF guard: a remote URL here is fetched server-side
             # by the VLM endpoint, so apply the same host policy as ingest
@@ -5011,6 +5315,12 @@ try:
                 _transcribe_media,
             )
             from multimodal_rag.utils.general_tools import sync_wrapper_safe
+
+            # P1-2: the local-path ACL applies here too — before the model
+            # check and before any read (same rationale as describe_media).
+            _local_audio = audio_url.removeprefix("file://")
+            if _local_audio.startswith("/") and os.path.exists(_local_audio):
+                _require_local_path_acl(os.path.realpath(_local_audio))
 
             # Query-time SSRF guard (same rationale as describe_media): a
             # remote URL here is fetched server-side by the ASR endpoint.

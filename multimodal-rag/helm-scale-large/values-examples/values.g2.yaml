@@ -35,7 +35,7 @@ replicaCount: 4
 
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v5.8.2
+  tag: v5.9.5
   pullPolicy: IfNotPresent
 
 qdrant:
@@ -43,7 +43,7 @@ qdrant:
 
   image:
     repository: qdrant/qdrant
-    tag: v1.19.0
+    tag: v1.19.2
     pullPolicy: IfNotPresent
 
   grpcPort: 6334
@@ -213,6 +213,8 @@ security:
   mediaTokenSecret: ''
   mediaTokenTtl: 3600
 
+  # TRUE by choice (chart default is now false): this site's every path
+  # traverses the enforcing oauth2-proxy AuthorizationPolicy below.
   trustProxyIdentity: true
   accessStore: true
   accessSelfMint: true

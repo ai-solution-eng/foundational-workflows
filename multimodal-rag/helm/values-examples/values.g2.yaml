@@ -37,14 +37,14 @@ replicaCount: 1
 image:
   # Packaged with the chart — leave as-is unless you built your own image.
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v5.8.2
+  tag: v5.9.5
   pullPolicy: IfNotPresent
 
 # Single-replica chart: the API mounts the Qdrant PVC read-only for disk reporting.
 qdrant:
   image:
     repository: qdrant/qdrant
-    tag: v1.19.0
+    tag: v1.19.2
     pullPolicy: IfNotPresent
   grpcPort: 6334
   httpPort: 6333
@@ -190,7 +190,9 @@ security:
   mediaAllowPathPrefixes: /data/datasets:/data/staging
   pwMaxFailures: 10
   pwFailWindow: 300
-  # Trust X-Auth-Request-*/X-Email/X-User headers; keep true ONLY behind an enforcing auth proxy.
+  # Trust X-Auth-Request-*/X-Email/X-User headers. TRUE here BY CHOICE (chart
+  # default is now false): this site's every path traverses the enforcing
+  # oauth2-proxy AuthorizationPolicy below. Never set it true without that.
   trustProxyIdentity: true
 
   # Self-service dataset selection + ★ memory binding on /access — ON this site.

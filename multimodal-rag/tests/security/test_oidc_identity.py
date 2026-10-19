@@ -154,7 +154,7 @@ class _JwksServer:
     """A minimal local JWKS endpoint: 127.0.0.1, ephemeral port, daemon
     thread.  Tests swap the served document / status code at will."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         holder = self
         self._doc: dict = {"keys": []}
         self._status = 200
@@ -1283,24 +1283,27 @@ def test_proxy_identity_ignored_without_trust_flag(monkeypatch):
 def test_proxy_identity_survives_explicit_credential_absence(monkeypatch, rest_client):
     """D24 end-to-end through the REST middleware: a browser request with
     ONLY the proxy's identity headers (the edge-authenticated shape) resolves
-    the registry identity — dataset reads work, admin is denied."""
+    the registry identity — dataset reads work, admin is denied.
+
+    P0-1 (audit 2026-10-16): the identity header is no longer sufficient on
+    its own — the request must ALSO carry the positive enforcing-proxy
+    assertion (here RAG_ENFORCING_PROXY_SIGNAL, the value the operator's
+    ingress injects).  Without it the request resolves nothing at all; that
+    negative is pinned in test_proxy_identity_bare_header_is_not_a_credential.
+    """
     monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "true")
+    monkeypatch.setenv("RAG_ENFORCING_PROXY_SIGNAL", "edge-secret-1")
     monkeypatch.setenv(cr.CLIENTS_ENV, "andrew:andrew-key")
     monkeypatch.setenv(cr.ACLS_ENV, "andrew:ds1,ds2")
-    r = rest_client.get(
-        "/api/datasets/ds1",
-        headers={"X-Auth-Request-Preferred-Username": "andrew"},
-    )
+    headers = {
+        "X-Auth-Request-Preferred-Username": "andrew",
+        "X-Enforcing-Proxy": "edge-secret-1",
+    }
+    r = rest_client.get("/api/datasets/ds1", headers=headers)
     assert r.status_code == 200
-    r = rest_client.get(
-        "/api/datasets/admin-only-check",
-        headers={"X-Auth-Request-Preferred-Username": "andrew"},
-    )
+    r = rest_client.get("/api/datasets/admin-only-check", headers=headers)
     assert r.status_code == 403  # D15 ACL denial fires before existence checks
-    r = rest_client.get(
-        "/api/admin/clients",
-        headers={"X-Auth-Request-Preferred-Username": "andrew"},
-    )
+    r = rest_client.get("/api/admin/clients", headers=headers)
     assert r.status_code == 403, "the proxy identity must never reach /api/admin/*"
 
 
@@ -1323,6 +1326,167 @@ def test_proxy_identity_spoof_rejected_without_trust(monkeypatch, rest_client):
     finally:
         monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "true")
         importlib.reload(api)
+
+
+# --- P0-1 (audit 2026-10-16): the proxy-identity credential needs a
+# --- POSITIVE enforcing-proxy assertion, not the trust flag alone.
+
+
+def test_proxy_identity_bare_header_is_not_a_credential(monkeypatch, rest_client):
+    """THE P0-1 regression: RAG_TRUST_PROXY_IDENTITY=1 plus a bare
+    X-Auth-Request-User must resolve NOTHING when no enforcing-proxy
+    assertion is configured — the audited shape (a direct ClusterIP call
+    that never traversed the gateway AuthorizationPolicy) got a full
+    identity, its grants, and the self-mint escalation chain from that
+    header alone."""
+    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    monkeypatch.delenv("RAG_ENFORCING_PROXY_SIGNAL", raising=False)
+    monkeypatch.setenv(cr.CLIENTS_ENV, "andrew:andrew-key")
+    monkeypatch.setenv(cr.ACLS_ENV, "andrew:ds1,ds2")
+    r = rest_client.get("/api/datasets/ds1", headers={"X-Auth-Request-User": "andrew"})
+    assert r.status_code in (401, 403), "the bare header must not authenticate"
+    # …and with a signal configured, a request WITHOUT it is equally refused.
+    monkeypatch.setenv("RAG_ENFORCING_PROXY_SIGNAL", "edge-secret-1")
+    r = rest_client.get("/api/datasets/ds1", headers={"X-Auth-Request-User": "andrew"})
+    assert r.status_code in (401, 403)
+    r = rest_client.get(
+        "/api/datasets/ds1",
+        headers={"X-Auth-Request-User": "andrew", "X-Enforcing-Proxy": "wrong-value"},
+    )
+    assert r.status_code in (401, 403), "a WRONG assertion value must not authenticate"
+
+
+def test_proxy_identity_assertion_header_is_the_positive_precondition(monkeypatch, rest_client):
+    """The positive control for the gate above: the same bare-header request
+    with the operator's signal value injected authenticates, and the
+    resolved identity carries the registry grants (never admin)."""
+    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    monkeypatch.setenv("RAG_ENFORCING_PROXY_SIGNAL", "edge-secret-1")
+    monkeypatch.setenv(cr.CLIENTS_ENV, "andrew:andrew-key")
+    monkeypatch.setenv(cr.ACLS_ENV, "andrew:ds1,ds2")
+    r = rest_client.get(
+        "/api/datasets/ds1",
+        headers={"X-Auth-Request-User": "andrew", "X-Enforcing-Proxy": "edge-secret-1"},
+    )
+    assert r.status_code == 200
+    r = rest_client.get(
+        "/api/admin/clients",
+        headers={"X-Auth-Request-User": "andrew", "X-Enforcing-Proxy": "edge-secret-1"},
+    )
+    assert r.status_code == 403, "the proxy identity is never admin"
+
+
+def test_proxy_identity_forwarded_jwt_asserts_the_edge_and_must_match_the_name(monkeypatch, rest_client, jwks_server):
+    """The fallback assertion: with no signal configured, a VERIFIED
+    forwarded OIDC token vouches that the edge realm authenticated the
+    request — but only for the name it resolves to.  A valid token of the
+    attacker's own must not vouch for a spoofed victim name (that pairing
+    was the audit's escalation), and a garbage token vouches for nothing."""
+    key = _setup_key(jwks_server)
+    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    monkeypatch.delenv("RAG_ENFORCING_PROXY_SIGNAL", raising=False)
+    monkeypatch.setenv(cr.CLIENTS_ENV, "andrew:andrew-key;mallory:mallory-key")
+    monkeypatch.setenv(cr.ACLS_ENV, "andrew:ds1,ds2;mallory:other")
+    alice_token = _mint(key, _claims(preferred="andrew"))
+    # Matching name: the JWT and the header agree → the identity resolves.
+    r = rest_client.get(
+        "/api/datasets/ds1",
+        headers={"X-Auth-Request-User": "andrew", "X-Auth-Request-Access-Token": alice_token},
+    )
+    assert r.status_code == 200
+    # A VALID token for mallory next to a spoofed andrew header: refused.
+    mallory_token = _mint(key, _claims(preferred="mallory"))
+    r = rest_client.get(
+        "/api/datasets/ds1",
+        headers={"X-Auth-Request-User": "andrew", "X-Auth-Request-Access-Token": mallory_token},
+    )
+    assert r.status_code in (401, 403)
+    # A garbage token is not evidence either.
+    r = rest_client.get(
+        "/api/datasets/ds1",
+        headers={"X-Auth-Request-User": "andrew", "X-Auth-Request-Access-Token": "not-a-jwt"},
+    )
+    assert r.status_code in (401, 403)
+
+
+def test_bind_presented_identity_resolves_the_sso_cookie(monkeypatch, sso_idp):
+    """P0-2: the self-authorizing media route binds the caller's identity
+    from the SAME presented-credential machinery the main auth path uses —
+    including the D22 SSO cookie a browser attaches to an <img> request
+    automatically.  Pinned here because the media handler's ACL step is only
+    as good as this binding."""
+    from starlette.requests import Request
+
+    import multimodal_rag.utils.clients_registry as cr
+
+    cookie_token = sso_idp["minted"]["token"]  # resolves to 'alice'
+    monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key;bob:bob-key")
+    monkeypatch.setenv(cr.ACLS_ENV, "alice:ds1;bob:ds2")
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/datasets/ds1/files/x.jpg",
+            "headers": [(b"cookie", f"pcai-sso={cookie_token}".encode())],
+            "client": ("10.0.0.1", 1),
+            "query_string": b"",
+        }
+    )
+    token = api._bind_presented_identity(request)
+    try:
+        ident = cr.current_identity()
+        assert ident is not None and ident.name == "alice"
+        assert ident.datasets == frozenset({"ds1"})
+    finally:
+        if token is not None:
+            cr.reset_current_identity(token)
+
+
+def test_bind_presented_identity_is_a_noop_without_a_registry(monkeypatch):
+    """The unconfigured deployment binds nothing (the legacy single-user
+    posture the media route must keep byte-identical)."""
+    from starlette.requests import Request
+
+    import multimodal_rag.utils.clients_registry as cr
+
+    monkeypatch.delenv(cr.CLIENTS_ENV, raising=False)
+    monkeypatch.delenv(cr.ACLS_ENV, raising=False)
+    monkeypatch.delenv("RAG_ACCESS_STORE", raising=False)
+    monkeypatch.setattr(api, "_RAG_API_KEY", "")
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/datasets/ds1/files/x.jpg",
+            "headers": [(b"x-api-key", b"whatever")],
+            "client": ("10.0.0.1", 1),
+            "query_string": b"",
+        }
+    )
+    assert api._bind_presented_identity(request) is None
+
+
+def test_enforcing_proxy_precondition_unit_matrix(monkeypatch):
+    """Unit matrix for the precondition helper itself (no HTTP): fail-closed
+    on every partial input — no request, no signal and no token, a
+    non-JWT-shaped token, and an unverifiable token."""
+    from starlette.requests import Request
+
+    def _req(headers: dict[str, str]) -> Request:
+        raw = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
+        return Request({"type": "http", "headers": raw, "client": ("10.0.0.9", 1), "method": "GET", "path": "/"})
+
+    monkeypatch.delenv("RAG_ENFORCING_PROXY_SIGNAL", raising=False)
+    assert api._enforcing_proxy_precondition(None) is False
+    assert api._enforcing_proxy_precondition(_req({})) is False
+    assert api._enforcing_proxy_precondition(_req({"X-Auth-Request-Access-Token": "opaque"})) is False
+    # Signal configured → exact match only.
+    monkeypatch.setenv("RAG_ENFORCING_PROXY_SIGNAL", "s3cret")
+    assert api._enforcing_proxy_precondition(_req({})) is False
+    assert api._enforcing_proxy_precondition(_req({"X-Enforcing-Proxy": "s3cret"})) is True
+    assert api._enforcing_proxy_precondition(_req({"X-Enforcing-Proxy": "s3cret "})) is True
+    assert api._enforcing_proxy_precondition(_req({"X-Enforcing-Proxy": "S3CRET"})) is False
+    assert api._enforcing_proxy_precondition(_req({"X-Enforcing-Proxy": "s3cre"})) is False
 
 
 def test_oauth_logged_out_landing_page(rest_client):

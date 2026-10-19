@@ -10,9 +10,10 @@ asserts the gating contract:
     security.* block leaks nothing), "true" only when security.accessStore;
   * RAG_ACCESS_DENY_SELECT and RAG_MEMORY_DEFAULT render only when set
     (empty values render nothing — no empty-string env noise);
-  * RAG_ACCESS_SELF_MINT renders on the DEFAULT render (the D25 default-on
-    ruling — chart-default true, same posture as accessStore) and an
-    explicit security.accessSelfMint=false removes it entirely;
+  * RAG_ACCESS_SELF_MINT is GATED and default-OFF (the P0-1 remediation,
+    2026-10-16: the default-on posture let a spoofed proxy identity mint a
+    durable key) — absent on the default render, rendered only for an explicit
+    security.accessSelfMint=true;
   * the default render is byte-identical to a render with the access-store
     template lines removed (the "default render byte-identical" fleet bar);
   * all three charts (helm / helm-scale-medium / helm-scale-large) carry the
@@ -131,12 +132,35 @@ def test_access_store_always_rendered_tracks_default(chart):
 
 @pytest.mark.skipif(not _helm_available(), reason="helm binary not available")
 @pytest.mark.parametrize("chart", CHARTS)
-def test_self_mint_renders_by_default_and_opts_out(chart):
-    """D25 default-on ruling (2026-10): RAG_ACCESS_SELF_MINT renders on the
-    DEFAULT render — the same default-on, explicit-opt-out posture as
-    RAG_ACCESS_STORE — and an explicit security.accessSelfMint=false
-    removes it entirely (the pre-D25 inert render)."""
+def test_self_mint_is_opt_in(chart):
+    """P0-1 remediation (2026-10-16): RAG_ACCESS_SELF_MINT is OPT-IN.
+
+    The D25 default-on ruling is superseded — with the header-trust posture
+    the audit reproduced (spoofed proxy identity → self-mint → durable key
+    carrying the victim's grants), a default-on mint is an escalation chain
+    every chart would ship.  The default render therefore carries NO
+    RAG_ACCESS_SELF_MINT (the app's inert default: the mint endpoint 409s),
+    and an explicit security.accessSelfMint=true renders it.
+
+    The example values files that DO want the feature (values.g2.yaml, the
+    ezaf-gateway deployment) set it explicitly — pinned here so a silent
+    chart-default flip cannot take the card away from them either.
+    """
     env = _configmap(_render_ok(chart))
-    assert 'RAG_ACCESS_SELF_MINT: "true"' in env
-    off = _configmap(_render_ok(chart, "--set", "security.accessSelfMint=false"))
-    assert "RAG_ACCESS_SELF_MINT" not in off
+    assert "RAG_ACCESS_SELF_MINT" not in env, "self-mint must be opt-in: a default render must not offer the mint"
+    on = _configmap(_render_ok(chart, "--set", "security.accessSelfMint=true"))
+    assert 'RAG_ACCESS_SELF_MINT: "true"' in on
+
+
+@pytest.mark.skipif(not _helm_available(), reason="helm binary not available")
+@pytest.mark.parametrize("chart", CHARTS)
+def test_trust_proxy_identity_defaults_off(chart):
+    """P0-1 (audit 2026-10-16): the proxy-identity trust flag renders
+    "false" by default on every chart — the headers are attacker-settable on
+    any path that bypasses the gateway, and the code side now ALSO requires
+    the positive enforcing-proxy assertion (RAG_ENFORCING_PROXY_SIGNAL)
+    before a header can resolve an identity."""
+    env = _configmap(_render_ok(chart))
+    assert 'RAG_TRUST_PROXY_IDENTITY: "false"' in env
+    on = _configmap(_render_ok(chart, "--set", "security.trustProxyIdentity=true"))
+    assert 'RAG_TRUST_PROXY_IDENTITY: "true"' in on

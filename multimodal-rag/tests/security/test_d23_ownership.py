@@ -42,6 +42,9 @@ import asyncio
 import json
 import os
 import sys
+import time
+from pathlib import Path
+from typing import Any, ClassVar
 
 import pytest
 
@@ -128,7 +131,7 @@ def _claims(*, sub="alice", preferred="alice", **extra) -> dict:
 class _JwksServer:
     """Loopback JWKS endpoint (the D21 test pattern)."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         import threading
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -252,7 +255,7 @@ def _setup_key(server: _JwksServer, key_id: str = KID) -> dict:
 
 
 @pytest.fixture
-def rest_client(monkeypatch, tmp_path):
+def rest_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     """The real FastAPI app with a stubbed manager + a REAL meta-backed
     meta.json layer under tmp_path (the test_dataset_acls / test_oidc_identity
     full-stack pattern).
@@ -276,7 +279,7 @@ def rest_client(monkeypatch, tmp_path):
         caption_with_asr = False
         caption_with_vlm = False
 
-        def __init__(self):
+        def __init__(self) -> None:
             self.deleted: list[str] = []
             self.public_flags: dict[str, bool] = {}
 
@@ -336,6 +339,7 @@ def rest_client(monkeypatch, tmp_path):
             rrf=None,
             contextual=False,
             created_by=None,
+            chunk=None,
         ):
             if self._meta_path(name).exists():
                 raise FileExistsError(f"Dataset '{name}' already exists")
@@ -343,6 +347,10 @@ def rest_client(monkeypatch, tmp_path):
             creator = str(created_by or "").strip()
             if creator:
                 meta["created_by"] = creator
+            # Per-dataset chunk overrides: mirror the real manager - an
+            # empty/absent payload stores NO key (inherit the model).
+            if chunk:
+                meta["chunk"] = dict(chunk)
             self._write_meta_raw(name, meta)
             return dict(meta)
 
@@ -1132,6 +1140,258 @@ def test_stats_qdrant_pvc_block_present_or_absent_never_erroring(rest_client):
     # in the test env there is no Qdrant: the block is either None or a
     # partial {used_bytes, replicas} shape — never a total/percent lie.
     assert qp is None or ("total_bytes" not in qp or "used_bytes" in qp)
+
+
+class _FakeResp:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        return None
+
+
+class _FakeQdrantClient:
+    """Stands in for httpx2.Client: answers the /cluster, /collections,
+    /collections/{name}/cluster, /readyz and /telemetry round trips the
+    helpers issue, from the route table below."""
+
+    routes: ClassVar[dict] = {}
+
+    def __init__(self, *a, **kw):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, timeout=None):
+        # most specific pattern wins: /collections/{n}/cluster also contains
+        # the /cluster substring, so plain dict order would misroute it.
+        for pattern in sorted(self.routes, key=len, reverse=True):
+            if pattern in url:
+                return _FakeResp(self.routes[pattern])
+        return _FakeResp({}, status_code=404)
+
+
+def test_cluster_replicas_counts_shards_from_per_collection_endpoint(monkeypatch):
+    """2026-10-15 fix: the /cluster response's 'collections' map is empty in
+    practice, so shard placement MUST come from the per-collection
+    /collections/{name}/cluster endpoint — the old helper counted 0 shards
+    per peer and the Stats page rendered '0 shd' for a healthy cluster."""
+    import multimodal_rag.api_server as api
+
+    monkeypatch.setenv("QDRANT_HOST", "rag-mcp-server-qdrant")
+    monkeypatch.setenv("QDRANT_PORT", "6333")
+    api._QDRANT_CLUSTER_CACHE.update({"ts": 0.0, "replicas": []})
+
+    _FakeQdrantClient.routes = {
+        "/collections/fp-x/cluster": {
+            "result": {
+                "peer_id": 11,
+                "local_shards": [{"shard_id": 1}, {"shard_id": 2}],
+                "remote_shards": [{"peer_id": 12, "shard_id": 3}],
+            }
+        },
+        "/collections/fp2/cluster": {
+            "result": {
+                "peer_id": 11,
+                "local_shards": [{"shard_id": 4}],
+                "remote_shards": [],
+            }
+        },
+        "/collections": {"result": {"collections": [{"name": "fp-x"}, {"name": "fp2"}]}},
+        "/cluster": {
+            "result": {
+                "status": "enabled",
+                "peers": {
+                    "11": {"uri": "http://rag-mcp-server-qdrant-0.rag-mcp-server-qdrant:6333"},
+                    "12": {"uri": "http://rag-mcp-server-qdrant-1.rag-mcp-server-qdrant:6333"},
+                },
+                "collections": {},  # empty in practice — the bug
+            }
+        },
+        "/readyz": {"result": True},
+    }
+    monkeypatch.setattr("httpx2.Client", _FakeQdrantClient)
+
+    replicas = api._qdrant_cluster_replicas()
+    # peer 11 (qdrant-0): fp-x 2 local + fp2 1 local = 3; peer 12: fp-x remote = 1
+    assert [r["shards"] for r in replicas] == [3, 1], replicas
+    assert [r["host"] for r in replicas] == [
+        "rag-mcp-server-qdrant-0",
+        "rag-mcp-server-qdrant-1",
+    ]
+    assert all(r["status"] == "ok" for r in replicas)
+
+
+def test_stats_per_replica_rows_carry_used_bytes_and_local_points(rest_client, monkeypatch):
+    """2026-10-15 fix: /api/stats merges per-replica telemetry (used bytes +
+    local point counts) INTO the per_replica rows it ships — the UI rendered
+    '—' for both columns even though the summed total came from that data."""
+    client, dm = rest_client
+    _seed_dataset(dm, "q-rows", created_by="alice")
+
+    rows = [
+        {"host": "rag-mcp-server-qdrant-0", "shards": 2, "status": "ok"},
+        {"host": "rag-mcp-server-qdrant-1", "shards": 1, "status": "ok"},
+    ]
+    usage = {
+        "rag-mcp-server-qdrant-0": 200 * 1024 * 1024,
+        "rag-mcp-server-qdrant-1": 171 * 1024 * 1024,
+    }
+    monkeypatch.setattr(api, "_qdrant_cluster_replicas", lambda: rows)
+    monkeypatch.setattr(api, "_qdrant_replica_usage", lambda reps, h, p: usage)
+    monkeypatch.setattr(api, "_parse_size_bytes", lambda s: 25 * 1024 * 1024 * 1024)
+    api._QDRANT_TELEMETRY_CACHE.update(
+        {
+            "ts": time.time(),
+            "usage": dict(usage),
+            "points": {"rag-mcp-server-qdrant-0": 120, "rag-mcp-server-qdrant-1": 80},
+        }
+    )
+
+    body = client.get("/api/stats").json()
+    qp = body["qdrant_pvc"]
+    assert qp is not None
+    assert qp["replica_count"] == 2
+    assert qp["per_replica_capacity_bytes"] == 25 * 1024 * 1024 * 1024
+    assert qp["total_bytes"] == 2 * 25 * 1024 * 1024 * 1024  # 2 replicas × 25 GiB
+    assert sum(qp["replicas"].values()) == qp["used_bytes"]
+    per = {r["host"]: r for r in qp["per_replica"]}
+    assert per["rag-mcp-server-qdrant-0"]["used_bytes"] == 200 * 1024 * 1024
+    assert per["rag-mcp-server-qdrant-0"]["local_points"] == 120
+    assert per["rag-mcp-server-qdrant-1"]["local_points"] == 80
+    # real PVC names for the per-replica table (data-<sts>-<ordinal>)
+    assert per["rag-mcp-server-qdrant-0"]["pvc"] == "data-rag-mcp-server-qdrant-0"
+    assert per["rag-mcp-server-qdrant-1"]["pvc"] == "data-rag-mcp-server-qdrant-1"
+
+
+def test_replica_usage_prefers_segment_disk_usage_bytes(monkeypatch):
+    """2026-10-15: per-peer used bytes come from the per-segment
+    info.disk_usage_bytes (ACTUAL on-disk blocks, incl. payload index) when
+    the telemetry detail level exposes segments — the shard-level
+    vectors/payloads ESTIMATES undercounted a 3-replica cluster ~3x. The
+    estimates stay the fallback when no per-segment detail is present."""
+    import multimodal_rag.api_server as api
+
+    api._QDRANT_TELEMETRY_CACHE.update({"ts": 0.0, "usage": {}})
+
+    def _telemetry(with_segments):
+        shard = {"points_count": 10, "vectors_size_bytes": 100, "payloads_size_bytes": 50}
+        if with_segments:
+            shard["segments"] = [
+                {"info": {"disk_usage_bytes": 900, "num_points": 7}},
+                {"info": {"disk_usage_bytes": 400, "num_points": 3}},
+            ]
+        return {
+            "result": {
+                "collections": {
+                    "collections": [
+                        {"shards": [{"local": shard}]},
+                        {"shards": [{"local": dict(shard)}]},
+                    ]
+                }
+            }
+        }
+
+    rows = [{"host": "n-0"}, {"host": "n-1"}]
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, timeout=None):
+            return _FakeResp(_telemetry("n-0" in url))
+
+        def raise_for_status(self):
+            return None
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._p = payload
+
+        def json(self):
+            return self._p
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr("httpx2.Client", _FakeClient)
+
+    usage = api._qdrant_replica_usage(rows, "q", "6333")
+    # n-0 has per-segment detail with REAL disk bytes: ACTUAL disk
+    # (900+400 per collection shard x2)
+    assert usage["n-0"] == 2 * (900 + 400), usage
+    # n-1 lacks segments: falls back to the estimates (100+50 per shard x2)
+    assert usage["n-1"] == 2 * (100 + 50), usage
+
+
+def test_replica_usage_never_zeroed_by_absent_disk_usage(monkeypatch):
+    """2026-10-15 hotfix: Qdrant v1.19.0 emits per-segment info WITHOUT
+    disk_usage_bytes — the first cut of the disk-usage change let that zero
+    out the whole card ('used 0 B', summary hidden). A segment list with no
+    disk_usage_bytes must fall back to the per-segment ESTIMATES."""
+    import multimodal_rag.api_server as api
+
+    api._QDRANT_TELEMETRY_CACHE.update({"ts": 0.0, "usage": {}})
+
+    # v1.19.0-shaped telemetry: segments present, info carries
+    # vectors/payloads sizes but NO disk_usage_bytes key at all
+    payload = {
+        "result": {
+            "collections": {
+                "collections": [
+                    {
+                        "shards": [
+                            {
+                                "local": {
+                                    "points_count": 10,
+                                    "segments": [
+                                        {
+                                            "info": {
+                                                "vectors_size_bytes": 700,
+                                                "payloads_size_bytes": 300,
+                                                "num_points": 10,
+                                            }
+                                        },
+                                    ],
+                                }
+                            }
+                        ]
+                    },
+                ]
+            }
+        }
+    }
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, timeout=None):
+            return _FakeResp(payload)
+
+    monkeypatch.setattr("httpx2.Client", _FakeClient)
+    usage = api._qdrant_replica_usage([{"host": "n-0"}], "q", "6333")
+    assert usage["n-0"] == 1000, usage  # vectors+payloads estimate, not 0
 
 
 def test_media_policy_trusts_own_media_base_url(monkeypatch):

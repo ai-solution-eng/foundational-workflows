@@ -27,8 +27,6 @@ import inspect
 import os
 import sys
 
-import pytest
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 import multimodal_rag.api_server as api
@@ -41,8 +39,7 @@ def test_annotation_stamps_admin_granted():
     assert 'ds["acl_granted"] = True' in src, "admin rows must be stamped granted"
     # The old early-return shape must be gone.
     assert "identity is None or identity.is_admin:" not in src, (
-        "the early-return-for-admin shape is back — admins would lose the "
-        "password affordance again"
+        "the early-return-for-admin shape is back — admins would lose the password affordance again"
     )
 
 
@@ -81,8 +78,7 @@ def test_no_admin_bypass_in_the_password_gate():
     """
     src = inspect.getsource(api._require_dataset_password)
     assert "is_admin" not in src, (
-        "_require_dataset_password gained an admin bypass — the dataset "
-        "password must still be proven by admins"
+        "_require_dataset_password gained an admin bypass — the dataset password must still be proven by admins"
     )
 
 
@@ -99,7 +95,6 @@ def test_admin_unlock_branch_is_narrowed_to_protected_datasets():
     assert admin_at != -1
     branch = src[:admin_at]
     assert "has_password" in branch, (
-        "the admin branch must gate on has_password, or it changes the "
-        "historical 409 for unprotected datasets"
+        "the admin branch must gate on has_password, or it changes the historical 409 for unprotected datasets"
     )
     assert "409" in branch, "the non-protected case must keep the historical 409"

@@ -243,6 +243,69 @@ def dedup_federated_results(entries: list[tuple[str, Any, float]]) -> list[tuple
     return [((item.dataset or ""), item.doc, item.score) for item in out]
 
 
+# Federated lanes -> one comparable space (P1-3, audit 2026-10-16).
+#
+# A federated pool mixes hits from datasets that may sit on DIFFERENT
+# retrieval lanes: a dense-only dataset contributes an embedder cosine
+# (higher = better, bounded ~[-1, 1]), while a hybrid dataset contributes RRF
+# rank arithmetic (sum of 1/(rank + k) over the dense + BM25 prefetches --
+# see vector_store._query_requests and the _score_kind stamp it writes on
+# every fused result).  Those numbers are NOT on a common scale: a 0.5 cosine
+# and a 0.5 RRF sum mean entirely different things, and an RRF sum is bounded
+# by the number of fused lanes (~2/(k+1) at best for two lanes), so a raw
+# score sort systematically buries every hybrid hit behind every dense hit
+# with a middling cosine.
+#
+# The common space is therefore RANK POSITION within each lane -- the same
+# "trust the order, not the magnitude" rule the RRF lane itself encodes, and
+# the rule _arerank_with already follows when it labels the incoming score
+# honestly (_retrieval_score for RRF, _embedding_score for cosine).  Each lane
+# is sorted by its own score (stable, so ties keep the caller's dataset
+# order), every entry is then scored 1/(k + rank) in lane-local rank space,
+# and the merged pool is ordered by that.  Rank 0 of either lane competes on
+# equal terms; within a single lane the resulting order is exactly the
+# historical score-descending order.
+_FEDERATED_RRF_K = 2  # qdrant-client's DEFAULT_RANKING_CONSTANT_K
+
+
+def federated_score_kind(doc: Any) -> str:
+    """Retrieval lane behind one federated entry's score.
+
+    ``"rrf"`` when the hit carries the hybrid lane's stamp (``vector_store``
+    writes ``_score_kind = "rrf"`` on every fused result), else ``"cosine"``
+    -- the default for every other path (dense cosine, reranker relevance, or
+    a bare non-dict payload).  Mirrors the labelling
+    ``mcp_server._format_retrieval_result`` applies to the same docs.
+    """
+    if isinstance(doc, dict) and doc.get("_score_kind") == "rrf":
+        return "rrf"
+    return "cosine"
+
+
+def lane_rank_scores(lanes: "list[tuple[str, float]]", *, k: int = _FEDERATED_RRF_K) -> list[float]:
+    """Rank-space scores that make different retrieval lanes comparable.
+
+    *lanes* is ``[(lane_label, score), ...]`` in the pool's incoming order.
+    Entries are grouped by label, each group is sorted by score descending
+    (stable -- ties keep the incoming order), and entry *i* is assigned
+    ``1/(k + rank)`` where *rank* is its position within its own group.
+
+    The result is monotone-decreasing in each lane's own score, so a
+    single-lane pool sorts identically to a raw score sort; a mixed pool
+    compares rank positions instead of incomparable magnitudes.  The returned
+    values are for ORDERING only -- callers keep the original scores.
+    """
+    by_lane: dict[str, list[int]] = {}
+    for i, (lane, _score) in enumerate(lanes):
+        by_lane.setdefault(str(lane), []).append(i)
+    out = [0.0] * len(lanes)
+    for indices in by_lane.values():
+        indices.sort(key=lambda i: lanes[i][1], reverse=True)
+        for rank, i in enumerate(indices):
+            out[i] = 1.0 / (k + rank)
+    return out
+
+
 def merge_federated_results(
     entries: list[tuple[str, Any, float]],
     *,
@@ -250,16 +313,30 @@ def merge_federated_results(
 ) -> list[tuple[str, Any, float]]:
     """Merge per-dataset result pools into one ranked, dataset-labelled pool.
 
-    Dedups on the dataset-qualified identity key (optional) and sorts by
-    score, descending — scores are embedder cosine similarities from the same
-    server-side embedder, so they are comparable across datasets.  Ties keep
-    the caller's dataset order (Python's stable sort).
+    Dedups on the dataset-qualified identity key (optional), then ranks the
+    survivors in a space that is meaningful ACROSS retrieval lanes.
+
+    Scores from different datasets are not directly comparable when those
+    datasets sit on different lanes: a dense-only dataset contributes an
+    embedder cosine, while a hybrid (dense + BM25, the default) dataset
+    contributes RRF rank arithmetic -- see :func:`lane_rank_scores` for the
+    full reasoning and the ``1/(k + rank)`` conversion.  Each lane is ranked
+    within itself and the merged pool is ordered by that lane-local rank, so
+    the best hit of each lane competes on equal terms instead of the hybrid
+    lane's bounded sums losing to dense cosines.
+
+    Ties keep the caller's dataset order (stable sorts throughout), and the
+    scores carried out are the ORIGINAL ones -- only the order is rewritten.
+    A single-lane pool (the common case: one dataset, or several datasets on
+    the same lane) sorts exactly as the historical score-descending merge.
     """
     if not entries:
         return []
     if dedup:
         entries = dedup_federated_results(entries)
-    return sorted(entries, key=lambda e: e[2], reverse=True)
+    ranks = lane_rank_scores([(federated_score_kind(doc), score) for _ds, doc, score in entries])
+    order = sorted(range(len(entries)), key=lambda i: ranks[i], reverse=True)
+    return [entries[i] for i in order]
 
 
 async def _arerank_with(
@@ -305,6 +382,52 @@ async def _arerank_with(
         paired.append((d, rerank_score))
     paired.sort(key=lambda x: x[1], reverse=True)
     return paired[:reranker_top_k]
+
+
+def _write_vector_name(vs: Any) -> str | None:
+    """The dense lane name a WRITE must target, resolved the same way as reads.
+
+    Audit 2026-10-16, P1-6.  ``QdrantVectorStore._dense_using()`` resolves
+    the dense lane defensively on every search: it prefers the name a
+    successful capability probe detected (``_dense_vector_name``), falls
+    back to the configured name, targets the server default (``None``) on a
+    probe-confirmed UNNAMED collection, and only then uses the "dense"
+    fallback.  ``supports_hybrid()`` re-probes a FAILED probe every
+    ``RAG_HYBRID_REPROBE_S``, so a store constructed during a Qdrant outage
+    recovers on the read path without a restart.
+
+    The write paths (upsert, dedup probe) used to read the raw
+    ``vs.vector_name`` attribute instead, which is frozen at construction
+    time.  A store built while that probe failed therefore kept writing to a
+    lane that search had already moved off — and on a named-vector
+    collection a bare (unnamed) vector is a hard Qdrant rejection, so
+    ingest failed while search worked.
+
+    Prefer the store's own resolver so both paths share one answer; fall
+    back to the attribute for stores that are not ``QdrantVectorStore``
+    (test doubles) or that predate the resolver.
+    """
+    # The capability probe is what populates ``_dense_vector_name`` (and
+    # flips ``_dense_name_probed`` for a confirmed-unnamed collection), and
+    # the search path always runs it before resolving.  A write must do the
+    # same: without it a store whose construction probe failed would resolve
+    # from a cold cache and fall back to the "dense" guess on an unnamed
+    # collection — the exact mismatch this helper exists to remove.
+    probe = getattr(vs, "supports_hybrid", None)
+    if callable(probe):
+        try:
+            probe()
+        except Exception:  # pragma: no cover - defensive: never break a write
+            logger.debug(
+                "Hybrid capability probe failed before a write; resolving from the last known shape", exc_info=True
+            )
+    resolve = getattr(vs, "_dense_using", None)
+    if callable(resolve):
+        try:
+            return resolve()
+        except Exception:  # pragma: no cover - defensive: never break a write
+            logger.debug("Dense-lane resolution failed; using the configured name", exc_info=True)
+    return getattr(vs, "vector_name", None)
 
 
 def _store_write_guard(vs: Any) -> Any:
@@ -519,8 +642,13 @@ def _bm25_indexable_text(text: str) -> str:
     twins and exactly what text queries match against.  (This differs from
     :func:`_has_real_text`, which strips captions too: that gate decides
     embedding inputs, this one decides lexical index inputs.)
+
+    Delegates to :func:`multimodal_rag.utils.bm25.indexable_text` so the
+    ingest side and the delete-side df decrement share ONE definition of
+    indexable text (audit 2026-10-16, P1-7).  Kept as a named wrapper
+    because tests and the contextualizer reference it directly.
     """
-    return _MEDIA_PLACEHOLDER_RE.sub("", text or "").strip()
+    return bm25_lane.indexable_text(text)
 
 
 def _detect_dense_vector_name(client: Any, collection_name: str) -> str | None:
@@ -585,7 +713,11 @@ def _bm25_sparse_vectors(sub_docs: list[Document], ctx: dict[str, Any] | None) -
     if ctx is None:
         return out
     for i, doc in enumerate(sub_docs):
-        text = _bm25_indexable_text(doc.page_content)
+        # ONE shared counting rule for ingest and delete (P1-7): the
+        # placeholder-stripped text, counted through the same helper the
+        # decrement path uses.  Re-checked here so a doc reduced to bare
+        # placeholders keeps no sparse lane at all.
+        text = bm25_lane.indexable_text(doc.page_content)
         if not text:
             continue
         tf = bm25_lane.term_counts(text)
@@ -2226,10 +2358,35 @@ class MultimodalRAG:
                             capture_output=True,
                             timeout=300,
                         )
+                        # A failed/empty transcode must never become a
+                        # stored payload (audit 2026-10-16, P2 empty-b64):
+                        # this branch used to b64-encode proc.stdout
+                        # unconditionally, so an ffmpeg failure produced
+                        # "data:video/mp4;base64," — an empty tier-3 payload
+                        # that the reranker and VLM then consume directly at
+                        # retrieval time.  Skip the URL instead (the doc keeps
+                        # its tier-2 preprocessed_* file ref, and a doc left
+                        # with no media is dropped by the usual skip rules).
+                        if proc.returncode != 0 or not proc.stdout:
+                            logger.warning(
+                                "Video resize failed for %s (exit %s, %d bytes out) — "
+                                "skipping this video payload rather than storing an empty one",
+                                path[:120],
+                                proc.returncode,
+                                len(proc.stdout or b""),
+                            )
+                            continue
                         mime = "video/mp4"
                         b64 = base64.b64encode(proc.stdout).decode("utf-8")
                         resized.append(f"data:{mime};base64,{b64}")
-                d[key] = resized if isinstance(val, list) else resized[0]
+                if not resized:
+                    # Every ref for this key was skipped (all failed to
+                    # transcode) — drop the key instead of writing an empty
+                    # list/string, so downstream sees "no media" rather than
+                    # a malformed payload.
+                    d.pop(key, None)
+                else:
+                    d[key] = resized if isinstance(val, list) else resized[0]
             out.append(d)
         return out
 
@@ -2375,7 +2532,16 @@ class MultimodalRAG:
 
             client = vs._client  # type: ignore[attr-defined]
             coll = vs.collection_name  # type: ignore[attr-defined]
-            vector_name = vs.vector_name  # type: ignore[attr-defined]
+            # Probe-backed lane resolution (audit 2026-10-16, P1-6): the
+            # build-time ``vs.vector_name`` is only as good as the
+            # ``get_collection`` probe that ran at construction.  When that
+            # probe failed (a Qdrant outage — the case the re-probe exists
+            # for), the attribute stays ``None`` while SEARCH self-heals
+            # through ``_dense_using()``.  Reading the attribute here made
+            # the dedup probe target a vector name search no longer used,
+            # so dedup silently stopped matching.  ``_dense_using()`` is the
+            # one resolution both paths must share.
+            vector_name = _write_vector_name(vs)
 
             responses = client.query_batch_points(
                 collection_name=coll,
@@ -2703,7 +2869,12 @@ class MultimodalRAG:
 
                 client = vs._client  # type: ignore[attr-defined]
                 coll = vs.collection_name  # type: ignore[attr-defined]
-                vector_name = vs.vector_name  # type: ignore[attr-defined]
+                # Probe-backed lane resolution (audit 2026-10-16, P1-6) — see
+                # _write_vector_name: the upsert must name the SAME lane
+                # search resolves, or a store built while the construction
+                # probe failed writes a bare vector into a named-vector
+                # collection and Qdrant rejects every point.
+                vector_name = _write_vector_name(vs)
 
                 # ── 3b. BM25 sparse vectors for the docs actually stored ────
                 # Runs after dedup so dropped duplicates never pollute the

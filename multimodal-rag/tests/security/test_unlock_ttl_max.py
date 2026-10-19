@@ -36,12 +36,12 @@ def _clean_env(monkeypatch):
 @pytest.mark.parametrize(
     "raw,expected",
     [
-        (None, 86400),        # unset -> bounded default
-        ("", 86400),          # blank -> default
-        ("0", 0),             # explicit opt-in: no-expiry ALLOWED
-        ("3600", 3600),       # explicit bound
-        ("abc", 86400),       # garbage -> default (never a crash)
-        ("-5", 86400),        # negative -> default
+        (None, 86400),  # unset -> bounded default
+        ("", 86400),  # blank -> default
+        ("0", 0),  # explicit opt-in: no-expiry ALLOWED
+        ("3600", 3600),  # explicit bound
+        ("abc", 86400),  # garbage -> default (never a crash)
+        ("-5", 86400),  # negative -> default
     ],
 )
 def test_unlock_ttl_max_parsing(monkeypatch, raw, expected):
@@ -90,8 +90,8 @@ def test_bounded_deployment_still_caps(monkeypatch):
     def rejects(ttl: int) -> bool:
         return ttl < 60 or bool(ttl_max and ttl > ttl_max)
 
-    assert rejects(3600) is False   # exactly at the cap
-    assert rejects(3601) is True    # over the cap
+    assert rejects(3600) is False  # exactly at the cap
+    assert rejects(3601) is True  # over the cap
     assert rejects(1800) is False
 
 

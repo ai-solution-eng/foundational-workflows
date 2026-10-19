@@ -39,6 +39,36 @@ spec:
             app: {{ .Values.deployment.appName }}
         spec:
           automountServiceAccountToken: false
+          # ── qdrant readiness gate (2026-10-17 incident) ──────────────────
+          # A cron tick must NOT touch qdrant while the cluster is still
+          # forming: after a cold STS restart a node can answer 503 for
+          # minutes, and a read that lands on an orphaned shard panics the
+          # leader (min > max).  Wait for /readyz, bounded by
+          # cronQdrantReadyTimeoutSeconds (default 1800 = 30 min); on
+          # timeout this tick FAILS loudly (the next tick retries) rather
+          # than hammering a half-joined cluster.
+          initContainers:
+            - name: wait-for-qdrant
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - python
+                - -c
+                - |
+                  import sys, time, urllib.request
+                  url = "http://{{ .Values.deployment.name }}-qdrant:{{ .Values.qdrant.httpPort }}/readyz"
+                  budget = int("{{ .Values.cronQdrantReadyTimeoutSeconds | default 1800 }}")
+                  deadline = time.time() + budget
+                  while True:
+                      try:
+                          with urllib.request.urlopen(url, timeout=5) as r:
+                              if r.status == 200:
+                                  print("qdrant /readyz OK"); sys.exit(0)
+                      except Exception:
+                          pass
+                      if time.time() >= deadline:
+                          print(f"qdrant not ready after {budget}s - failing this tick (next tick retries)"); sys.exit(1)
+                      time.sleep(10)
           restartPolicy: OnFailure
           containers:
             - name: stm-reaper

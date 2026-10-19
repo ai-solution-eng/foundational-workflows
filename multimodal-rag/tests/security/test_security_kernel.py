@@ -610,6 +610,85 @@ def test_rest_traversal_refused(served_dataset):
         assert b"root:" not in r.content
 
 
+def test_rest_media_acl_denied_key_cannot_read_media(served_dataset, token_secret, monkeypatch):
+    """P0-2 (audit 2026-10-16): the dataset ACL must gate MEDIA serving.
+
+    Reproduced pre-fix: an ACL-denied key 403ed on metadata/search/documents
+    but got 200 + bytes from /api/datasets/{name}/files/... because
+    api_serve_file sat in the middleware PUBLIC set (the D20 fail-closed
+    branch and _rag_acl_path_denial never ran).  Same for an unauthenticated
+    caller on a passwordless dataset.  Both are pinned refused here; the
+    password/token flows are pinned still-working right below.
+    """
+    import multimodal_rag.utils.clients_registry as cr
+
+    (client, _files) = served_dataset
+    monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key;bob:bob-key")
+    monkeypatch.setenv(cr.ACLS_ENV, "alice:dsA;bob:other-ds")
+    # The ACL-denied key: 403 on every surface, media included.
+    r = client.get("/api/datasets/dsA", headers={"X-API-Key": "bob-key"})
+    assert r.status_code == 403
+    r = client.get("/api/datasets/dsA/files/img.jpg", headers={"X-API-Key": "bob-key"})
+    assert r.status_code == 403, "an ACL-denied key must not read the bytes"
+    assert b"jpegdata" not in r.content
+    # The glob fallback (bare filename) must not be a way around it either.
+    r = client.get("/api/datasets/dsA/files/*", headers={"X-API-Key": "bob-key"})
+    assert r.status_code in (403, 404)
+    # The ALLOWED key still reads the same file.
+    r = client.get("/api/datasets/dsA/files/img.jpg", headers={"X-API-Key": "alice-key"})
+    assert r.status_code == 200 and r.content.startswith(b"\xff\xd8\xff")
+    # No credential at all on a CONFIGURED deployment: refused too (the same
+    # caller is 401ed on every other dataset route).
+    r = client.get("/api/datasets/dsA/files/img.jpg")
+    assert r.status_code == 403
+
+
+def test_rest_media_token_still_authorizes_its_own_file(served_dataset, token_secret, monkeypatch):
+    """P0-2 preservation: a media token keeps full authorization for its own
+    file with NO key presented — the <img> flow the audit verified sound.
+    The token is minted through an authorized call, so the ACL step must not
+    break the token path for a caller the middleware cannot identify."""
+    import multimodal_rag.utils.clients_registry as cr
+
+    (client, _files) = served_dataset
+    monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key")
+    monkeypatch.setenv(cr.ACLS_ENV, "alice:dsA")
+    good = _api_sign("dsA", "img.jpg")
+    r = client.get("/api/datasets/dsA/files/img.jpg", params={"token": good})
+    assert r.status_code == 200 and r.content.startswith(b"\xff\xd8\xff")
+    # A foreign token is still refused (no ACL widening either).
+    r = client.get("/api/datasets/dsA/files/img.jpg", params={"token": _api_sign("dsB", "img.jpg")})
+    assert r.status_code == 403
+
+
+def test_rest_media_traversal_still_refused_with_identity(served_dataset, monkeypatch):
+    """P0-2 preservation: the traversal defences are untouched by the ACL
+    step — every encoding still 403/404s, for an authenticated caller too."""
+    import multimodal_rag.utils.clients_registry as cr
+
+    (client, _files) = served_dataset
+    monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key")
+    monkeypatch.setenv(cr.ACLS_ENV, "alice:dsA")
+    for evil in ("..%2F..%2F..%2Fetc%2Fpasswd", "../../../../etc/passwd", "%2e%2e/%2e%2e/etc/passwd"):
+        r = client.get(f"/api/datasets/dsA/files/{evil}", headers={"X-API-Key": "alice-key"})
+        assert r.status_code in (403, 404), f"{evil} -> {r.status_code}"
+        assert b"root:" not in r.content
+
+
+def test_rest_media_unconfigured_deployment_unchanged(served_dataset, monkeypatch):
+    """P0-2 preservation: with NO registry configured the legacy single-user
+    behaviour is byte-identical — a credential-less fetch of a passwordless
+    dataset still serves (the D20 posture the fix must not tighten)."""
+    import multimodal_rag.utils.clients_registry as cr
+
+    (client, _files) = served_dataset
+    for var in (cr.CLIENTS_ENV, cr.ACLS_ENV, "RAG_ACCESS_STORE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(_api_mod, "_RAG_API_KEY", "")
+    r = client.get("/api/datasets/dsA/files/img.jpg")
+    assert r.status_code == 200 and r.content.startswith(b"\xff\xd8\xff")
+
+
 def test_rest_media_token_gate(served_dataset, token_secret):
     (client, _files) = served_dataset
     good = _api_sign("dsA", "img.jpg")

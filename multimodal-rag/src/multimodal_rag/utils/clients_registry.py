@@ -37,7 +37,7 @@ import re
 import threading
 from contextvars import ContextVar
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from multimodal_rag.utils.logging_utils import logging
 from multimodal_rag.utils.mcp_auth import configured_keys

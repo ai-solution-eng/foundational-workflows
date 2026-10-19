@@ -43,14 +43,14 @@ replicaCount: 4
 image:
   # Packaged with the chart — leave as-is unless you built your own image.
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v5.8.2
+  tag: v5.9.5
   pullPolicy: IfNotPresent
 
 qdrant:
   replicas: 3
   image:
     repository: qdrant/qdrant
-    tag: v1.19.0
+    tag: v1.19.2
     pullPolicy: IfNotPresent
   grpcPort: 6334
   httpPort: 6333
@@ -252,14 +252,16 @@ security:
   mediaAllowPathPrefixes: /data/datasets:/data/staging
   pwMaxFailures: 10
   pwFailWindow: 300
-  # Keep true: behind oauth2-proxy the identity headers are authoritative.
+  # Keep true: behind oauth2-proxy the identity headers are authoritative
+  # (chart default is now false).
   trustProxyIdentity: true
 
   # Per-user self-selection off: central oauth2-proxy owns identity here.
   accessStore: false
   # Comma-separated datasets that can never be self-selected.
   accessDenySelect: ''
-  # accessSelfMint is ON by chart default but INERT here while accessStore is false.
+  # accessSelfMint is OPT-IN (chart default false since 2026-10-16) and stays
+  # unset here — INERT anyway while accessStore is false.
   # Fallback memory dataset (RAG_MEMORY_DEFAULT) for callers without a ★ binding.
   memoryDefault: ''
   # Keep false: in-cluster Prometheus scrapes without a token (if true, set metrics.serviceMonitorBearerSecret).

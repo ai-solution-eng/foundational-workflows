@@ -42,14 +42,14 @@ replicaCount: 2
 image:
   # Packaged with the chart — leave as-is unless you built your own image.
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v5.8.2
+  tag: v5.9.5
   pullPolicy: IfNotPresent
 
 qdrant:
   replicas: 2
   image:
     repository: qdrant/qdrant
-    tag: v1.19.0
+    tag: v1.19.2
     pullPolicy: IfNotPresent
   grpcPort: 6334
   httpPort: 6333
@@ -240,6 +240,8 @@ security:
   pwMaxFailures: 10
   pwFailWindow: 300
   # Trust X-Auth-Request-*/X-Email/X-User headers; keep true ONLY behind an enforcing auth proxy.
+  # TRUE by choice (chart default is now false): this site's every path
+  # traverses the enforcing oauth2-proxy AuthorizationPolicy below.
   trustProxyIdentity: true
 
   # Self-service dataset selection + ★ memory binding on /access; needs mcp.apiKeyClients.

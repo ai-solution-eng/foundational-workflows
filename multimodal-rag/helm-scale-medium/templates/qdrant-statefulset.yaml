@@ -82,9 +82,19 @@ spec:
             httpGet:
               path: /healthz
               port: {{ .Values.qdrant.httpPort }}
-            failureThreshold: 30
+            # A cold join replays the whole raft log over NFS; the old 30x5s
+            # (150s) budget killed the pod mid-catch-up (2026-10-17 incident).
+            # Generous by default because the safe wait is data-dependent.
+            failureThreshold: {{ .Values.qdrant.startupProbeFailureThreshold | default 240 }}
             periodSeconds: 5
             timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.qdrant.httpPort }}
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /healthz

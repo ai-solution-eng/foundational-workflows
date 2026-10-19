@@ -1,4 +1,3 @@
-| `memory_status()` | Report-only probe: the CURRENT caller's memory-write capability (`{memory_available, dataset, writable, unlocked, detail}`) — the cheap pre-flight for automated memory writers (gateway distiller, harness shims). No arguments, no cross-identity oracle, no side effects (no unlock-cache write, no password-throttle consumption, no dataset mutation). A writer calls this BEFORE spending model tokens on a summary — `memory_available && writable && unlocked` predicts `add_memory` success (residual failure modes are storage errors, not ACL) | no | — |
 # Configuring MCP Access
 
 How to connect any MCP-compatible client (opencode, Claude Desktop, Open WebUI, etc.) to the Multimodal RAG server's MCP sidecar.
@@ -59,7 +58,7 @@ If the cluster ingress uses `oauth2-proxy` (EZUA), include a bearer token in the
 
 ---
 
-## 2. Available tools (21)
+## 2. Available tools (23)
 
 > **Read-only grants (D26):** when the caller's key carries mode ACLs (`RAG_DATASET_ACLS` token form `name:ds1:ro` or an overlay `{"name": …, "mode": "ro"}`), the write tools — `dataset_add_documents`, `dataset_delete_documents`, `dataset_replace_document`, `add_memory`, `delete_memory`, `forget_session` — require an **rw** grant for the target dataset: an ro (or ro-only) dataset refuses with a clear `ToolError`; read tools are unchanged.
 
@@ -69,6 +68,9 @@ If the cluster ingress uses `oauth2-proxy` (EZUA), include a bearer token in the
 | `unlock_dataset(dataset_name, password, ttl)` | Verify a dataset password; cached per-process (default 30 min; `ttl` bounded by `RAG_UNLOCK_MAX_TTL`, `0` = no expiry when the deployment opts in) — pass `password=` per call on multi-replica deployments, or select the dataset once instead (below) | yes | yes |
 | `select_dataset(dataset_name, password?)` | **D16** (opt-in): add a dataset to YOUR key's set — protected ones require the correct password, saved server-side so no tool needs `password=` afterwards | yes | if protected |
 | `deselect_dataset(dataset_name)` | **D16**: remove one of YOUR selections (and its saved password); operator-ACL grants untouched | yes | — |
+| `create_short_term_memory(session_id, ttl_seconds?, name?)` | **Short-term memory** (opt-in `shortTermMemory.enabled`): mint an ephemeral session dataset — non-guessable name `stm-<base32(hmac_sha256(salt, session_id))[:16]>`, `kind=short_term`, lifetime `ttl_seconds` (default 6h, cap `shortTermMemory.maxTtlHours`=24h), granted to the creating identity only. Passwordless by design; HIDDEN from `list_datasets` — keep the returned name, it is the only handle. 503 when `RAG_STM_NAME_SALT` is unset (never mints guessable names) | no | never |
+| `end_short_term_memory(dataset_name)` | **Short-term memory**: tear down one STM dataset. Owner-or-admin (D23) and refuses any dataset whose `kind != "short_term"` — never a general dataset-deletion backdoor. Existence is resolved before the ownership gate, so a non-owner learns nothing | no | — |
+| `memory_status()` | **Report-only probe**: the CURRENT caller's memory-write capability (`{memory_available, dataset, writable, unlocked, detail}`) — the cheap pre-flight for automated memory writers (gateway distiller, harness shims). No arguments, no cross-identity oracle, no side effects (no unlock-cache write, no password-throttle consumption, no dataset mutation). `memory_available && writable && unlocked` predicts `add_memory` success (residual failure modes are storage errors, not ACL) | no | — |
 | `set_memory_dataset(dataset_name?)` | **D16**: bind your ★ memory dataset (omit the arg to clear) — `add_memory`/`search_memory` then need no `dataset_name`/`password` | no | — |
 | `search_dataset(dataset_name, query, image?, video?, audio?, top_k?, use_reranker?, reranker_top_k?, base_llm_modalities?, password?, media_base_url?, file_types?, severities?, source_prefix?, date_from?, date_to?)` | Full multimodal retrieval with post-processing; optional metadata filters (`file_types`, `severities`, `source_prefix`, `date_from`/`date_to`) applied server-side before ranking | yes | if protected |
 | `get_dataset_files(dataset_name, file_path?, limit?, offset?, password?)` | List or retrieve files in a dataset | yes | if protected |
@@ -130,7 +132,7 @@ If the calling LLM doesn't support a modality (set via `base_llm_modalities`), r
 }
 ```
 
-All 21 tools are exposed on every connection. The client (or its `tools` config) can disable specific tools it doesn't want the model to see.
+All 23 tools are exposed on every connection. The client (or its `tools` config) can disable specific tools it doesn't want the model to see.
 
 ### 3.2 opencode (unified single connection, 2026-10)
 

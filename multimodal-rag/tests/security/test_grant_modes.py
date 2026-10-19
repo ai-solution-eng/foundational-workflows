@@ -474,6 +474,25 @@ def test_mcp_require_dataset_write_matrix():
 # ===========================================================================
 
 
+def test_rest_path_denial_ro_covers_short_term_memory_delete():
+    """D26 gap (audit 2026-10-16): DELETE /api/short-term-memory/{name} is a
+    dataset deletion but lives outside /api/datasets/..., so the path-shaped
+    write gate never matched it — a ro-only key could destroy an STM dataset
+    it may only read.  The gate now recognises that shape; the owner-or-admin
+    D23 check in the handler is untouched (both must pass)."""
+    ro = _ro("stm-abc")
+    rw = _rw("stm-abc")
+    ro_msg = "read-only for this API key"
+    assert ro_msg in api._rag_acl_path_denial("/api/short-term-memory/stm-abc", "DELETE", ro)
+    # the rw control passes, and the create (POST) path is unaffected
+    assert api._rag_acl_path_denial("/api/short-term-memory/stm-abc", "DELETE", rw) is None
+    assert api._rag_acl_path_denial("/api/short-term-memory/stm-abc", "GET", ro) is None
+    # a ro grant on a DIFFERENT dataset does not gate this one
+    assert api._rag_acl_path_denial("/api/short-term-memory/other", "DELETE", ro) is None
+    # the bare collection path (no name) is not a delete target
+    assert api._rag_acl_path_denial("/api/short-term-memory", "DELETE", ro) is None
+
+
 def test_rest_path_denial_ro_matrix():
     """The REST deny-checker refuses the mutating dataset surfaces for a ro
     grant with the D26 denial string; the D16 select and D23 creator-publish

@@ -19,14 +19,15 @@ Run::
 import sys
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from multimodal_rag.dataset_manager import DatasetManager  # noqa: E402
-from multimodal_rag.stm_reaper import reap_once  # noqa: E402
-from multimodal_rag.utils import bm25 as bm25_lane  # noqa: E402
+from multimodal_rag.dataset_manager import DatasetManager
+from multimodal_rag.stm_reaper import reap_once
+from multimodal_rag.utils import bm25 as bm25_lane
 
 NOW = 2_000_000_000
 H = 3600
@@ -54,7 +55,11 @@ def _seed(dm: DatasetManager, name: str, payloads: list[dict]):
     from qdrant_client.models import PointStruct
 
     store = dm._get_rag(name, check_embedder=False).vector_store
-    vector = {bm25_lane.DENSE_VECTOR_NAME: [0.1] * _DIM}
+    # Explicit dict[str, Any]: the bare literal infers dict[Any, ...] (the key
+    # is a module constant) and dict is INVARIANT in its value type, so neither
+    # dict[Any, ...] nor dict[str, list[float]] satisfies PointStruct.vector's
+    # named-vector mapping union.
+    vector: dict[str, Any] = {bm25_lane.DENSE_VECTOR_NAME: [0.1] * _DIM}
     store._client.upsert(
         store.collection_name,
         points=[PointStruct(id=uuid.uuid4().hex, vector=vector, payload=p) for p in payloads],
@@ -208,7 +213,7 @@ def test_boundary_expires_equal_now_is_kept(dm):
 # ---------------------------------------------------------------------------
 
 
-def test_immortal_dataset_is_never_scrolled_or_opened(dm, monkeypatch):
+def test_immortal_dataset_is_never_scrolled_or_opened(dm: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """A dataset with no lifetime is skipped BEFORE any Qdrant traffic:
     neither _get_rag nor scroll is called for it, even though it holds a
     point whose expiry is far in the past."""
@@ -220,11 +225,11 @@ def test_immortal_dataset_is_never_scrolled_or_opened(dm, monkeypatch):
     real_get_rag = DatasetManager._get_rag
     real_scroll = type(store._client).scroll
 
-    def spy_get_rag(self, name, *a, **k):
+    def spy_get_rag(self: Any, name: Any, *a: Any, **k: Any) -> Any:
         opened.append(name)
         return real_get_rag(self, name, *a, **k)
 
-    def spy_scroll(self, collection_name, *a, **k):
+    def spy_scroll(self: Any, collection_name: Any, *a: Any, **k: Any) -> Any:
         scrolled.append(collection_name)
         return real_scroll(self, collection_name, *a, **k)
 

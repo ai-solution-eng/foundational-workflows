@@ -345,4 +345,11 @@ def test_reap_decision_reason_tokens_are_stable():
         sl.reap_decision({"expires_at": NOW - 1}, DS, NOW).reason,
         sl.reap_decision({"expires_at": NOW + 1}, DS, NOW).reason,
     }
-    assert observed == {"no-payload", "dataset-immortal", "no-expires-at", "malformed-expires-at", "expired", "not-expired"}
+    assert observed == {
+        "no-payload",
+        "dataset-immortal",
+        "no-expires-at",
+        "malformed-expires-at",
+        "expired",
+        "not-expired",
+    }

@@ -33,9 +33,23 @@ spec:
         fsGroup: 1000
       initContainers:
         - name: fix-pvc-permissions
-          image: busybox:latest
+          # PINNED (audit 2026-10-16): busybox:latest is unpinned mutable
+          # supply-chain surface for a root init container. resources keep the
+          # chown walk from bursting node memory on large NFS trees.
+          image: busybox:1.37.0
+          imagePullPolicy: IfNotPresent
           securityContext:
             runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              # chown/chgrp need CAP_CHOWN; find over NFS wants DAC bypass on
+              # foreign-owned files. Nothing else.
+              add: ["CHOWN", "DAC_OVERRIDE"]
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 500m, memory: 128Mi}
           # Skip the walk when ownership is already correct: the data PVC
           # can hold hundreds of thousands of files (NFS), and chown -R
           # over NFS on every pod start stalls the rollout in Init for
