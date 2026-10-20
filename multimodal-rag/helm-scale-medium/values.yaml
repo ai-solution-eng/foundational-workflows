@@ -54,7 +54,7 @@ replicaCount: 2
 
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v5.9.5
+  tag: v6.0.0
   pullPolicy: IfNotPresent
 
 qdrant:
@@ -74,8 +74,39 @@ qdrant:
   client:
     preferGrpc: true
     timeout: 30
+    # --- Vector memory placement (Qdrant v1.19 memory tiers) --------------
+    # Every structure is an mmap file that the OS can evict; only "pinned"
+    # is a heap allocation that must fit in RAM (the only tier that can
+    # OOM). Tiers: pinned | cached | cold.
+    #
+    # int8 quantization is kept for the SPEED of int8 scoring, not to save
+    # memory -- we do not rescore, so the fp32 originals are never read at
+    # query time and stay "cold" (evictable). Pin the quantized copy so the
+    # candidate-scoring pass never touches disk.
     quantization: int8
-    quantizationAlwaysRam: true
+    quantizationMemory: pinned
+    # Dense originals: cold (not read on the scoring path, see above; still
+    # read on rare non-scoring paths such as the with_vectors lookup).
+    denseMemory: cold
+    # Dense storage datatype: float16 halves the on-disk/page-cache footprint
+    # of the originals permanently. NOT the same as quantization (a datatype
+    # replaces the originals; quantization adds a compressed copy beside them).
+    datatype: float32
+    # Sparse (BM25) inverted index. Read on every hybrid query. Its size vs
+    # the dense int8 lane depends on chunk size (measured on this repo,
+    # LOWER BOUND -- dev-checkout regex tokenizer, f32-valued postings):
+    #   chunk_size 2048 -> ~590-660 unique terms, ~1.1-1.2x dense int8
+    #   chunk_size 8192 -> ~1370-1380 unique terms, ~2.5x dense int8
+    # Default "cached" (warmed at startup, evictable by the OS) rather than
+    # "pinned" (a heap allocation that must fit in RAM and can OOM).
+    sparseMemory: cached
+    # Shards per node for NEW collections. shard_number is create-time only
+    # (Qdrant cannot change it without recreating the collection) and
+    # defaults to the peer count at creation. 1 = that default. Qdrant's
+    # scaling guidance suggests >= 2 shards/node if you plan to scale out,
+    # at the cost of per-shard overhead. Trade-off, not a settled default.
+    # Existing collections are unaffected.
+    shardMultiple: 1
   telemetryDisabled: true
 
 redis:
@@ -360,6 +391,16 @@ backups:
   schedule: 0 3 * * *
   bucket: ''
   retentionDays: 0
+  # Optional: back up PASSWORD-PROTECTED datasets too. Name of a user-owned
+  # Secret (pre-create it; the chart never creates Secrets for you) whose
+  # KEYS are dataset names and VALUES the matching dataset password:
+  #   kubectl -n <ns> create secret generic <name> \
+  #     --from-literal=<dataset-name>=<password> ...
+  # Mounted read-only into the backup CronJob; a protected dataset without a
+  # matching key is skipped with a loud SKIP-PROTECTED log line. Leave '' to
+  # keep the old behavior (protected datasets always skipped).
+  protectedPasswords:
+    existingSecret: ''
 
 # Watched S3 sources (opt-in reconciler CronJob): each tick POSTs every source's
 # prefixes to batch-urls with sync=true. Prefixes must be s3:// directory URLs.

@@ -130,7 +130,11 @@ data:
   QDRANT_PREFER_GRPC: {{ .Values.qdrant.client.preferGrpc | quote }}
   QDRANT_CLIENT_TIMEOUT: {{ .Values.qdrant.client.timeout | quote }}
   QDRANT_QUANTIZATION: {{ .Values.qdrant.client.quantization | quote }}
-  QDRANT_QUANTIZATION_ALWAYS_RAM: {{ .Values.qdrant.client.quantizationAlwaysRam | quote }}
+  QDRANT_QUANTIZATION_MEMORY: {{ .Values.qdrant.client.quantizationMemory | default "pinned" | quote }}
+  QDRANT_DENSE_MEMORY: {{ .Values.qdrant.client.denseMemory | default "cold" | quote }}
+  QDRANT_DATATYPE: {{ .Values.qdrant.client.datatype | default "float32" | quote }}
+  QDRANT_SPARSE_MEMORY: {{ .Values.qdrant.client.sparseMemory | default "cached" | quote }}
+  QDRANT_SHARD_MULTIPLE: {{ .Values.qdrant.client.shardMultiple | default 1 | quote }}
   # Dynamic embedding query batcher (search path)
   EMBEDDING_QUERY_BATCH_SIZE: {{ .Values.app.embeddingQueryBatchSize | quote }}
   EMBEDDING_QUERY_BATCH_WAIT_MS: {{ .Values.app.embeddingQueryBatchWaitMs | quote }}

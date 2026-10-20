@@ -1,10 +1,15 @@
 {{- if .Values.backups.enabled }}
-# Opt-in scheduled dataset backups: exports every non-password-protected
-# dataset via GET /api/datasets/{name}/export and uploads the .tar.gz to the
-# configured S3/MinIO bucket (reuses the app image's httpx + boto3 and the
-# existing S3_* credentials from the model-keys Secret).  Protected datasets
-# are skipped — their exports require the dataset password, which backups
-# deliberately do not hold.
+# Opt-in scheduled dataset backups: exports every dataset via
+# GET /api/datasets/{name}/export and uploads the .tar.gz to the configured
+# S3/MinIO bucket (reuses the app image's httpx + boto3 and the existing S3_*
+# credentials from the model-keys Secret).  Password-protected datasets are
+# exported too WHEN their password is available in the optional
+# protected-passwords Secret (backups.protectedPasswords.existingSecret —
+# one key per dataset name, value = the dataset password, mounted read-only
+# at /etc/rag/dataset-passwords; a volume mount rather than envFrom because
+# dataset names carry hyphens/dots that envFrom would silently drop).
+# A protected dataset WITHOUT a matching key is skipped with a loud
+# SKIP-PROTECTED log line naming the missing key — never silently.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -51,6 +56,7 @@ spec:
                   if not headers:
                       print("[backup] WARNING: RAG_API_KEY empty - auth-enabled deployments will 401 every call")
                   api = os.environ["BACKUP_API_URL"].rstrip("/")
+                  PW_DIR = "/etc/rag/dataset-passwords"
                   bucket = os.environ["BACKUP_BUCKET"]
                   endpoint = os.environ.get("S3_ENDPOINT_URL") or None
                   s3 = boto3.client(
@@ -68,13 +74,24 @@ spec:
                       name = ds.get("name", "")
                       if not name:
                           continue
+                      pw = None
                       if ds.get("has_password"):
-                          print(f"[backup] skip {name}: password protected (export needs the dataset password)")
-                          skipped += 1
-                          continue
+                          pw_file = os.path.join(PW_DIR, name)
+                          try:
+                              with open(pw_file, "r", encoding="utf-8") as pf:
+                                  pw = pf.read().rstrip("\r\n") or None
+                          except OSError:
+                              pw = None
+                          if not pw:
+                              print(f"[backup] SKIP-PROTECTED {name}: no key '{name}' in the protected-passwords Secret - add it to enable this dataset's backup")
+                              skipped += 1
+                              continue
                       try:
                           with tempfile.NamedTemporaryFile(suffix=".tar.gz") as f:
-                              with httpx.stream("GET", f"{api}/api/datasets/{name}/export", headers=headers or None, timeout=httpx.Timeout(1800.0, connect=30.0)) as r:
+                              export_headers = dict(headers)
+                              if pw:
+                                  export_headers["X-Dataset-Password"] = pw
+                              with httpx.stream("GET", f"{api}/api/datasets/{name}/export", headers=export_headers or None, timeout=httpx.Timeout(1800.0, connect=30.0)) as r:
                                   r.raise_for_status()
                                   for chunk in r.iter_bytes():
                                       f.write(chunk)
@@ -165,6 +182,11 @@ spec:
               volumeMounts:
                 - name: tmp
                   mountPath: /tmp
+                {{- if .Values.backups.protectedPasswords.existingSecret }}
+                - name: dataset-passwords
+                  mountPath: /etc/rag/dataset-passwords
+                  readOnly: true
+                {{- end }}
               resources:
                 requests:
                   memory: "256Mi"
@@ -175,4 +197,9 @@ spec:
           volumes:
             - name: tmp
               emptyDir: {}
+            {{- if .Values.backups.protectedPasswords.existingSecret }}
+            - name: dataset-passwords
+              secret:
+                secretName: {{ .Values.backups.protectedPasswords.existingSecret }}
+            {{- end }}
 {{- end }}

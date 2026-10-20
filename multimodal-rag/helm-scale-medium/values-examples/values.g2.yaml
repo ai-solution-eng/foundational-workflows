@@ -42,7 +42,7 @@ replicaCount: 2
 image:
   # Packaged with the chart — leave as-is unless you built your own image.
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v5.9.5
+  tag: v6.0.0
   pullPolicy: IfNotPresent
 
 qdrant:
@@ -58,7 +58,11 @@ qdrant:
     preferGrpc: true
     timeout: 30
     quantization: int8
-    quantizationAlwaysRam: true
+    quantizationMemory: pinned
+    denseMemory: cold
+    datatype: float32
+    sparseMemory: cached
+    shardMultiple: 1
   telemetryDisabled: true
 
 # Shares dataset unlock state across API replicas so a user unlocks once.
@@ -303,6 +307,10 @@ backups:
   schedule: 0 3 * * *
   bucket: ''
   retentionDays: 0
+  # Optional Secret (keys = dataset names, values = passwords) so
+  # password-protected datasets are backed up too; '' = skip them.
+  protectedPasswords:
+    existingSecret: ''
 
 # Opt-in reconciler CronJob: each tick POSTs each source's s3:// prefixes to
 # batch-urls — new/changed objects ingest, deleted ones are pruned.

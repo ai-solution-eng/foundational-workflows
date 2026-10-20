@@ -39,7 +39,7 @@ replicaCount: 1
 image:
   # Packaged with the chart — leave as-is unless you built your own image.
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v5.9.5
+  tag: v6.0.0
   pullPolicy: IfNotPresent
 
 # Single-replica chart: the API mounts the Qdrant PVC read-only for disk reporting.
@@ -228,6 +228,10 @@ backups:
   schedule: 0 3 * * *
   bucket: ''
   retentionDays: 0
+  # Optional Secret (keys = dataset names, values = passwords) so
+  # password-protected datasets are backed up too; '' = skip them.
+  protectedPasswords:
+    existingSecret: ''
 
 # Opt-in reconciler CronJob: POSTs each source's s3:// prefixes to batch-urls
 # (new/changed ingest, deleted prune); every prefix must be an s3:// directory.

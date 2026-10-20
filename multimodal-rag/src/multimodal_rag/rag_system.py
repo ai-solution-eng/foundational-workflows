@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from io import BytesIO
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 
@@ -49,6 +49,9 @@ from multimodal_rag.vector_store import (
     ensure_search_payload_indexes,
     filters_to_predicate,
 )
+
+if TYPE_CHECKING:
+    from qdrant_client.models import Datatype, Memory, ScalarQuantization
 
 logger = logging.getLogger(__name__)
 
@@ -480,7 +483,123 @@ def _qdrant_client_timeout():
         return None
 
 
-def _qdrant_quantization_config():
+def _qdrant_memory_tier(env_var: str, default: str) -> "Memory | None":
+    """Resolve a Qdrant v1.19 memory tier (``pinned`` / ``cached`` / ``cold``).
+
+    Qdrant 1.19 replaced the legacy boolean flags (``always_ram`` on
+    quantization, ``on_disk`` on vectors/sparse indexes) with one
+    three-valued ``memory`` parameter per structure. The tiers are not
+    interchangeable with the old booleans: ``cached`` is an *evictable*
+    mmap'd page-cache warm-up, whereas ``pinned`` is a heap allocation
+    that must fit in RAM. Only ``pinned`` can OOM a node.
+
+    Returns ``None`` for an unknown/blank value so the caller can fall
+    back to Qdrant's own default for that structure.
+    """
+    from qdrant_client.models import Memory
+
+    raw = (os.environ.get(env_var) or default).lower().strip()
+    try:
+        return Memory(raw)
+    except ValueError:
+        logger.warning("Unknown %s='%s', using Qdrant default", env_var, raw)
+        return None
+
+
+def _qdrant_dense_memory() -> "Memory | None":
+    """Resolved memory tier for DENSE vectors (``QDRANT_DENSE_MEMORY``).
+
+    Wraps :func:`_qdrant_memory_tier` with the one server-side constraint that
+    matters: Qdrant REJECTS ``pinned`` for dense vectors (they are mmap-only
+    representations — only the quantized copy has a heap-backed form). Asking
+    for it is downgraded to ``cached`` with a warning rather than failing
+    collection creation with an obscure server error.
+
+    Kept as a separate function so the guard is directly testable — a test
+    that re-implements the downgrade inline would keep passing even if this
+    logic regressed.
+    """
+    from qdrant_client.models import Memory
+
+    tier = _qdrant_memory_tier("QDRANT_DENSE_MEMORY", "cold")
+    if tier == Memory.PINNED:
+        logger.warning(
+            "QDRANT_DENSE_MEMORY=pinned is not supported for dense vectors (mmap-only); using 'cached' instead"
+        )
+        return Memory.CACHED
+    return tier
+
+
+def _qdrant_vector_datatype() -> "Datatype | None":
+    """Dense-vector storage datatype for new collections (``QDRANT_DATATYPE``).
+
+    ``float32`` (default) or ``float16``. This is NOT quantization: a
+    datatype changes the *originals* themselves, so float16 halves both the
+    on-disk footprint and the page-cache pressure permanently, whereas
+    quantization adds a second compressed copy beside full-precision
+    originals.
+
+    CAUTION: the originals are still read on some non-scoring paths — e.g.
+    ``mcp_server._lookup_dataset_vector`` scrolls with ``with_vectors=True``
+    — so float16 silently rounds what those paths return. Enable it only
+    after confirming no consumer needs exact fp32 vectors.
+
+    Returns ``None`` for an unknown/blank value so Qdrant keeps its own
+    default (float32).
+    """
+    from qdrant_client.models import Datatype
+
+    raw = (os.environ.get("QDRANT_DATATYPE") or "float32").lower().strip()
+    try:
+        return Datatype(raw)
+    except ValueError:
+        logger.warning("Unknown QDRANT_DATATYPE='%s', using float32", raw)
+        return Datatype.FLOAT32
+
+
+def _qdrant_shard_multiple() -> int:
+    """Shards per node for new collections (``QDRANT_SHARD_MULTIPLE``).
+
+    Qdrant defaults ``shard_number`` to the node count at collection
+    creation and CANNOT change it later without recreating the collection.
+    A multiple of 1 means the shard count equals the peer count *at creation
+    time*; Qdrant's own scaling guidance suggests >= 2 shards per node so a
+    later scale-out has shards to move. This is a trade-off, not a settled
+    default: more shards cost per-shard overhead. Applies to *new*
+    collections only.
+    """
+    raw = (os.environ.get("QDRANT_SHARD_MULTIPLE") or "1").strip()
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Unknown QDRANT_SHARD_MULTIPLE='%s', using 1", raw)
+        return 1
+    return val if val > 0 else 1
+
+
+def _qdrant_node_count(client: Any) -> int:
+    """Best-effort peer count for shard_number math; 0 when unavailable.
+
+    Returns 0 when the count cannot be determined, so the caller falls back
+    to Qdrant's own default rather than pinning a wrong number. Note the
+    distinction: a cluster-ENABLED single node reports itself as one peer
+    (returns 1); only a cluster-DISABLED instance (or an unreachable one,
+    or embedded local mode, which raises NotImplementedError) yields 0.
+    """
+    try:
+        info = client.cluster_status()
+        peers = getattr(info, "peers", None)
+        if peers:
+            return len(peers)
+    except Exception as exc:
+        # Local (embedded) Qdrant raises NotImplementedError; an unreachable
+        # or single-node cluster may raise or return no peers. Either way we
+        # fall through to Qdrant's own default rather than pin a wrong count.
+        logger.debug("Qdrant cluster_status unavailable (%s); leaving shard_number default", exc)
+    return 0
+
+
+def _qdrant_quantization_config() -> "ScalarQuantization | None":
     """Scalar quantization config for new Qdrant collections.
 
     Defaults to int8 (4x memory reduction, ~1-2% recall loss, faster
@@ -489,10 +608,17 @@ def _qdrant_quantization_config():
     — the 1-2% recall loss is acceptable without the extra full-
     precision reranking pass.
 
-    ``QDRANT_QUANTIZATION_ALWAYS_RAM`` (default ``true``) controls whether
-    quantized vectors are pinned in RAM for fast search. Disable
-    (``false``) for very large datasets (2M+ points) to avoid OOM —
-    quantized vectors will be read from disk per-search instead.
+    ``QDRANT_QUANTIZATION_MEMORY`` (default ``pinned``) is the v1.19 memory
+    tier for the *quantized* copy. Pin it (heap, never evicted) so the
+    candidate-scoring pass never touches disk — that is the entire point
+    of keeping a compressed copy. Set ``cached``/``cold`` to make it
+    evictable instead, at the cost of a disk read per search once the
+    page cache is under pressure.
+
+    The legacy ``QDRANT_QUANTIZATION_ALWAYS_RAM`` boolean is still read as
+    a fallback so existing deployments keep their behaviour across the
+    upgrade: ``true`` -> ``pinned``, ``false`` -> ``cold``. It is
+    deprecated and ``QDRANT_QUANTIZATION_MEMORY`` wins when both are set.
 
     Only applies to *newly created* collections; existing collections
     keep their original config.
@@ -501,20 +627,24 @@ def _qdrant_quantization_config():
     if mode in ("none", "off", "false", "0"):
         return None
 
-    always_ram = os.environ.get("QDRANT_QUANTIZATION_ALWAYS_RAM", "true").lower() in ("true", "1", "yes")
-
     if mode not in ("int8", "scalar", "true", "1", ""):
         logger.warning("Unknown QDRANT_QUANTIZATION='%s', falling back to int8", mode)
 
     from qdrant_client.models import ScalarQuantization, ScalarQuantizationConfig, ScalarType
 
-    return ScalarQuantization(
-        scalar=ScalarQuantizationConfig(
-            type=ScalarType.INT8,
-            quantile=0.99,
-            always_ram=always_ram,
-        ),
-    )
+    # Legacy boolean -> tier, so a deployment that only sets the old var
+    # keeps its current placement (always_ram=true => pinned).
+    legacy = os.environ.get("QDRANT_QUANTIZATION_ALWAYS_RAM")
+    if legacy is None:
+        default_tier = "pinned"
+    else:
+        default_tier = "pinned" if legacy.lower() in ("true", "1", "yes") else "cold"
+    memory = _qdrant_memory_tier("QDRANT_QUANTIZATION_MEMORY", default_tier)
+
+    kwargs: dict[str, Any] = {"type": ScalarType.INT8, "quantile": 0.99}
+    if memory is not None:
+        kwargs["memory"] = memory
+    return ScalarQuantization(scalar=ScalarQuantizationConfig(**kwargs))
 
 
 # ---------------------------------------------------------------------------
@@ -1801,7 +1931,7 @@ class MultimodalRAG:
         or the dataset directory (DatasetManager passes the latter).
         """
         from qdrant_client import QdrantClient
-        from qdrant_client.models import Distance, SparseVectorParams, VectorParams
+        from qdrant_client.models import Distance, SparseIndexParams, SparseVectorParams, VectorParams
 
         if client is None:
             if qdrant_host:
@@ -1828,12 +1958,76 @@ class MultimodalRAG:
         )
         vector_name: str | None = None
         if not any(c.name == collection_name for c in collections):
-            client.create_collection(
-                collection_name=collection_name,
-                vectors_config={bm25_lane.DENSE_VECTOR_NAME: VectorParams(size=vector_size, distance=Distance.COSINE)},
-                sparse_vectors_config={bm25_lane.BM25_VECTOR_NAME: SparseVectorParams()},
-                quantization_config=_qdrant_quantization_config(),
-            )
+            # Memory placement (Qdrant v1.19 ``memory`` tiers). Every
+            # structure is mmap-backed and evictable EXCEPT the quantized
+            # copy, which is heap-pinned so the candidate-scoring pass never
+            # reads from disk. Originals go ``cold``: they are not read on
+            # the SCORING path (we do not rescore — see
+            # _qdrant_quantization_config), so pre-warming them would only
+            # evict structures that are used. They ARE still read on rare
+            # non-scoring paths (mcp_server._lookup_dataset_vector scrolls
+            # with with_vectors=True), which now page-fault.
+            dense_params: dict[str, Any] = {
+                "size": vector_size,
+                "distance": Distance.COSINE,
+            }
+            dense_memory = _qdrant_dense_memory()
+            if dense_memory is not None:
+                dense_params["memory"] = dense_memory
+            dense_datatype = _qdrant_vector_datatype()
+            if dense_datatype is not None:
+                dense_params["datatype"] = dense_datatype
+
+            # Sparse (BM25) inverted index. It is NOT negligible, and its
+            # size relative to the dense int8 lane depends entirely on chunk
+            # size. Measured on this repo — LOWER BOUND, because the dev
+            # checkout uses the regex tokenizer (production uses the bundled
+            # Qwen tokenizer, which yields MORE unique terms) and because
+            # postings here are float32-valued (~7.59 B/posting: 4 B doc id +
+            # 4 B value, calibrated against Qdrant's uint8 BM42 figure).
+            # Reproduce with: python tests/measurements/measure_sparse_footprint.py
+            #     chunk_size 2048 -> ~590-660 terms, ~1.1-1.2x dense int8
+            #     chunk_size 8192 -> ~1370-1380 terms, ~2.5x dense int8
+            # Both are read on every hybrid query, so it defaults to
+            # ``cached`` (evictable, warmed at startup) rather than ``pinned``
+            # (a heap allocation that must fit in RAM and can OOM).
+            sparse_index: dict[str, Any] = {}
+            sparse_memory = _qdrant_memory_tier("QDRANT_SPARSE_MEMORY", "cached")
+            if sparse_memory is not None:
+                sparse_index["memory"] = sparse_memory
+
+            create_kwargs: dict[str, Any] = {
+                "collection_name": collection_name,
+                "vectors_config": {bm25_lane.DENSE_VECTOR_NAME: VectorParams(**dense_params)},
+                "sparse_vectors_config": {
+                    bm25_lane.BM25_VECTOR_NAME: SparseVectorParams(
+                        index=SparseIndexParams(**sparse_index) if sparse_index else None,
+                    ),
+                },
+                "quantization_config": _qdrant_quantization_config(),
+            }
+            # shard_number is CREATE-TIME ONLY (Qdrant cannot change it
+            # without recreating the collection) and defaults to the QDRANT
+            # PEER count at creation — not the app's replicaCount, which is a
+            # different deployment. We leave it unset so that default applies,
+            # but allow an explicit multiple for clusters that plan to scale
+            # out later.
+            shard_multiple = _qdrant_shard_multiple()
+            if shard_multiple and shard_multiple > 1:
+                node_count = _qdrant_node_count(client)
+                if node_count:
+                    create_kwargs["shard_number"] = node_count * shard_multiple
+                else:
+                    # Silent no-op is the worst outcome: the operator asked
+                    # for N shards/node and would otherwise never learn the
+                    # request was dropped.
+                    logger.warning(
+                        "QDRANT_SHARD_MULTIPLE=%d ignored: could not determine Qdrant peer "
+                        "count; falling back to Qdrant's default shard_number",
+                        shard_multiple,
+                    )
+
+            client.create_collection(**create_kwargs)
             vector_name = bm25_lane.DENSE_VECTOR_NAME
             # Payload indexes for metadata-filtered search (best-effort —
             # filtering works without them, just slower).  Existing

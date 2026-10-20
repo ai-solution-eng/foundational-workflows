@@ -362,8 +362,11 @@ def test_backup_cron_sends_the_api_key(chart: str):
     compile(script, "backup-cron.py", "exec")
     assert 'os.environ.get("RAG_API_KEY")' in script, "backup cron must present the deployment key"
     assert '"X-RAG-Api-Key"' in script
-    # Both HTTP calls carry the header.
-    assert script.count("headers=headers or None") == 2, "the datasets list AND the export stream must send the key"
+    # Both HTTP calls carry the header: the datasets list sends it directly;
+    # the export stream derives export_headers from it (dict(headers)) and may
+    # add X-Dataset-Password for protected datasets (2026-10).
+    assert script.count("headers=headers or None") == 1, "the datasets list must send the key"
+    assert "export_headers = dict(headers)" in script, "the export stream must derive its headers from the API-key headers"
 
 
 # ---------------------------------------------------------------------------

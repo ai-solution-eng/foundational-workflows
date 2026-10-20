@@ -26,6 +26,7 @@ values.
 |---|---|
 | `values.g2.yaml` | **SE G2** — HPE internal cluster (`pcai-se-ai-application.hst.rdlabs.hpecorp.net`, `project-user-*` namespaces, HPE SSO at the gateway). Model URLs are the real shared serving endpoints (not secret); every credential is a filler. |
 | `values.hosted-trial.yaml` | **Hosted trial** — customer PCAI. Uses the `${DOMAIN_NAME}` placeholder (PCAI substitutes it before rendering), oauth2-proxy AuthorizationPolicy, and fillers for all model keys. |
+| `secrets.g2.yaml` | **SE G2 secrets companion** — the four Secrets (`rag-model-keys`, `rag-platform-keys`, `mcp-fleet-apikeys`, `rag-dataset-passwords`) with every credential as a `<FILL:...>` placeholder. Copy OUTSIDE git, fill, `kubectl apply -n <ns>`, then point `modelSecrets.existingSecret` / `security.existingSecret` / `mcp.apiKey.existingSecret` / `backups.protectedPasswords.existingSecret` at them. See the file header for the full sequence. |
 
 Both files also carry a commented-out `security.oidc` block (decision D21 — OIDC JWT as a second registry credential) at the same spot as the chart's `security` block: off by default, with the site-specific notes in the comments.
 

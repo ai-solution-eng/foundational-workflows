@@ -1,0 +1,55 @@
+{
+  "bytes_per_posting_float32_values": 7.59,
+  "calibration": "BM42 13MB/530k/5.6elem measured WITH datatype=uint8; scaled by -1B uint8 +4B float32 for our unset (default f32) datatype",
+  "caveat": "Dev-checkout tokenizer is the regex fallback, NOT the bundled Qwen tokenizer used in production; subword tokenization yields MORE unique terms, so these ratios are a LOWER BOUND.",
+  "results": {
+    "prose_2048": {
+      "chunks": 7,
+      "mean": 659,
+      "median": 705,
+      "p90": 836,
+      "max": 836,
+      "sparse_bytes_per_point": 5003.7,
+      "dense_int8_bytes_per_point": 4096,
+      "sparse_over_dense": 1.22,
+      "sparse_GB_per_1M": 4.66,
+      "dense_int8_GB_per_1M": 3.81
+    },
+    "prose_8192": {
+      "chunks": 2,
+      "mean": 1381,
+      "median": 1381.0,
+      "p90": 1693,
+      "max": 1693,
+      "sparse_bytes_per_point": 10485.7,
+      "dense_int8_bytes_per_point": 4096,
+      "sparse_over_dense": 2.56,
+      "sparse_GB_per_1M": 9.77,
+      "dense_int8_GB_per_1M": 3.81
+    },
+    "code_2048": {
+      "chunks": 47,
+      "mean": 587.9,
+      "median": 611,
+      "p90": 681,
+      "max": 779,
+      "sparse_bytes_per_point": 4463.8,
+      "dense_int8_bytes_per_point": 4096,
+      "sparse_over_dense": 1.09,
+      "sparse_GB_per_1M": 4.16,
+      "dense_int8_GB_per_1M": 3.81
+    },
+    "code_8192": {
+      "chunks": 13,
+      "mean": 1379.8,
+      "median": 1482,
+      "p90": 1666,
+      "max": 1722,
+      "sparse_bytes_per_point": 10476.6,
+      "dense_int8_bytes_per_point": 4096,
+      "sparse_over_dense": 2.56,
+      "sparse_GB_per_1M": 9.76,
+      "dense_int8_GB_per_1M": 3.81
+    }
+  }
+}

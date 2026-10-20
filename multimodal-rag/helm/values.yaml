@@ -42,7 +42,7 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v5.9.5
+  tag: v6.0.0
   pullPolicy: IfNotPresent
 
 qdrant:
@@ -186,6 +186,20 @@ mcp:
 #     RAG_INGEST_CONCURRENCY: "8"
 # Scope decision 2026-10-16 (audit P2): plumbing all of them would triple the
 # values surface for knobs most deployments never touch.
+#
+# Qdrant memory-tier knobs (v1.19) follow the same rule in THIS chart — they
+# are settable only via extraEnv. The code defaults already apply the intended
+# placement (quantized copy pinned, originals cold, sparse index cached); set
+# these only to override, e.g.
+#   extraEnv:
+#     QDRANT_DENSE_MEMORY: "cached"        # originals: cold (default) | cached
+#     QDRANT_QUANTIZATION_MEMORY: "pinned" # quantized: pinned (default) | cached | cold
+#     QDRANT_SPARSE_MEMORY: "cached"       # sparse index: cached (default) | pinned | cold
+#     QDRANT_DATATYPE: "float32"           # float32 (default) | float16
+#     QDRANT_SHARD_MULTIPLE: "1"           # shards per node for NEW collections
+# NOTE: dense "pinned" is rejected by Qdrant (dense vectors are mmap-only) and
+# is downgraded to "cached" with a warning. The scale charts expose these as
+# first-class qdrant.client.* values instead.
 extraEnv: {}
 
 # ============================================================================
@@ -311,6 +325,16 @@ backups:
   schedule: 0 3 * * *
   bucket: ''
   retentionDays: 0
+  # Optional: back up PASSWORD-PROTECTED datasets too. Name of a user-owned
+  # Secret (pre-create it; the chart never creates Secrets for you) whose
+  # KEYS are dataset names and VALUES the matching dataset password:
+  #   kubectl -n <ns> create secret generic <name> \
+  #     --from-literal=<dataset-name>=<password> ...
+  # Mounted read-only into the backup CronJob; a protected dataset without a
+  # matching key is skipped with a loud SKIP-PROTECTED log line. Leave '' to
+  # keep the old behavior (protected datasets always skipped).
+  protectedPasswords:
+    existingSecret: ''
 
 # Watched S3 sources (opt-in reconciler CronJob): each tick POSTs every source's
 # prefixes to batch-urls with sync=true. Prefixes must be s3:// directory URLs.

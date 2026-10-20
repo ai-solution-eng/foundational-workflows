@@ -289,10 +289,27 @@ them only with intent:
   contextual retrieval; one small LLM call per real-text chunk). Off by default;
   existing datasets are untouched.
 
-The optional backup CronJob (`backups.enabled`) exports every
-non-password-protected dataset on a schedule (`backups.schedule`), uploads the
+The optional backup CronJob (`backups.enabled`) exports every dataset on a
+schedule (`backups.schedule`) — password-protected ones when their passwords are
+provided (see below) — uploads the
 `.tar.gz` archives to `backups.bucket` (reusing the `s3.*` credentials), and —
 when `backups.retentionDays` > 0 — prunes backup objects older than that.
+
+Password-protected datasets are backed up too when you provide their
+passwords via `backups.protectedPasswords.existingSecret`: a user-owned Secret
+(pre-create it — the chart never creates Secrets) with one key per dataset
+name and the dataset's password as the value:
+
+```bash
+kubectl -n <ns> create secret generic rag-dataset-passwords \
+  --from-literal=<dataset-name>=<password> --from-literal=<other-ds>=<other-pw>
+```
+
+The Secret is mounted read-only into the backup pod; a protected dataset
+without a matching key is skipped with a loud `SKIP-PROTECTED` log line naming
+the key to add. Exports strip the password hash, so restoring a protected
+dataset requires passing `password` to `POST /api/admin/datasets/import`
+(supported) — the backup archive alone cannot re-protect it.
 `backups.bucket` is a **bare bucket name** (no `s3://` scheme — it is passed
 straight to boto3) and **must exist before the first run** (MinIO does not
 auto-create buckets; a missing bucket fails the run until the next tick).

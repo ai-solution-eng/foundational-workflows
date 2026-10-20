@@ -7,7 +7,7 @@ Status: proposal, not committed scope. Authored 2026-08-31, after the v3.0.0 sec
 | 1 | Metadata-filtered search | S/M | High for log/code/table corpora |
 | 2 | ~~Hybrid dense + BM25 (RRF)~~ — **shipped in 3.4.0** | — | Biggest retrieval-quality lever |
 | 3 | OCR for scanned PDFs | S/M | Unlocks scanned archives |
-| 4 | Backup restore/import | S/M | Closes the DR loop |
+| 4 | ~~Backup restore/import~~ — **shipped** (`POST /api/admin/datasets/import`; protected datasets covered by `backups.protectedPasswords.existingSecret` since the 2026-10 backup update) | S/M | Closes the DR loop |
 | 5 | S3 sync with pruning | S/M | Completes S3 ingest story |
 | 6 | Memory management tools | S | Fixes a documented MCP gap |
 | 7 | Prometheus `/metrics` | S/M | Makes the next audit continuous |
@@ -73,7 +73,9 @@ Status: proposal, not committed scope. Authored 2026-08-31, after the v3.0.0 sec
 
 ---
 
-## 4. Backup restore / import
+## 4. Backup restore / import — **SHIPPED** (see `POST /api/admin/datasets/import`; the notes below are the original design, kept for context)
+
+> Shipped 2026: the import endpoint exists and the backup CronJob covers password-protected datasets via `backups.protectedPasswords.existingSecret`.
 
 **Problem.** `GET /api/datasets/{name}/export` and the v3.2.0 backup CronJob write backups, but nothing reads them back. The CronJob also skips password-protected datasets, so restore is the only recovery path for those. The export contains `meta.json` (hash stripped), `documents.jsonl` (`{"id","payload"}`, **no vectors**) and `files/`.
 

@@ -308,7 +308,7 @@ curl -X POST "$BASE/api/datasets/$DATASET/search" \
 | `POST` | `/api/datasets/{name}/lock` | Immediately revoke a cached unlock |
 | `POST` | `/api/datasets/{name}/media-token` | Mint a short-lived dataset-scoped HMAC media token (`?token=`) so the password never travels in a URL |
 | `GET` | `/api/datasets/{name}/files/{path}` | Serve a stored file (header, `?password=`, or `?token=`) |
-| `GET` | `/api/datasets/{name}/export` | Download full dataset backup (`.tar.gz`: `meta.json` + `documents.jsonl` + `files/`) |
+| `GET` | `/api/datasets/{name}/export` | Download full dataset backup (`.tar.gz`: `meta.json` + `documents.jsonl` + `files/`) — password-protected datasets require `X-Dataset-Password` (the export strips the password hash) |
 | `GET` | `/api/datasets/{name}/documents/download?format=md\|jsonl` | Download every document as one file — readable Markdown (default) or `{"id","text","metadata"}` JSONL; no binary files, heavy base64 media stripped |
 | `POST` | `/api/admin/datasets/{name}/recreate` | Rebuild a dataset from its on-disk files with the current embedder (drops old collection, re-embeds; poll `upload-status/{job_id}`; password-protected datasets require the `X-Dataset-Password` header) |
 | `POST` | `/api/admin/datasets/{name}/contextual-preview` | Cost preview for enabling contextual retrieval — a LABELED ESTIMATE (live point count ×2 for hybrid collections, one context call's token math, configured VLM name); read-only, no side effects |

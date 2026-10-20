@@ -755,6 +755,19 @@ When `S3_ENDPOINT_URL` is unset, the default boto3 credential chain (IAM roles, 
 - `original_source` field preserves the original basename alongside the stored `source` PVC path.
 - Document deletion by Qdrant point ID (`PointIdsList` selector with `wait=True`).
 
+**Scheduled backups (opt-in CronJob, `backups.*`):** exports EVERY dataset on a
+schedule via `GET /api/datasets/{name}/export` and uploads the `.tar.gz` archives to
+the configured S3/MinIO bucket (dedicated bucket — never a watched-sources prefix, or
+the exports re-ingest as documents). Password-protected datasets are covered too when
+`backups.protectedPasswords.existingSecret` names a Secret whose keys are dataset names
+and values their passwords (mounted read-only into the backup pod; a protected dataset
+without a matching key is skipped with a loud `SKIP-PROTECTED` log line). Exports carry
+`meta.json` (password hash stripped — restoring a protected dataset needs `password` on
+the import call), `documents.jsonl` (payloads only, **no vectors**) and `files/`.
+Restore: `POST /api/admin/datasets/import` (multipart upload or `{"s3_uri": ...}` —
+pulls straight from the backup bucket), which re-embeds on the way in; poll
+`upload-status/{job_id}`. `backups.retentionDays` > 0 prunes exports older than N days.
+
 **Endpoint verification** (at startup): the embedder is pinged via OpenAI-compatible `GET /v1/models` and raises `RuntimeError` if unreachable (it is the one required model); reranker/vlm/asr are optional — if unreachable, a warning is logged and startup proceeds without them.
 
 **Admin storage stats:** `/api/admin/storage` returns PVC disk usage (total/used/free/utilization) and per-dataset breakdowns with file-type sub-items (docs + bytes per type). Runs in a thread pool (via `run_in_executor`) so health/readiness probes stay responsive during large collection scans. File-type backfill uses paginated Qdrant scroll (256 points at a time, capped at 50k) with

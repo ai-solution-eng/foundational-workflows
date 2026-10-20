@@ -3,6 +3,73 @@
 All notable changes to this project are tracked here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 
+## [Unreleased] — Qdrant memory-tier migration (v1.19)
+
+### Added
+- **Backup CronJob can now back up password-protected datasets** via
+  `backups.protectedPasswords.existingSecret`: name a user-owned Secret whose
+  keys are dataset names and values the matching dataset passwords; it is
+  mounted read-only into the backup pod and each protected dataset's export
+  carries its `X-Dataset-Password`. (Volume mount rather than `envFrom` —
+  dataset names contain hyphens/dots that `envFrom` silently drops.) A
+  protected dataset without a matching key is skipped with a loud
+  `SKIP-PROTECTED` log line naming the missing key — never silently.
+  Leaving the key `''` (the default, and all shipped example values) keeps
+  the previous always-skip behavior.
+
+### Changed
+- **Qdrant memory placement migrated off the deprecated legacy flags** to the
+  v1.19 three-valued `memory` tier (`pinned` | `cached` | `cold`). The legacy
+  `QDRANT_QUANTIZATION_ALWAYS_RAM` boolean is still honoured as a fallback
+  (`true` → `pinned`, `false` → `cold`) so an upgrading deployment keeps its
+  current placement; the new `QDRANT_QUANTIZATION_MEMORY` wins when both are
+  set. Applies to **newly created** collections only.
+- **Dense originals now default to `cold`** (`QDRANT_DENSE_MEMORY`). They are
+  never read on the *scoring* path (we do not rescore), so pre-warming them
+  into page cache only evicted structures that are actually used. Note they
+  ARE still read on some non-scoring paths — e.g.
+  `mcp_server._lookup_dataset_vector` scrolls with `with_vectors=True` — so
+  this trades a page fault on those rare paths for steady-state headroom.
+- **Sparse (BM25) index now defaults to `cached`** (`QDRANT_SPARSE_MEMORY`)
+  instead of Qdrant's `pinned` default, because `pinned` is a heap
+  allocation that must fit in RAM and can OOM. Its size relative to the dense
+  int8 lane is **chunk-size dependent**, and these figures are a LOWER BOUND
+  (the dev checkout uses the regex tokenizer rather than the bundled Qwen one,
+  and postings are float32-valued — ~7.59 B/posting, calibrated against
+  Qdrant's published *uint8* BM42 figure). Measured on this repo by
+  `tests/measurements/measure_sparse_footprint.py`:
+  `chunk_size 2048` → ~590-660 unique terms (~1.1-1.2× dense int8);
+  `chunk_size 8192` → ~1370-1380 unique terms (~2.5× dense int8).
+- New `qdrant.client.*` values: `quantizationMemory`, `denseMemory`,
+  `datatype`, `sparseMemory`, `shardMultiple` (large + medium charts).
+- New `QDRANT_DATATYPE` (default `float32`) — set `float16` to halve the
+  originals' disk/page-cache footprint. Distinct from quantization: a datatype
+  replaces the originals, quantization adds a compressed copy beside them.
+- New `QDRANT_SHARD_MULTIPLE` (default `1`) — `shard_number` is create-time
+  only and defaults to the node count; a multiple > 1 creates
+  `nodes × multiple` shards so a later scale-out has shards to move.
+
+### Notes
+- Only `pinned` is a heap allocation that must fit in RAM (the sole tier that
+  can OOM); `cached` and `cold` are mmap files the OS evicts under pressure,
+  so "pull back in as needed" is automatic. Eviction is global page-cache LRU,
+  **not** per-dataset — there is no per-collection eviction control.
+- Qdrant **rejects `pinned` for dense vectors** (mmap-only representation), so
+  `QDRANT_DENSE_MEMORY=pinned` is downgraded to `cached` with a warning rather
+  than failing collection creation.
+- `QDRANT_SHARD_MULTIPLE > 1` logs a warning (instead of silently no-op'ing)
+  when the Qdrant peer count cannot be determined.
+- New test coverage: `tests/full_pipeline/test_qdrant_memory_tiers.py` (30
+  tests) covers tier parsing, legacy→tier fallback precedence, datatype and
+  shard-multiple parsing, peer-count failure modes, and the dense-pinned guard
+  — the guard test calls the production helper `_qdrant_dense_memory()`, so a
+  regression there fails the test rather than passing on a transcription.
+- `tests/measurements/measure_sparse_footprint.py` reproduces the sparse-index
+  sizing numbers above (writes `tests/measurements/sparse-footprint.json`).
+- Existing collections keep their original config; re-creating a dataset is the
+  only way to change `shard_number` or `datatype`.
+
+
 ## [Unreleased] — 2026-10-16 audit remediation wave
 
 ### Security

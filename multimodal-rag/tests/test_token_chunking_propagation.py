@@ -225,9 +225,9 @@ def test_xml_processor_forwards_splitter_to_inner_text_processor():
     This exact line was dropped once already; the guard exists so it cannot
     silently regress again.
     """
-    from multimodal_rag.dataset_manager import DatasetManager  # noqa: F401
     import inspect as _inspect
 
+    from multimodal_rag.dataset_manager import DatasetManager  # noqa: F401
     from multimodal_rag.input_processing.xml_processor import XMLProcessor
 
     src = _inspect.getsource(XMLProcessor._chunk_large)
