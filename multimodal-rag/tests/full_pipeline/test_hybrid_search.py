@@ -61,12 +61,20 @@ from qdrant_client.models import (
     VectorParams,
 )
 
+from multimodal_rag import vector_store as vector_store_mod
 from multimodal_rag.dataset_manager import DATASET_SCHEMA_VERSION, DatasetManager
 from multimodal_rag.rag_system import MultimodalRAG, _bm25_indexable_text
 from multimodal_rag.utils import bm25 as bm25_lane
 from multimodal_rag.utils import metrics
 from multimodal_rag.utils.model_adapters import MultiModalEmbeddings
-from multimodal_rag.vector_store import QdrantVectorStore, RrfParams, _is_fusion_unsupported_error
+from multimodal_rag.vector_store import (
+    _DEFAULT_PREFETCH_FLOOR,
+    _MAX_PREFETCH_FLOOR,
+    QdrantVectorStore,
+    RrfParams,
+    _is_fusion_unsupported_error,
+    _prefetch_depth,
+)
 
 COLL = "hybrid_search_test"
 DIM = 8
@@ -507,7 +515,17 @@ def test_fusion_request_shape():
         assert isinstance(req.query, FusionQuery) and req.query.fusion == Fusion.RRF
         assert req.limit == 7 and req.prefetch is not None and len(req.prefetch) == 2
         dense_pf, sparse_pf = req.prefetch
-        assert dense_pf.using == bm25_lane.DENSE_VECTOR_NAME and dense_pf.limit == 7
+        # The DISPLAY limit stays k, but the per-lane PREFETCH depth is
+        # decoupled from it: RRF is rank arithmetic over its candidate
+        # lists, so binding the prefetch to k made a document's fused score
+        # depend on how many results the caller asked to see (a doc at
+        # dense 11 + sparse 1 scored 0.5000 at k=10 but 0.6200 at k=20).
+        # Both lanes now fuse over a fixed floor, and the result is
+        # truncated to k afterwards.
+        assert dense_pf.using == bm25_lane.DENSE_VECTOR_NAME
+        assert dense_pf.limit == _prefetch_depth(7) >= 7
+        assert sparse_pf.limit == _prefetch_depth(7)
+        assert dense_pf.limit > 7, "prefetch must exceed the display limit (score invariance)"
         assert sparse_pf.using == bm25_lane.BM25_VECTOR_NAME
         assert isinstance(sparse_pf.query, SparseVector)
         # No query text (multimodal query) → flat dense request.
@@ -646,12 +664,21 @@ def test_unsupported_fusion_degrades_gracefully() -> None:
         results = asyncio.run(rig.store.asimilarity_search_with_relevance_scores("some text", 5))
         assert len(results) == 1, "first (unsupported) attempt must fall back and still return results"
         assert rig.store._fusion_supported is False
-        assert shapes == [True, False], "fusion attempt must be retried dense-only within the same search"
+        # The FIRST attempt is a fusion request on the legacy path (prefetch
+        # present) and a pair of flat lane requests on the twin-collapse path
+        # (no prefetch — that path never asks the backend to fuse).  Both must
+        # then retry dense-only within the same search.
+        first_is_fusion = shapes[0]
+        if vector_store_mod._twin_collapse_enabled():
+            assert first_is_fusion is False, "twin-collapse path uses flat lane requests, not prefetch fusion"
+        else:
+            assert first_is_fusion is True, "legacy path must attempt the fusion request first"
+        assert shapes[1] is False, "fusion attempt must be retried dense-only within the same search"
 
         # Subsequent searches skip the fusion attempt entirely.
         results = asyncio.run(rig.store.asimilarity_search_with_relevance_scores("some text", 5))
         assert len(results) == 1
-        assert shapes == [True, False, False], "after the fallback the store must not retry fusion per query"
+        assert shapes[-1] is False, "after the fallback the store must not retry fusion per query"
     finally:
         rig.close()
 
@@ -1840,3 +1867,176 @@ if __name__ == "__main__":
             traceback.print_exc()
     print(f"\n{'All tests passed!' if not failed else f'{failed} test(s) failed'}")
     sys.exit(1 if failed else 0)
+
+
+# ---------------------------------------------------------------------------
+# P1 (2026-10-21): RRF score invariance in top_k
+# ---------------------------------------------------------------------------
+
+
+def test_prefetch_depth_decouples_from_display_limit():
+    """A fused score must not depend on how many results the caller asked to SEE.
+
+    RRF is rank arithmetic over its candidate lists, so the prefetch window is
+    part of the ranking definition.  When both prefetches were bound to k, a
+    doc that is dense rank 11 and sparse rank 1 scored 1/12 + 1/2 = 0.5833 with
+    a deep pool, but only 0.5000 at top_k=10 (the dense lane cannot return
+    position 11, so its contribution vanished and the doc looked single-lane).
+
+    The floor must cover EVERY legal request, not just top_k: aretrieve
+    over-fetches for the reranker with max(top_k, 4*reranker_top_k), and
+    reranker_top_k is allowed up to 50, so fetch_k reaches 200.
+    """
+    # Every legal (top_k, reranker_top_k) combination must fuse over ONE pool.
+    depths = {_prefetch_depth(top_k) for top_k in (1, 10, 50, 100)}
+    for reranker_top_k in (1, 3, 10, 30, 50):
+        for top_k in (10, 100):
+            depths.add(_prefetch_depth(max(top_k, 4 * reranker_top_k)))
+    assert depths == {_DEFAULT_PREFETCH_FLOOR}, f"still coupled to display params: {sorted(depths)}"
+    # A caller asking for MORE than the floor still gets a full page.
+    assert _prefetch_depth(10_000) >= 10_000
+
+
+def test_prefetch_depth_is_configurable(monkeypatch):
+    """RAG_PREFETCH_FLOOR overrides the floor; a bad value must not break search."""
+    monkeypatch.setenv("RAG_PREFETCH_FLOOR", "250")
+    assert _prefetch_depth(10) == 250
+    monkeypatch.setenv("RAG_PREFETCH_FLOOR", "nonsense")
+    # Falls back to the default rather than raising - a bad env var must not
+    # take retrieval down.
+    assert _prefetch_depth(10) == _DEFAULT_PREFETCH_FLOOR
+    monkeypatch.setenv("RAG_PREFETCH_FLOOR", "-5")
+    assert _prefetch_depth(10) == _DEFAULT_PREFETCH_FLOOR
+    # An absurd value is CLAMPED, never sent verbatim as an unbounded scan.
+    monkeypatch.setenv("RAG_PREFETCH_FLOOR", "1000000")
+    assert _prefetch_depth(10) == _MAX_PREFETCH_FLOOR
+
+
+def test_stable_tiebreak_is_deterministic():
+    """Equal fused scores must order reproducibly (P2).
+
+    Equal fused scores are structural under RRF: with weights 1.5/1.0 and k=2
+    the dense ladder yields 0.6, 0.4286, 0.3333... and the sparse ladder
+    0.5, 0.3333, 0.25..., so dense position 3 ties sparse position 2 at
+    exactly 0.3333.  qdrant-client sorts on score alone, leaving ties in
+    Qdrant return order, which is not guaranteed stable between identical
+    queries.
+    """
+    from multimodal_rag.vector_store import Document, _stable_tiebreak
+
+    def _doc(src, page, text):
+        return Document(page_content=text, metadata={"source": src, "page": page})
+
+    a = (_doc("b.pdf", 2, "beta"), 0.3333)
+    b = (_doc("a.pdf", 9, "alpha"), 0.3333)
+    c = (_doc("c.pdf", 1, "gamma"), 0.6000)
+    # TWINS: identical source/page/chunk_index AND identical text — the four
+    # content key fields all collide, so only _point_id can order them.
+    t1 = (_doc("twin.pdf", 4, "same"), 0.5)
+    t2 = (_doc("twin.pdf", 4, "same"), 0.5)
+    t1[0].metadata["_point_id"] = "aaa"
+    t2[0].metadata["_point_id"] = "bbb"
+    twin_orders = set()
+    for perm in ([t1, t2], [t2, t1]):
+        got = tuple(d.metadata["_point_id"] for d, _ in _stable_tiebreak(list(perm)))
+        twin_orders.add(got)
+    assert twin_orders == {("aaa", "bbb")}, f"twin tiebreak not total: {twin_orders}"
+    # Shuffled input must produce the SAME order every time.
+    orders = set()
+    for perm in ([a, b, c], [b, a, c], [c, a, b], [b, c, a]):
+        got = tuple((d.metadata["source"], d.metadata["page"]) for d, _ in _stable_tiebreak(list(perm)))
+        orders.add(got)
+    assert len(orders) == 1, f"tiebreak not deterministic: {orders}"
+    # Higher score first, then content order.
+    assert next(iter(orders)) == (("c.pdf", 1), ("a.pdf", 9), ("b.pdf", 2))
+
+
+# ---------------------------------------------------------------------------
+# P1 (2026-10-21): pre-fusion twin collapse
+# ---------------------------------------------------------------------------
+
+
+def test_twin_collapse_per_lane_keeps_higher_similarity():
+    """Per-lane collapse keeps ONE representative: the higher similarity.
+
+    Twins are intentional: a document may be represented by a multimodal
+    parent and a text-only twin.  Within a single lane the better-scoring
+    representation must win, and the loser must not consume a rank position.
+    """
+    from multimodal_rag.vector_store import collapse_lane_by_twin
+
+    def h(pid, sim, twin, page=23):
+        return (pid, {"source": "M.pdf", "page": page, "chunk_index": None, "_twin": twin}, sim)
+
+    parent = h("p-par", 0.40, False, page=23)
+    twin = h("p-twi", 0.58, True, page=23)
+    other = h("p-o", 0.50, False, page=26)   # distinct document
+
+    got = [x[0] for x in collapse_lane_by_twin([parent, twin, other])]
+    assert got == ["p-twi", "p-o"], "higher similarity must win, order preserved"
+
+    # Order-independent.
+    got2 = [x[0] for x in collapse_lane_by_twin([twin, parent, other])]
+    assert got2 == got
+
+
+def test_twin_collapse_merges_cross_lane_representations():
+    """Dense may pick one rep and sparse the other: still ONE document.
+
+    This is the point of twins - each lane uses its own best representation -
+    so the fusion must merge them into a single entry carrying BOTH lane
+    positions rather than emitting the document twice.
+    """
+    from multimodal_rag.vector_store import fuse_lanes_with_twin_collapse
+
+    def h(pid, sim, twin, page=23):
+        return (pid, {"source": "M.pdf", "page": page, "chunk_index": None, "_twin": twin}, sim)
+
+    parent = h("p-par", 0.40, False, page=23)
+    twin = h("p-twi", 0.58, True, page=23)
+    other = h("p-o", 0.50, False, page=26)   # distinct document
+
+    fused = fuse_lanes_with_twin_collapse([parent, other], [twin], limit=10)
+    assert len(fused) == 2, f"parent+twin must collapse to one doc, got {len(fused)}"
+    _score, _pid, _meta, dpos, spos = fused[0]
+    assert dpos is not None and spos is not None, "merged doc must carry BOTH lane positions"
+
+
+def test_twin_collapse_score_is_representation_independent():
+    """A doc scores the same whichever representation each lane returned.
+
+    The defect being fixed: with server-side fusion the fused score changed
+    when the twin and parent both entered the pool, so asking for MORE
+    results could LOWER a document score.
+    """
+    from multimodal_rag.vector_store import fuse_lanes_with_twin_collapse
+
+    def h(pid, sim, twin, page=23):
+        return (pid, {"source": "M.pdf", "page": page, "chunk_index": None, "_twin": twin}, sim)
+
+    other = h("p-o", 0.50, False, page=26)   # distinct document
+    twin = h("p-twi", 0.58, True, page=23)
+    parent = h("p-par", 0.40, False, page=23)
+
+    a = fuse_lanes_with_twin_collapse([twin, other], [twin], limit=10)[0][0]
+    b = fuse_lanes_with_twin_collapse([parent, other], [twin], limit=10)[0][0]
+    assert abs(a - b) < 1e-9, f"score must not depend on which rep a lane returned: {a} vs {b}"
+
+
+def test_twin_collapse_scores_match_server_side_arithmetic():
+    """The client-side lane term must equal qdrant-client weighted RRF."""
+    from multimodal_rag.vector_store import _rrf_lane_term
+
+    assert abs(_rrf_lane_term(0, 1.0, 2) - 0.5) < 1e-12
+    assert abs(_rrf_lane_term(1, 1.0, 2) - 1.0 / 3) < 1e-12
+    assert abs(_rrf_lane_term(0, 1.5, 2) - 0.6) < 1e-12
+
+
+def test_twin_collapse_docs_without_source_never_collapse():
+    """Raw text drops (no source) must not collapse against each other."""
+    from multimodal_rag.vector_store import fuse_lanes_with_twin_collapse
+
+    a = ("a", {"text": "alpha"}, 0.9)
+    b = ("b", {"text": "beta"}, 0.8)
+    fused = fuse_lanes_with_twin_collapse([a, b], [], limit=10)
+    assert len(fused) == 2, "sourceless docs must stay distinct"

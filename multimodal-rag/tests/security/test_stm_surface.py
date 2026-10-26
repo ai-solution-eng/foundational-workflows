@@ -571,15 +571,24 @@ class _McpDM:
 
 
 @pytest.fixture()
-def mcp_env(monkeypatch):
+def mcp_env(monkeypatch, tmp_path):
     """Isolated MCP env: salt set, registry keyed alice/bob, stub DM wired
     into get_manager.  Yields (call, dm) where call(name, args) invokes the
-    REGISTERED tool via mcp.call_tool and returns (status, text)."""
+    REGISTERED tool via mcp.call_tool and returns (status, text).
+
+    DATA_PATH MUST be per-test (tmp_path), not a fixed /tmp path.  The admin
+    registry overlay (access/clients.json) is written to disk and read back
+    with an mtime cache, so a shared directory leaks state BETWEEN runs:
+    test_mcp_create_uses_the_shared_create_predicate step 3 mints bob with
+    can_create_datasets=True, which then survives into the NEXT run's step 2
+    and defeats the RAG_DATASETS_CREATE_ALLOWED=0 assertion.  That made the
+    test pass on a clean /tmp and fail on every subsequent run (~1/10 pass).
+    """
     import asyncio
 
     import multimodal_rag.mcp_server as mcp
 
-    monkeypatch.setenv("DATA_PATH", "/tmp/stm-mcp-test-data")
+    monkeypatch.setenv("DATA_PATH", str(tmp_path))
     monkeypatch.setenv("RAG_STM_NAME_SALT", "behavioural-test-salt")
     monkeypatch.setenv("RAG_API_KEY", "deployment-admin-key")
     monkeypatch.delenv("RAG_ACCESS_STORE", raising=False)  # store OFF by default

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "multimodal-rag"
-version = "6.0.0"
+version = "6.2.0"
 description = "Multimodal RAG MCP server — ingestion, hybrid retrieval (dense + bm25), memory"
 requires-python = ">=3.12"
 # Dependency source of truth for the IMAGE is docker/requirements.txt (the

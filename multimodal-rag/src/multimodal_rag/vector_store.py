@@ -41,6 +41,275 @@ _QDRANT_IO_POOL = ThreadPoolExecutor(
 )
 
 
+# Minimum per-lane candidate depth for hybrid (RRF) fusion.
+#
+# RRF is rank arithmetic over its candidate lists, so the prefetch window is
+# part of the RANKING DEFINITION, not of the paging.  Coupling it to the
+# display limit made a document's fused score depend on how many results the
+# caller asked to see (see the prefetch block in _query_requests).  A fixed
+# floor decouples the two: fusion always considers at least this many
+# candidates per lane, and the fused list is truncated to k afterwards.
+#
+# Why 200: the floor must cover the LARGEST pool any caller can
+# request, or the invariance this exists for is lost.  rag_system.aretrieve
+# over-fetches for the reranker with fetch_k = max(top_k, 4*reranker_top_k),
+# and reranker_top_k is allowed up to 50, so fetch_k can reach 200 while
+# top_k tops out at 100.  A floor of 100 would fuse a reranked call over 200
+# candidates and an unranked one over 100 — the same display-parameter
+# coupling in a new costume.  At 200 every request fuses over the same pool.
+# NOTE: lowering RAG_PREFETCH_FLOOR below 200 trades that invariance back.
+_DEFAULT_PREFETCH_FLOOR = 200
+# Hard ceiling on the configurable floor.  Every other limit on this path is
+# bounded (top_k 1..100, reranker_top_k 1..50); without a cap a typo like
+# RAG_PREFETCH_FLOOR=1000000 would be sent verbatim as a Prefetch limit on
+# BOTH lanes and turn a config mistake into an unbounded Qdrant scan.
+_MAX_PREFETCH_FLOOR = 1000
+
+
+def _prefetch_floor() -> int:
+    """Resolved per-lane prefetch floor (RAG_PREFETCH_FLOOR, default 200).
+
+    Falls back to the default on a blank/unparseable/non-positive value and
+    clamps an oversized one, rather than raising: a bad env var must not take
+    retrieval down, and must not turn into an unbounded Qdrant scan either.
+    """
+    raw = (os.environ.get("RAG_PREFETCH_FLOOR") or "").strip()
+    if not raw:
+        return _DEFAULT_PREFETCH_FLOOR
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Unknown RAG_PREFETCH_FLOOR=%r, using %d", raw, _DEFAULT_PREFETCH_FLOOR)
+        return _DEFAULT_PREFETCH_FLOOR
+    if val <= 0:
+        logger.warning("RAG_PREFETCH_FLOOR=%r is not positive, using %d", raw, _DEFAULT_PREFETCH_FLOOR)
+        return _DEFAULT_PREFETCH_FLOOR
+    if val > _MAX_PREFETCH_FLOOR:
+        logger.warning("RAG_PREFETCH_FLOOR=%r exceeds the %d cap, clamping", raw, _MAX_PREFETCH_FLOOR)
+        return _MAX_PREFETCH_FLOOR
+    return val
+
+
+def _prefetch_depth(k: int) -> int:
+    """Per-lane candidate depth for a fused request of display limit k.
+
+    Always at least k (a caller asking for more than the floor still gets a
+    full page) and at least the configured floor, so ordinary queries are
+    score-invariant in k.
+    """
+    return max(int(k), _prefetch_floor())
+
+
+def _stable_tiebreak(items: "list[tuple[Document, float]]") -> "list[tuple[Document, float]]":
+    """Order fused results deterministically: score desc, then a content key.
+
+    Equal fused scores are structural under RRF, not a corner case: with the
+    default weights (dense 1.5, sparse 1.0, k=2) the dense ladder yields
+    0.6, 0.4286, 0.3333, ... and the sparse ladder 0.5, 0.3333, 0.25, ...,
+    so a dense-position-3 hit ties a sparse-position-2 hit at exactly
+    0.3333.  qdrant-client's fusion sorts on the score alone, leaving tied
+    entries in Qdrant's return order, which is not guaranteed stable between
+    identical queries.
+
+    The key is content-derived ((source, page, chunk_index, text prefix))
+    with the point id as the FINAL discriminator.  Content leads so the
+    order is stable across a re-ingest of unchanged files (point ids are
+    regenerated on re-ingest); the point id is needed because the content
+    fields COLLIDE by construction for a twin and its parent, and for
+    media-only points with no page/chunk_index.
+    """
+
+    def _key(pair: "tuple[Document, float]") -> tuple:
+        doc = pair[0]
+        meta = getattr(doc, 'metadata', None) or {}
+        text = (getattr(doc, 'page_content', '') or '')[:200]
+        # Numeric-aware coercion so page/chunk ordering is natural ('2' before
+        # '10') and a missing value sorts consistently rather than as ''.
+        def _num(v: Any) -> tuple:
+            try:
+                return (0, float(v))
+            except (TypeError, ValueError):
+                return (1, str(v or ''))
+
+        return (
+            str(meta.get('source') or ''),
+            _num(meta.get('page')),
+            _num(meta.get('chunk_index')),
+            text,
+            # FINAL total-order key.  The four content fields above COLLIDE by
+            # construction for a twin and its parent (a text twin shares
+            # source/page/chunk_index AND its page_content is identical), and
+            # for media-only points (no page/chunk_index, empty text).  Without
+            # a further key those ties fall back to Qdrant's return order —
+            # exactly the non-determinism this function exists to remove.
+            # _point_id is written by _points_to_docs on every point.
+            str(meta.get('_point_id') or ''),
+        )
+
+    return sorted(items, key=lambda p: (-float(p[1]), _key(p)))
+
+
+# ---------------------------------------------------------------------------
+# Pre-fusion twin collapse + client-side RRF
+# ---------------------------------------------------------------------------
+#
+# Twins are an intentional ingest feature: one document is represented by up
+# to two points (a multimodal parent and a text-only/caption twin) so an image
+# embedding and an image+text embedding can both represent the same content.
+# Both points share (source, page, chunk_index, time-window).
+#
+# The defect this fixes.  Server-side RRF fuses BY POINT ID, so a parent and
+# its twin enter fusion as two independent candidates.  Whether both land in
+# the prefetch window depends on the requested depth, and _dedup_twins then
+# PREFERS THE NON-TWIN REGARDLESS OF SCORE.  Net effect: a document's fused
+# score DROPS as the caller asks for MORE results, because the weaker
+# representation wins the tiebreak once the twin also makes the cut.  Observed
+# on a real corpus: one page scored 0.1979 at top_k<=31 (twin only) and 0.0790
+# at top_k>=32 (parent won the dedup).
+#
+# The fix.  Collapse the representations PER LANE first, keeping the HIGHER
+# similarity of the two, then fuse the per-lane winners.  A document then
+# occupies exactly one slot in each lane, and its score no longer depends on
+# pool depth.  When dense and sparse pick DIFFERENT representations of the
+# same document, both lane contributions still count toward one document
+# (that is the point of twins: let each lane use its best representation).
+
+_RRF_DEFAULT_K = 2
+
+
+def _twin_collapse_enabled() -> bool:
+    """Whether hybrid search collapses twins per lane BEFORE fusion.
+
+    Default ON (product ruling 2026-10-22).  Server-side RRF fuses by point id,
+    so a multimodal parent and its text-only twin arrived as two independent
+    candidates: the same document could be returned TWICE, and its fused score
+    depended on the requested depth (a doc at dense-11/sparse-1 scored 0.5000
+    at top_k=10 but 0.5833 at top_k=20).  This switches hybrid queries to two
+    lane requests fused client-side (see _query_requests_laned / _execute_laned),
+    so a document occupies one slot per lane and its score stops depending on
+    how many results the caller asked for.
+
+    Escape hatch: RAG_TWIN_COLLAPSE=0 restores the legacy single-request
+    server-side fusion path.
+    """
+    raw = (os.environ.get("RAG_TWIN_COLLAPSE") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _twin_identity(meta: dict) -> tuple | None:
+    """Document identity shared by a parent and its twin, or None.
+
+    Mirrors MultimodalRAG._twin_identity_key (rag_system) exactly:
+    (source, page, chunk_index, time-window).  Kept as a local copy because
+    vector_store must not import rag_system (rag_system imports this module).
+    Video segments share (source, None, None) and are disambiguated by their
+    time window.
+    """
+    src = meta.get("source") or ""
+    if not src:
+        return None
+    return (
+        str(src),
+        meta.get("page"),
+        meta.get("chunk_index"),
+        (meta.get("timestamp_start"), meta.get("timestamp_end")),
+    )
+
+
+def _rrf_lane_term(pos: int, weight: float, k: int) -> float:
+    """One lane RRF contribution at 0-indexed position pos.
+
+    Matches qdrant-client weighted formula exactly
+    (hybrid/fusion.py: 1 / ((pos + 1) / w + k - 1)) so client-side and
+    server-side scores stay comparable.
+    """
+    if weight <= 0:
+        return 0.0
+    return 1.0 / ((pos + 1.0) / weight + k - 1.0)
+
+
+def collapse_lane_by_twin(
+    hits: "list[tuple[str, dict, float]]",
+) -> "list[tuple[str, dict, float]]":
+    """Collapse twin representations WITHIN one lane, keeping the better score.
+
+    hits is [(point_id, metadata, similarity), ...] in the lane's own order.
+    Returns the same shape, order preserved, with at most one entry per
+    _twin_identity: the representative whose similarity is HIGHEST.
+
+    This is the per-lane half of the fix.  It runs BEFORE fusion, so the lane
+    contributes one candidate per document and its rank positions are not
+    consumed by a sibling that will only be discarded afterwards.
+    """
+    best: dict[tuple, int] = {}
+    keep = [True] * len(hits)
+    for i, (pid, meta, sim) in enumerate(hits):
+        ident = _twin_identity(meta or {}) or ("__point__", pid)
+        j = best.get(ident)
+        if j is None:
+            best[ident] = i
+        elif sim > hits[j][2]:
+            keep[j] = False
+            best[ident] = i
+        else:
+            keep[i] = False
+    return [h for h, k in zip(hits, keep) if k]
+
+
+def fuse_lanes_with_twin_collapse(
+    dense_hits: "list[tuple[str, dict, float]]",
+    sparse_hits: "list[tuple[str, dict, float]]",
+    *,
+    limit: int,
+    dense_weight: float = 1.0,
+    sparse_weight: float = 1.0,
+    k: int = _RRF_DEFAULT_K,
+) -> "list[tuple[float, str, dict, int | None, int | None]]":
+    """Per-lane twin collapse, then RRF over lane positions.
+
+    dense_hits / sparse_hits are [(point_id, metadata, similarity), ...] in
+    each lane's own rank order.  Each lane is collapsed first
+    (:func:`collapse_lane_by_twin`), then positions are scored.
+
+    Returns [(score, point_id, metadata, dense_pos, sparse_pos), ...] sorted
+    best first, truncated to limit.  A document found by BOTH lanes merges
+    into one entry carrying both positions -- including when the two lanes
+    picked different representations of it, which is exactly what twins are
+    for.
+    """
+    dense = collapse_lane_by_twin(dense_hits)
+    sparse = collapse_lane_by_twin(sparse_hits)
+
+    entries: dict[tuple, dict] = {}
+
+    def _absorb(lane: str, pos: int, pid: str, meta: dict) -> None:
+        ident = _twin_identity(meta or {}) or ("__point__", pid)
+        cur = entries.get(ident)
+        if cur is None:
+            entries[ident] = {"pid": pid, "meta": meta, "d": None, "s": None}
+            cur = entries[ident]
+        key = "d" if lane == "dense" else "s"
+        if cur[key] is None:
+            cur[key] = pos
+
+    for pos, (pid, meta, _sim) in enumerate(dense):
+        _absorb("dense", pos, pid, meta)
+    for pos, (pid, meta, _sim) in enumerate(sparse):
+        _absorb("sparse", pos, pid, meta)
+
+    scored: list[tuple[float, str, dict, int | None, int | None]] = []
+    for cur in entries.values():
+        score = 0.0
+        if cur["d"] is not None:
+            score += _rrf_lane_term(cur["d"], dense_weight, k)
+        if cur["s"] is not None:
+            score += _rrf_lane_term(cur["s"], sparse_weight, k)
+        scored.append((score, cur["pid"], cur["meta"], cur["d"], cur["s"]))
+
+    # Deterministic: score desc, then point id (stable across calls).
+    scored.sort(key=lambda t: (-t[0], str(t[1])))
+    return scored[:limit]
+
 def _lightweight_payload_selector():
     """Payload selector that excludes heavy base64 ``image``/``video`` keys.
 
@@ -289,6 +558,108 @@ class VectorStore:
     raw cosine similarity (higher = more similar) for both backends.
     """
 
+    def _lane_requests(
+        self,
+        emb: list[float],
+        sparse: Any,
+        k: int,
+        with_payload: Any,
+        flt: Any,
+        want_dense_vectors: bool,
+    ) -> "list[tuple[Any, bool]]":
+        """Per-lane requests for twin-collapsing hybrid search.
+
+        Emits TWO flat requests (dense, then sparse) instead of one server-side
+        RRF fusion request.  The caller fuses them client-side via
+        fuse_lanes_with_twin_collapse, which is what makes per-lane twin
+        collapse possible at all: server-side RRF fuses by point id, so a
+        parent and its twin arrive as two independent candidates and cannot be
+        collapsed before scoring.
+
+        Both lanes return prefetch_k candidates (the same floor the fusion
+        request used) and both carry the dense vector so the true cosine can
+        be recomputed for sparse-lane-only hits.
+        """
+        from qdrant_client.models import QueryRequest
+
+        prefetch_k = _prefetch_depth(k)
+        dense_using = self._dense_using()
+        vec: Any = ([dense_using] if dense_using is not None else True) if want_dense_vectors else False
+        return [
+            (
+                QueryRequest(
+                    query=emb,
+                    using=dense_using,
+                    limit=prefetch_k,
+                    with_payload=with_payload,
+                    with_vector=vec,
+                    filter=flt,
+                ),
+                True,
+            ),
+            (
+                QueryRequest(
+                    query=sparse,
+                    using=bm25_lane.BM25_VECTOR_NAME,
+                    limit=prefetch_k,
+                    with_payload=with_payload,
+                    with_vector=vec,
+                    filter=flt,
+                ),
+                True,
+            ),
+        ]
+    def _query_requests_laned(
+        self,
+        queries: "list[tuple[list[float], int, bool, dict[str, Any] | None, str | None, RrfParams | None]]",
+        hybrid: bool,
+    ) -> "list[list[tuple[Any, bool]]]":
+        """Like :meth:`_query_requests`, but one request LIST per query.
+
+        Hybrid queries emit TWO requests (dense lane, sparse lane) instead of
+        one server-side RRF fusion request; the caller fuses them client-side
+        so twins can be collapsed per lane BEFORE scoring.  Non-hybrid queries
+        emit the usual single flat dense request.
+
+        Returning a list-of-lists (rather than a flat list) is what lets the
+        executor map responses back to their query when the request count is
+        no longer 1:1.
+        """
+        from qdrant_client.models import QueryRequest
+
+        stats = self._bm25_stats() if hybrid else None
+        lightweight = _lightweight_payload_selector()
+        want_dense_vectors = self._embedding_scores_enabled()
+        grouped: list[list[tuple[Any, bool]]] = []
+
+        for emb, k, need_media, filters, query_text, rrf in queries:
+            flt = build_payload_filter(filters)
+            with_payload: Any = True if need_media else lightweight
+            sparse = None
+            if stats is not None and query_text:
+                try:
+                    sparse = bm25_lane.build_query_sparse_vector(query_text, stats)
+                except Exception as exc:
+                    logger.warning("BM25 query vector build failed - dense-only for this query: %s", exc)
+            if sparse is not None:
+                grouped.append(self._lane_requests(emb, sparse, k, with_payload, flt, want_dense_vectors))
+            else:
+                grouped.append(
+                    [
+                        (
+                            QueryRequest(
+                                query=emb,
+                                using=self._dense_using(),
+                                limit=k,
+                                with_payload=with_payload,
+                                with_vector=False,
+                                filter=flt,
+                            ),
+                            False,
+                        )
+                    ]
+                )
+        return grouped
     def similarity_search_with_score_by_vector(
         self, embedding: list[float], k: int, need_media: bool = True, filters: dict[str, Any] | None = None
     ) -> list[tuple[Document, float]]:
@@ -795,13 +1166,41 @@ class QdrantVectorStore(VectorStore):
                     fused_query: Any = RrfQuery(rrf=Rrf(k=rrf.k, weights=[rrf.dense_weight, rrf.sparse_weight]))
                 else:
                     fused_query = FusionQuery(fusion=Fusion.RRF)
+                # Prefetch DEPTH vs DISPLAY limit.  RRF is defined over its
+                # candidate lists, so the prefetch window is part of the
+                # RANKING DEFINITION, not of the paging.  Binding both
+                # prefetches to `k` made a document's fused score depend on
+                # how many results the caller asked to SEE.
+                #
+                # Worked example, unweighted (w=1.0, k=2), so a lane's
+                # position p (1-indexed) contributes 1/(p+1): a doc that is
+                # dense rank 11 and sparse rank 1 scores
+                #   1/12 + 1/2 = 0.0833 + 0.5000 = 0.5833
+                # when both lanes are prefetched deeply enough.  At top_k=10
+                # the dense lane cannot return position 11 at all, so the
+                # dense term vanishes and the doc scores 0.5000 — appearing
+                # to be a pure sparse hit.  Same document, same query,
+                # different score, and the shallow view misreports its lane.
+                #
+                # Decouple them: fuse over a fixed floor of candidates, then
+                # truncate to k.  For every k <= the floor the fused score is
+                # identical, and top-10 is a strict prefix of top-20.
+                #
+                # Honest limitations: (a) RRF scores remain relative to the
+                # pool, so invariance holds only within the floor; (b) the
+                # rerank path legitimately over-fetches (rag_system.aretrieve
+                # uses fetch_k = max(top_k, 4*reranker_top_k)), so a reranked
+                # call may fuse over a deeper pool than an unranked one.
+                prefetch_k = _prefetch_depth(k)
                 out.append(
                     (
                         QueryRequest(
                             query=fused_query,
                             prefetch=[
-                                Prefetch(query=emb, using=self._dense_using(), limit=k, filter=flt),
-                                Prefetch(query=sparse, using=bm25_lane.BM25_VECTOR_NAME, limit=k, filter=flt),
+                                Prefetch(query=emb, using=self._dense_using(), limit=prefetch_k, filter=flt),
+                                Prefetch(
+                                    query=sparse, using=bm25_lane.BM25_VECTOR_NAME, limit=prefetch_k, filter=flt
+                                ),
                             ],
                             limit=k,
                             with_payload=with_payload,
@@ -911,6 +1310,56 @@ class QdrantVectorStore(VectorStore):
         def _run(reqs: list[Any]) -> list[Any]:
             with observe_qdrant("query_batch_points"):
                 return self._client.query_batch_points(collection_name=self.collection_name, requests=reqs)
+        use_lanes = hybrid and _twin_collapse_enabled()
+        if use_lanes:
+            # Twin-collapsing path: two lane requests per hybrid query, fused
+            # client-side so twins are collapsed PER LANE before scoring.
+            grouped = self._query_requests_laned(queries, hybrid)
+            try:
+                results = self._execute_laned(queries, grouped)
+            except Exception as exc:
+                if not _is_fusion_unsupported_error(exc):
+                    raise
+                self._fusion_supported = False
+                logger.warning(
+                    "Qdrant backend rejected per-lane hybrid requests (%s: %s) - "
+                    "collection '%s' falls back to dense-only retrieval",
+                    type(exc).__name__,
+                    exc,
+                    self.collection_name,
+                )
+                fallback = self._query_requests(queries, False)
+                for _rq, _h in fallback:
+                    SEARCH_HYBRID.labels(mode="dense").inc()
+                fb_results = _points_to_docs(_run([req for req, _ in fallback]))
+                # Same deterministic tiebreak the legacy dense path applies, so
+                # a degraded search is reproducible too.
+                return [_stable_tiebreak(pq) for pq in fb_results]
+            for group in grouped:
+                for _rq, _h in group:
+                    SEARCH_HYBRID.labels(mode="hybrid" if _h else "dense").inc()
+            for q_idx, per_query in enumerate(results):
+                rrf_requested = queries[q_idx][5]
+                applied = bool(
+                    isinstance(rrf_requested, RrfParams)
+                    and (
+                        rrf_requested.k is not None
+                        or rrf_requested.dense_weight != 1.0
+                        or rrf_requested.sparse_weight != 1.0
+                    )
+                )
+                for doc, _ in per_query:
+                    doc.metadata["_score_kind"] = "rrf"
+                    if applied:
+                        assert rrf_requested is not None
+                        doc.metadata["_rrf"] = {
+                            "dense": rrf_requested.dense_weight,
+                            "sparse": rrf_requested.sparse_weight,
+                            "k": rrf_requested.k,
+                        }
+                results[q_idx] = _stable_tiebreak(per_query)
+            return results
+
 
         try:
             executed = requests
@@ -955,6 +1404,12 @@ class QdrantVectorStore(VectorStore):
                 # weighted-RRF override was silently dropped — results stay
                 # UNSTAMPED (an honest dense result carries no weights, and
                 # the surfaces report ``rrf.applied=false`` from that).
+                #
+                # The deterministic tiebreak still applies: raw cosine ties
+                # are common for duplicate/near-identical media, and this is
+                # the most common path on a cold dataset (no BM25 stats yet,
+                # hybrid disabled, or a backend that degraded to dense-only).
+                results[q_idx] = _stable_tiebreak(per_query)
                 continue
             rrf_requested = queries[q_idx][5]
             applied_override = bool(
@@ -979,8 +1434,97 @@ class QdrantVectorStore(VectorStore):
                     }
             if want_vectors:
                 self._stamp_dense_cosines(queries[q_idx][0], responses[q_idx].points, per_query)
+            # Deterministic tiebreak on EQUAL fused scores.
+            #
+            # qdrant-client's fusion sorts on the score alone
+            # (hybrid/fusion.py: sorted(scores.items(), key=item[1], reverse=True)),
+            # and equal fused scores are common and STRUCTURAL: the dense and
+            # sparse ladders both produce exactly 0.3333, 0.2000, 0.1429 ...
+            # so a dense-pos-2 hit and a sparse-pos-1 hit tie exactly.  With
+            # no secondary key, the surviving order is whatever Qdrant
+            # returned for the equal-scored points, which is not guaranteed —
+            # observed as two documents swapping places between identical
+            # calls.  Sorting here (score desc, then a stable content key)
+            # makes repeated identical searches reproducible.
+            results[q_idx] = _stable_tiebreak(per_query)
         return results
 
+    def _execute_laned(
+        self,
+        queries: "list[tuple[list[float], int, bool, dict[str, Any] | None, str | None, RrfParams | None]]",
+        grouped: "list[list[tuple[Any, bool]]]",
+    ) -> "list[list[tuple[Document, float]]]":
+        """Run per-lane requests and fuse them client-side with twin collapse.
+
+        Each query contributes either ONE dense request (dense-only path, no
+        fusion, raw cosine scores) or TWO lane requests (dense + sparse) that
+        are collapsed per lane, then RRF-scored by
+        :func:`fuse_lanes_with_twin_collapse`.
+
+        Returns the same shape as the fused path: one list of
+        ``(Document, fused_score)`` per query, best first.
+        """
+        from multimodal_rag.utils.metrics import observe_qdrant
+
+        flat: list[Any] = [req for group in grouped for req, _ in group]
+        with observe_qdrant("query_batch_points"):
+            responses = self._client.query_batch_points(collection_name=self.collection_name, requests=flat)
+
+        out: list[list[tuple[Document, float]]] = []
+        cursor = 0
+        for q_idx, group in enumerate(grouped):
+            n = len(group)
+            chunk = responses[cursor : cursor + n]
+            cursor += n
+            k = queries[q_idx][1]
+            rrf_req = queries[q_idx][5]
+
+            if n == 1 and not group[0][1]:
+                # Dense-only: no fusion, scores are raw cosine.  Same shape and
+                # semantics as the legacy flat path.
+                out.append(_points_to_docs(chunk)[0])
+                continue
+
+            dense_docs = _points_to_docs([chunk[0]])[0]
+            sparse_docs = _points_to_docs([chunk[1]])[0]
+
+            dense_hits = [
+                (doc.metadata.get("_point_id", ""), doc.metadata, float(score)) for doc, score in dense_docs
+            ]
+            sparse_hits = [
+                (doc.metadata.get("_point_id", ""), doc.metadata, float(score)) for doc, score in sparse_docs
+            ]
+
+            dw = rrf_req.dense_weight if isinstance(rrf_req, RrfParams) else 1.0
+            sw = rrf_req.sparse_weight if isinstance(rrf_req, RrfParams) else 1.0
+            kk = rrf_req.k if isinstance(rrf_req, RrfParams) and rrf_req.k is not None else _RRF_DEFAULT_K
+
+            fused = fuse_lanes_with_twin_collapse(
+                dense_hits, sparse_hits, limit=k, dense_weight=dw, sparse_weight=sw, k=kk
+            )
+
+            by_id = {doc.metadata.get("_point_id", ""): doc for doc, _s in dense_docs + sparse_docs}
+            per_query: list[tuple[Document, float]] = []
+            for score, pid, _meta, _d, _s in fused:
+                doc = by_id.get(pid)
+                if doc is None:
+                    continue
+                per_query.append((doc, float(score)))
+
+            # Stamp the TRUE dense cosine on every surviving doc, exactly as the
+            # fused path does.  The stored vector arrives on BOTH lane responses
+            # (each request asked for with_vector), so a sparse-only hit still
+            # gets its cosine.  Pair positionally per lane; the doc objects are
+            # shared with by_id, so the stamp lands on the fused result.
+            if self._embedding_scores_enabled():
+                q_emb = queries[q_idx][0]
+                if dense_docs:
+                    self._stamp_dense_cosines(q_emb, chunk[0].points, dense_docs)
+                if len(chunk) > 1 and sparse_docs:
+                    self._stamp_dense_cosines(q_emb, chunk[1].points, sparse_docs)
+
+            out.append(per_query)
+        return out
     def _batcher(self) -> _QdrantBatcher:
         """Per-event-loop batcher (created lazily, one per running loop)."""
         loop = asyncio.get_running_loop()

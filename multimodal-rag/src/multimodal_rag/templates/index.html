@@ -1459,6 +1459,11 @@ dropZone.addEventListener('drop', e => {
 let _retryFiles = [];
 let _uploadSeq = 0;       // monotonic counter for unique per-file status lines
 let _uploadsActive = 0;   // in-flight batch uploads (disables Clear while busy)
+// Files already given their ONE retry after a delete+recreate ACL race (see
+// the 403 branch in uploadOne). Keyed on FILE identity (name:size:lastModified)
+// so the guard survives Retry-Failed, and a genuinely permission-denied file
+// still surfaces its error instead of looping.
+let _aclRaceRetried = new Set();
 
 function _updateRetryButton() {
   const btn = document.getElementById('retry-btn');
@@ -1496,6 +1501,10 @@ async function handleFiles(files) {
 
   _uploadsActive++;
   _updateClearButton();
+  // NOTE: _aclRaceRetried is deliberately NOT cleared here.  It is keyed on
+  // file identity so a file keeps its single retry across batches (including
+  // Retry-Failed, which re-enters this function).  A genuinely ACL-denied
+  // file therefore surfaces its error instead of looping.
 
   // Register these files for potential retry (skip ones already tracked as done+ok)
   for (const f of fileArray) {
@@ -1567,6 +1576,32 @@ async function handleFiles(files) {
       if (!resp.ok) {
         let errMsg = `HTTP ${resp.status}`;
         try { const e = await resp.json(); errMsg = e.detail || e.message || errMsg; } catch {}
+        // A dataset that was just deleted+recreated has a window where its
+        // name has not yet been re-established in the ACL store, so the D15
+        // middleware 403s.  That is a TIMING artifact — the same request
+        // succeeds moments later — so retry it once instead of painting the
+        // file red.
+        //
+        // Match the D15 ACL wording SPECIFICALLY.  The D23 ownership denial
+        // ("dataset ownership is configured — D23") contains the same
+        // "not permitted for this API key" substring but is PERMANENT (you
+        // are not the creator); retrying it would stall 2.5s and show a
+        // misleading "waiting for dataset to settle" state.
+        // Keyed on FILE identity, not the per-batch line key: line keys are
+        // re-minted every batch, so a line-keyed guard would silently re-arm
+        // the retry on each Retry-Failed click.  This key survives batches.
+        const aclRaceKey = `${file.name}:${file.size}:${file.lastModified}`;
+        const aclRace = resp.status === 403
+          && /dataset ACLs are configured/i.test(errMsg)
+          && /not permitted for this API key/i.test(errMsg)
+          && !_aclRaceRetried.has(aclRaceKey);
+        if (aclRace) {
+          _aclRaceRetried.add(aclRaceKey);
+          _updateFileLine(fileKey, `<span style="color:var(--text-muted);width:16px;flex-shrink:0">↻</span> ${escHtml(file.name)} <span style="color:var(--text-muted);font-size:.75rem">waiting for dataset to settle…</span>`);
+          await new Promise(r => setTimeout(r, 2500));
+          fileQueue.unshift(file);   // retry once, at the head of the queue
+          return;
+        }
         _updateFileLine(fileKey, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(file.name)} — ${escHtml(errMsg)}`);
         const rt = _retryFiles.find(r => r.name === file.name);
         if (rt) { rt.done = true; rt.ok = false; }
@@ -2068,11 +2103,23 @@ async function searchDataset() {
   container.innerHTML = '<div style="text-align:center;padding:20px"><span class="spinner"></span></div>';
 
   try {
-    // Build multimodal query
-    const query = {};
-    if (q) query.text = q;
+    // Build the query.
+    //
+    // A TEXT-ONLY search MUST be sent as a plain string.  The server's
+    // dict branch is the MULTIMODAL path: it embeds and searches by vector
+    // only, and `aretrieve` never threads `rrf` down it (see the
+    // `isinstance(query, dict)` branch in rag_system.aretrieve), so it
+    // bypasses hybrid dense+BM25 fusion entirely.  Sending `{text: q}`
+    // here silently downgraded every front-page search to dense cosine:
+    // the BM25 lane never ran and the dataset's RRF weights were ignored.
+    // Only attach a dict when there is actually media to send.
+    let query;
     if (_searchMediaDataUrl && _searchMediaType) {
+      query = {};
+      if (q) query.text = q;
       query[_searchMediaType] = _searchMediaDataUrl;
+    } else {
+      query = q;
     }
 
     const body = { query, top_k, use_reranker, reranker_top_k };
@@ -2151,7 +2198,16 @@ async function searchDataset() {
         }
       }
       const _copyPayload = encodeURIComponent(_text + (_mediaUrls.length ? '\n\nMedia:\n' + _mediaUrls.join('\n') : ''));
+      // Label WHAT the score means.  Under hybrid retrieval the score is RRF
+      // rank arithmetic (a ladder like 0.8333/0.6667/0.5), not a cosine
+      // similarity — showing it bare invites "why is relevance 0.83 for a bad
+      // match?".  content._score_kind survives the server round-trip; the
+      // reranker score (a true relevance number) is shown separately.
+      const _kind = r.score_kind
+        || (c && typeof c === 'object' && c._score_kind)
+        || 'cosine';
       const _scoreParts = [`#${i + 1} · score: ${r.score}`];
+      if (_kind === 'rrf') _scoreParts.push('(rrf rank fusion)');
       if (r.embedding_score !== undefined) _scoreParts.push(`(embedding: ${r.embedding_score})`);
       if (r.reranker_score !== undefined && r.score !== r.reranker_score) _scoreParts.push(`(reranker: ${r.reranker_score})`);
       return `<div class="result-item" style="position:relative">

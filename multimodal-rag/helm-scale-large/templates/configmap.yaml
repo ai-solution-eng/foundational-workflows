@@ -142,6 +142,12 @@ data:
   # items) after this many ms; bursts never split.  0 = always wait the
   # full window.  See app.embeddingQueryIdleWaitMs in values.yaml.
   EMBEDDING_QUERY_IDLE_WAIT_MS: {{ int (.Values.app.embeddingQueryIdleWaitMs | default 50) | quote }}
+  # embed-batcher query-vector cache: identical (model, text) repeats are
+  # served from memory (agents retry; shared datasets re-ask). 0 disables.
+  EMBED_BATCH_CACHE_MAX: {{ int (.Values.app.embedBatchCacheMax | default 4096) | quote }}
+  # Per-result dense-cosine stamping: OFF = no per-candidate vector transfer.
+  # Ranking is Qdrant-side RRF; this score is display-only (see values.yaml).
+  RAG_HYBRID_EMBEDDING_SCORES: {{ ternary "1" "0" (default false .Values.app.hybridEmbeddingScores) | quote }}
   EMBEDDING_MAX_IMAGES_PER_PROMPT: {{ .Values.app.embeddingMaxImagesPerPrompt | quote }}
   {{- if .Values.embedBatcher.enabled }}
   # Shared (cross-process) embedding query batcher: all API/MCP pods route

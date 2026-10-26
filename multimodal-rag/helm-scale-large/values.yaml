@@ -55,7 +55,7 @@ replicaCount: 4
 
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v6.0.0
+  tag: v6.2.0
   pullPolicy: IfNotPresent
 
 qdrant:
@@ -169,6 +169,14 @@ app:
   embeddingQueryBatchSize: 128
   embeddingQueryBatchWaitMs: 200
   embeddingQueryIdleWaitMs: 50
+  # Per-result dense-cosine stamping ("embedding_score").  OFF: the hybrid
+  # RRF fusion already fixes the ranking server-side, so this score is display
+  # metadata only — but computing it asks Qdrant to return each candidate's
+  # full dense vector (16KB/candidate at 4096 dims) for a client-side cosine.
+  # That transfer dominated query latency on G2 (2026-10-23: ~1.4s/search at a
+  # 200-candidate prefetch floor). Leave off unless a UI needs the number.
+  hybridEmbeddingScores: false
+  embedBatchCacheMax: 4096
   embeddingMaxImagesPerPrompt: 4
   qdrantQueryBatchSize: 128
   qdrantQueryBatchWaitMs: 5

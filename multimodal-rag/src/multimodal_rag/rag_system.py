@@ -705,6 +705,23 @@ _MEDIA_PLACEHOLDER_RE = re.compile(
 )
 
 
+# Doc-level stash for the merged-annotation context (feature: merged
+# caption+context).  The Preprocessor writes it when ONE call produced both
+# the caption and the document context; acontextualize_docs consumes it and
+# removes the key so it never reaches metadata/payload.
+_MERGED_CONTEXT_KEY = "_merged_context"
+
+
+def _vlm_supports_images(vlm: Any) -> bool:
+    """Whether *vlm* advertises image input (read, never assumed).
+
+    allowable_modalities is a ChatModel field a deployment can override via
+    MODEL_VLM_EXTRA, so a text-only endpoint behind the VLM role is
+    possible.  A false negative just keeps the two-call path.
+    """
+    return "image" in tuple(getattr(vlm, "allowable_modalities", ()) or ())
+
+
 def _has_real_text(text: str) -> bool:
     """True if *text* contains any content beyond captions/placeholders."""
     remaining = _CAPTION_LINE_RE.sub("", text)
@@ -1397,6 +1414,13 @@ class Preprocessor:
     caption_with_asr: bool = False
     caption_with_vlm: bool = False
     chunk_size: int = 128
+    # Merged caption+context (feature: merged annotation).  When True AND
+    # the doc carries real text AND image media AND the VLM accepts images,
+    # ONE call produces both the [Image description] and the
+    # [Document context] artifacts.  The context half is stashed on the doc
+    # under _MERGED_CONTEXT_KEY for acontextualize_docs to consume without a
+    # second call.  False (or any unmet condition) keeps the two-call path.
+    contextualize: bool = False
 
     def __call__(
         self,
@@ -1489,7 +1513,46 @@ class Preprocessor:
             # below (see _strip_embed_caption).
             image_needs_vlm = "image" not in target_modalities and media["image"]
             image_captioned = False
-            if image_needs_vlm:
+            # Merged annotation (feature: merged caption+context): when this
+            # doc ALSO qualifies for contextual retrieval (real text present)
+            # and the VLM accepts images, one call yields both the caption and
+            # the document context.  The context is stashed for the
+            # contextualize stage to reuse, so the same model is not asked
+            # twice about the same chunk.  Falls back to the normal
+            # caption-only call on any failure.
+            # OFF by default: the merged prompt measured far thinner captions
+            # than the dedicated captioning prompt (26 vs 243 words on the
+            # same page), and the caption drives retrieval-time reuse plus the
+            # caption-twin embedding.  Enable with RAG_MERGED_ANNOTATION=true
+            # once the merged prompt matches dedicated-caption quality.
+            merged_used = False
+            if (
+                contextualizer.merged_annotation_enabled()
+                and self.contextualize
+                and self.vlm is not None
+                and media["image"]
+                and (image_needs_vlm or self.caption_img)
+                and _has_real_text(d.get("text") or "")
+                and _vlm_supports_images(self.vlm)
+            ):
+                merged = await contextualizer.annotate_media_merged(d, self.vlm)
+                if merged is not None:
+                    merged_caption, merged_context = merged
+                    # Keep the context half regardless - it is a real
+                    # artifact and the contextualize stage will consume it.
+                    if merged_context:
+                        d[_MERGED_CONTEXT_KEY] = merged_context
+                    # Only claim the merge when a CAPTION actually came back.
+                    # The merged prompt permits "CAPTION: NONE", so an
+                    # empty caption with an image attached must fall through
+                    # to the normal caption call rather than silently
+                    # dropping the caption artifact (no warning, no
+                    # fallback would be a data loss).
+                    if merged_caption:
+                        text_parts.append(f"[Image description]: {merged_caption}")
+                        image_captioned = True
+                        merged_used = True
+            if image_needs_vlm and not merged_used:
                 if self.vlm is not None:
                     vlm_tasks.append(self._describe(d, query=query))
                 else:
@@ -1499,7 +1562,7 @@ class Preprocessor:
                     # entirely" rule); the doc itself is omitted later if
                     # nothing embeddable remains.
                     d.pop("image", None)
-            elif self.caption_img and media["image"]:
+            elif self.caption_img and media["image"] and not merged_used:
                 # Caption generated for the stored payload; stripped from the
                 # embedding input below (see _strip_embed_caption).
                 vlm_tasks.append(self._describe(d, query=query))
@@ -1541,7 +1604,10 @@ class Preprocessor:
                 if vlm_results[vlm_idx]:
                     text_parts.append(f"[Video description]: {vlm_results[vlm_idx]}")
                 vlm_idx += 1
-            if (image_needs_vlm or image_captioned) and self.vlm is not None:
+            # merged_used: the caption was already appended above, and no
+            # _describe task was queued for this doc - consuming vlm_results
+            # here would index an empty list.
+            if (image_needs_vlm or image_captioned) and self.vlm is not None and not merged_used:
                 if vlm_results[vlm_idx]:
                     text_parts.append(f"[Image description]: {vlm_results[vlm_idx]}")
                 vlm_idx += 1
@@ -1862,6 +1928,7 @@ class MultimodalRAG:
             caption_with_asr=self.caption_with_asr,
             caption_with_vlm=self.caption_with_vlm,
             chunk_size=self.preprocess_chunk_size,
+            contextualize=self.contextualize,
         )
         # caption_with_asr is passed through so retrieval can still transcribe
         # video audio tracks for docs ingested WITHOUT captioning (e.g. created
@@ -2179,7 +2246,13 @@ class MultimodalRAG:
                 docs.append(Document(page_content=inp, metadata={}))
             elif isinstance(inp, dict):
                 text = inp.get("text", "")
-                meta = {k: v for k, v in inp.items() if k != "text"}
+                # _MERGED_CONTEXT_KEY is an INTERNAL ingest stash (the
+                # merged-annotation context, consumed by acontextualize_docs).
+                # It must never reach metadata: this converter copies every
+                # non-text key, and any doc the contextualizer SKIPS (memory
+                # docs, twins, no-VLM) never consumes it.  Strip it here so
+                # the guarantee holds on every path, not just the happy one.
+                meta = {k: v for k, v in inp.items() if k not in ("text", _MERGED_CONTEXT_KEY)}
                 # Metadata-filtered search keys off metadata.file_type —
                 # classify once at ingest from the document source.  Docs
                 # without any source (raw text drops) stay unlabelled.

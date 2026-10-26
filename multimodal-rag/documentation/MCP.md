@@ -217,3 +217,79 @@ The unified frontend (`/`, `RAG_SSO_GATE`-gated) ships a fifth tab, **Inspector*
 The sidecar then resolves identity itself from the forwarded credential against the SAME registry store (D15 ACLs ∪ D16 selections, ★ memory binding, per-caller unlock scoping) — the Inspector exercises the real MCP path, not a shortcut around it. Tool-level failures render as the tool's own error text.
 
 **Env:** `RAG_INSPECTOR_MCP_URL` (default `http://127.0.0.1:9090/mcp` — the chart's sidecar topology; point it at `http://localhost:8001/mcp` for `kubectl port-forward` dev setups) and `RAG_INSPECTOR_TIMEOUT_S` (default 300 — tool calls embed and search). Read per request.
+
+---
+
+## 6. Rendering media URLs in a browser that cannot reach the app host
+
+`MEDIA_BASE_URL` points at the PCAI application endpoint, and **that host sits behind
+the platform oauth2-proxy SSO gate** (a `CUSTOM` `AuthorizationPolicy` on the
+istio-ingressgateway — see `helm-scale-large/templates/authorizationpolicy.yaml`).
+The gate runs *in front of* the app: every request on the host, including
+`/api/datasets/{ds}/files/{f}?token=...`, is answered `302` to Keycloak before FastAPI
+sees it. That breaks two things at once:
+
+1. **The media token never gets evaluated.** The HMAC `?token=` exists precisely so
+   `<img>`/`<video>`/`<audio>` tags — which cannot set headers — can fetch protected
+   media. The proxy does not know that token, so a signed URL behaves exactly like an
+   unsigned one: `302`.
+2. **A live SSO session does not rescue it.** The gateway cookie is
+   `Domain=pcai-se-ai-application…; SameSite=Lax`. `Lax` cookies are **not** sent on
+   cross-site subresource loads, so an `<img>` embedded in a page on any other origin
+   (a local GUI on `127.0.0.1:3080`, say) fires cookieless and is `302`d again.
+
+A page served from the **same registrable domain** (Open WebUI on
+`open-webui.pcai-se-ai-application…`) is same-site, so the cookie rides along and media
+renders there. Anything on a different origin does not.
+
+### `scripts/media-proxy.py`
+
+A localhost shim for exactly that case. It fetches bytes through the MCP gateway —
+which authenticates with a **bearer key**, not a cookie — and re-serves them from a
+local origin the browser loads without any SSO involvement:
+
+```bash
+python3 scripts/media-proxy.py --port 8788     # key from PCAI_LLM_API_KEY or ~/.dsh/.env
+```
+
+Then swap the origin of any RAG media URL:
+
+```text
+https://rag-mcp-server.<domain>/api/datasets/andrew-personal-dataset/files/DSC01378_preprocessed.JPG
+                          ↓
+http://127.0.0.1:8788/api/datasets/andrew-personal-dataset/files/DSC01378_preprocessed.JPG
+```
+
+| Behaviour | Detail |
+|---|---|
+| Accepted paths | `/api/datasets/{ds}/files/{f}` (the real route) and `/{ds}/{f}` (shorthand) |
+| Filenames | both the stored `{32-hex}_name` and the short human name resolve (uuid prefix stripped) |
+| `?token=` | accepted and ignored — the proxy re-authorises through the gateway key, so stale/absent tokens are fine |
+| Caching | in-memory plus a disk cache (default `~/.dsh/tmp-rag-media-proxy`, falling back to `.scratch/`) |
+| Status codes | `200` ok, `404` no such file, `413` file exceeds `MCP_FILE_BYTES_MAX`, `502` gateway error |
+| Bind | `127.0.0.1` only; reads nothing beyond what the configured gateway key may already read; exposes no filesystem path |
+
+> **Size limit — the one real constraint.** `get_dataset_file_bytes` refuses files over
+> `MCP_FILE_BYTES_MAX` (default **256 KiB**), so the proxy can serve most preprocessed
+> image previews and small documents but not full-size photos, video, or audio. That is a
+> transport cap, not a permission problem, and the proxy answers `413` to say so. To serve
+> bulk media, raise `MCP_FILE_BYTES_MAX` on the deployment (`extraEnv` in the chart values;
+> note it is *not* currently a first-class chart value) — or serve those files over REST
+> from a same-site origin instead.
+
+### Why not just fix the deployment?
+
+Three alternatives, in increasing order of blast radius:
+
+1. **Same-origin front end** — render the media from a page on the app's own domain
+   (Open WebUI already works this way). No config change; nothing to bypass.
+2. **`oauth2-proxy --skip-auth-route`** for `/api/datasets/.*/files/.*` — lets the app's
+   HMAC media token be the only gate, which is the design `api_server.py` already
+   documents. This is a gateway-policy change on a shared PCAI unit: coordinate it.
+3. **Server-side proxy with credentials** — have the consuming front end fetch media
+   through an authenticated backend and re-serve it from its own origin (what
+   `scripts/media-proxy.py` does, locally).
+
+The proxy is option 3 in its smallest form: no cluster change, no shared-policy edit, and
+it reuses the credential the MCP client already holds.
+
