@@ -331,7 +331,7 @@
     <a class="nav-link" href="/">Datasets</a>
     <a class="nav-link" href="/manage">Manage</a>
     <a class="nav-link current" href="/access">Access</a>
-    <button class="btn btn-outline btn-sm" id="signout-btn" onclick="signOut()" title="Forget the stored key on this device and reload to the sign-in state">Sign out</button>
+    <button class="btn btn-outline btn-sm" id="signout-btn" onclick="signOut()" style="display:none" title="Forget the stored key on this device and reload to the sign-in state">Sign out</button>
     <div class="theme-toggle" onclick="toggleTheme()" title="Toggle dark/light mode">
       <span id="theme-label">Light</span>
       <div class="theme-toggle-track">
@@ -1266,9 +1266,11 @@ function showView(which) {
   document.getElementById('login-card').style.display = which === 'login' ? 'block' : 'none';
   document.getElementById('access-view').style.display = which === 'access' ? 'block' : 'none';
   document.getElementById('admin-view').style.display = (which === 'access' && isAdmin) ? 'block' : 'none';
-  // Sign out lives in the header on every view: it always just clears both
-  // storage keys and reloads (a no-op when nothing is stored).
-  document.getElementById('signout-btn').style.display = 'inline-flex';
+  // Sign out forgets the locally stored API key.  With no key stored (an
+  // SSO-only session, or a login card reached without a saved key) there is
+  // nothing to forget and the button would be a no-op — keep it hidden.
+  document.getElementById('signout-btn').style.display =
+    getStoredKey() ? 'inline-flex' : 'none';
 }
 
 async function probeAdmin() {

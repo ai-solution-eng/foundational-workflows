@@ -3179,23 +3179,30 @@ function renderIdentityChip() {
   }
   chip.innerHTML = html;
   chip.style.display = 'flex';
-  signout.style.display = 'inline-flex';
+  // Sign out only when THIS browser holds the credential it would forget: a
+  // pasted/remembered API key.  An SSO/OIDC session is owned by the identity
+  // provider (the platform edge's cookie or the D22 HttpOnly session cookie);
+  // ending it from the page does not end the platform's IdP session, which
+  // re-authenticates — so the button would look like a no-op.  The embedded
+  // deployment key is injected server-side and cannot be forgotten either.
+  signout.style.display =
+    (state.keyMode === 'paste' && getStoredKey()) ? 'inline-flex' : 'none';
   if (keylink) keylink.style.display = state.keyMode === 'embedded' ? 'none' : 'inline';
 }
 
-// sso-cookie → server-side logout; pasted/embedded key → forget locally.
+// Reachable only from a pasted/remembered key now (SSO/OIDC sessions hide
+// the button — the identity provider owns that session; see
+// renderIdentityChip).  Forget the key locally, then end any edge session.
 function signOut() {
-  // D24 sign-out, COMPLETE version (the "sign out doesn't work" report):
-  // behind an enforcing gateway there are TWO sessions to end —
+  // D24 sign-out: behind an enforcing gateway there are TWO sessions to end —
   //   1. the remembered/pasted API key (localStorage/sessionStorage), and
   //   2. the edge SSO session (oauth2-proxy's HttpOnly cookie at the gateway).
   // Ending only #1 reloads into… the edge re-authenticating instantly
   // (X-Auth-Request-* headers re-injected), which looks like "sign out
   // does nothing".  Ending only #2 leaves a remembered key re-signing-in.
-  // So: ALWAYS clear the key, ALWAYS end the edge session via the gateway's
-  // standard oauth2-proxy sign-out (same-origin), and — because the IdP's
-  // own SSO cookie may silently re-authenticate through oauth2-proxy —
-  // chain to Keycloak's end_session when we know the issuer (full SLO).
+  // So: clear the key AND send the browser through the gateway's standard
+  // oauth2-proxy sign-out (same-origin).  The IdP's own SSO session is not
+  // endable from this page — /oauth/logged-out explains that to the user.
   clearKey();
   location.href = '/oauth2/sign_out?rd=' + encodeURIComponent('/oauth/logged-out');
 }

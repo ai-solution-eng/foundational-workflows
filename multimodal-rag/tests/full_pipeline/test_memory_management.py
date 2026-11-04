@@ -126,6 +126,24 @@ def test_delete_documents_ignores_blank_entries():
     assert {pid for pid, _ in dm.scroll_documents("any", limit=10)} == {pid}
 
 
+def test_delete_documents_charges_counter_only_for_existing_points():
+    """Regression (2026-11-04): re-submitting an already-deleted id must not
+    decrement document_count again.
+
+    Live symptom: a 109-id cleanup was re-probed for verification, and each
+    re-probe charged the counter for ids that were already gone - the stored
+    count read 719 while 835 points remained.
+    """
+    client = _client()
+    keep = _upsert(client, "keep me", memory_kind="note")
+    gone = uuid.uuid4().hex  # never inserted
+    dm, decrements = _dm_with(client)
+    assert dm.delete_documents("any", [keep, gone]) == 2
+    assert decrements == [1], "only the point that existed may be charged"
+    assert dm.delete_documents("any", [gone]) == 1
+    assert decrements == [1, 0], "a re-submitted deleted id must charge nothing"
+
+
 # ---------------------------------------------------------------------------
 # scroll_documents — the filter shapes list_memories builds
 # ---------------------------------------------------------------------------

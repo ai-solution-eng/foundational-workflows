@@ -5266,6 +5266,38 @@ class DatasetManager:
             if offset is None:
                 break
 
+    def _existing_point_count(self, client: Any, collection: str, ids: list[Any]) -> int:
+        """Count how many of *ids* actually exist in *collection*.
+
+        document_count is a plain stored counter, so a delete must charge it
+        only for points that were really removed. Without this probe a caller
+        that re-submits ids (a retried/idempotent dedupe pass, or a
+        verification re-probe of ids already deleted) decremented the counter
+        for points that were not there - observed live 2026-11-04: the counter
+        read 719 while 835 points remained, because a 109-id delete was
+        re-submitted twice.
+
+        Best-effort by design: a probe failure must never block a delete, so
+        it falls back to len(ids) (the historical behaviour) and logs.
+        """
+        try:
+            return len(
+                client.retrieve(
+                    collection_name=collection,
+                    ids=ids,
+                    with_payload=False,
+                    with_vectors=False,
+                )
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "existing-point probe failed for %s (%d ids); charging the counter for all of them",
+                collection,
+                len(ids),
+                exc_info=True,
+            )
+            return len(ids)
+
     def delete_document(self, dataset_name: str, doc_id: str) -> None:
         """Delete a single document from a dataset by its point ID."""
         rag = self._get_rag(dataset_name)
@@ -5274,6 +5306,12 @@ class DatasetManager:
         client = vs._client  # type: ignore[attr-defined]
         from qdrant_client.models import PointIdsList
 
+        # Charge the counter only if the point is really there.
+        existing = self._existing_point_count(
+            client,
+            vs.collection_name,
+            [doc_id],  # type: ignore[attr-defined]
+        )
         # Fetch the point's terms for the BM25 df decrement BEFORE deletion.
         self.forget_bm25_documents(dataset_name, [doc_id])
         client.delete(
@@ -5281,7 +5319,7 @@ class DatasetManager:
             points_selector=PointIdsList(points=[doc_id]),
             wait=True,
         )
-        self._decrement_count(dataset_name, 1)
+        self._decrement_count(dataset_name, existing)
 
     def delete_session_memories(
         self,
@@ -5400,6 +5438,15 @@ class DatasetManager:
         client = vs._client  # type: ignore[attr-defined]
         from qdrant_client.models import PointIdsList
 
+        # Charge the counter only for points that actually exist. Re-submitting
+        # ids used to decrement the stored count for points that were already
+        # gone, which is how an idempotent dedupe re-run silently corrupted
+        # document_count (2026-11-04).
+        existing = self._existing_point_count(
+            client,
+            vs.collection_name,
+            clean,  # type: ignore[attr-defined]
+        )
         # Fetch terms for the BM25 df decrement BEFORE deletion.
         self.forget_bm25_documents(dataset_name, clean)
         client.delete(
@@ -5407,7 +5454,7 @@ class DatasetManager:
             points_selector=PointIdsList(points=clean),
             wait=True,
         )
-        self._decrement_count(dataset_name, len(clean))
+        self._decrement_count(dataset_name, existing)
         return len(clean)
 
     def scroll_documents(

@@ -18,6 +18,14 @@ All notable changes to this project are tracked here. Format loosely follows [Ke
   the previous always-skip behavior.
 
 ### Changed
+- **The Sign out button is hidden for SSO/OIDC sessions.** It only ever
+  forgot a locally stored API key; an SSO session is owned by the identity
+  provider (the platform edge's cookie or the D22 HttpOnly session cookie),
+  so ending it from the page does not end the platform's IdP session — the
+  IdP re-authenticates and the button appears to do nothing. The button now
+  renders only when this browser holds a pasted/remembered key (the `paste`
+  key mode), on both `/` and `/access`; SSO users sign out through the
+  platform.
 - **Qdrant memory placement migrated off the deprecated legacy flags** to the
   v1.19 three-valued `memory` tier (`pinned` | `cached` | `cold`). The legacy
   `QDRANT_QUANTIZATION_ALWAYS_RAM` boolean is still honoured as a fallback
