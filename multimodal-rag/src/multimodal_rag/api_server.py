@@ -4843,6 +4843,11 @@ async def _federated_rest_search(
         for entry in outcome:
             doc = entry.get("content")
             extra = {k: v for k, v in entry.items() if k not in ("content", "score")}
+            # dm.search reports the retrieval lane as an entry field and
+            # strips the private stamp from content, but the lane-aware
+            # merge below (and the shared rerank helper) still read it.
+            if isinstance(doc, dict) and extra.get("score_kind") == "rrf" and "_score_kind" not in doc:
+                doc["_score_kind"] = "rrf"
             if extra:
                 extra_fields[id(doc)] = extra
             entries.append((name, doc, float(entry.get("score", 0.0))))
@@ -4881,6 +4886,24 @@ async def _federated_rest_search(
                 entry_out["embedding_score"] = doc["_embedding_score"]
             if "_reranker_score" in doc and "reranker_score" not in entry_out:
                 entry_out["reranker_score"] = doc["_reranker_score"]
+            # Label WHAT the emitted score is, with the MCP contract precedence:
+            # reranker relevance > RRF rank arithmetic > cosine.  The fan-out
+            # entry already carries the label dm.search derived; the merged
+            # rerank copy re-stamps the private keys on the doc instead.
+            if "_reranker_score" in doc:
+                entry_out["score_kind"] = "reranker"
+            elif "_score_kind" in doc:
+                entry_out["score_kind"] = "rrf" if doc["_score_kind"] == "rrf" else "cosine"
+            else:
+                entry_out.setdefault("score_kind", "cosine")
+            if "_retrieval_score" in doc:
+                # Pre-rerank score, kept visible alongside the reranker one.
+                entry_out["retrieval_score"] = doc["_retrieval_score"]
+            # Private lane stamps stay out of the public content payload.
+            doc.pop("_score_kind", None)
+            doc.pop("_retrieval_score", None)
+        else:
+            entry_out.setdefault("score_kind", "cosine")
         results.append(entry_out)
 
     return {"query": q, "filters": filters, "results": results, "skipped": skipped, "errors": errors}
@@ -6106,48 +6129,46 @@ def _qdrant_replica_usage(
         return dict(_QDRANT_TELEMETRY_CACHE.get("usage") or {})
 
 
-def _collect_health_stats() -> dict[str, Any]:
-    """Synchronous helper that does the actual work for /api/admin/health."""
-    global _last_cpu_time, _last_wall_time
+# Qdrant status / collection count / total points for /api/admin/health: one
+# /collections call plus ONE /collections/{name} call per collection.  The
+# management UI polls the endpoint every 10s, so 12 collections meant ~13
+# Qdrant round trips per poll per open browser — the same fan-out shape the
+# telemetry/cluster caches above already cover; this one was missed.  Cached
+# for _QDRANT_HEALTH_FANOUT_TTL (30s, matching _QDRANT_CLUSTER_TTL).  Only
+# successful fan-outs are cached: a failure is never stored, so "unreachable"
+# surfaces on the very next poll, and a cached "ok" can mask a dead Qdrant
+# for at most _QDRANT_HEALTH_FANOUT_TTL (30s, ~3 UI polls) after the last
+# successful fan-out — that is the deliberate staleness bound.
+_QDRANT_HEALTH_FANOUT_CACHE: dict[str, Any] = {
+    "ts": 0.0,
+    "status": "unknown",
+    "collections": 0,
+    "total_points": 0,
+}
+_QDRANT_HEALTH_FANOUT_TTL = 30.0
 
-    import shutil
 
-    # -- CPU (delta from last call) -------------------------------------------
-    rusage = resource.getrusage(resource.RUSAGE_SELF)
-    cpu_seconds = rusage.ru_utime + rusage.ru_stime
-    now = time.monotonic()
-    cpu_limit = _read_cpu_limit()
-    if _last_wall_time > 0:
-        delta_cpu = cpu_seconds - _last_cpu_time
-        delta_wall = now - _last_wall_time
-        cpu_percent = round(min(delta_cpu / delta_wall / cpu_limit * 100, 100.0), 1) if delta_wall > 0 else 0.0
-    else:
-        cpu_percent = 0.0
-    _last_cpu_time = cpu_seconds
-    _last_wall_time = now
+def _qdrant_health_fanout() -> "tuple[str, int, int]":
+    """(status, collection count, total points) for /api/admin/health.
 
-    # -- Memory ----------------------------------------------------------------
-    rss_kb = rusage.ru_maxrss  # max RSS in KB (Linux)
-    # Also read current VmRSS from /proc for live value
-    try:
-        for line in Path("/proc/self/status").read_text().splitlines():
-            if line.startswith("VmRSS:"):
-                rss_kb = int(line.split()[1])
-                break
-    except Exception:
-        logger.debug("Suppressed exception", exc_info=True)
-    rss_bytes = rss_kb * 1024
-    mem_limit = _read_cgroup_memory_limit()
-    mem_percent = round(rss_bytes / mem_limit * 100, 1) if mem_limit > 0 else 0.0
-
-    # -- File PVC disk ----------------------------------------------------------
-    dm = get_manager()
-    usage = shutil.disk_usage(str(dm.base_path))
-
-    # -- Qdrant status + total points ------------------------------------------
-    qdrant_status = "unknown"
-    qdrant_collections = 0
-    qdrant_total_points = 0
+    Re-runs the 1 + per-collection GET fan-out only when
+    ``_QDRANT_HEALTH_FANOUT_CACHE`` is older than
+    ``_QDRANT_HEALTH_FANOUT_TTL``; within the TTL the cached trio is
+    served.  Exceptions (→ "unreachable") are NOT cached — the next poll
+    retries immediately, so a dead Qdrant is reported on the following poll
+    and a cached "ok" masks an outage for at most
+    ``_QDRANT_HEALTH_FANOUT_TTL`` seconds (the staleness bound).
+    """
+    now = time.time()
+    if now - _QDRANT_HEALTH_FANOUT_CACHE["ts"] <= _QDRANT_HEALTH_FANOUT_TTL:
+        return (
+            str(_QDRANT_HEALTH_FANOUT_CACHE["status"]),
+            int(_QDRANT_HEALTH_FANOUT_CACHE["collections"]),
+            int(_QDRANT_HEALTH_FANOUT_CACHE["total_points"]),
+        )
+    status = "unknown"
+    collections = 0
+    total_points = 0
     try:
         import httpx2
 
@@ -6158,38 +6179,60 @@ def _collect_health_stats() -> dict[str, Any]:
                 base = f"http://{qhost}:{qport}"
                 resp = client.get(f"{base}/collections")
                 if resp.status_code == 200:
-                    qdrant_status = "ok"
+                    status = "ok"
                     cols = resp.json()["result"]["collections"]
-                    qdrant_collections = len(cols)
+                    collections = len(cols)
                     for col in cols:
                         info = client.get(f"{base}/collections/{col['name']}").json()["result"]
-                        qdrant_total_points += info.get("points_count", 0)
+                        total_points += info.get("points_count", 0)
     except Exception:
-        qdrant_status = "unreachable"
+        # Failure: report it now and leave the cache untouched so the next
+        # health poll re-attempts the fan-out (recovery is seen immediately).
+        return ("unreachable", collections, total_points)
+    _QDRANT_HEALTH_FANOUT_CACHE.update(
+        {"ts": now, "status": status, "collections": collections, "total_points": total_points}
+    )
+    return (status, collections, total_points)
 
-    # -- Qdrant PVC disk usage (only when mounted read-only) -------------------
-    # The Qdrant PVC is a separate volume from the file PVC; Qdrant's HTTP API
-    # does not expose on-disk usage, so we read it from the read-only mount
-    # configured in the Helm chart (env QDRANT_STORAGE_PATH).
-    qdrant_pvc: dict[str, Any] | None = None
-    if QDRANT_STORAGE_PATH and Path(QDRANT_STORAGE_PATH).exists():
-        try:
-            q_usage = shutil.disk_usage(QDRANT_STORAGE_PATH)
-            qdrant_pvc = {
-                "total_bytes": q_usage.total,
-                "used_bytes": q_usage.used,
-                "free_bytes": q_usage.free,
-                "used_percent": round(q_usage.used / q_usage.total * 100, 1),
-            }
-        except Exception:
-            logger.debug("Suppressed exception", exc_info=True)
 
-    # -- Qdrant cluster (per-replica shard placement + configured capacity) ----
-    # Qdrant does not expose on-disk usage per node, so for a sharded cluster
-    # (one RWO PVC per replica, none mounted on the API pod) we surface the
-    # per-replica shard placement from the cluster API plus the configured
-    # per-replica PVC size (QDRANT_PVC_SIZE) so operators can gauge storage
-    # spread without exec/kubectl.
+# Cluster fan-out for /api/admin/health: one /cluster call, one /collections
+# listing and one /collections/{name}/cluster call PER COLLECTION (plus the
+# per-replica telemetry pass, itself TTL-cached) — the same defect class as
+# the points fan-out above, re-run on every 10s poll.  Cached here for
+# _QDRANT_HEALTH_CLUSTER_TTL (30s).  Deliberately a SEPARATE cache from
+# _qdrant_cluster_replicas()/_QDRANT_CLUSTER_CACHE: that variant readyz-probes
+# each peer and returns uri/status per replica, i.e. a different response
+# contract (/api/stats consumes it).  Only successful passes are cached — an
+# exception leaves the cache untouched, so a cluster-block outage surfaces on
+# the next poll and is never masked longer than the TTL (same bound as above).
+_QDRANT_HEALTH_CLUSTER_CACHE: dict[str, Any] = {"ts": 0.0, "info": None}
+_QDRANT_HEALTH_CLUSTER_TTL = 30.0
+
+
+def _copy_cluster_info(info: "dict[str, Any] | None") -> "dict[str, Any] | None":
+    """Defensive per-level copy of a cached cluster payload — the neighbour
+    caches copy their entries on every read too — so no caller can mutate the
+    cached object through a returned reference."""
+    if info is None:
+        return None
+    return {**info, "replicas": [dict(r) for r in info.get("replicas") or []]}
+
+
+def _qdrant_health_cluster_info() -> "dict[str, Any] | None":
+    """cluster_info payload for /api/admin/health, TTL-cached.
+
+    Serves ``_QDRANT_HEALTH_CLUSTER_CACHE`` within
+    ``_QDRANT_HEALTH_CLUSTER_TTL``; on a miss re-runs the /cluster +
+    per-collection-cluster fan-out (the body that used to live inline in
+    _collect_health_stats, verbatim).  Exceptions are NOT cached — the
+    endpoint reports cluster_info=None for that poll and the next poll
+    retries, so an outage is never masked longer than the TTL.  A computed
+    None (no QDRANT_HOST, non-200 /cluster) IS cached: the value is
+    deterministic for the TTL window.
+    """
+    now = time.time()
+    if now - _QDRANT_HEALTH_CLUSTER_CACHE["ts"] <= _QDRANT_HEALTH_CLUSTER_TTL:
+        return _copy_cluster_info(_QDRANT_HEALTH_CLUSTER_CACHE["info"])
     cluster_info: dict[str, Any] | None = None
     try:
         import httpx2
@@ -6277,7 +6320,90 @@ def _collect_health_stats() -> dict[str, Any]:
                             "expected_replicas": _qdrant_expected_replicas(),
                         }
     except Exception:
+        # Failure: report None for this poll and leave the cache untouched so
+        # the next health poll re-attempts the fan-out.
         logger.debug("Suppressed exception", exc_info=True)
+        return None
+    _QDRANT_HEALTH_CLUSTER_CACHE.update({"ts": now, "info": cluster_info})
+    return _copy_cluster_info(cluster_info)
+
+
+def _collect_health_stats() -> dict[str, Any]:
+    """Synchronous helper that does the actual work for /api/admin/health."""
+    global _last_cpu_time, _last_wall_time
+
+    import shutil
+
+    # -- CPU (delta from last call) -------------------------------------------
+    rusage = resource.getrusage(resource.RUSAGE_SELF)
+    cpu_seconds = rusage.ru_utime + rusage.ru_stime
+    now = time.monotonic()
+    cpu_limit = _read_cpu_limit()
+    if _last_wall_time > 0:
+        delta_cpu = cpu_seconds - _last_cpu_time
+        delta_wall = now - _last_wall_time
+        cpu_percent = round(min(delta_cpu / delta_wall / cpu_limit * 100, 100.0), 1) if delta_wall > 0 else 0.0
+    else:
+        cpu_percent = 0.0
+    _last_cpu_time = cpu_seconds
+    _last_wall_time = now
+
+    # -- Memory ----------------------------------------------------------------
+    rss_kb = rusage.ru_maxrss  # max RSS in KB (Linux)
+    # Also read current VmRSS from /proc for live value
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                rss_kb = int(line.split()[1])
+                break
+    except Exception:
+        logger.debug("Suppressed exception", exc_info=True)
+    rss_bytes = rss_kb * 1024
+    mem_limit = _read_cgroup_memory_limit()
+    mem_percent = round(rss_bytes / mem_limit * 100, 1) if mem_limit > 0 else 0.0
+
+    # -- File PVC disk ----------------------------------------------------------
+    dm = get_manager()
+    usage = shutil.disk_usage(str(dm.base_path))
+
+    # -- Qdrant status + total points ------------------------------------------
+    # The 1 + per-collection Qdrant fan-out used to run inline here on every
+    # health poll; it is now TTL-cached in _qdrant_health_fanout() (failures
+    # uncached, staleness bound = _QDRANT_HEALTH_FANOUT_TTL).  The CPU/memory/
+    # disk/PVC readings in this helper stay per-request fresh.
+    qdrant_status, qdrant_collections, qdrant_total_points = _qdrant_health_fanout()
+
+    # -- Qdrant PVC disk usage (only when mounted read-only) -------------------
+    # The Qdrant PVC is a separate volume from the file PVC; Qdrant's HTTP API
+    # does not expose on-disk usage, so we read it from the read-only mount
+    # configured in the Helm chart (env QDRANT_STORAGE_PATH).
+    qdrant_pvc: dict[str, Any] | None = None
+    if QDRANT_STORAGE_PATH and Path(QDRANT_STORAGE_PATH).exists():
+        try:
+            q_usage = shutil.disk_usage(QDRANT_STORAGE_PATH)
+            qdrant_pvc = {
+                "total_bytes": q_usage.total,
+                "used_bytes": q_usage.used,
+                "free_bytes": q_usage.free,
+                "used_percent": round(q_usage.used / q_usage.total * 100, 1),
+            }
+        except Exception:
+            logger.debug("Suppressed exception", exc_info=True)
+
+    # -- Qdrant cluster (per-replica shard placement + configured capacity) ----
+    # Qdrant does not expose on-disk usage per node, so for a sharded cluster
+    # (one RWO PVC per replica, none mounted on the API pod) we surface the
+    # per-replica shard placement from the cluster API plus the configured
+    # per-replica PVC size (QDRANT_PVC_SIZE) so operators can gauge storage
+    # spread without exec/kubectl.  The fan-out (1 /cluster + 1 /collections +
+    # one /collections/{name}/cluster per collection + the per-replica
+    # telemetry pass) used to run inline here on every poll; it is now
+    # TTL-cached in _qdrant_health_cluster_info() — failures uncached, same
+    # staleness bound as the points fan-out above.  It stays a SEPARATE cache
+    # from _qdrant_cluster_replicas()/_QDRANT_CLUSTER_CACHE: the stats
+    # endpoint's variant readyz-probes each peer and returns uri/status per
+    # replica — a different response contract.
+    cluster_info = _qdrant_health_cluster_info()
 
     return {
         "cpu": {

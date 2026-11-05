@@ -150,9 +150,9 @@ def _check_media_url_policy(url: str) -> None:
     """Policy for *media* fetches of user-supplied refs (http(s) AND local).
 
     Covers both query-time media URLs (search with image/video/audio,
-    ``describe_media``, ``transcribe_audio``) and media refs embedded in
-    user-supplied documents (``POST /documents``, MCP ``add_memory``), which
-    the server fetches at embed time and again at query time.
+    ``inspect_media``) and media refs embedded in user-supplied documents
+    (``POST /documents``, MCP ``add_memory``), which the server fetches at
+    embed time and again at query time.
 
     For http(s): same rules as :func:`_check_url_policy` with one difference —
     loopback is allowed by default, because clients legitimately pass the
@@ -193,10 +193,9 @@ def _check_media_url_policy(url: str) -> None:
     host = urlparse(url).hostname or ""
     # The server's OWN media host (MEDIA_BASE_URL) is trusted: search
     # results mint self-referential media URLs on it by design (HMAC-token
-    # protected), so refusing to fetch them back breaks describe_media /
-    # transcribe_audio and client previews for exactly the URLs this server
-    # issued.  Read per call (env convention); everything else keeps the
-    # strict private/SSRF rules.
+    # protected), so refusing to fetch them back breaks inspect_media and
+    # client previews for exactly the URLs this server issued.  Read per call
+    # (env convention); everything else keeps the strict private/SSRF rules.
     own_media_host = (os.environ.get("MEDIA_BASE_URL", "") or "").strip()
     if own_media_host:
         own_media_host = (urlparse(own_media_host).hostname or "").strip().lower()

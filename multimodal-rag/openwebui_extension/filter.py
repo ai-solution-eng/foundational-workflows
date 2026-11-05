@@ -202,16 +202,15 @@ class Filter:
                 "The user attached media. The following MCP tools are "
                 "available — choose the right one based on what the user "
                 "is asking for:\n\n"
-                "1. `describe_media` — Call this when the user wants you "
+                "1. `inspect_media` — Call this when the user wants you "
                 "to DESCRIBE or ANALYSE the uploaded media itself (e.g. "
-                '"what\'s in this image?", "describe this video"). Pass '
-                "the media URL from the list below as `media_url`. No "
-                "dataset needed. Returns a VLM description + markdown.\n\n"
-                "2. `transcribe_audio` — Call this when the user wants a "
-                "TRANSCRIPTION of uploaded audio (e.g. \"what's said in "
-                'this recording?"). Pass the audio URL as `audio_url`. '
-                "No dataset needed. Returns the transcript text.\n\n"
-                "3. `search_dataset` — Call this when the user wants to "
+                '"what\'s in this image?", "describe this video", "what\'s '
+                'said in this recording?"). Pass the media URL from the list '
+                'below as `media_url` (add `media_type="audio"` for an '
+                "audio file whose URL has no audio extension). No dataset "
+                "needed. Returns a VLM description + markdown for images and "
+                "videos, or an ASR transcript for audio.\n\n"
+                "2. `search_dataset` — Call this when the user wants to "
                 'FIND SIMILAR content in a dataset (e.g. "find images '
                 'like this", "search for related documents"). Pass the '
                 "dataset name and the matching media URL from the list "
@@ -1093,9 +1092,9 @@ class Filter:
             f"{modalities_block}\n\n"
             f"Staged media (use these EXACT URLs — do NOT modify them "
             f"or construct your own) — pass the relevant URL to the "
-            f"`media_url` / `audio_url` parameter of `describe_media` / "
-            f"`transcribe_audio`, or the matching `image` / `video` / "
-            f"`audio` parameter of `search_dataset`:\n"
+            f"`media_url` parameter of `inspect_media` (with "
+            f'`media_type="audio"` for audio), or the matching `image` / '
+            f"`video` / `audio` parameter of `search_dataset`:\n"
             f"{media_block}"
         )
 

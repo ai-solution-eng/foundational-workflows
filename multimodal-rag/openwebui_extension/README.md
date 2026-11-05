@@ -24,7 +24,7 @@ This extension solves that by **deferring to the RAG MCP tool** instead of embed
 
 1. **Allows uploads** of any modality without requiring the LLM to support them natively.
 2. **Stages the media** on the RAG API's staging endpoint and injects only a short `file://` URL hint plus the dataset name — **no base64** in the LLM context.
-3. Lets the **LLM call the MCP tools itself** with that URL — `describe_media` to analyse the media, `transcribe_audio` to transcribe it, or `search_dataset` for similar content — so results arrive as tool results (not as silently injected context).
+3. Lets the **LLM call the MCP tools itself** with that URL — `inspect_media` to analyse an image/video or transcribe audio, or `search_dataset` for similar content — so results arrive as tool results (not as silently injected context).
 
 If the RAG MCP is not enabled (`DEFER_TO_MCP = false`), the filter simply warns the user and strips the unsupported modality.
 
@@ -292,7 +292,7 @@ If your model natively supports some modality (e.g. text + images) and you do **
 **With filter:**
 1. Image bytes are uploaded to `POST /api/staging` on the RAG API.
 2. The filter fetches the live dataset list from `GET /api/datasets` (6 datasets in the current deployment, e.g. `andrew-test-dataset`, `stacks-project`, ...).
-3. The image is stripped from the LLM request; only a hint is injected: a staged-media block listing the exact `file://` URLs, the live dataset list, and the suggested `base_llm_modalities` — telling the LLM it can call `describe_media(media_url=...)`, `transcribe_audio(audio_url=...)`, or `search_dataset(image=..., dataset_name=...)` with those URLs.
+3. The image is stripped from the LLM request; only a hint is injected: a staged-media block listing the exact `file://` URLs, the live dataset list, and the suggested `base_llm_modalities` — telling the LLM it can call `inspect_media(media_url=..., media_type="audio"?)` or `search_dataset(image=..., dataset_name=...)` with those URLs.
 4. The LLM picks the most relevant tool (and dataset) and calls it with the staged `file://` URL.
 5. The MCP server reads the media from the shared PVC and returns the description / transcription / retrieved context (e.g. _"Image shows a Golden Retriever in a park..."_).
 6. The LLM uses that tool result to answer.

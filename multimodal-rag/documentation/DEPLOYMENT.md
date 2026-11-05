@@ -4,7 +4,7 @@
 > - The SSO migration is now documented values-first and ORDERED — a new §5b subsection gives the enablement chain (keys/registry → D21 `oidc.enabled` → D22 browser SSO → D23 `ssoGate` → D25 `accessSelfMint` last) with the G2-vs-Hosted edge posture, and two previously undocumented values rows were added: `security.trustProxyIdentity` (D24) and `security.oidc.sso.*` (D22).
 > - §5b was re-verified key-by-key against `helm/values.yaml`, the chart templates and the shipped examples — including `values-hardened-g2.yaml`, the base chart's MCP network-zone overlay (now referenced here).
 > - The `${DOMAIN_NAME}` gotcha is sharpened: raw-CLI deploys pass the placeholder through and the istio validation webhook denies the VirtualService (the values editor envsubs it; CLI must resolve it first).
-> - Chart-truth fixes: packaged image default is `v5.7.1` (was v4.4.1); the MCP tool count is 23 (the `memory_status` capability probe plus the two short-term-memory tools); `mcp.apiKey.existingSecret` renders in all three charts (the v4.0.0 scale wiring); the large chart adds `security.oidc.platformCa.*`.
+> - Chart-truth fixes: packaged image default is `v5.7.1` (was v4.4.1); the MCP tool count was 23 at that wave (21 since the media-tool merge — see MCP.md § 2); `mcp.apiKey.existingSecret` renders in all three charts (the v4.0.0 scale wiring); the large chart adds `security.oidc.platformCa.*`.
 
 > **PCAI is a Kubernetes wrapper — you never run `helm` or `kubectl`.** You import the packaged chart (`rag-mcp-server` `.tar.gz`) into PCAI once, then drive the deployment by setting the chart's
 > **`values.yaml`** in the PCAI *Helm Values* editor (or via the PCAI API). Every `--set` in this guide maps 1:1 to a key in `values.yaml`. There is no `envsubst` step — set the actual domain value
@@ -185,7 +185,7 @@ in `values.yaml` (both examples in `helm/values-examples/` set them too):
 | `security.archiveMaxTotalBytes` | `2147483648` (2 GiB) | Zip/tar/rar unpacked-size cap, nested archives included |
 | `security.archiveMaxMemberBytes` | `1073741824` (1 GiB) | Per-member unpacked-size cap |
 | `security.archiveMaxEntries` | `10000` | Per-archive entry count cap (zip-bomb guard) |
-| `security.mediaAllowPathPrefixes` | `/data/datasets:/data/staging` | `file://` prefixes the MCP `describe_media`/`transcribe_audio`/audio-query tools may read (`:`-separated, fail-closed) |
+| `security.mediaAllowPathPrefixes` | `/data/datasets:/data/staging` | `file://` prefixes the MCP `inspect_media`/audio-query tools may read (`:`-separated, fail-closed) |
 | `security.pwMaxFailures` | `10` | Password-failure throttle: failures per identity before 429s (REST + MCP unlock) |
 | `security.pwFailWindow` | `300` | Window (seconds) those failures are counted over |
 | `security.trustProxyIdentity` | `false` | **D24** — trust the auth proxy's identity headers (`X-Auth-Request-*`) as a presented credential (one of the three D25 mint sources). Correct `true` behind an ENFORCING proxy that overwrites these headers on every request (the ezaf-gateway / oauth2-proxy — both site examples keep it); `false` (the raw-env default) for direct unmeshed callers, which could otherwise spoof the headers — with D25 on, a spoofed identity could mint keys. |
@@ -462,9 +462,10 @@ from the base and medium charts).
 ### Enabling the SSO stack — the order matters (D21 → D22 → D23 → D25)
 
 The SSO knobs stack; enable them in THIS order (the gated knobs render only
-when true — default render byte-identical, EXCEPT D25 self-mint, which now
-ships default-ON in all three charts and is inert by construction without an
-identity source; the rendered envs are read per request — flipping an
+when true — default render byte-identical, INCLUDING D25 self-mint, which ships
+OFF by default in all three charts since the 2026-10-16 audit remediation
+— opt in with `security.accessSelfMint: true` — and is inert by construction
+without an identity source; the rendered envs are read per request — flipping an
 already-rendered flag needs no restart, but a NEW env needs one values
 apply):
 
@@ -483,11 +484,10 @@ apply):
 3. **D23 `security.ssoGate: true`** — gates the served HTML pages; meaningful
    only with an identity source (D21/D22) or API keys configured (an empty
    deployment gates to nothing).
-4. **D25 `security.accessSelfMint`** — chart-default OFF since the 2026-10-16 audit remediation (opt in with `security.accessSelfMint: true`) in all three charts
-   (the same default-on, explicit-opt-out posture as the access store). Its
+4. **D25 `security.accessSelfMint`** — chart-default OFF since the 2026-10-16 audit remediation in all three charts — opt-in, unlike the default-on access store (set `security.accessSelfMint: true` to enable). Its
    only accepted identity sources are the SSO ones (D21 JWT / D22 cookie / D24
    proxy header): without one, no session can ever carry the mint proof —
-   the default-on knob is inert by construction, not a broken state (it also
+   the knob is inert by construction, not a broken state (it also
    needs the access store on, so the minted entry has somewhere to live).
    `false` restores the pre-D25 inert behaviour (mint 409s). An
    API-key-authenticated caller can never mint regardless.
@@ -501,8 +501,9 @@ COMPLEMENTARY, not competing — edge auth gates ingress, D21 binds app
 identity — with `trustProxyIdentity: true` likewise correct behind the
 enforcing proxy. One G2 edge caveat (observed 2026-10): the shared gateway
 chains SSO on all paths — it 302s non-browser fetches (even the app's signed
-media URLs in cross-site `<img>` tags; see the CHANGELOG's
-`get_dataset_file_bytes` entry for why base64-via-MCP was the fix) — so
+media URLs in cross-site `<img>` tags; see the CHANGELOG's entry on the
+base64-via-MCP fix — that tool is now `get_dataset_files(return_bytes=True)`)
+— so
 key-carrying REST/MCP access from OUTSIDE the cluster needs a platform-side
 skip-auth decision; in-cluster callers (the LLM-gateway relay, MCP clients
 behind it) reach the service directly and are unaffected.
@@ -635,7 +636,7 @@ When `mcp.enabled=true` (default), the MCP server runs as a sidecar container ex
 
 For the full tool list, connection configs (opencode, Claude Desktop, Open WebUI, stdio), and the long-term memory setup, see:
 
-- **[MCP.md](MCP.md)** — all 23 MCP tools + connection configs for any client
+- **[MCP.md](MCP.md)** — all 21 MCP tools + connection configs for any client
 - **[MEMORY.md](MEMORY.md)** — per-user long-term memory setup (opencode + Open WebUI)
 
 ### Quick reference
@@ -687,7 +688,7 @@ Both the API server and MCP server connect to the same Qdrant instance and share
 
 When `ezua.enabled=true` (default), the chart also creates:
 
-- **VirtualService** — routes `ezua.virtualService.endpoint` through `ezua.virtualService.istioGateway` (default `istio-system/ezaf-gateway`), with three timeout tiers: batch uploads/SSE and `/mcp` get `ezua.virtualService.longTimeout` (3600s), everything else `ezua.virtualService.timeout` (300s). The endpoint is **required** — with it unset the chart render fails with `Valid .Values.ezua.virtualService.endpoint is required !`, and the endpoint value is also what builds `MEDIA_BASE_URL` (PVC-path → HTTPS media URLs in MCP search results)
+- **VirtualService** — routes `ezua.virtualService.endpoint` through `ezua.virtualService.istioGateway` (default `istio-system/ezaf-gateway`), with three timeout tiers: batch uploads/SSE and `/mcp` get `ezua.virtualService.longTimeout` (3600s), everything else `ezua.virtualService.timeout` (300s). The endpoint is **required** — with it unset the chart render fails with `Valid .Values.ezua.virtualService.endpoint is required !`, and the endpoint value is also what builds `MEDIA_BASE_URL` (PVC-path → HTTPS media URLs in MCP search results). `MEDIA_BASE_URL` is rendered only while this VirtualService renders; when it is empty the MCP server logs a startup warning and media URLs fall back to relative REST paths that a browser chat client cannot render
 - **AuthorizationPolicy** (`ezua.authorizationPolicy.enabled`, default `true`) — enforces OAuth2 authentication at the Istio ingress gateway, via provider `ezua.authorizationPolicy.providerName` (`oauth2-proxy`) in `ezua.authorizationPolicy.namespace` (`istio-system`). Set `enabled: false` where the gateway already applies SSO centrally (SE G2)
 - **Kyverno ClusterPolicy** — auto-labels **Deployments and Services** in the release namespace with `hpe-ezua/type: vendor-service` and `hpe-ezua/app: rag-mcp-server` (required for the EZUA ingress to discover the service). **The policy still matches only Deployment/Service objects** (fixed 2026-09-24): the EzAF platform ships its own admission policy that rewrites the scheduler on every pod carrying that `hpe-ezua/type` label, which made cron pods with orphaned finalizers undeletable — this chart version permanently immunizes the release against that interaction. Separately (2026-10), the **pod templates of the long-running workloads** (API Deployment, Qdrant, Redis, embed-batcher) render the same vendor labels themselves: the app-catalog card's *status* is derived from labeled pods, and an app whose pods carry no `hpe-ezua` labels shows "Unknown" in the catalog. **Cron-job pods stay unlabeled** — labeled pods are scheduler-stamped at every admission and become undeletable on pod update.
 

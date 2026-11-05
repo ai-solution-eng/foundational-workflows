@@ -29,9 +29,9 @@ curl http://localhost:8000/api/datasets     # → {"datasets": [...]} (empty ini
 |---|---|
 | `GET /healthz` | Liveness of API and MCP sidecar. Deliberately does **not** probe model endpoints — a remote embedder outage is not fixed by restarting this pod. |
 | `GET /readyz` | Readiness. Gates on the background embedder probe after `MODEL_HEALTH_FAIL_THRESHOLD` (default 3) consecutive failures — an embedder outage drops the pod out of Service rotation without a restart loop. |
-| `GET /api/admin/health` | Full picture: model endpoints, Qdrant status + per-replica shard placement (scale charts), PVC usage. Includes the live `models.embedder` probe result (checked every `MODEL_HEALTH_INTERVAL`, default 60s). |
+| `GET /api/admin/health` | Full picture: model endpoints, Qdrant status + per-replica shard placement (scale charts), PVC usage. Includes the live `models.embedder` probe result (checked every `MODEL_HEALTH_INTERVAL`, default 60s); the Qdrant points/shard fan-out is TTL-cached for 30s (failed fan-outs are never cached, so an outage still surfaces on the next poll). |
 | `GET /api/admin/connections` | Live-checks **every** configured model endpoint (`/v1/models`) → per-role `healthy` / `not_provided` / `unhealthy`. The management page's "Test connections" button runs the same check. |
-| `GET /metrics` | Prometheus counters/histograms (HTTP, ingest, Qdrant ops, caches, hybrid-vs-dense). Unauthenticated like `/healthz`. |
+| `GET /metrics` | Prometheus counters/histograms (HTTP, ingest, Qdrant ops, caches, hybrid-vs-dense). Unauthenticated like `/healthz` unless `security.metricsAuth` is enabled. |
 
 The management page (`/manage`) shows the live embedder status indicator and a Qdrant card; on scale charts (no Qdrant PVC mounted on the API pod) it shows per-replica shard placement instead of exact
 PVC bytes.

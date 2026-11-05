@@ -19,7 +19,7 @@ End-to-end multimodal retrieval-augmented generation: ingest documents in 17+ fo
 - **Modality conversion** — retrieved media the LLM doesn't support is auto-converted (images/video → VLM description, audio → ASR transcript)
 - **Dataset management** — password-protected datasets, per-dataset Qdrant collections, dedup (cosine ≥ 0.995), S3/HTTP URL ingestion with sync reconciliation
 - **Watched S3 sources** (opt-in) — a reconciler CronJob keeps datasets in sync with S3/MinIO prefixes on a schedule: new/changed objects ingest, objects deleted upstream are pruned, unchanged objects are skipped via a per-dataset ETag/Size state (no re-download)
-- **MCP server** — 23 tools (search, federated search, list, document management add/delete/replace, file-bytes fetch, self-service dataset selection + ★ memory binding, short-term session datasets, memory-writer capability probe, recall + memory management, describe media, transcribe audio) over streamable-http / stdio / sse
+- **MCP server** — 21 tools (search, federated search, list, document management add/delete/replace, file listing + bounded base64 bytes, self-service dataset selection + ★ memory binding, short-term session datasets, memory-writer capability probe, recall + memory management, media inspection — VLM description / ASR transcript) over streamable-http / stdio / sse
 - **Long-term memory** — per-user LLM-curated memory store for opencode and Open WebUI, with SSO-backed isolation
 - **Open WebUI extension** — filter that routes unsupported modalities to the RAG MCP tool, plus inlet/outlet memory hooks
 - **Helm chart** — 2-container pod (API + MCP sidecar), Qdrant StatefulSet, Istio/EZUA ingress with oauth2-proxy
@@ -62,7 +62,7 @@ Both the API server and MCP server connect to the same Qdrant instance and share
 | **[USAGE.md](USAGE.md)** | HTML frontend usage + programmatic Python API |
 | **[documentation/API.md](documentation/API.md)** | REST API reference with `curl`/Python examples — create datasets, add/delete files |
 | **[documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md)** | Import the chart, set values in the PCAI *Helm Values* editor (G2 vs hosted-trial profiles, the ordered SSO stack), verify, troubleshoot |
-| **[documentation/MCP.md](documentation/MCP.md)** | All 23 MCP tools + connection configs for opencode, Claude Desktop, OWUI, stdio |
+| **[documentation/MCP.md](documentation/MCP.md)** | All 21 MCP tools + connection configs for opencode, Claude Desktop, OWUI, stdio |
 | **[documentation/MEMORY.md](documentation/MEMORY.md)** | Long-term memory setup per client (opencode + Open WebUI), multi-user isolation, operations |
 | **[documentation/FEATURES.md](documentation/FEATURES.md)** | Deep technical reference: every format, chunking strategy, embedding, reranking, storage |
 | **[documentation/AGENTS.md](documentation/AGENTS.md)** | opencode agent policy: when to recall / write memories |
@@ -106,7 +106,7 @@ The charts ship auth **on by default** (`security.apiKey` / `mediaTokenSecret` a
 | `INGEST_BLOCK_PRIVATE_HOSTS` | Reject http(s) URLs (ingest **and query-time media**) that resolve to private/link-local ranges (query-time still allows loopback — clients pass the server's own media URLs back). Every fetch — ingest downloads and media refs, redirect hops included — connects to the IP the policy validated (DNS-rebinding pin: check-time DNS = fetch-time DNS; a redirect into private/metadata space is refused). When an HTTP(S) proxy env is set the pin is skipped (the proxy performs egress DNS — the check-time denylist still ran). | `true` |
 | `MAX_REMOTE_DOWNLOAD_BYTES` | Cap per remote/S3 download (streamed, aborted past this). | 536870912 |
 | `ARCHIVE_MAX_TOTAL_BYTES` / `ARCHIVE_MAX_MEMBER_BYTES` / `ARCHIVE_MAX_ENTRIES` | Zip/tar/rar unpacked-size caps (incl. nested archives). | 2 GiB / 1 GiB / 10000 |
-| `MEDIA_ALLOW_PATH_PREFIXES` | Allowlist of `file://` prefixes the MCP `describe_media`/`transcribe_audio`/audio-query tools may read (`:`-separated). | `DATA_PATH/datasets:DATA_PATH/staging` (fail-closed when unset) |
+| `MEDIA_ALLOW_PATH_PREFIXES` | Allowlist of `file://` prefixes the MCP `inspect_media`/audio-query tools may read (`:`-separated). | `DATA_PATH/datasets:DATA_PATH/staging` (fail-closed when unset) |
 | `PW_MAX_FAILURES` / `PW_FAIL_WINDOW` | Password-failure throttle (returns 429 per identity). | 10 / 300 s |
 | `RAG_MCP_SHARED_UNLOCK` | Opt OUT of per-caller unlock scoping (fleet decision D10): one shared unlock cache + throttle bucket for every caller. Only for gateway-fronted SINGLE-USER deployments. Unset (default) = per-caller: provided identity → `X-Forwarded-For` chain → socket peer, so one caller's `unlock_dataset` never opens a dataset for other callers. | unset (per-caller) |
 | `MODEL_HEALTH_INTERVAL` / `MODEL_HEALTH_FAIL_THRESHOLD` | Background embedder probe: interval in seconds, and consecutive failures before a warning is logged. The result surfaces in `/api/admin/health` and the manage page — `/healthz` and `/readyz` deliberately do **not** gate on the embedder (a remote-model outage is not fixed by restarting this pod). | 60 / 3 |

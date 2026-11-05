@@ -2,7 +2,7 @@
 
 Per-user long-term memory of past LLM interactions, backed by the Multimodal RAG server. Two clients are supported — **opencode** (MCP tools, LLM-curated) and **Open WebUI** (filter inlet/outlet, auto-recall + LLM-distilled writes).
 
-> **See also:** [MCP.md](MCP.md) for the MCP tool reference and connection configs; [FEATURES.md](FEATURES.md) § "MCP Server" for the server-side internals (`_MemoryHeaderMiddleware`, `_run_retrieval`,
+> **See also:** [MCP.md](MCP.md) for the MCP tool reference and connection configs; [FEATURES.md](FEATURES.md) § "MCP Server" for the server-side internals (`_MemoryHeaderMiddleware`, `_arun_retrieval`,
 > query-vector caching).
 
 ---
@@ -178,7 +178,7 @@ Recall currently surfaces memories from all clients (no `source` filter at searc
 
 ### Deleting memories
 
-There is **no `delete_memory` tool in v1**. To remove a memory:
+Use the MCP **`delete_memory`** tool: pass the `memory_ids` exactly as `search_memory` / `list_memories` returned them (explicit IDs only — nothing query-directed; a split memory's chunks delete one at a time, so pass every chunk id; a D26 read-only grant refuses the delete). REST still works:
 - **REST:** `DELETE /api/datasets/{name}/documents/{doc_id}` (find the `doc_id` via `GET /api/datasets/{name}/documents`).
 - To correct a wrong memory, write a new corrected one and tell the user the old one is superseded (dedup won't catch it because the text differs).
 
@@ -205,20 +205,20 @@ For opencode, "rotation" = changing the dataset's password via the REST API and 
 
 ### Confirming it's working
 
-- **opencode:** `opencode mcp list` shows both connections; watch the tool-call stream for `rag-memory_search_memory` / `rag-memory_add_memory`. The session-history plugin writes `[session-memory] …` diagnostics to `~/.local/share/opencode/log/session-memory.log` (override the directory with `SESSION_MEMORY_LOG_DIR`) and stores records with `kind: session_history`. The plugin never writes to the
+- **opencode:** `opencode mcp list` shows the `rag` connection (unified config; `rag-memory` + `rag-knowledge` on the legacy two-connection pattern); watch the tool-call stream for `rag_search_memory` / `rag_add_memory`. The session-history plugin writes `[session-memory] …` diagnostics to `~/.local/share/opencode/log/session-memory.log` (override the directory with `SESSION_MEMORY_LOG_DIR`) and stores records with `kind: session_history`. The plugin never writes to the
   terminal — TUI output from plugins would overlap the display.
 - **OWUI:** check the filter logs for `Memory recall: N hit(s)` and `Memory stored in 'owui-memory-…': …`. Recall injects a system message; writes happen silently in the outlet.
 - **Server:** `kubectl logs -l app=rag-mcp-server -c rag-mcp-server` shows tool invocations; `GET /api/datasets/{name}` returns `document_count` to confirm writes are landing.
 - **Multi-replica:** in stateless mode (v1.3.0+), each request logs as a fresh transport (no "Created new transport with session ID" line). The REST unlock cache is shared via Redis (not in-memory) — verify with `kubectl exec deploy/rag-mcp-server-redis -- redis-cli KEYS '*unlock*'`. The MCP unlock cache is per-process; on multi-replica deployments pass `password=` on each MCP tool call instead of
   relying on `unlock_dataset`.
-- **API-key auth (`RAG_API_KEY`) does not affect the memory plugins:** both the DSH and opencode session-memory plugins talk MCP (`/mcp`, `tools/call`) — the MCP server has no API-key middleware. Only direct REST callers need the `X-RAG-Api-Key` header.
+- **API-key auth DOES affect the memory plugins:** both the DSH and opencode session-memory plugins talk MCP (`/mcp`, `tools/call`), and the MCP transport has its OWN API-key middleware (`RAG_API_KEYS` / `MCP_API_KEYS`, opt-in) — once keys are configured, every `/mcp` request, plugin writes included, must carry the key/bearer (D20 fail-closed: an unauthenticated write 401s). Only direct REST callers use the `X-RAG-Api-Key` header.
 
 
 ### Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| opencode: `ToolError: No memory dataset specified` | `RAG_MEMORY_DATASET` not exported | Export it in the shell that launches opencode |
+| opencode: `ToolError: No memory dataset specified` | No ★ binding (D16) and no `X-Memory-Dataset` header / `RAG_MEMORY_DEFAULT` / `MEMORY_DATASET` set | ★ your memory dataset once on `/access` (§ 2), or export `RAG_MEMORY_DATASET` |
 | opencode: no `[session-memory]` lines in `session-memory.log` | Plugin not loaded | Plugins load at startup — quit and restart opencode; confirm `documentation/opencode-memory/plugins/session-memory-logger.ts` (or the global copy) exists |
 | opencode: `Incorrect password for dataset` | `RAG_MEMORY_PASSWORD` wrong / stale | Re-verify against the dataset's password |
 | opencode: `rag-memory` connection not listed | URL unreachable / ingress token missing | Check `RAG_INGRESS_TOKEN` and the URL; try `opencode mcp debug rag-memory` |
@@ -235,7 +235,7 @@ For opencode, "rotation" = changing the dataset's password via the REST API and 
 
 | File | What's in it |
 |---|---|
-| `src/multimodal_rag/mcp_server.py` | `add_memory` / `search_memory` tools, `_MemoryHeaderMiddleware`, `_run_retrieval` |
+| `src/multimodal_rag/mcp_server.py` | `add_memory` / `search_memory` tools, `_MemoryHeaderMiddleware`, `_arun_retrieval` |
 | `openwebui_extension/filter.py` | OWUI inlet (recall) + outlet (distil/store), per-user HMAC, auto-create |
 | `documentation/opencode-memory/plugins/session-memory-logger.ts` | Template — auto-writes a structured per-session history (`kind: session_history`) to the memory dataset |
 | `documentation/opencode-memory/plugins/memory-provenance.ts` | Template — attaches git + session provenance to every `add_memory` call |

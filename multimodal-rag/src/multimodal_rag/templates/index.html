@@ -672,7 +672,7 @@
     <div class="card-header">
       <h2>Upload History</h2>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <input type="text" id="history-filter" placeholder="Filter by dataset or file..." style="width:240px;font-size:.8rem;padding:6px 10px" oninput="loadUploadHistory()">
+        <input type="text" id="history-filter" placeholder="Filter by dataset or file..." style="width:240px;font-size:.8rem;padding:6px 10px" oninput="scheduleHistoryFilter()">
         <button class="btn btn-outline btn-sm" onclick="loadUploadHistory()">Refresh</button>
         <button class="btn btn-outline btn-sm" onclick="clearUploadHistory()">Clear</button>
       </div>
@@ -1182,7 +1182,7 @@ async function createDataset() {
     for (const id of ['ds-chunk-size', 'ds-chunk-overlap', 'ds-code-chunk-size', 'ds-code-chunk-overlap']) {
       const el = document.getElementById(id); if (el) el.value = '';
     }
-    await listDatasets();
+    await refreshVisibleLists();
     selectDataset(name);
   } catch (e) {
     toast(e.message, 'error');
@@ -1253,6 +1253,69 @@ async function listDatasets() {
   renderDatasetList();
   // Keep the Admin tab's full-power list in sync (D23).
   if (typeof renderAdminDatasets === 'function' && state.isAdmin) renderAdminDatasets();
+}
+
+// -----------------------------------------------------------------------
+// List refresh (2026-11 efficiency fix, defect 1)
+// -----------------------------------------------------------------------
+// Mutations used to fire BOTH listDatasets() and refreshDatasets() — three
+// fetches (operator list + access catalog + identity selections) for one
+// click — including the list the user cannot see.  refreshVisibleLists()
+// refreshes ONLY the list actually on screen and marks the hidden one(s)
+// stale; switchAppTab() re-fetches a stale list when it comes on screen,
+// so whatever the user is looking at never goes stale.
+let _datasetsListStale = false;   // operator/admin list hidden at last mutation
+let _accessListStale = false;     // access catalog hidden at last mutation
+
+function _appViewVisible(viewId) {
+  const el = document.getElementById(viewId);
+  return !!(el && el.style.display !== 'none');
+}
+
+// Fire-and-forget re-fetch of the operator list with the same auth handling
+// as boot (401/403 → sign-in; anything else → toast).  The stale flag is
+// held TRUE until the fetch actually succeeds — a failed re-fetch must leave
+// the list marked stale so the next tab switch retries (2026-11 review fix).
+function _reloadDatasetsListSafe() {
+  _datasetsListStale = true;
+  listDatasets().then(function () {
+    _datasetsListStale = false;
+  }).catch(function (e) {
+    if (e.status === 401 || e.status === 403) { handleAuthRejected('Your credentials were rejected by the server'); return; }
+    toast(e.message || 'Could not load datasets', 'error');
+  });
+}
+
+async function refreshVisibleLists() {
+  if (_appViewVisible('view-admin') || _appViewVisible('view-datasets')) {
+    // The admin list renders from the SAME `datasets` array (see
+    // renderAdminDatasets and listDatasets' tail), so one operator-list
+    // fetch covers both views.
+    // 2026-11 review fix: a failed refetch must NOT (a) propagate into the
+    // caller's try/catch — the mutation already succeeded server-side, and
+    // re-toasting its FETCH error would read as a failed mutation — or
+    // (b) clear the stale flag while the data is stale.  Mark stale up
+    // front, clear only on success, and swallow the error the way boot and
+    // _reloadDatasetsListSafe do (401/403 → sign-in, else → toast).
+    _datasetsListStale = true;
+    try {
+      await listDatasets();
+      _datasetsListStale = false;
+    } catch (e) {
+      if (e.status === 401 || e.status === 403) { handleAuthRejected('Your credentials were rejected by the server'); return; }
+      toast(e.message || 'Could not refresh the dataset list', 'error');
+    }
+  } else {
+    _datasetsListStale = true;
+  }
+  if (_appViewVisible('view-access')) {
+    // refreshDatasets never rejects (it toasts 401/403 internally) but
+    // reports success, so a failed load leaves the flag stale for the
+    // next tab switch instead of claiming a fresh list.
+    _accessListStale = !(await refreshDatasets());
+  } else {
+    _accessListStale = true;
+  }
 }
 
 async function selectDataset(name) {
@@ -1401,8 +1464,7 @@ async function deleteDataset() {
     toast(`Deleted "${selectedDataset}"`);
     selectedDataset = null;
     document.getElementById('selected-info').style.display = 'none';
-    await listDatasets();
-    refreshDatasets().catch(function () {});
+    await refreshVisibleLists();
   } catch (e) {
     toast(e.message, 'error');
   }
@@ -1426,7 +1488,7 @@ async function recreateDataset() {
       if (job.status === 'complete') {
         const n = job.result && job.result.file_count != null ? job.result.file_count : job.processed_files;
         toast(`Recreated "${selectedDataset}" (${n} file${n === 1 ? '' : 's'})`);
-        await listDatasets();
+        await refreshVisibleLists();
         await loadManageStats();
         return;
       }
@@ -1459,10 +1521,12 @@ dropZone.addEventListener('drop', e => {
 let _retryFiles = [];
 let _uploadSeq = 0;       // monotonic counter for unique per-file status lines
 let _uploadsActive = 0;   // in-flight batch uploads (disables Clear while busy)
-// Files already given their ONE retry after a delete+recreate ACL race (see
-// the 403 branch in uploadOne). Keyed on FILE identity (name:size:lastModified)
-// so the guard survives Retry-Failed, and a genuinely permission-denied file
-// still surfaces its error instead of looping.
+// Batches already given their ONE retry after a delete+recreate ACL race
+// (see the 403 branch in uploadBatch).  The 403 hits the whole request, so
+// the guard is keyed on the FIRST file's identity (name:size:lastModified) —
+// the batch's stable representative — which keeps the one-retry property
+// across Retry-Failed, and a genuinely permission-denied batch still
+// surfaces its error instead of looping.
 let _aclRaceRetried = new Set();
 
 function _updateRetryButton() {
@@ -1506,10 +1570,21 @@ async function handleFiles(files) {
   // Retry-Failed, which re-enters this function).  A genuinely ACL-denied
   // file therefore surfaces its error instead of looping.
 
-  // Register these files for potential retry (skip ones already tracked as done+ok)
+  // Register these files for potential retry.  Bookkeeping is keyed by
+  // FILE OBJECT IDENTITY, not name (2026-11 review fix): the name-keyed
+  // replace-on-push made two same-named files in one pick share ONE entry
+  // holding the LAST File object, so a failure on the first could never be
+  // retried (Retry would re-upload the second).  A cross-pick skip is
+  // preserved: a different object whose name already has a done+ok entry
+  // is not registered, as before.
   for (const f of fileArray) {
-    if (!_retryFiles.some(r => r.name === f.name && r.done && r.ok)) {
-      _retryFiles = _retryFiles.filter(r => r.name !== f.name);
+    const existing = _retryFiles.find(r => r.file === f);
+    if (existing) {
+      // Re-entry via Retry-Failed: the SAME File object uploads again —
+      // reset its state so a second failure re-arms the button.
+      existing.done = false;
+      existing.ok = false;
+    } else if (!_retryFiles.some(r => r.name === f.name && r.done && r.ok)) {
       _retryFiles.push({name: f.name, file: f, done: false, ok: false});
     }
   }
@@ -1556,14 +1631,47 @@ async function handleFiles(files) {
     summary.innerHTML = `Processing ${fileArray.length} file(s) · ${totalChunks.toLocaleString()} chunk(s)`;
   }
 
-  // Upload files — each file gets its own job, up to 3 concurrent
+  // Upload in BATCHES: the endpoint accepts a LIST of files in ONE
+  // multipart request and tracks them all in ONE job with per-file events,
+  // so each batch costs ONE request + ONE status poller instead of one per
+  // file.  Concurrency stays at 3 — the same number of server-side ingest
+  // pipelines as the old per-file workers.
+  //
+  // Why not one request for the entire pick?
+  //   (a) MAX_UPLOAD_BYTES (default 1 GiB) is enforced PER FILE by the
+  //       streaming guard; in one giant request a single oversized file
+  //       413s the whole request BEFORE any job exists.  With small batches
+  //       only that batch's lines go red and the rest still upload.
+  //   (b) RAG_MAX_BODY_BYTES does NOT apply to multipart (the body-cap
+  //       middleware explicitly exempts multipart/form-data — Starlette
+  //       disk-spools it), so batch size 5 exceeds no documented
+  //       total-body cap; it just bounds per-request temp staging.
+  //   (c) same-named files (below) need unambiguous per-line events.
   const _BATCH_CONCURRENCY = 3;
-  const fileQueue = [...fileArray];
+  const _UPLOAD_BATCH_SIZE = 5;
+  const _nameCounts = new Map();
+  for (const f of fileArray) _nameCounts.set(f.name, (_nameCounts.get(f.name) || 0) + 1);
+  const batches = [];
+  let _curBatch = [];
+  for (const f of fileArray) {
+    if ((_nameCounts.get(f.name) || 0) > 1) {
+      // A name that appears more than once in this pick keeps a SOLO
+      // batch: job events carry the bare filename, so two same-named files
+      // in one job could steal each other's per-line progress (the old
+      // per-file jobs made every name's events unambiguous).
+      if (_curBatch.length) { batches.push(_curBatch); _curBatch = []; }
+      batches.push([f]);
+    } else {
+      _curBatch.push(f);
+      if (_curBatch.length === _UPLOAD_BATCH_SIZE) { batches.push(_curBatch); _curBatch = []; }
+    }
+  }
+  if (_curBatch.length) batches.push(_curBatch);
+  const batchQueue = [...batches];
 
-  async function uploadOne(file) {
-    const fileKey = lineKeys.get(file);
+  async function uploadBatch(batchFiles) {
     const fd = new FormData();
-    fd.append('files', file);
+    for (const file of batchFiles) fd.append('files', file);
     const pw = datasetPasswords[selectedDataset] || '';
     if (pw) fd.append('password', pw);
 
@@ -1578,58 +1686,83 @@ async function handleFiles(files) {
         try { const e = await resp.json(); errMsg = e.detail || e.message || errMsg; } catch {}
         // A dataset that was just deleted+recreated has a window where its
         // name has not yet been re-established in the ACL store, so the D15
-        // middleware 403s.  That is a TIMING artifact — the same request
-        // succeeds moments later — so retry it once instead of painting the
-        // file red.
+        // middleware 403s the whole request BEFORE any file is staged.
+        // That is a TIMING artifact — the same request succeeds moments
+        // later — so retry the whole batch once instead of painting every
+        // line red.
         //
-        // Match the D15 ACL wording SPECIFICALLY.  The D23 ownership denial
-        // ("dataset ownership is configured — D23") contains the same
-        // "not permitted for this API key" substring but is PERMANENT (you
-        // are not the creator); retrying it would stall 2.5s and show a
-        // misleading "waiting for dataset to settle" state.
-        // Keyed on FILE identity, not the per-batch line key: line keys are
-        // re-minted every batch, so a line-keyed guard would silently re-arm
-        // the retry on each Retry-Failed click.  This key survives batches.
-        const aclRaceKey = `${file.name}:${file.size}:${file.lastModified}`;
+        // Match the D15 ACL wording SPECIFICALLY, exactly as before: the
+        // D23 ownership denial ("dataset ownership is configured — D23")
+        // contains the same "not permitted for this API key" substring but
+        // is PERMANENT (you are not the creator); retrying it would stall
+        // 2.5s and show a misleading "waiting for dataset to settle" state.
+        // Keyed on the FIRST file's identity (name:size:lastModified) —
+        // the batch's stable representative — so the one-retry guard
+        // survives Retry-Failed exactly as the old per-file guard did.
+        const first = batchFiles[0];
+        const aclRaceKey = `${first.name}:${first.size}:${first.lastModified}`;
         const aclRace = resp.status === 403
           && /dataset ACLs are configured/i.test(errMsg)
           && /not permitted for this API key/i.test(errMsg)
           && !_aclRaceRetried.has(aclRaceKey);
         if (aclRace) {
           _aclRaceRetried.add(aclRaceKey);
-          _updateFileLine(fileKey, `<span style="color:var(--text-muted);width:16px;flex-shrink:0">↻</span> ${escHtml(file.name)} <span style="color:var(--text-muted);font-size:.75rem">waiting for dataset to settle…</span>`);
+          for (const file of batchFiles) {
+            _updateFileLine(lineKeys.get(file), `<span style="color:var(--text-muted);width:16px;flex-shrink:0">↻</span> ${escHtml(file.name)} <span style="color:var(--text-muted);font-size:.75rem">waiting for dataset to settle…</span>`);
+          }
           await new Promise(r => setTimeout(r, 2500));
-          fileQueue.unshift(file);   // retry once, at the head of the queue
+          batchQueue.unshift(batchFiles);   // retry the batch once, at the head
           return;
         }
-        _updateFileLine(fileKey, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(file.name)} — ${escHtml(errMsg)}`);
-        const rt = _retryFiles.find(r => r.name === file.name);
-        if (rt) { rt.done = true; rt.ok = false; }
+        for (const file of batchFiles) {
+          _updateFileLine(lineKeys.get(file), `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(file.name)} — ${escHtml(errMsg)}`);
+          const rt = _retryFiles.find(r => r.file === file);   // by object identity (review fix)
+          if (rt) { rt.done = true; rt.ok = false; }
+        }
         return;
       }
       const { job_id } = await resp.json();
-      _updateFileLine(fileKey, `<span style="color:var(--accent);width:16px;flex-shrink:0">📦</span> ${escHtml(file.name)} <span style="color:var(--text-muted);font-size:.75rem">uploaded</span>`);
-      await pollJob(job_id, file.name, fileKey, _updateFileLine, _fileChunkTotal, _fileChunkExpected,
+      for (const file of batchFiles) {
+        _updateFileLine(lineKeys.get(file), `<span style="color:var(--accent);width:16px;flex-shrink:0">📦</span> ${escHtml(file.name)} <span style="color:var(--text-muted);font-size:.75rem">uploaded</span>`);
+      }
+      // Names are unique WITHIN a batch (same-named files were split into
+      // solo batches above), so a bare filename maps to exactly one line.
+      const nameToKey = new Map();
+      for (const file of batchFiles) nameToKey.set(file.name, lineKeys.get(file));
+      // Retry bookkeeping is keyed by File object identity (2026-11 review
+      // fix): map the job's bare filename back to THIS batch's actual File
+      // object, then find the record holding exactly that object.  Two
+      // same-named files in different (solo) batches therefore keep
+      // independent retry entries instead of sharing one.
+      const nameToFile = new Map(batchFiles.map(f => [f.name, f]));
+      const _retryRecord = (fname) => {
+        const f = nameToFile.get(fname);
+        return f ? _retryFiles.find(r => r.file === f) : undefined;
+      };
+      await pollBatchJob(job_id, nameToKey, _updateFileLine, _fileChunkTotal, _fileChunkExpected,
         (fname, chunks) => { totalChunks += chunks; _updateSummary(); },
-        (fname) => { const rt = _retryFiles.find(r => r.name === fname); if (rt) { rt.done = true; rt.ok = true; } },
-        (fname) => { const rt = _retryFiles.find(r => r.name === fname); if (rt) { rt.done = true; rt.ok = false; } }
+        (fname) => { const rt = _retryRecord(fname); if (rt) { rt.done = true; rt.ok = true; } },
+        (fname) => { const rt = _retryRecord(fname); if (rt) { rt.done = true; rt.ok = false; } },
+        (fileKey, delta) => { if (delta !== 0) { totalChunks += delta; _updateSummary(); } }
       );
     } catch (e) {
-      _updateFileLine(fileKey, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(file.name)} — ${escHtml(e.message)}`);
-      const rt = _retryFiles.find(r => r.name === file.name);
-      if (rt) { rt.done = true; rt.ok = false; }
+      for (const file of batchFiles) {
+        _updateFileLine(lineKeys.get(file), `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(file.name)} — ${escHtml(e.message)}`);
+        const rt = _retryFiles.find(r => r.file === file);   // by object identity (review fix)
+        if (rt) { rt.done = true; rt.ok = false; }
+      }
     }
   }
 
-  // Process files with bounded concurrency
+  // Process batches with bounded concurrency
   async function runUploads() {
     const workers = [];
     for (let i = 0; i < _BATCH_CONCURRENCY; i++) {
       workers.push((async () => {
-        while (fileQueue.length > 0) {
-          const file = fileQueue.shift();
-          if (!file) break;
-          await uploadOne(file);
+        while (batchQueue.length > 0) {
+          const batch = batchQueue.shift();
+          if (!batch) break;
+          await uploadBatch(batch);
         }
       })());
     }
@@ -1643,13 +1776,22 @@ async function handleFiles(files) {
   _updateRetryButton();
   _uploadsActive--;
   _updateClearButton();
-  listDatasets();
+  refreshVisibleLists().catch(function () {});
 }
 
-// Poll an upload job until completion
-async function pollJob(jobId, fileLabel, fileKey, updateLine, chunkTotals, chunkExpected, onComplete, onOk, onFail) {
+// Poll ONE multi-file upload job until completion.  Every job event carries
+// a `file` field; nameToKey routes each event to that file's status line
+// (names are unique within a batch — same-named files get solo batches).
+// onReconcile(fileKey, delta) fires at the END only: it hands the caller the
+// DELTA between the authoritative per-file chunk count (job.result.files)
+// and whatever the event stream accumulated, so the caller can correct its
+// running total without double-counting.
+async function pollBatchJob(jobId, nameToKey, updateLine, chunkTotals, chunkExpected, onComplete, onOk, onFail, onReconcile) {
   const POLL_INTERVAL = 2000;
   let lastEventIdx = 0;
+  const settledOk = new Set();    // names with a terminal complete/skipped event
+  const settledErr = new Set();   // names with a terminal error event
+  const deduped = new Set();      // names whose 'skipped' (dedup) event was seen
 
   return new Promise((resolve) => {
     const poll = async () => {
@@ -1661,11 +1803,14 @@ async function pollJob(jobId, fileLabel, fileKey, updateLine, chunkTotals, chunk
         const events = job.events || [];
         for (let i = lastEventIdx; i < events.length; i++) {
           const data = events[i];
+          const fileKey = nameToKey.get(data.file);
+          if (!fileKey) continue;   // defensive: event for a file not on our lines
+          const fname = escHtml(data.file);
           if (data.status === 'preprocessing') {
-            updateLine(fileKey, `<span style="color:var(--text-muted);width:16px;flex-shrink:0">⚙</span> ${escHtml(fileLabel)}`);
+            updateLine(fileKey, `<span style="color:var(--text-muted);width:16px;flex-shrink:0">⚙</span> ${fname}`);
           } else if (data.status === 'preprocessed') {
             if (data.total) chunkExpected[fileKey] = data.total;
-            updateLine(fileKey, `<span style="color:var(--accent);width:16px;flex-shrink:0">◐</span> ${escHtml(fileLabel)}`);
+            updateLine(fileKey, `<span style="color:var(--accent);width:16px;flex-shrink:0">◐</span> ${fname}`);
           } else if (data.status === 'embedding') {
             const soFar = chunkTotals[fileKey] || 0;
             const exp = chunkExpected[fileKey];
@@ -1673,17 +1818,26 @@ async function pollJob(jobId, fileLabel, fileKey, updateLine, chunkTotals, chunk
             if (soFar > 0 && exp) chunkInfo = `${soFar.toLocaleString()} / (est.) ${exp.toLocaleString()} chunks embedded…`;
             else if (soFar > 0) chunkInfo = `${soFar.toLocaleString()} chunks embedded…`;
             else chunkInfo = 'embedding…';
-            updateLine(fileKey, `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> ${escHtml(fileLabel)} <span style="color:var(--text-muted);font-size:.75rem">${chunkInfo}</span>`);
-          } else if (data.status === 'complete' && data.chunks !== undefined) {
-            chunkTotals[fileKey] = (chunkTotals[fileKey] || 0) + (data.chunks || 0);
+            updateLine(fileKey, `<span class="spinner" style="width:16px;height:16px;flex-shrink:0"></span> ${fname} <span style="color:var(--text-muted);font-size:.75rem">${chunkInfo}</span>`);
+          } else if ((data.status === 'complete' && data.chunks !== undefined) || data.status === 'skipped') {
+            // A big PDF is handed to the embedder in sub-batches, so one
+            // file may emit SEVERAL complete events — accumulate, don't
+            // replace.  'skipped' = content-hash dedup (already in dataset).
+            const chunks = data.chunks || 0;
+            chunkTotals[fileKey] = (chunkTotals[fileKey] || 0) + chunks;
             const fileTotal = chunkTotals[fileKey];
             const color = fileTotal > 0 ? 'var(--green)' : 'var(--text-muted)';
             const icon = fileTotal > 0 ? '✓' : '⏭';
-            const label = fileTotal > 0 ? `${fileTotal.toLocaleString()} chunk(s)` : 'already in dataset';
-            updateLine(fileKey, `<span style="color:${color};width:16px;flex-shrink:0">${icon}</span> ${escHtml(fileLabel)} — ${label}`);
-            onComplete(fileLabel, data.chunks || 0);
+            const label = data.status === 'skipped' ? 'already in dataset (deduplicated)'
+              : (fileTotal > 0 ? `${fileTotal.toLocaleString()} chunk(s)` : 'already in dataset');
+            updateLine(fileKey, `<span style="color:${color};width:16px;flex-shrink:0">${icon}</span> ${fname} — ${label}`);
+            settledOk.add(data.file);
+            if (data.status === 'skipped') deduped.add(data.file);
+            onComplete(data.file, chunks);
           } else if (data.status === 'error') {
-            updateLine(fileKey, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(fileLabel)} — ${escHtml(data.error || 'failed')}`);
+            updateLine(fileKey, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${fname} — ${escHtml(data.error || 'failed')}`);
+            settledErr.add(data.file);
+            onFail(data.file);
           }
         }
         lastEventIdx = events.length;
@@ -1691,20 +1845,78 @@ async function pollJob(jobId, fileLabel, fileKey, updateLine, chunkTotals, chunk
         if (job.status === 'complete') {
           const warns = (job.result && job.result.warnings) || [];
           if (warns.length) {
-            const lineEl = document.querySelector('div[data-file-key="' + fileKey + '"]');
-            if (lineEl) {
+            // Job-wide caption skips — one note under the status block.
+            const statusEl = document.getElementById('upload-status');
+            if (statusEl) {
               const w = document.createElement('div');
               w.style.marginTop = '2px'; w.style.fontSize = '.78rem'; w.style.color = '#b45309';
               w.textContent = '⚠ ' + warns.length + ' caption(s) skipped — ' + warns[0] + (warns.length > 1 ? ' (+' + (warns.length - 1) + ' more)' : '');
-              lineEl.appendChild(w);
+              statusEl.appendChild(w);
             }
           }
-          if (onOk) onOk(fileLabel);
+          // TERMINAL RECONCILIATION (2026-11 review fix): the server keeps
+          // only the LAST 500 events per job (api_server.py trims the list
+          // to the last 500 on every append).  When the client's lastEventIdx
+          // cursor reaches the capped length, every event the server emits
+          // afterwards sits beyond it and is never processed — so a late
+          // per-file error would never be seen.  A batch that emits more
+          // than 500 events (a 5-file pick of long documents easily does)
+          // would therefore (a) never process that late error — the loop
+          // below would then mark a FAILED file OK — and (b) under-count
+          // its chunks.  The event stream is correct for LIVE progress
+          // (unchanged above) but is not authoritative at the end:
+          // job.result.files is (one entry per file:
+          // {"file","chunks"} or {"file","chunks":0,"error"}).  Reconcile
+          // terminal state and chunk totals from it.  Names are unique
+          // within a batch (solo-batch rule), so the mapping is unambiguous.
+          const resultFiles = (job.result && job.result.files) || [];
+          for (const name of nameToKey.keys()) {
+            const fileKey = nameToKey.get(name);
+            const entry = resultFiles.find(f => f && f.file === name);
+            if (entry && entry.error) {
+              // The per-file error event may have been trimmed away — paint
+              // the red line now if the stream never did (a failed file
+              // must end retryable, never OK).
+              if (!settledErr.has(name)) {
+                settledErr.add(name);
+                updateLine(fileKey, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(name)} — ${escHtml(entry.error)}`);
+                onFail(name);
+              }
+              // A failed file stores 0 chunks authoritatively, even if the
+              // stream saw sub-batch completes before the failure.
+              const prevErr = chunkTotals[fileKey] || 0;
+              if (prevErr !== 0) { chunkTotals[fileKey] = 0; onReconcile(fileKey, 0 - prevErr); }
+              continue;
+            }
+            if (entry && typeof entry.chunks === 'number') {
+              // Authoritative chunk count: replace whatever the stream
+              // accumulated and hand the caller the correction delta.
+              const prev = chunkTotals[fileKey] || 0;
+              if (entry.chunks !== prev) {
+                chunkTotals[fileKey] = entry.chunks;
+                onReconcile(fileKey, entry.chunks - prev);
+              }
+            }
+            // Refresh the line to its terminal state either way — if the
+            // file's complete event was beyond the cap the line would
+            // otherwise freeze mid-progress.
+            const fileTotal = chunkTotals[fileKey] || 0;
+            const color = fileTotal > 0 ? 'var(--green)' : 'var(--text-muted)';
+            const icon = fileTotal > 0 ? '✓' : '⏭';
+            const label = fileTotal > 0 ? `${fileTotal.toLocaleString()} chunk(s)`
+              : (deduped.has(name) ? 'already in dataset (deduplicated)' : 'already in dataset');
+            updateLine(fileKey, `<span style="color:${color};width:16px;flex-shrink:0">${icon}</span> ${escHtml(name)} — ${label}`);
+            if (!settledErr.has(name)) onOk(name);
+          }
           resolve();
           return;
         } else if (job.status === 'error') {
-          if (onFail) onFail(fileLabel);
-          updateLine(fileKey, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(fileLabel)} — ${escHtml(job.error || 'failed')}`);
+          for (const [name, lineKey] of nameToKey) {
+            if (settledOk.has(name)) { onOk(name); continue; }   // stored before the job died
+            if (settledErr.has(name)) continue;                  // already red + retryable
+            onFail(name);
+            updateLine(lineKey, `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> ${escHtml(name)} — ${escHtml(job.error || 'failed')}`);
+          }
           resolve();
           return;
         }
@@ -1758,7 +1970,7 @@ async function addText() {
       status.appendChild(w);
     }
     input.value = '';
-    await listDatasets();
+    await refreshVisibleLists();
   } catch (e) {
     status.textContent = '';
     toast(e.message, 'error');
@@ -1889,6 +2101,44 @@ async function addUrls() {
           if (job.status === 'complete') {
             clearInterval(timer);
             const result = job.result || {};
+            // TERMINAL RECONCILIATION (2026-11 review fix): same 500-event
+            // cap as the upload poller — api_server.py trims job.events to
+            // the last 500, so lastEventIdx pins and late per-URL events
+            // are never seen (a 50-URL paste easily exceeds the cap).  The
+            // live lines above are fine for progress, but the final counts
+            // and frozen lines come from job.result.files (one entry per
+            // URL: {"file","chunks"} or {"file","chunks":0,"error"}).
+            for (const entry of result.files || []) {
+              if (!entry || typeof entry.file !== 'string') continue;
+              const line = Array.from(progress.querySelectorAll('div[data-url]')).find(
+                el => el.getAttribute('data-url') === entry.file
+              );
+              if (entry.error) {
+                // The per-URL error event may have been trimmed away.
+                if (line) line.innerHTML = `<span style="color:var(--red);width:16px;flex-shrink:0">✗</span> <span style="font-size:.82rem;word-break:break-all">${escHtml(entry.file)}</span> — ${escHtml(entry.error)}`;
+                const prevErr = _urlFileChunkTotal[entry.file] || 0;
+                if (prevErr !== 0) { _urlFileChunkTotal[entry.file] = 0; totalChunks -= prevErr; }
+                continue;
+              }
+              if (typeof entry.chunks === 'number') {
+                // Authoritative count: correct the stream's total by the
+                // delta (it may have missed capped events or double-counted
+                // after a trim shifted the cursor).
+                const prev = _urlFileChunkTotal[entry.file] || 0;
+                if (entry.chunks !== prev) {
+                  _urlFileChunkTotal[entry.file] = entry.chunks;
+                  totalChunks += entry.chunks - prev;
+                }
+              }
+              // Refresh the line to its terminal state either way.
+              if (line) {
+                const fileTotal = _urlFileChunkTotal[entry.file] || 0;
+                const color = fileTotal > 0 ? 'var(--green)' : 'var(--text-muted)';
+                const icon = fileTotal > 0 ? '✓' : '⏭';
+                const label = fileTotal > 0 ? `${fileTotal.toLocaleString()} chunk(s)` : 'already in dataset';
+                line.innerHTML = `<span style="color:${color};width:16px;flex-shrink:0">${icon}</span> <span style="font-size:.82rem;word-break:break-all">${escHtml(entry.file)}</span> — ${label}`;
+              }
+            }
             const fileCount = result.file_count || urls.length;
             status.innerHTML = `<span style="color:var(--green)">Done</span> — ${totalChunks.toLocaleString()} chunk(s) stored from ${fileCount} file(s)`;
             toast(`Ingested ${fileCount} URL(s), ${totalChunks.toLocaleString()} chunk(s)`);
@@ -1910,7 +2160,7 @@ async function addUrls() {
       poll();
     });
 
-    await listDatasets();
+    await refreshVisibleLists();
   } catch (e) {
     clearInterval(timer);
     for (const el of progress.querySelectorAll('div')) {
@@ -2198,16 +2448,25 @@ async function searchDataset() {
         }
       }
       const _copyPayload = encodeURIComponent(_text + (_mediaUrls.length ? '\n\nMedia:\n' + _mediaUrls.join('\n') : ''));
-      // Label WHAT the score means.  Under hybrid retrieval the score is RRF
-      // rank arithmetic (a ladder like 0.8333/0.6667/0.5), not a cosine
+      // Label WHAT the score means.  Under hybrid retrieval a fused score is
+      // RRF rank arithmetic (a ladder like 0.8333/0.6667/0.5), not a cosine
       // similarity — showing it bare invites "why is relevance 0.83 for a bad
-      // match?".  content._score_kind survives the server round-trip; the
-      // reranker score (a true relevance number) is shown separately.
+      // match?".  A reranked hit's score IS the reranker relevance, so it is
+      // labelled "(reranker)" and the pre-rerank score stays visible next to
+      // it ("rrf: …" / "embedding: …").  score_kind is the server contract;
+      // the fallbacks below only matter for a page cached against an older
+      // server.  A reranked hit there carries no score_kind but DOES report
+      // reranker_score === score (the old server already copied the reranker
+      // relevance into score), so it is still labelled by what the number IS,
+      // never by the lane it came from.
       const _kind = r.score_kind
-        || (c && typeof c === 'object' && c._score_kind)
-        || 'cosine';
+        || ((r.reranker_score !== undefined && r.score === r.reranker_score)
+          ? 'reranker'
+          : ((c && typeof c === 'object' && c._score_kind) || 'cosine'));
       const _scoreParts = [`#${i + 1} · score: ${r.score}`];
-      if (_kind === 'rrf') _scoreParts.push('(rrf rank fusion)');
+      if (_kind === 'reranker') _scoreParts.push('(reranker)');
+      else if (_kind === 'rrf') _scoreParts.push('(rrf rank fusion)');
+      if (r.retrieval_score !== undefined) _scoreParts.push(`(rrf: ${r.retrieval_score})`);
       if (r.embedding_score !== undefined) _scoreParts.push(`(embedding: ${r.embedding_score})`);
       if (r.reranker_score !== undefined && r.score !== r.reranker_score) _scoreParts.push(`(reranker: ${r.reranker_score})`);
       return `<div class="result-item" style="position:relative">
@@ -2300,7 +2559,7 @@ async function deleteDocument(docId) {
       undefined, undefined, passwordHeader());
     toast('Document deleted');
     showDocs();
-    listDatasets();
+    refreshVisibleLists().catch(function () {});
   } catch (e) {
     toast(e.message, 'error');
   }
@@ -2322,7 +2581,8 @@ async function saveDatasetSettings() {
   try {
     await api('PATCH', '/api/datasets/' + selectedDataset, body, undefined, passwordHeader());
     toast('Dataset flags applied (affects new content)');
-    listDatasets();
+    // (2026-11: no list fetch here — saveDatasetSettings only runs via the
+    // unified "Save settings" button, which refreshes once for all sections.)
     const d = datasets.find(x => x.name === selectedDataset);
     if (d) {
       d.caption_with_asr = cAsr.checked;
@@ -2403,7 +2663,7 @@ async function saveDescription() {
   try {
     await api('PATCH', `/api/datasets/${selectedDataset}`, { description: desc }, undefined, passwordHeader());
     toast('Description updated');
-    listDatasets();
+    refreshVisibleLists().catch(function () {});
     const d = datasets.find(x => x.name === selectedDataset);
     if (d) {
       d.description = desc;
@@ -2470,7 +2730,7 @@ async function saveDatasetAll() {
     setTimeout(() => { const n = document.getElementById('settings-note'); if (n) n.textContent = ''; }, 6000);
   }
   toast(okCount === results.length ? `Settings saved (${okCount}/${results.length})` : 'Some settings failed — see notes', okCount === results.length ? 'success' : 'error');
-  listDatasets();
+  refreshVisibleLists().catch(function () {});
 }
 
 // -----------------------------------------------------------------------
@@ -2843,7 +3103,26 @@ async function loadManageStats() {
 // Upload history (Manage page)
 // -----------------------------------------------------------------------
 
+// 2026-11 efficiency fix, defect 3: the filter box used to fire a FULL
+// `GET /api/admin/upload-history?limit=200` on every keystroke (17 fetches
+// for "quarterly report") and then filter client-side anyway.  The input
+// now debounces 300 ms; Refresh / Clear / boot stay immediate.
+let _historyFilterTimer = null;
+
+function scheduleHistoryFilter() {
+  if (_historyFilterTimer) clearTimeout(_historyFilterTimer);
+  _historyFilterTimer = setTimeout(function () {
+    _historyFilterTimer = null;
+    loadUploadHistory();
+  }, 300);
+}
+
+function cancelHistoryFilterDebounce() {
+  if (_historyFilterTimer) { clearTimeout(_historyFilterTimer); _historyFilterTimer = null; }
+}
+
 async function loadUploadHistory() {
+  cancelHistoryFilterDebounce();   // a live call voids any pending keystroke
   const container = document.getElementById('upload-history-table');
   if (!container) return;
   const filter = ((document.getElementById('history-filter') || {}).value || '').trim().toLowerCase();
@@ -3075,12 +3354,32 @@ function switchAppTab(name) {
   document.querySelectorAll('.app-view').forEach(v => {
     v.style.display = (v.id === 'view-' + name) ? 'block' : 'none';
   });
+  // A pending history-filter debounce must not fire after the user has
+  // switched away (the manage-page filter is the only debounced input).
+  cancelHistoryFilterDebounce();
   // Reflect the tab in the URL (#datasets/#access/#admin/#stats) without
   // polluting history; the hashchange listener stays consistent.
   try { history.replaceState(null, '', '#' + name); }
   catch (e) { location.hash = name; }
   if (name === 'stats') startStatsPolling(); else stopStatsPolling();
-  if (name === 'access') ensureAccessLoaded();
+  if (name === 'access') {
+    if (_accessListStale) {
+      // A mutation landed while this tab was hidden — re-fetch before
+      // showing it (ensureAccessLoaded's _accessLoaded guard would skip).
+      // The flag is cleared ONLY when the re-fetch succeeds (refreshDatasets
+      // reports it), so a failed refresh is retried on the next visit
+      // (2026-11 review fix).
+      refreshDatasets().then(function (ok) { if (ok) _accessListStale = false; });
+    } else {
+      ensureAccessLoaded();
+    }
+  }
+  if ((name === 'datasets' || name === 'admin') && _datasetsListStale) {
+    // Both views render from the `datasets` array; a hidden-tab mutation
+    // must be re-fetched before either comes on screen.  The flag is held
+    // stale until the fetch succeeds (2026-11 review fix).
+    _reloadDatasetsListSafe();
+  }
   if (name === 'admin') ensureAdminLoaded(false);
   if (name === 'inspector') ensureInspectorLoaded();
 }
@@ -3139,8 +3438,7 @@ async function deleteDatasetRow(btn) {
       selectedDataset = null;
       document.getElementById('selected-info').style.display = 'none';
     }
-    await listDatasets();
-    refreshDatasets().catch(function () {});
+    await refreshVisibleLists();
   } catch (e) {
     toast(e.message, 'error');
   }
@@ -3399,12 +3697,20 @@ async function enterWorkspace(initialTab, isManage) {
   renderIdentityChip();
   applyCreateGating();
   initCaptionCheckboxes();
+  let _bootListOk = false;
   try {
     await listDatasets();
+    _bootListOk = true;
   } catch (e) {
     if (e.status === 401 || e.status === 403) { handleAuthRejected('Your credentials were rejected by the server'); return; }
     toast(e.message || 'Could not load datasets', 'error');
   }
+  // Boot loaded the operator list (and, below, the access catalog) — the
+  // first tab switch must not re-fetch them (2026-11 list-refresh fix).
+  // A FAILED boot load leaves that list flagged stale so the first switch
+  // to it retries the fetch (2026-11 review fix).
+  _datasetsListStale = !_bootListOk;
+  _accessListStale = false;
   if (isManage) {
     loadManageStats();
     loadUploadHistory();
@@ -3413,7 +3719,8 @@ async function enterWorkspace(initialTab, isManage) {
   }
   resolveAdmin();
   probeStatsAvailability();
-  ensureAccessLoaded();
+  // Same as above: a failed boot access load re-flags the catalog stale.
+  ensureAccessLoaded().then(function (ok) { if (!ok) _accessListStale = true; });
   renderMemoryPanel();   // D23 addendum: memory front and center (or hidden)
   renderSelfMintCard();   // D25: right on first paint (paste/embedded → hidden)
   switchAppTab(initialTab);
@@ -3540,23 +3847,31 @@ async function loadAccessDatasets() {
   renderSelfMintCard();   // D25: right once accessStoreOn/selections are known
 }
 
+// Both return true when the catalog is (now) fresh, false when the load
+// failed (after toasting / signing in) — callers use that to keep their
+// "stale" flags honest: a failed refresh must leave the list marked stale
+// (2026-11 review fix).
 async function refreshDatasets() {
   try {
     await loadAccessDatasets();
+    return true;
   } catch (e) {
-    if (e.status === 401 || e.status === 403) { handleAuthRejected('Your credentials were rejected by the server'); return; }
+    if (e.status === 401 || e.status === 403) { handleAuthRejected('Your credentials were rejected by the server'); return false; }
     toast(e.message, 'error');
+    return false;
   }
 }
 
 async function ensureAccessLoaded() {
-  if (_accessLoaded) return;
+  if (_accessLoaded) return true;
   _accessLoaded = true;
   try {
     await loadAccessDatasets();
+    return true;
   } catch (e) {
-    if (e.status === 401 || e.status === 403) { handleAuthRejected('Your credentials were rejected by the server'); return; }
+    if (e.status === 401 || e.status === 403) { handleAuthRejected('Your credentials were rejected by the server'); return false; }
     toast(e.message, 'error');
+    return false;
   }
 }
 
@@ -3975,7 +4290,7 @@ async function selectAccessDataset(name, password, checkbox) {
     toast(res.message || `Dataset '${name}' selected`);
     openSelectRow = null;
     selectError = null;
-    await refreshDatasets();
+    await refreshVisibleLists();
   } catch (e) {
     if (e.status === 401) { handleAuthRejected('Your credentials were rejected by the server'); return; }
     selectError = { name, message: e.message || 'Select failed' };
@@ -4001,7 +4316,7 @@ async function submitSelect(event, form) {
     toast(res.message || `Dataset '${name}' selected`);
     openSelectRow = null;
     selectError = null;
-    await refreshDatasets();
+    await refreshVisibleLists();
   } catch (e) {
     if (e.status === 401) { handleAuthRejected('Your credentials were rejected by the server'); return; }
     selectError = {
@@ -4017,11 +4332,11 @@ async function deselectAccessDataset(name) {
     const res = await api('POST', `/api/datasets/${encodeURIComponent(name)}/deselect`);
     toast(res.message || `Dataset '${name}' removed from your datasets (re-select any time)`);
     if (serverMemory === name) serverMemory = '';
-    await refreshDatasets();
+    await refreshVisibleLists();
   } catch (e) {
     if (e.status === 401) { handleAuthRejected('Your credentials were rejected by the server'); return; }
     toast(e.message || 'Deselect failed', 'error');
-    await refreshDatasets();
+    await refreshVisibleLists();
   }
 }
 
@@ -4085,7 +4400,7 @@ async function submitUnlock(event, form) {
     openUnlockRow = null;
     unlockError = null;
     toast(unlockToast(name, ttl, res));
-    await refreshDatasets();   // re-render the row from the server's lock state
+    await refreshVisibleLists();   // re-render the row from the server's lock state
   } catch (e) {
     if (e.status === 401) { handleAuthRejected('Your credentials were rejected by the server'); return; }
     // 403 → wrong password (the key itself is fine — never log out here).
@@ -4107,7 +4422,7 @@ async function lockDataset(btn) {
     if (openUnlockRow === name) openUnlockRow = null;
     unlockError = null;
     toast((res && res.message) || `Dataset '${name}' locked`);
-    await refreshDatasets();
+    await refreshVisibleLists();
   } catch (e) {
     btn.disabled = false;
     if (e.status === 401) { handleAuthRejected('Your credentials were rejected by the server'); return; }
@@ -4306,7 +4621,7 @@ async function createMemoryDataset(btn) {
     await refreshWhoamiFlags();
     _memoryDone = {};
     toast('\u2605 \'' + clean + '\' is now your long-term memory dataset');
-    await listDatasets();
+    await refreshVisibleLists();
     renderMemoryPanel();
   } catch (e) {
     if (e && e.status === 401) { handleAuthRejected('Your credentials were rejected by the server'); return; }
@@ -4655,8 +4970,7 @@ async function adminTogglePublic(btn) {
   try {
     const res = await api('POST', `/api/admin/datasets/${name}/public`, { public: want });
     toast(res.message || (want ? 'Dataset is now GLOBAL (all minted keys)' : 'Dataset is private again'));
-    await listDatasets();
-    renderAdminDatasets();
+    await refreshVisibleLists();   // listDatasets() already re-renders the admin list
   } catch (e) {
     btn.disabled = false;
     toast(e.message, 'error');
@@ -4677,9 +4991,7 @@ async function adminDeleteDataset(btn) {
       selectedDataset = null;
       document.getElementById('selected-info').style.display = 'none';
     }
-    await listDatasets();
-    renderAdminDatasets();
-    refreshDatasets().catch(function () {});
+    await refreshVisibleLists();   // one fetch: the admin list renders from the same `datasets` array
   } catch (e) {
     btn.disabled = false;
     toast(e.message, 'error');
@@ -4708,8 +5020,7 @@ async function adminResetPassword(btn) {
       ? ('Password removed from "' + name + '" \u2014 it is now unprotected')
       : ('New password set for "' + name + '"'));
     if (removing) delete datasetPasswords[name];
-    await listDatasets();
-    renderAdminDatasets();
+    await refreshVisibleLists();   // listDatasets() already re-renders the admin list
   } catch (e) {
     toast(e.message || 'Reset failed', 'error');
   } finally {
