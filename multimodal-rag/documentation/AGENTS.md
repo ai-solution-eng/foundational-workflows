@@ -3,7 +3,7 @@
 This repo ships a Multimodal RAG MCP server. When connected to opencode it provides **long-term memory** of past interactions via MCP tools:
 
 - **Memory tools** — personal, per-user long-term memory: `add_memory`, `search_memory`, `delete_memory`, `list_memories`, `forget_session`. The memory dataset and its password are resolved **server-side from your identity** (the /access ★ binding + saved selection), so you do NOT pass `dataset_name` or `password` to these tools.
-- **Knowledge tools** — access to the shared project/knowledge datasets: `search_dataset`, `search_datasets`, `list_datasets`, `get_dataset_files`, `get_dataset_info`, `unlock_dataset`, `dataset_add_documents`, `dataset_delete_documents`, `dataset_replace_document`, `describe_media`, `transcribe_audio`. For these you DO pass `dataset_name` explicitly; pass `password` only for protected datasets.
+- **Knowledge tools** — access to the shared project/knowledge datasets: `search_dataset`, `search_datasets`, `list_datasets`, `get_dataset_files`, `get_dataset_info`, `unlock_dataset`, `dataset_add_documents`, `dataset_delete_documents`, `dataset_replace_document`, `inspect_media`. For these you DO pass `dataset_name` explicitly; pass `password` only for protected datasets.
 
 Tools arrive prefixed with the MCP connection name (e.g. `rag_add_memory` under the unified 2026-10 config; `rag-memory_add_memory` / `rag-knowledge_search_dataset` under the legacy two-connection pattern). Adapt the prefixes below to whatever `opencode mcp list` shows.
 

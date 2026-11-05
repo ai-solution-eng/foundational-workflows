@@ -5168,17 +5168,41 @@ class DatasetManager:
         for doc, score in results:
             entry: dict[str, Any] = {"content": doc, "score": round(score, 4)}
             if isinstance(doc, dict):
+                # Label WHAT the emitted score is -- the same contract the MCP
+                # surface uses: the reranker relevance when a rerank pass
+                # produced it, else RRF rank-fusion arithmetic on a hybrid
+                # lane, else a true cosine.  Computed before the private
+                # stamps below are popped.
+                if "_reranker_score" in doc:
+                    entry["score_kind"] = "reranker"
+                elif doc.get("_score_kind") == "rrf":
+                    entry["score_kind"] = "rrf"
+                else:
+                    entry["score_kind"] = "cosine"
                 emb = doc.pop("_embedding_score", None)
                 rerank = doc.pop("_reranker_score", None)
+                retrieval = doc.pop("_retrieval_score", None)
+                # The lane stamp is internal plumbing for the merge/rerank
+                # helpers -- never part of the public content payload (clients
+                # read the score_kind entry field instead).
+                doc.pop("_score_kind", None)
                 if emb is not None:
                     entry["embedding_score"] = emb
                 if rerank is not None:
                     entry["reranker_score"] = rerank
+                if retrieval is not None:
+                    # Pre-rerank score, kept visible.  Only ever the hybrid
+                    # lane's RRF rank arithmetic: _arerank_with writes it
+                    # when the doc arrived fused (its lane stamp is 'rrf')
+                    # and puts a dense lane's pre-rerank cosine in
+                    # _embedding_score instead.
+                    entry["retrieval_score"] = retrieval
                 # Pop the private per-doc stamp after folding it into the
                 # first entry's request-level block (it must not leak into
                 # the content payload).
                 stamp = doc.pop("_rrf", None)
             else:
+                entry["score_kind"] = "cosine"
                 stamp = None
             if rrf_block is not None and not any("rrf" in e for e in output):
                 first_stamp: dict[str, Any] | None = stamp if isinstance(stamp, dict) else None

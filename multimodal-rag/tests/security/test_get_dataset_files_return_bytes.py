@@ -1,23 +1,28 @@
-"""MCP ``get_dataset_file_bytes`` — bounded base64 bytes for ONE dataset file.
+"""MCP ``get_dataset_files(return_bytes=True)`` — bounded base64 bytes for ONE
+dataset file.
 
-The companion to ``get_dataset_files`` (which lists files and returns a
-download URL for binaries but never the bytes).  The tests pin the tool's
-guard chain and result shape:
+Merged 2026-11: the former standalone bytes tool is now the
+``return_bytes=True`` mode of ``get_dataset_files`` — same ACL/password
+funnel, same traversal guard, same ``MCP_FILE_BYTES_MAX`` cap, same payload
+shape.  These tests pin the bytes mode AND the unchanged default modes:
 
-* the SAME guard chain as ``get_dataset_files`` (D15 ACL → existence →
-  password gate), then traversal-safe path resolution, the size cap, and
-  the base64 payload;
-* size cap → ToolError naming the cap and the REST/download fallback
-  (never a silent truncation);
-* password gate parity: locked → the word-identical P2 error message;
-  correct password unlocks AND caches the unlock.
+* the SAME guard chain as the listing mode (D15 ACL → existence → password
+  gate), then traversal-safe path resolution, the size cap, and the base64
+  payload;
+* size cap → ToolError naming the cap and the REST/download fallback (never a
+  silent truncation);
+* password gate parity: locked → the word-identical P2 error message; correct
+  password unlocks AND caches the unlock;
+* ``return_bytes=True`` without ``file_path`` is a clear ToolError;
+* omitting ``return_bytes`` keeps the old behaviour (inline text for text
+  files, metadata + download URL for binaries).
 
 Everything runs OFFLINE: real DatasetManager + local-mode Qdrant + the
 conftest stub embedder.
 
 Run::
 
-    pytest tests/security/test_get_dataset_file_bytes.py -q
+    pytest tests/security/test_get_dataset_files_return_bytes.py -q
 """
 
 import asyncio
@@ -98,6 +103,11 @@ def _payload(result: str) -> dict:
     return json.loads(result)
 
 
+def _bytes(**kwargs) -> dict:
+    """Call the merged tool in bytes mode (the former standalone bytes tool)."""
+    return _payload(_call(mcp.get_dataset_files, return_bytes=True, **kwargs))
+
+
 def _stage_file(dm: DatasetManager, name: str, data: bytes) -> Path:
     """Write raw bytes into the dataset's files/ dir (the place the tool reads)."""
     files_dir = dm._dataset_dir("docs") / "files"
@@ -115,7 +125,7 @@ def _stage_file(dm: DatasetManager, name: str, data: bytes) -> Path:
 def test_bytes_roundtrip_gif(dm):
     """base64 out == bytes in; metadata fields populated."""
     p = _stage_file(dm, "pixel.gif", _GIF)
-    out = _payload(_call(mcp.get_dataset_file_bytes, dataset_name="docs", file_path="pixel.gif"))
+    out = _bytes(dataset_name="docs", file_path="pixel.gif")
     assert out["dataset"] == "docs"
     assert out["file"] == "pixel.gif"
     assert out["size_bytes"] == p.stat().st_size == len(_GIF)
@@ -129,10 +139,39 @@ def test_bytes_roundtrip_gif(dm):
 
 def test_bytes_jpeg_magic(dm):
     p = _stage_file(dm, "photo.jpg", _JPEG)
-    out = _payload(_call(mcp.get_dataset_file_bytes, dataset_name="docs", file_path="photo.jpg"))
+    out = _bytes(dataset_name="docs", file_path="photo.jpg")
     assert base64.b64decode(out["data"])[:2] == b"\xff\xd8"  # FF D8 JPEG magic
     assert out["mime_type"] == "image/jpeg"
     assert out["size_bytes"] == p.stat().st_size
+
+
+def test_bytes_mode_wins_over_inline_text(dm):
+    """A text file is returned inline by default — with return_bytes it is bytes."""
+    _stage_file(dm, "notes.txt", b"hello bytes")
+    inline = _payload(_call(mcp.get_dataset_files, dataset_name="docs", file_path="notes.txt"))
+    assert inline["content"] == "hello bytes"
+    out = _bytes(dataset_name="docs", file_path="notes.txt")
+    assert base64.b64decode(out["data"]) == b"hello bytes"
+
+
+# ---------------------------------------------------------------------------
+# The default (non-bytes) modes are unchanged
+# ---------------------------------------------------------------------------
+
+
+def test_default_binary_mode_still_returns_download_url(dm):
+    """Without return_bytes, a binary is metadata + download_url (no bytes)."""
+    _stage_file(dm, "pixel.gif", _GIF)
+    out = _payload(_call(mcp.get_dataset_files, dataset_name="docs", file_path="pixel.gif"))
+    assert out["download_url"].endswith("/api/datasets/docs/files/pixel.gif")
+    assert "data" not in out and "encoding" not in out
+
+
+def test_return_bytes_requires_file_path(dm):
+    """return_bytes=True is a per-file mode — asking for it while listing is a
+    clear error, not a silently ignored flag."""
+    with pytest.raises(mcp.ToolError, match="return_bytes=True requires file_path"):
+        _call(mcp.get_dataset_files, dataset_name="docs", return_bytes=True)
 
 
 # ---------------------------------------------------------------------------
@@ -144,10 +183,10 @@ def test_over_cap_refused_with_fallback_hint(dm, monkeypatch):
     _stage_file(dm, "big.bin", b"x" * 4096)
     monkeypatch.setattr(mcp, "_file_bytes_max", lambda: 1024)
     with pytest.raises(mcp.ToolError, match="MCP_FILE_BYTES_MAX"):
-        _call(mcp.get_dataset_file_bytes, dataset_name="docs", file_path="big.bin")
+        _bytes(dataset_name="docs", file_path="big.bin")
     # cap mention AND the download-URL fallback hint are both in the message
     with pytest.raises(mcp.ToolError, match=r"byte tool cap \(MCP_FILE_BYTES_MAX\)"):
-        _call(mcp.get_dataset_file_bytes, dataset_name="docs", file_path="big.bin")
+        _bytes(dataset_name="docs", file_path="big.bin")
 
 
 def test_env_var_cap_respected(dm, monkeypatch):
@@ -155,9 +194,9 @@ def test_env_var_cap_respected(dm, monkeypatch):
     _stage_file(dm, "mid.bin", b"y" * 2048)
     monkeypatch.setenv("MCP_FILE_BYTES_MAX", "1024")
     with pytest.raises(mcp.ToolError, match="tool cap"):
-        _call(mcp.get_dataset_file_bytes, dataset_name="docs", file_path="mid.bin")
+        _bytes(dataset_name="docs", file_path="mid.bin")
     monkeypatch.setenv("MCP_FILE_BYTES_MAX", "4096")
-    out = _payload(_call(mcp.get_dataset_file_bytes, dataset_name="docs", file_path="mid.bin"))
+    out = _bytes(dataset_name="docs", file_path="mid.bin")
     assert base64.b64decode(out["data"]) == b"y" * 2048
 
 
@@ -166,7 +205,7 @@ def test_oversize_exactly_at_cap_allowed(dm, monkeypatch):
     data = b"z" * 1024
     _stage_file(dm, "edge.bin", data)
     monkeypatch.setenv("MCP_FILE_BYTES_MAX", "1024")
-    out = _payload(_call(mcp.get_dataset_file_bytes, dataset_name="docs", file_path="edge.bin"))
+    out = _bytes(dataset_name="docs", file_path="edge.bin")
     assert base64.b64decode(out["data"]) == data
 
 
@@ -175,7 +214,7 @@ def test_cap_floor_respected(dm, monkeypatch):
     _stage_file(dm, "tiny.bin", b"t" * 1500)
     monkeypatch.setenv("MCP_FILE_BYTES_MAX", "8")
     with pytest.raises(mcp.ToolError, match="1024"):
-        _call(mcp.get_dataset_file_bytes, dataset_name="docs", file_path="tiny.bin")
+        _bytes(dataset_name="docs", file_path="tiny.bin")
 
 
 # ---------------------------------------------------------------------------
@@ -190,33 +229,33 @@ def test_traversal_refused(dm):
     # resolves inside files/ — only real escapes are refused.
     for evil in ("../secret.txt", "a/../../secret.txt", "/etc/passwd"):
         with pytest.raises(mcp.ToolError, match="Invalid file path."):
-            _call(mcp.get_dataset_file_bytes, dataset_name="docs", file_path=evil)
-    out = _payload(_call(mcp.get_dataset_file_bytes, dataset_name="docs", file_path="ok.txt"))
+            _bytes(dataset_name="docs", file_path=evil)
+    out = _bytes(dataset_name="docs", file_path="ok.txt")
     assert base64.b64decode(out["data"]) == b"fine"
 
 
 def test_missing_file_refused(dm):
     with pytest.raises(mcp.ToolError, match="not found in dataset"):
-        _call(mcp.get_dataset_file_bytes, dataset_name="docs", file_path="ghost.txt")
+        _bytes(dataset_name="docs", file_path="ghost.txt")
 
 
 def test_missing_dataset_refused(dm):
     with pytest.raises(mcp.ToolError, match="Dataset 'nope' not found."):
-        _call(mcp.get_dataset_file_bytes, dataset_name="nope", file_path="x.txt")
+        _bytes(dataset_name="nope", file_path="x.txt")
 
 
 def test_acl_denied_dataset_refused(dm, acl_client):
-    """A key with no grant for 'docs' is denied — same error surface as
-    get_dataset_files, and WITHOUT an existence oracle."""
+    """A key with no grant for 'docs' is denied — same error surface as the
+    listing mode, and WITHOUT an existence oracle."""
     import multimodal_rag.utils.clients_registry as cr
 
     token = cr.set_current_identity(cr.Identity(kind="client", name="bob", datasets=frozenset()))
     try:
         with pytest.raises(mcp.ToolError, match="not permitted for this API key"):
-            _call(mcp.get_dataset_file_bytes, dataset_name="docs", file_path="pixel.gif")
+            _bytes(dataset_name="docs", file_path="pixel.gif")
         # denial does not confirm existence: an unknown dataset gets the SAME error
         with pytest.raises(mcp.ToolError, match="not permitted for this API key"):
-            _call(mcp.get_dataset_file_bytes, dataset_name="never-created", file_path="x")
+            _bytes(dataset_name="never-created", file_path="x")
     finally:
         cr.reset_current_identity(token)
 
@@ -226,6 +265,6 @@ def test_password_gate_parity(dm):
     dm.set_password("docs", "hunter2")
     _stage_file(dm, "pixel.gif", _GIF)
     with pytest.raises(mcp.ToolError, match="Incorrect password"):
-        _call(mcp.get_dataset_file_bytes, dataset_name="docs", file_path="pixel.gif")
-    out = _payload(_call(mcp.get_dataset_file_bytes, dataset_name="docs", file_path="pixel.gif", password="hunter2"))
+        _bytes(dataset_name="docs", file_path="pixel.gif")
+    out = _bytes(dataset_name="docs", file_path="pixel.gif", password="hunter2")
     assert base64.b64decode(out["data"]) == _GIF

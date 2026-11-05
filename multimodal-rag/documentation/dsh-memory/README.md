@@ -42,10 +42,10 @@ redis (unlock cache across replicas)
 
 **Models** (all remote, no local GPU): embedder `Qwen3-VL-Embedding-8B` (4096-d, text/image/video), reranker `Qwen3-VL-Reranker-8B`, ASR `Cohere Transcribe`, VLM `Qwen3.8-27B-FP8`.
 
-**Security model (important):** the MCP server scopes the `X-Memory-Dataset` / `X-Dataset-Password` HTTP headers **only** to the `add_memory` / `search_memory` *memory* tools. The general dataset tools (`search_dataset`, `get_dataset_info`, …) **never** read those headers — they require an explicit `password` argument or a prior `unlock_dataset`. This is deliberate isolation, not a bug: a memory
+**Security model (important):** the MCP server scopes the `X-Memory-Dataset` / `X-Dataset-Password` HTTP headers **only** to the *memory* tools (`add_memory`, `search_memory`, `delete_memory`, `list_memories`, `forget_session`). The general dataset tools (`search_dataset`, `get_dataset_info`, …) **never** read those headers — they require an explicit `password` argument or a prior `unlock_dataset`. This is deliberate isolation, not a bug: a memory
 password can never silently unlock another dataset.
 
-**9 MCP tools:** `list_datasets`, `unlock_dataset`, `search_dataset`, `add_memory`, `search_memory`, `get_dataset_files`, `get_dataset_info`, `describe_media`, `transcribe_audio`.
+**The MCP tools this integration exercises** (the server now exposes 21 in total — see `documentation/MCP.md` § 2): `list_datasets`, `unlock_dataset`, `search_dataset`, `add_memory`, `search_memory`, `get_dataset_files`, `get_dataset_info`, `inspect_media`.
 
 ---
 

@@ -443,7 +443,7 @@ the offline ingest tests that assert base vs twin embedding inputs.
 1. Query is embedded using the same Qwen3-VL-Embedding-8B model.
 2. Similarity search in Qdrant returns `top_k` (default 10) results — **hybrid dense + BM25 with server-side RRF fusion** on hybrid-capable collections (see below), flat dense cosine on legacy ones.
 3. Optional **Qwen3-VL-Reranker-8B** cross-encoder reranks the results; final count truncated to `reranker_top_k`.
-4. **Score breakdown**: each result exposes `embedding_score` and `reranker_score` separately, in addition to the combined rounded `score`.
+4. **Score breakdown**: each result exposes a rounded `score` plus `score_kind` (`reranker` | `rrf` | `cosine`) labelling what it is, and — on a reranked hit — the components separately: `reranker_score`, and the pre-rerank score as `embedding_score` (dense lane) or `retrieval_score` (hybrid lane).
 
 ### Metadata-filtered search
 
@@ -497,7 +497,7 @@ The reranker is now a **first-class model role** (`RerankerModel`) cleanly separ
 | `/score` | POST `text_1` (query) + `text_2` (documents) | `list[list[float]]` (Q>1) or `list[float]` (Q=1) → raw relevance scores |
 | `/rerank` | POST `query` + `documents` | `list[list[dict]]` → ranked dicts with `index` + `relevance_score` |
 
-**RAG integration:** `_arerank_results` attaches both `_embedding_score` and `_reranker_score` to each doc dict, sorts by reranker score, truncates to `reranker_top_k`.
+**RAG integration:** `_arerank_results` attaches `_reranker_score` to each doc dict — plus the doc's incoming score as `_embedding_score` on a dense lane or `_retrieval_score` on a hybrid RRF lane — sorts by reranker score, truncates to `reranker_top_k`.
 
 **Base URL handling:** `MultiModalReranker.__init__` strips `/v1` from the embedder's `base_url` to avoid OpenAI client warnings on the non-standard endpoints.
 
@@ -590,7 +590,7 @@ get the audio inline as base64 instead. Step failures return structured `{"error
 
 ## MCP Server
 
-Exposes **23 MCP tools** (`mcp_server.py`):
+Exposes **21 MCP tools** (`mcp_server.py`):
 
 | Tool | Purpose |
 |------|---------|
@@ -604,10 +604,12 @@ Exposes **23 MCP tools** (`mcp_server.py`):
 | `set_memory_dataset()` | **D16**: bind the key's ★ memory dataset server-side — `add_memory` / `search_memory` then need neither `dataset_name` nor `password` |
 | `search_dataset()` | Multimodal search (`dataset_name`, `query`, `image`/`video`/`audio`, `top_k`, `use_reranker`, `reranker_top_k`, `password`, `media_base_url`, plus the metadata-filter params `file_types`/`severities`/`source_prefix`/`date_from`/`date_to`). Instantiates a `Postprocessor` for modality conversion based on `base_llm_modalities`. |
 | `search_datasets()` | **Federated search** across datasets (`datasets` list or `"all"`) — per-dataset `top_k`, concurrent fan-out, dataset-labelled merged results, single optional rerank over the pool, dataset-qualified dedup. Password-protected datasets that are not unlocked are skipped with a note; there is deliberately **no `password` parameter** (passwords stay out of tool signatures). |
-| `get_dataset_files()` | List or retrieve files from a dataset (text inline; binary returns metadata + `download_url`) |
+| `get_dataset_files()` | List or retrieve files from a dataset (text inline; binary returns metadata + an absolute, HMAC-signed `download_url` (`{MEDIA_BASE_URL}/api/datasets/{ds}/files/{name}?token=…`, the per-file `{32-hex}_` uuid prefix stripped) + `expires_in_seconds` and, for images, a ready-to-paste `markdown` field — when `MEDIA_BASE_URL` is unset it falls back to the relative REST path with a `note` saying the URL is not browser-renderable; `return_bytes=True` + `file_path` returns the raw bytes as base64 under `MCP_FILE_BYTES_MAX`) |
 | `get_dataset_info()` | Returns dataset metadata |
-| `describe_media()` | Standalone VLM description of an image/video (no dataset needed) |
-| `transcribe_audio()` | Standalone ASR transcription of an audio file (no dataset needed) |
+| `dataset_add_documents(dataset_name, paths?, texts?, password?)` | Ingests local file paths (must sit inside `MEDIA_ALLOW_PATH_PREFIXES`), `http(s)://`/`s3://` URLs (S3 prefixes expanded per object) and/or raw `texts` into an existing dataset — the REST-ingest twin (same pipeline and download policy) |
+| `dataset_delete_documents(dataset_name, doc_ids?, filter?, limit?, password?)` | Deletes by point-ID list (from `search_dataset` / `dataset_add_documents`) or by `{"source_prefix": …}` filter (server-side `MatchPrefix` scroll, `limit`-capped) — exactly one of `doc_ids` / `filter`, the REST-delete twin |
+| `dataset_replace_document(dataset_name, doc_id, path, password?)` | Ingests the replacement FIRST (a failed ingest leaves the old document untouched — no data loss), then deletes the old point; a failed final delete returns an honest `{"status": "partial"}` with both versions present. The old point ID must exist (no silent degrade into a plain add) |
+| `inspect_media()` | Standalone media understanding of ONE file (no dataset needed): image/video → VLM description, audio → ASR transcript. Modality is sniffed from the URL/path; ambiguous refs ask for `media_type`; `query` is image/video-only, `max_seconds` audio-only |
 | `add_memory()` | Store an LLM-curated memory into a personal memory dataset. `dataset_name`/`password` optional — resolved from the `X-Memory-Dataset` / `X-Dataset-Password` request headers (or `MEMORY_DATASET` env) so the model does not pass them. Merges provenance metadata (`source`, `memory_kind`, `memory_ts`, `memory_tags`, `session_id`) into the Qdrant payload. Long memories are split into docs of at most `MEMORY_MAX_TOKENS` (default 8192) — the header/provenance block is prepended to **every** chunk (`memory_chunks`/`chunk_index`/`chunk_total`/`memory_truncated` payload fields). A re-written memory of the same kind is **superseded in place** (prior chunks for that `session_id` + kind are deleted first) — covering BOTH `session_history` (a re-flushed transcript keeps one current history) and `project-summary` (the gateway distiller's re-distilled summaries used to APPEND one copy per resume — fixed 2026-10-14, ~87 duplicate pairs found in a curation pass). Only the SAME kind supersedes; memories without a `session_id` are never touched. |
 | `search_memory()` | Recall from the personal memory dataset; same resolution + retrieval/postproc as `search_dataset` (via the shared retrieval core). |
 | `delete_memory()` | Delete memories **by explicit point ID** (ids come from `search_memory`/`list_memories` results) — no query/similarity-directed deletion, so an LLM can only remove what it has seen listed. Reports a preview of each deleted memory and unknown ids. |
@@ -621,7 +623,7 @@ dataset **password**; the memory headers are read ONLY inside `add_memory`/`sear
 
 **Query-vector caching:** `search_dataset`/`search_memory` reuse a stored Qdrant vector when the query media is already in the dataset, else a hash-keyed in-process LRU cache, avoiding re-embedding the same media twice.
 
-**PVC→HTTP URL conversion:** When `media_base_url` is set (via `MEDIA_BASE_URL` env), `file://` PVC paths in results are rewritten to `{media_base_url}/api/datasets/{name}/files/{path}` HTTP URLs.
+**PVC→HTTP URL conversion:** When `media_base_url` is set (via `MEDIA_BASE_URL` env), `file://` PVC paths in results are rewritten to signed HTTP URLs — `{media_base_url}/api/datasets/{name}/files/{path}?token=…`, each carrying a short-lived HMAC (an `<img>`/`<video>` tag cannot send the dataset password) with the per-file `{32-hex}_` uuid prefix stripped so the URL is the human-readable filename.
 
 **DNS rebinding protection disabled** (`TransportSecuritySettings(enable_dns_rebinding_protection=False)`) for cluster networking.
 
@@ -705,7 +707,7 @@ frontend also uses tokens: it mints a dataset-scoped token (`POST /api/datasets/
 into `os.environ` every `CONFIG_RELOAD_INTERVAL` seconds (default 15) and, on change, rebuilds the four model objects and invalidates the RAG cache — kubelet propagates a ConfigMap/Secret edit to the mounted files within ~1s, so a model swap takes effect **without a rollout restart**. The new embedder is verified against its `/v1/models` before being swapped; if unreachable the old configuration
 is kept and the error logged. When `CONFIG_DIR` is unset (e.g. local runs) behaviour is unchanged — a rollout is required.
 
-**Local-file allowlist (MCP media):** `describe_media` / `transcribe_audio` / audio queries may only read `file://`/local paths under `MEDIA_ALLOW_PATH_PREFIXES` (default `DATA_PATH/datasets` + `DATA_PATH/staging`); disallowed paths are refused (fail-closed).
+**Local-file allowlist (MCP media):** `inspect_media` / audio queries may only read `file://`/local paths under `MEDIA_ALLOW_PATH_PREFIXES` (default `DATA_PATH/datasets` + `DATA_PATH/staging`); disallowed paths are refused (fail-closed).
 
 **Remote-URL ingest guards (SSRF):**
 - `INGEST_BLOCK_PRIVATE_HOSTS` blocks private/loopback/link-local targets — **on by default**. `s3://` downloads are unaffected (only `http(s)://`).
@@ -835,15 +837,13 @@ For a typical PDF sub-batch (~60 text + ~4 image docs): **~5 HTTP requests** ins
 
 ## Upload UX
 
-**XHR upload with progress**: Uses `XMLHttpRequest` instead of `fetch` for real upload progress bars (`📤` → `📦` → `⚙` → `◐` → spinner → `✓`).
+**Batched upload with progress**: Files go out in batches of 5 (a same-named file gets a solo batch) — ONE multipart `fetch` POST to `/api/datasets/{name}/batch-files` per batch → ONE job → ONE status poller (3 batches in flight), not one request + poller per file. Progress state (`📤` → `📦` → `⚙` → `◐` → spinner → `✓`) is driven by the job's event stream.
 
 **Chunk count accumulation**: Per-file chunk counts are accumulated across sub-batches via `_fileChunkTotal` map. A file split across multiple sub-batches shows its total chunk count (e.g., `✓ 2,048 chunk(s)`) instead of just the last sub-batch's count.
 
 **Estimated chunk totals**: The "preprocessed" progress event includes `total` (estimated total chunks for the file). During embedding, the line shows `128 / (est.) 1,024 chunks embedded…` once the total is known. The estimate arrives after the generator finishes extracting the file — the frontend updates from `128 chunks embedded…` to `128 / (est.) 1,024 chunks embedded…` when it arrives.
 
-**Connection drop resilience**: `xhr.onerror` and `xhr.onload` poll `GET /api/datasets/{name}` every 10s for `document_count`. Shows "Processing in background" instead of "Failed". Marks complete when count stabilizes (3 unchanged polls).
-
-**Timer fix**: The upload timer `setInterval` is cleared in `xhr.upload.onload` so the SSE-driven chunk count summary isn't overwritten with `"Uploading 14 file(s)... 219s"` after upload completes.
+**Failure resilience**: a transient status-poll error just keeps the poller running; a failed file goes red and stays retryable from the Retry-Failed button; at job completion the client reconciles terminal state and chunk counts against `job.result.files` (the server keeps only the last 500 events per job, so the event stream alone is not authoritative at the end).
 
 ---
 

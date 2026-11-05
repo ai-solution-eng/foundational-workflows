@@ -111,7 +111,7 @@ const NOISE_TOOLS = new Set([
   "todowrite",
   "question",
   "session-id",
-  "describe_media",
+  "inspect_media",
   "list_datasets",
   "get_dataset_files",
   "get_dataset_info",

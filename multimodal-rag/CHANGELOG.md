@@ -57,6 +57,72 @@ All notable changes to this project are tracked here. Format loosely follows [Ke
   only and defaults to the node count; a multiple > 1 creates
   `nodes × multiple` shards so a later scale-out has shards to move.
 
+- **MCP tool surface consolidated 23 → 21 tools (BREAKING for MCP clients).**
+  Two pairs did the same job behind the same guard funnel, so they were merged:
+  - `get_dataset_file_bytes(dataset_name, file_path, password?)` →
+    `get_dataset_files(dataset_name, file_path, return_bytes=True, password?)`.
+    Same response payload, same `MCP_FILE_BYTES_MAX` cap and over-cap refusal;
+    without `return_bytes` the tool keeps its historical behaviour (binaries
+    come back as metadata + a download URL).
+  - `describe_media(media_url, query?, media_type?)` and
+    `transcribe_audio(audio_url, max_seconds?)` →
+    `inspect_media(media_url, query?, media_type?, max_seconds?)`, which sniffs
+    image/video vs audio from the URL, Content-Type and magic bytes and asks for
+    `media_type` when the signals are irreconcilable. Both response shapes are
+    unchanged (`description`… / `transcript`…). `query` is now refused for audio
+    and `max_seconds` refused for image/video rather than silently ignored.
+  In-repo consumers migrated: `scripts/media-proxy.py`, the Open WebUI filter,
+  the DSH `rag-media-view` skill, the memory plugins, and the docs.
+- **MCP tool descriptions dieted ~37%** — 23,019 → 14,408 characters of docstring
+  prose (≈5,750 → ≈3,600 tokens shipped on EVERY request). Duplicated
+  explanations, repeated bounds, worked examples and ops detail were removed;
+  every parameter meaning, return-shape contract, security constraint and the
+  untrusted-content notice are preserved. `documentation/MCP.md` §2 is now
+  generated from the docstrings by `scripts/gen_mcp_docs.py`, so the table can
+  no longer drift from the code.
+- **`/api/admin/health` no longer fans out to Qdrant on every poll.** The
+  per-collection points count and the cluster/replica block each ran
+  `GET /collections` + one call per collection on every request, while the
+  management UI polls the endpoint every 10s (~27 round trips per poll, ~162/min
+  per open browser). Both fan-outs are now TTL-cached at 30s (~1 amortized
+  round trip per poll); failures are never cached, so a dead Qdrant still
+  surfaces on the next poll and a cached `ok` masks an outage for at most 30s.
+- **Web UI request efficiency.** Three client-side defects fixed:
+  (a) every mutation refetched BOTH list endpoints (3 requests per click); it now
+  refreshes only the visible list and marks the hidden one stale for its tab
+  entry; (b) file uploads sent one request and one 2s poller PER FILE — now one
+  request and one poller per batch of up to 5 files (same-named files keep solo
+  batches so per-file progress stays unambiguous); (c) the upload-history filter
+  fetched 200 rows on every keystroke — now debounced 300ms.
+
+### Fixed
+- **Search results no longer mislabel a reranker score as RRF rank fusion.**
+  With the reranker enabled, `DatasetManager.search` put the reranker relevance
+  in `score` but left the hybrid lane's private `_score_kind` stamp inside
+  `content`, so the web UI's Search tab rendered e.g.
+  `#1 · score: 0.4191 (rrf rank fusion)` for a number that was never an RRF
+  sum. Every search entry now carries `score_kind` — `reranker` when a rerank
+  pass produced the score, `rrf` for hybrid rank arithmetic, `cosine` on
+  dense-only lanes — and the private `_score_kind` / `_retrieval_score` stamps
+  no longer leak into `content`. A reranked hybrid hit keeps its pre-rerank
+  score visible as `retrieval_score` (rendered as `(rrf: …)` next to
+  `(reranker)`), matching the contract the MCP surface already used. The
+  federated `POST /api/search` path labels entries the same way and re-stamps
+  the lane internally so its lane-aware merge order is unchanged.
+- **Media URLs returned by `get_dataset_files` are now renderable by a chat
+  client.** The binary branch returned a *relative* `download_url` with no
+  signature, so a browser UI could not fetch it (an `<img>` tag cannot send
+  headers), and the search hint then told the model to pull the file's base64
+  "and embed it from your workspace" — advice that only works for an agentic
+  harness with a filesystem. In Open WebUI that produced a ~300 KB base64 blob
+  in the chat reply (~100k tokens for one capped image) that the model could
+  not reproduce faithfully. The tool now returns the same absolute, HMAC-signed
+  URL the search results already used (plus a ready-to-paste `markdown` link
+  for images), falling back to the relative path only when `MEDIA_BASE_URL` is
+  unset — and in that case the server logs a startup warning instead of
+  degrading silently. The search hint now routes display to the signed URL and
+  states that `return_bytes` is only for a client that can persist the bytes.
+
 ### Notes
 - Only `pinned` is a heap allocation that must fit in RAM (the sole tier that
   can OOM); `cached` and `cold` are mmap files the OS evicts under pressure,

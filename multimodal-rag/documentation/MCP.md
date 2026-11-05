@@ -58,37 +58,40 @@ If the cluster ingress uses `oauth2-proxy` (EZUA), include a bearer token in the
 
 ---
 
-## 2. Available tools (23)
-
-> **Read-only grants (D26):** when the caller's key carries mode ACLs (`RAG_DATASET_ACLS` token form `name:ds1:ro` or an overlay `{"name": …, "mode": "ro"}`), the write tools — `dataset_add_documents`, `dataset_delete_documents`, `dataset_replace_document`, `add_memory`, `delete_memory`, `forget_session` — require an **rw** grant for the target dataset: an ro (or ro-only) dataset refuses with a clear `ToolError`; read tools are unchanged.
+## 2. Available tools (21)
 
 | Tool | Purpose | Needs `dataset_name`? | Needs `password`? |
 |------|---------|----------------------|-------------------|
-| `list_datasets()` | List the caller's datasets with metadata — only the key's EFFECTIVE datasets (operator grants ∪ selections; access isolation) | — | — |
-| `unlock_dataset(dataset_name, password, ttl)` | Verify a dataset password; cached per-process (default 30 min; `ttl` bounded by `RAG_UNLOCK_MAX_TTL`, `0` = no expiry when the deployment opts in) — pass `password=` per call on multi-replica deployments, or select the dataset once instead (below) | yes | yes |
-| `select_dataset(dataset_name, password?)` | **D16** (opt-in): add a dataset to YOUR key's set — protected ones require the correct password, saved server-side so no tool needs `password=` afterwards | yes | if protected |
-| `deselect_dataset(dataset_name)` | **D16**: remove one of YOUR selections (and its saved password); operator-ACL grants untouched | yes | — |
-| `create_short_term_memory(session_id, ttl_seconds?, name?)` | **Short-term memory** (opt-in `shortTermMemory.enabled`): mint an ephemeral session dataset — non-guessable name `stm-<base32(hmac_sha256(salt, session_id))[:16]>`, `kind=short_term`, lifetime `ttl_seconds` (default 6h, cap `shortTermMemory.maxTtlHours`=24h), granted to the creating identity only. Passwordless by design; HIDDEN from `list_datasets` — keep the returned name, it is the only handle. 503 when `RAG_STM_NAME_SALT` is unset (never mints guessable names) | no | never |
-| `end_short_term_memory(dataset_name)` | **Short-term memory**: tear down one STM dataset. Owner-or-admin (D23) and refuses any dataset whose `kind != "short_term"` — never a general dataset-deletion backdoor. Existence is resolved before the ownership gate, so a non-owner learns nothing | no | — |
-| `memory_status()` | **Report-only probe**: the CURRENT caller's memory-write capability (`{memory_available, dataset, writable, unlocked, detail}`) — the cheap pre-flight for automated memory writers (gateway distiller, harness shims). No arguments, no cross-identity oracle, no side effects (no unlock-cache write, no password-throttle consumption, no dataset mutation). `memory_available && writable && unlocked` predicts `add_memory` success (residual failure modes are storage errors, not ACL) | no | — |
-| `set_memory_dataset(dataset_name?)` | **D16**: bind your ★ memory dataset (omit the arg to clear) — `add_memory`/`search_memory` then need no `dataset_name`/`password` | no | — |
-| `search_dataset(dataset_name, query, image?, video?, audio?, top_k?, use_reranker?, reranker_top_k?, base_llm_modalities?, password?, media_base_url?, file_types?, severities?, source_prefix?, date_from?, date_to?)` | Full multimodal retrieval with post-processing; optional metadata filters (`file_types`, `severities`, `source_prefix`, `date_from`/`date_to`) applied server-side before ranking | yes | if protected |
-| `get_dataset_files(dataset_name, file_path?, limit?, offset?, password?)` | List or retrieve files in a dataset | yes | if protected |
-| `get_dataset_file_bytes(dataset_name, file_path, password?)` | ONE file's raw bytes as base64 (JSON: `{dataset, file, size_bytes, type, mime_type, encoding, data}`) — the way to actually GET a picture/audio/video into the calling agent's hands so it can be displayed or inspected locally; companion to `get_dataset_files` (which returns metadata + a download URL for binaries, never the bytes). Size-capped by `MCP_FILE_BYTES_MAX` (default 256 KiB — enough for `*_preprocessed` image previews, too small to move bulk media; over-cap refuses with the REST/download-URL fallback) | yes | if protected |
-| `get_dataset_info(dataset_name, password?)` | Dataset metadata | yes | if protected |
-| `dataset_add_documents(dataset_name, paths?, texts?, password?)` | Add documents to a dataset — local file paths (inside the media allowlist), `http(s)://`/`s3://` URLs, or raw text; the MCP twin of the REST ingest endpoints, same pipeline and download policy | yes | if protected |
-| `dataset_delete_documents(dataset_name, doc_ids?, filter?, limit?, password?)` | Delete documents **by explicit point ID(s)** or by `{"source_prefix": …}` filter (exactly one selector); the MCP twin of the REST delete-document endpoint, extended with batch IDs and prefix filter | yes | if protected |
-| `dataset_replace_document(dataset_name, doc_id, path, password?)` | Replace one document: ingest the new `path` **first**, then delete the old point — a failed ingest leaves the old document untouched; a failed final delete reports `"status": "partial"` with both versions present | yes | if protected |
-| `describe_media(media_url, query?, media_type?)` | Standalone VLM description of an image/video (no dataset needed) | — | — |
-| `transcribe_audio(audio_url, max_seconds?)` | Standalone ASR transcription (no dataset needed) | — | — |
-| `add_memory(text, image?, video?, audio?, metadata?, dataset_name?, password?)` | Store a memory into the caller's memory dataset | optional¹ | optional¹ |
-| `search_memory(query, image?, video?, audio?, top_k?, use_reranker?, reranker_top_k?, base_llm_modalities?, dataset_name?, password?)` | Recall from the caller's memory dataset | optional¹ | optional¹ |
-| `delete_memory(memory_ids, dataset_name?, password?)` | Delete memories **by explicit point ID** (from `search_memory`/`list_memories` results); reports a preview of each deleted memory and unknown ids. No similarity/query-directed deletion exists. | optional¹ | optional¹ |
-| `list_memories(limit?, kind?, tags?, include_session_history?, dataset_name?, password?)` | List stored memories newest-first with `memory_id`, kind, timestamp, tags and a preview — the source of ids for `delete_memory` | optional¹ | optional¹ |
-| `forget_session(session_id, dataset_name?, password?)` | Delete the `session_history` memory for one session (never touches curated memories) | optional¹ | optional¹ |
-| `search_datasets(datasets \| "all", query, image?, video?, audio?, top_k?, use_reranker?, reranker_top_k?, base_llm_modalities?, file_types?, severities?, source_prefix?, date_from?, date_to?)` | **Federated search**: concurrent per-dataset fan-out, dataset-labelled merged results, dataset-qualified dedup, one optional rerank over the pool. Password-protected datasets without a cached unlock are skipped with a note — there is deliberately **no `password` parameter** | no | never |
+| `list_datasets(cursor=None, limit=None)` | List the datasets available to you with document counts and access status — ALWAYS call this FIRST when you don't know a dataset's exact name. | — | — |
+| `unlock_dataset(dataset_name, password, ttl=1800)` | Unlock a password-protected dataset for the current session: other tools (search_dataset, get_dataset_files, get_dataset_info) then accept requests without a password parameter for the TTL duration. | yes | yes |
+| `select_dataset(dataset_name, password=None)` | Add a dataset to YOUR key's accessible set: a protected dataset's CORRECT password is verified and saved server-side — other tools need no password argument. | yes | if protected |
+| `deselect_dataset(dataset_name)` | Remove a dataset from YOUR key's accessible set. | yes | — |
+| `create_short_term_memory(session_id, ttl_seconds=None, name=None)` | Create a short-term-memory dataset for one agent session: a NON-GUESSABLE name is minted and HIDDEN from the catalog — KEEP the returned name, the only handle. | no | never |
+| `end_short_term_memory(dataset_name)` | Explicitly tear down (delete) a short-term-memory dataset. | no | — |
+| `set_memory_dataset(dataset_name=None)` | Mark which dataset is YOUR long-term memory store (the /access page's ★). | no | — |
+| `search_dataset(dataset_name, query='', image=None, video=None, audio=None, top_k=10, use_reranker=False, reranker_top_k=3, base_llm_modalities=None, password=None, media_base_url=None, file_types=None, severities=None, source_prefix=None, date_from=None, date_to=None, dense_weight=None, sparse_weight=None, k=None)` | Search ONE multimodal RAG dataset by MEANING: images/videos match what they show (captions + image↔text embeddings — text queries DO find pictures), audio its transcript, documents their text. | yes | if protected |
+| `search_datasets(datasets, query='', image=None, video=None, audio=None, top_k=5, use_reranker=False, reranker_top_k=3, base_llm_modalities=None, file_types=None, severities=None, source_prefix=None, date_from=None, date_to=None)` | Search SEVERAL datasets with ONE query and merge the ranked results. | no | never |
+| `memory_status()` | Report the calling key's memory-write capability. | no | — |
+| `add_memory(text, image=None, video=None, audio=None, metadata=None, dataset_name=None, password=None)` | Store a memory (durable fact / decision / preference) for recall via search_memory; distil a concise, self-contained record. | optional¹ | optional¹ |
+| `search_memory(query, image=None, video=None, audio=None, top_k=5, use_reranker=False, reranker_top_k=3, base_llm_modalities=None, dataset_name=None, password=None)` | Recall relevant memories from your personal long-term memory store. | optional¹ | optional¹ |
+| `delete_memory(memory_ids, dataset_name=None, password=None)` | Delete memories from your personal long-term memory store by point ID — pass memory_id values from search_memory / list_memories. | optional¹ | optional¹ |
+| `list_memories(limit=20, kind=None, tags=None, include_session_history=False, dataset_name=None, password=None)` | List stored memories — newest first, with memory_id (→ delete_memory), kind, timestamp, tags, preview; session histories hidden unless requested. | optional¹ | optional¹ |
+| `forget_session(session_id, dataset_name=None, password=None)` | Delete the stored session-history memory for one session. | optional¹ | optional¹ |
+| `get_dataset_files(dataset_name, file_path=None, limit=100, offset=0, password=None, return_bytes=False)` | Browse a dataset's files by NAME — paginated listing, or one file by path; to find files by CONTENT, use search_dataset. | yes | if protected |
+| `get_dataset_info(dataset_name, password=None)` | Return metadata (including document count and password status) for a dataset. | yes | if protected |
+| `dataset_add_documents(dataset_name, paths=None, texts=None, password=None)` | Add documents to a dataset: local file paths, http(s)/s3 URLs, or raw text — REST-ingest twin (same pipeline and download policy). | yes | if protected |
+| `dataset_delete_documents(dataset_name, doc_ids=None, filter=None, limit=10000, password=None)` | Delete documents by point ID(s) or source-prefix filter — REST-delete twin. | yes | if protected |
+| `dataset_replace_document(dataset_name, doc_id, path, password=None)` | Ingest the new path, then delete the old point — new content goes FIRST: a failed ingest leaves the old document untouched; a failed final delete leaves both versions ("status": "partial"). | yes | if protected |
+| `inspect_media(media_url, query=None, media_type=None, max_seconds=None)` | Inspect ONE media file whose URL/path you already have: image/video are described/answered by the vision-language model (VLM), audio transcribed by ASR. | — | — |
 
-¹ The memory tools resolve `dataset_name` / `password` from request headers (`X-Memory-Dataset` / `X-Dataset-Password`) or the `MEMORY_DATASET` env var when omitted — see [MEMORY.md](MEMORY.md).
+> This table (and the tool count) is generated by `scripts/gen_mcp_docs.py` from the MCP
+> server source — AST-only, no server import, so it cannot drift. Regenerate with
+> `python scripts/gen_mcp_docs.py` after any `@mcp.tool()` signature or docstring change;
+> do not edit the table by hand.
+
+> **Read-only grants (D26):** when the caller's key carries mode ACLs (`RAG_DATASET_ACLS` token form `name:ds1:ro` or an overlay `{"name": …, "mode": "ro"}`), the write tools — `dataset_add_documents`, `dataset_delete_documents`, `dataset_replace_document`, `add_memory`, `delete_memory`, `forget_session` — require an **rw** grant for the target dataset: an ro (or ro-only) dataset refuses with a clear `ToolError`; read tools are unchanged.
+
+¹ The memory tools resolve `dataset_name` from the `X-Memory-Dataset` header → the caller's ★ binding → `RAG_MEMORY_DEFAULT` → `MEMORY_DATASET` (an explicit `dataset_name` argument is honoured only when nothing was bound — a disagreeing one is refused), and `password` from an explicit argument → the `X-Dataset-Password` header → the saved selection → `RAG_MEMORY_PASSWORD` — see [MEMORY.md](MEMORY.md).
 
 ### `search_dataset` example
 
@@ -110,7 +113,7 @@ Returns JSON with:
 ### Modality conversion
 
 If the calling LLM doesn't support a modality (set via `base_llm_modalities`), retrieved media is automatically converted to text:
-- **images/video** → VLM (Gemma 4 31B) describes them → text
+- **images/video** → VLM (Qwen3.8-27B-FP8 by chart default) describes them → text
 - **audio** → ASR (Cohere Transcribe) transcribes → text
 
 ---
@@ -132,7 +135,7 @@ If the calling LLM doesn't support a modality (set via `base_llm_modalities`), r
 }
 ```
 
-All 23 tools are exposed on every connection. The client (or its `tools` config) can disable specific tools it doesn't want the model to see.
+All 21 tools are exposed on every connection. The client (or its `tools` config) can disable specific tools it doesn't want the model to see.
 
 ### 3.2 opencode (unified single connection, 2026-10)
 
@@ -269,7 +272,7 @@ http://127.0.0.1:8788/api/datasets/andrew-personal-dataset/files/DSC01378_prepro
 | Status codes | `200` ok, `404` no such file, `413` file exceeds `MCP_FILE_BYTES_MAX`, `502` gateway error |
 | Bind | `127.0.0.1` only; reads nothing beyond what the configured gateway key may already read; exposes no filesystem path |
 
-> **Size limit — the one real constraint.** `get_dataset_file_bytes` refuses files over
+> **Size limit — the one real constraint.** `get_dataset_files(return_bytes=True)` refuses files over
 > `MCP_FILE_BYTES_MAX` (default **256 KiB**), so the proxy can serve most preprocessed
 > image previews and small documents but not full-size photos, video, or audio. That is a
 > transport cap, not a permission problem, and the proxy answers `413` to say so. To serve

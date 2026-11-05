@@ -266,15 +266,15 @@ class MediaStore:
             return payload
 
         result = self.gateway.call(
-            "mm-rag__get_dataset_file_bytes",
-            {"dataset_name": dataset, "file_path": stored},
+            "mm-rag__get_dataset_files",
+            {"dataset_name": dataset, "file_path": stored, "return_bytes": True},
         )
         if result.get("ok") is False or "data" not in result:
             error = result.get("error") or (key + " unavailable")
-            # get_dataset_file_bytes refuses anything over MCP_FILE_BYTES_MAX
-            # (256 KiB by default).  That is a transport limit, not a
-            # permission problem, and the browser deserves a status that says
-            # so: 413 rather than a misleading 404.
+            # get_dataset_files(return_bytes=True) refuses anything over
+            # MCP_FILE_BYTES_MAX (256 KiB by default).  That is a transport
+            # limit, not a permission problem, and the browser deserves a
+            # status that says so: 413 rather than a misleading 404.
             if "tool cap" in error or "MCP_FILE_BYTES_MAX" in error:
                 raise MediaTooLarge(error)
             raise FileNotFoundError(error)

@@ -1,18 +1,18 @@
 """P1-2 (audit 2026-10-16): MEDIA_ALLOW_PATH_PREFIXES is a PATH allowlist,
 not an ACL.
 
-The defect: ``describe_media`` / ``transcribe_audio`` /
-``_mcp_ingest_local_path`` / ``dataset_replace_document`` read local files
-that merely had to sit under the media-path prefixes — which span EVERY
-tenant's ``datasets/`` tree.  Reproduced: an ACL-denied tenant's file bytes
-reached the VLM, and a cross-tenant copy into the caller's own dataset
-succeeded.
+The defect: the two former single-modality media tools (now the single
+``inspect_media`` tool) / ``_mcp_ingest_local_path`` /
+``dataset_replace_document`` read local files that merely had to sit under
+the media-path prefixes — which span EVERY tenant's ``datasets/`` tree.
+Reproduced: an ACL-denied tenant's file bytes reached the VLM, and a
+cross-tenant copy into the caller's own dataset succeeded.
 
 Pinned here (negative + positive):
 
   * a local path inside another dataset's directory is refused for an
-    identity that does not reach that dataset (D15/D16), for both the media
-    tools and the ingest tools;
+    identity that does not reach that dataset (D15/D16), for every
+    ``inspect_media`` modality (image/video/audio) and the ingest tools;
   * the SAME path is accepted for the dataset's owner / an ACL-granted key;
   * paths outside any dataset directory (staging) and the identity-less
     single-user deployment are unchanged — the prefix policy alone.
@@ -57,11 +57,18 @@ def mcp_env(monkeypatch, tmp_path):
     root = tmp_path / "datasets"
     (root / "mine" / "files").mkdir(parents=True)
     (root / "theirs" / "files").mkdir(parents=True)
-    (root / "mine" / "files" / "ok.jpg").write_bytes(b"\xff\xd8\xffmine")
-    (root / "theirs" / "files" / "secret.jpg").write_bytes(b"\xff\xd8\xffsecret")
     staging = tmp_path / "staging"
     staging.mkdir()
-    (staging / "handoff.jpg").write_bytes(b"\xff\xd8\xffstaged")
+    # One file per modality inspect_media routes on — the ACL gate must hold
+    # for image, video AND audio (it used to be pinned on the VLM tool only).
+    for ext, blob in (
+        ("jpg", b"\xff\xd8\xff"),
+        ("mp4", b"\x00\x00\x00\x18ftypmp42"),
+        ("mp3", b"ID3\x04\x00"),
+    ):
+        (root / "mine" / "files" / f"ok.{ext}").write_bytes(blob)
+        (root / "theirs" / "files" / f"secret.{ext}").write_bytes(blob)
+        (staging / f"handoff.{ext}").write_bytes(blob)
     # media_paths resolves the prefix list ONCE at import (module constants),
     # so the suite patches them directly — the sibling suites' pattern.
     monkeypatch.setattr(mp, "_MEDIA_ALLOW_PATH_PREFIXES", (str(root), str(staging)))
@@ -72,6 +79,7 @@ def mcp_env(monkeypatch, tmp_path):
     # and no real DatasetManager can be built without an embedder endpoint.
     class _StubDM:
         vlm = None
+        asr = None
 
         class embedder:  # attribute-style stub
             mm_processor_kwargs = {}  # noqa: RUF012 — attribute-style stub
@@ -86,6 +94,11 @@ def mcp_env(monkeypatch, tmp_path):
 
     monkeypatch.setattr(mcp, "get_manager", lambda: _StubDM())
     return mcp, root, staging
+
+
+#: The three modalities ``inspect_media`` routes on. The ACL gate must hold
+#: for every one of them — it used to be pinned on the VLM tool only.
+_MEDIA_EXTS = ("jpg", "mp4", "mp3")
 
 
 def _acl_helper(mcp):
@@ -139,25 +152,28 @@ def test_dataset_for_local_path_resolves_and_picks_the_longest_root(mcp_env):
 # ===========================================================================
 
 
-def test_media_tool_refuses_another_datasets_file(mcp_env, monkeypatch):
+@pytest.mark.parametrize("ext", _MEDIA_EXTS)
+def test_media_tool_refuses_another_datasets_file(mcp_env, monkeypatch, ext):
     """THE P1-2 regression: an ACL-denied key must not hand another tenant's
-    file to the VLM, even though the path passes the prefix allowlist."""
+    file to the VLM/ASR, even though the path passes the prefix allowlist.
+    Parametrized over the three modalities ``inspect_media`` routes on."""
     mcp, root, _staging = mcp_env
     monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key;bob:bob-key")
     monkeypatch.setenv(cr.ACLS_ENV, "alice:mine;bob:theirs")
-    secret = str((root / "theirs" / "files" / "secret.jpg").resolve())
+    secret = str((root / "theirs" / "files" / f"secret.{ext}").resolve())
     token = cr.set_current_identity(cr.resolve_presented(["alice-key"]))
     try:
-        status, text = _call(mcp, "describe_media", {"media_url": f"file://{secret}"})
+        status, text = _call(mcp, "inspect_media", {"media_url": f"file://{secret}"})
         assert status == "error", text
         assert "not permitted for this API key" in text
-        # The VLM must never have been reached (the refusal is pre-read).
+        # The model must never have been reached (the refusal is pre-read).
         assert "VLM description failed" not in text
+        assert "ASR transcription failed" not in text
         # …and alice's OWN dataset path passes the ACL step (it then fails
-        # later for an unrelated reason: no VLM configured on the stub —
+        # later for an unrelated reason: no VLM/ASR configured on the stub —
         # which is exactly the proof that the ACL no longer refused it).
-        own = str((root / "mine" / "files" / "ok.jpg").resolve())
-        status, text = _call(mcp, "describe_media", {"media_url": f"file://{own}"})
+        own = str((root / "mine" / "files" / f"ok.{ext}").resolve())
+        status, text = _call(mcp, "inspect_media", {"media_url": f"file://{own}"})
         assert "not permitted for this API key" not in text
     finally:
         cr.reset_current_identity(token)
@@ -178,21 +194,22 @@ def test_ingest_tool_refuses_another_datasets_file(mcp_env, monkeypatch):
         cr.reset_current_identity(token)
 
 
-def test_staging_paths_and_identityless_callers_unchanged(mcp_env, monkeypatch):
+@pytest.mark.parametrize("ext", _MEDIA_EXTS)
+def test_staging_paths_and_identityless_callers_unchanged(mcp_env, monkeypatch, ext):
     """The preservation half: staging paths (outside every dataset root) and
     a deployment with no registry identity behave exactly as before — the
     prefix policy alone decides."""
     mcp, _root, staging = mcp_env
-    staged = str((staging / "handoff.jpg").resolve())
+    staged = str((staging / f"handoff.{ext}").resolve())
     # identity-less (D15 inactive): the legacy default.
-    _status, text = _call(mcp, "describe_media", {"media_url": f"file://{staged}"})
+    _status, text = _call(mcp, "inspect_media", {"media_url": f"file://{staged}"})
     assert "not permitted for this API key" not in text
     # and with an identity bound: staging is still not dataset-governed.
     monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key")
     monkeypatch.setenv(cr.ACLS_ENV, "alice:mine")
     token = cr.set_current_identity(cr.resolve_presented(["alice-key"]))
     try:
-        _status, text = _call(mcp, "describe_media", {"media_url": f"file://{staged}"})
+        _status, text = _call(mcp, "inspect_media", {"media_url": f"file://{staged}"})
         assert "not permitted for this API key" not in text
     finally:
         cr.reset_current_identity(token)
@@ -206,7 +223,7 @@ def test_prefix_policy_still_applies_first(mcp_env, monkeypatch):
     monkeypatch.setenv(cr.ACLS_ENV, "alice:mine")
     token = cr.set_current_identity(cr.resolve_presented(["alice-key"]))
     try:
-        status, text = _call(mcp, "describe_media", {"media_url": "file:///etc/passwd"})
+        status, text = _call(mcp, "inspect_media", {"media_url": "file:///etc/passwd"})
         assert status == "error"
         assert "MEDIA_ALLOW_PATH_PREFIXES" in text
     finally:

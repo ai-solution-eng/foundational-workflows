@@ -2,6 +2,8 @@
 
 Status: proposal, not committed scope. Authored 2026-08-31, after the v3.0.0 security round and v3.2.0 performance/hardening round. The security and performance surfaces are deliberately left alone here — these items extend retrieval quality, operability, and the MCP/memory product surface, in preference order. Effort: S (≤1 day), M (2–4 days), L (a week+).
 
+> **Status (2026-11):** all eight items below have shipped — see CHANGELOG.md and MCP.md § 2; the sections below are the original design record.
+
 | # | Feature | Effort | Impact |
 |---|---------|--------|--------|
 | 1 | Metadata-filtered search | S/M | High for log/code/table corpora |
@@ -112,7 +114,7 @@ Status: proposal, not committed scope. Authored 2026-08-31, after the v3.0.0 sec
 
 ## 6. Memory management tools (MCP)
 
-**Problem.** `AGENTS.md` documents it: there is no `delete_memory`, so correcting a wrong memory means writing a superseding one. The filter plumbing exists (`metadata.memory_kind` / `session_id`, `dataset_manager.py:3314`).
+**Problem.** `AGENTS.md` documented it: there was no `delete_memory` (it now exists — `delete_memory(memory_ids)`, see MCP.md § 2), so correcting a wrong memory meant writing a superseding one. The filter plumbing exists (`metadata.memory_kind` / `session_id`, `dataset_manager.py:3314`).
 
 **Design.** Three tools, same header-based identity resolution as `add_memory`/`search_memory` (memory headers only ever resolve inside memory tools):
 
