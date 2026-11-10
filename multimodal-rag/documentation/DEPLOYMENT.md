@@ -587,7 +587,7 @@ LLM gateway an explicit `X-API-Key` still outranks a co-forwarded `Authorization
 Bearer`); observed JWT-only users appear in `GET /api/admin/clients` as
 `{"source": "observed"}` entries. Issuer is **REQUIRED** when enabled (the app logs a
 loud startup warning without it) and every knob is read per request — no restart.
-Chart wiring renders the `RAG_OIDC_*` envs into BOTH containers only when
+Chart wiring renders the `OIDC_*` envs into BOTH containers only when
 `oidc.enabled: true` (the default render is byte-identical). Browser sign-in
 (D22) rides on this same resolver via `security.oidc.sso.*` — the §2 values
 row and the §5b ordered-enablement subsection cover it.

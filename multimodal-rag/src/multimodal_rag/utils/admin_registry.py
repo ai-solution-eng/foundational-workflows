@@ -16,7 +16,7 @@ file on the shared PVC:
 D21 — OIDC sign-in fields (optional, per client entry):
 
 * ``"oidc": "<alias>"`` — binds this client to the JWT identity whose
-  ``RAG_OIDC_IDENTITY_CLAIM`` (or ``sub``) resolves to ``<alias>``: the
+  ``OIDC_IDENTITY_CLAIM`` (or ``sub``) resolves to ``<alias>``: the
   verified token then adopts the CLIENT's name and datasets (both
   credentials, one identity — same client_id).  A JWT whose name matches a
   client's name by convention needs no alias.  Must satisfy the registry

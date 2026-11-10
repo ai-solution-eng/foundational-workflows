@@ -176,20 +176,20 @@ def jwks_server():
 # ===========================================================================
 
 _OIDC_ENV_NAMES = (
-    "RAG_OIDC_ENABLED",
-    "RAG_OIDC_ISSUER",
-    "RAG_OIDC_AUDIENCE",
-    "RAG_OIDC_IDENTITY_CLAIM",
-    "RAG_OIDC_JWKS_URL",
-    "RAG_OIDC_JWKS_REFRESH_SECONDS",
-    "RAG_OIDC_OBSERVED_TTL",
-    "RAG_OIDC_FETCH_TIMEOUT_SECONDS",
-    "RAG_OIDC_CLOCK_SKEW_SECONDS",
-    "RAG_OIDC_SSO_ENABLED",
-    "RAG_OIDC_SSO_CLIENT_ID",
-    "RAG_OIDC_SSO_CLIENT_SECRET",
-    "RAG_OIDC_SSO_REDIRECT_URI",
-    "RAG_OIDC_SSO_PROVIDER_URL",
+    "OIDC_ENABLED",
+    "OIDC_ISSUER",
+    "OIDC_AUDIENCE",
+    "OIDC_IDENTITY_CLAIM",
+    "OIDC_JWKS_URL",
+    "OIDC_JWKS_REFRESH_SECONDS",
+    "OIDC_OBSERVED_TTL",
+    "OIDC_FETCH_TIMEOUT_SECONDS",
+    "OIDC_CLOCK_SKEW_SECONDS",
+    "OIDC_SSO_ENABLED",
+    "OIDC_SSO_CLIENT_ID",
+    "OIDC_SSO_CLIENT_SECRET",
+    "OIDC_SSO_REDIRECT_URI",
+    "OIDC_SSO_PROVIDER_URL",
     "RAG_SSO_GATE",
 )
 
@@ -242,10 +242,10 @@ def _clean_env(monkeypatch, tmp_path):
 def _oidc_on(monkeypatch, jwks_server):
     """Default per-test OIDC wiring (the D21 pattern): enabled, loopback
     JWKS, refetch-on-every-verify."""
-    monkeypatch.setenv("RAG_OIDC_ENABLED", "1")
-    monkeypatch.setenv("RAG_OIDC_ISSUER", ISSUER)
-    monkeypatch.setenv("RAG_OIDC_JWKS_URL", jwks_server.url)
-    monkeypatch.setenv("RAG_OIDC_JWKS_REFRESH_SECONDS", "0")
+    monkeypatch.setenv("OIDC_ENABLED", "1")
+    monkeypatch.setenv("OIDC_ISSUER", ISSUER)
+    monkeypatch.setenv("OIDC_JWKS_URL", jwks_server.url)
+    monkeypatch.setenv("OIDC_JWKS_REFRESH_SECONDS", "0")
 
 
 def _setup_key(server: _JwksServer, key_id: str = KID) -> dict:
@@ -498,7 +498,7 @@ def test_create_with_no_identity_stamps_anonymous(rest_client, monkeypatch):
     ``anonymous`` (no identity to name)."""
     client, dm = rest_client
     monkeypatch.delenv(cr.CLIENTS_ENV, raising=False)
-    monkeypatch.setenv("RAG_OIDC_ENABLED", "0")  # keep registry_configured() False
+    monkeypatch.setenv("OIDC_ENABLED", "0")  # keep registry_configured() False
     r = client.post("/api/datasets", json={"name": "bare"}, headers=_ADMIN)
     assert r.status_code == 200
     assert dm._read_meta_raw("bare")["created_by"] == "anonymous"
@@ -963,10 +963,10 @@ def test_whoami_flags_sso_enabled_shape(rest_client, jwks_server, monkeypatch):
     """flags.sso_enabled reports the D22 flow's configured state."""
     client, _dm = rest_client
     key = _setup_key(jwks_server)
-    monkeypatch.setenv("RAG_OIDC_SSO_ENABLED", "1")
-    monkeypatch.setenv("RAG_OIDC_SSO_CLIENT_ID", "ua")
-    monkeypatch.setenv("RAG_OIDC_SSO_CLIENT_SECRET", "sso-secret")
-    monkeypatch.setenv("RAG_OIDC_SSO_REDIRECT_URI", "https://rag.example/oauth/oidc/callback")
+    monkeypatch.setenv("OIDC_SSO_ENABLED", "1")
+    monkeypatch.setenv("OIDC_SSO_CLIENT_ID", "ua")
+    monkeypatch.setenv("OIDC_SSO_CLIENT_SECRET", "sso-secret")
+    monkeypatch.setenv("OIDC_SSO_REDIRECT_URI", "https://rag.example/oauth/oidc/callback")
     r = client.get("/api/oidc-session", headers={"Authorization": f"Bearer {_mint(key, _claims(preferred='alice'))}"})
     assert r.json()["flags"]["sso_enabled"] is True
 
@@ -1038,11 +1038,11 @@ def test_gate_401_page_links_sso_login_when_enabled(rest_client, monkeypatch, jw
     client, _dm = rest_client
     _setup_key(jwks_server)
     monkeypatch.setenv("RAG_SSO_GATE", "1")
-    monkeypatch.setenv("RAG_OIDC_SSO_ENABLED", "1")
-    monkeypatch.setenv("RAG_OIDC_SSO_CLIENT_ID", "ua")
-    monkeypatch.setenv("RAG_OIDC_SSO_CLIENT_SECRET", "sso-secret")
-    monkeypatch.setenv("RAG_OIDC_SSO_REDIRECT_URI", "https://rag.example/oauth/oidc/callback")
-    monkeypatch.setenv("RAG_OIDC_SSO_PROVIDER_URL", "https://oidc.test/.well-known/openid-configuration")
+    monkeypatch.setenv("OIDC_SSO_ENABLED", "1")
+    monkeypatch.setenv("OIDC_SSO_CLIENT_ID", "ua")
+    monkeypatch.setenv("OIDC_SSO_CLIENT_SECRET", "sso-secret")
+    monkeypatch.setenv("OIDC_SSO_REDIRECT_URI", "https://rag.example/oauth/oidc/callback")
+    monkeypatch.setenv("OIDC_SSO_PROVIDER_URL", "https://oidc.test/.well-known/openid-configuration")
     import multimodal_rag.utils.oidc_sso as oidc_sso_module
 
     monkeypatch.setattr(oidc_sso_module, "_discovery_cache", {})
@@ -1051,7 +1051,7 @@ def test_gate_401_page_links_sso_login_when_enabled(rest_client, monkeypatch, jw
     assert r.status_code == 401
     assert "/oauth/login" in r.text
     # SSO disabled → no link (the honest message only).
-    monkeypatch.setenv("RAG_OIDC_SSO_ENABLED", "0")
+    monkeypatch.setenv("OIDC_SSO_ENABLED", "0")
     monkeypatch.setattr(oidc_sso_module, "_discovery_cache", {})
     r2 = client.get("/")
     assert r2.status_code == 401

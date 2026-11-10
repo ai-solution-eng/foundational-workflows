@@ -18,6 +18,19 @@ All notable changes to this project are tracked here. Format loosely follows [Ke
   the previous always-skip behavior.
 
 ### Changed
+- **OIDC env vars are app-agnostic now: `OIDC_*` / `OIDC_SSO_*` instead of
+  `RAG_OIDC_*` / `RAG_OIDC_SSO_*`.** The names are deployment-wide, not
+  RAG-owned — the shared verifier lives in `pcai_utils` and is consumed by
+  several apps, so claiming a `RAG_` prefix was misleading (a non-RAG app had
+  to fork it just to rename the variables). The `security.oidc.*` and
+  `security.oidc.sso.*` values are UNCHANGED — only the env names the charts
+  render changed, in all three charts. The previous `RAG_OIDC_*` names are
+  still READ as a deprecated alias (one warning per name), so a pod still
+  running the old chart keeps working through the roll; the alias goes away
+  once every chart ships the new names. Same change adds
+  `JWKS_FORCE_MIN_INTERVAL` (default 60 s): the unknown-`kid` forced-refetch
+  rate limit, so an UNAUTHENTICATED garbage token with a random `kid` cannot
+  drive one outbound JWKS fetch per request.
 - **The Sign out button is hidden for SSO/OIDC sessions.** It only ever
   forgot a locally stored API key; an SSO session is owned by the identity
   provider (the platform edge's cookie or the D22 HttpOnly session cookie),

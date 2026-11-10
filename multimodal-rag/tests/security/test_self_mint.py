@@ -184,22 +184,22 @@ def _clean_env(monkeypatch, tmp_path):
         "MEMORY_DATASET",
         "RAG_MEMORY_DATASET",
         "RAG_TRUST_PROXY_IDENTITY",
-        "RAG_OIDC_SSO_ENABLED",
-        "RAG_OIDC_SSO_CLIENT_ID",
-        "RAG_OIDC_SSO_CLIENT_SECRET",
-        "RAG_OIDC_SSO_REDIRECT_URI",
+        "OIDC_SSO_ENABLED",
+        "OIDC_SSO_CLIENT_ID",
+        "OIDC_SSO_CLIENT_SECRET",
+        "OIDC_SSO_REDIRECT_URI",
     ):
         monkeypatch.delenv(name, raising=False)
     for name in (
-        "RAG_OIDC_ENABLED",
-        "RAG_OIDC_ISSUER",
-        "RAG_OIDC_AUDIENCE",
-        "RAG_OIDC_IDENTITY_CLAIM",
-        "RAG_OIDC_JWKS_URL",
-        "RAG_OIDC_JWKS_REFRESH_SECONDS",
-        "RAG_OIDC_OBSERVED_TTL",
-        "RAG_OIDC_FETCH_TIMEOUT_SECONDS",
-        "RAG_OIDC_CLOCK_SKEW_SECONDS",
+        "OIDC_ENABLED",
+        "OIDC_ISSUER",
+        "OIDC_AUDIENCE",
+        "OIDC_IDENTITY_CLAIM",
+        "OIDC_JWKS_URL",
+        "OIDC_JWKS_REFRESH_SECONDS",
+        "OIDC_OBSERVED_TTL",
+        "OIDC_FETCH_TIMEOUT_SECONDS",
+        "OIDC_CLOCK_SKEW_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("DATA_PATH", str(tmp_path))
@@ -228,10 +228,10 @@ def _clean_env(monkeypatch, tmp_path):
 def _oidc_on(monkeypatch, jwks_server):
     """Default per-test OIDC wiring: enabled, the loopback JWKS, refetch on
     every verify (TTL 0) — order-independent, the test_oidc_identity way."""
-    monkeypatch.setenv("RAG_OIDC_ENABLED", "1")
-    monkeypatch.setenv("RAG_OIDC_ISSUER", ISSUER)
-    monkeypatch.setenv("RAG_OIDC_JWKS_URL", jwks_server.url)
-    monkeypatch.setenv("RAG_OIDC_JWKS_REFRESH_SECONDS", "0")
+    monkeypatch.setenv("OIDC_ENABLED", "1")
+    monkeypatch.setenv("OIDC_ISSUER", ISSUER)
+    monkeypatch.setenv("OIDC_JWKS_URL", jwks_server.url)
+    monkeypatch.setenv("OIDC_JWKS_REFRESH_SECONDS", "0")
 
 
 def _setup_key(server: _JwksServer, key_id: str = KID) -> dict:

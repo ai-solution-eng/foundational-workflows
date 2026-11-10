@@ -339,8 +339,8 @@ def registry_configured() -> bool:
     a restart; leaving both unset keeps the single-key behaviour
     byte-identical.
 
-    D21: a fully configured OIDC resolver (``RAG_OIDC_ENABLED`` +
-    ``RAG_OIDC_ISSUER``) counts as configured too — a JWT-only deployment
+    D21: a fully configured OIDC resolver (``OIDC_ENABLED`` +
+    ``OIDC_ISSUER``) counts as configured too — a JWT-only deployment
     must resolve identities (the D20 anonymous branch must NOT engage there),
     and once this returns True JWTs resolve through oidc_identity below.
 

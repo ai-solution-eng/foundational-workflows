@@ -50,7 +50,7 @@ from multimodal_rag.utils import oidc_identity as oidc
 # Synthetic crypto: keys, JWK encoding, token minting (no jwt lib needed)
 # ===========================================================================
 
-#: A fixed fake https issuer — ``iss`` is COMPARED to ``RAG_OIDC_ISSUER``,
+#: A fixed fake https issuer — ``iss`` is COMPARED to ``OIDC_ISSUER``,
 #: never fetched, so a non-existent https URL is safe; only the JWKS URL is
 #: fetched (always 127.0.0.1 here).
 ISSUER = "https://oidc.test/realm-test"
@@ -202,6 +202,18 @@ def jwks_server():
 # ===========================================================================
 
 _OIDC_ENV_NAMES = (
+    # canonical, app-agnostic names (what the charts render)
+    "OIDC_ENABLED",
+    "OIDC_ISSUER",
+    "OIDC_AUDIENCE",
+    "OIDC_IDENTITY_CLAIM",
+    "OIDC_JWKS_URL",
+    "OIDC_JWKS_REFRESH_SECONDS",
+    "OIDC_OBSERVED_TTL",
+    "OIDC_FETCH_TIMEOUT_SECONDS",
+    "OIDC_CLOCK_SKEW_SECONDS",
+    "JWKS_FORCE_MIN_INTERVAL",
+    # deprecated RAG_ aliases — cleared too, so a developer shell cannot leak
     "RAG_OIDC_ENABLED",
     "RAG_OIDC_ISSUER",
     "RAG_OIDC_AUDIENCE",
@@ -211,6 +223,7 @@ _OIDC_ENV_NAMES = (
     "RAG_OIDC_OBSERVED_TTL",
     "RAG_OIDC_FETCH_TIMEOUT_SECONDS",
     "RAG_OIDC_CLOCK_SKEW_SECONDS",
+    "RAG_JWKS_FORCE_MIN_INTERVAL",
 )
 
 
@@ -241,6 +254,8 @@ def _clean_env(monkeypatch, tmp_path):
     # ar._mtime_cache.clear() house pattern).
     oidc._jwks_cache.clear()
     oidc._jwks_negative.clear()
+    oidc._jwks_fetching.clear()
+    oidc._forced_refetch_at.clear()
     oidc._observed_throttle.clear()
     oidc._observed_cache.clear()
     yield
@@ -248,6 +263,8 @@ def _clean_env(monkeypatch, tmp_path):
     acc._mtime_cache.clear()
     oidc._jwks_cache.clear()
     oidc._jwks_negative.clear()
+    oidc._jwks_fetching.clear()
+    oidc._forced_refetch_at.clear()
     oidc._observed_throttle.clear()
     oidc._observed_cache.clear()
 
@@ -259,10 +276,10 @@ def _oidc_on(monkeypatch, jwks_server):
     independent regardless of how the implementation caches.  Cache-behaviour
     tests below override the TTL and mint with their OWN issuer (so a cache
     keyed by URL or issuer alike cannot leak between tests)."""
-    monkeypatch.setenv("RAG_OIDC_ENABLED", "1")
-    monkeypatch.setenv("RAG_OIDC_ISSUER", ISSUER)
-    monkeypatch.setenv("RAG_OIDC_JWKS_URL", jwks_server.url)
-    monkeypatch.setenv("RAG_OIDC_JWKS_REFRESH_SECONDS", "0")
+    monkeypatch.setenv("OIDC_ENABLED", "1")
+    monkeypatch.setenv("OIDC_ISSUER", ISSUER)
+    monkeypatch.setenv("OIDC_JWKS_URL", jwks_server.url)
+    monkeypatch.setenv("OIDC_JWKS_REFRESH_SECONDS", "0")
 
 
 def _setup_key(server: _JwksServer, key_id: str = KID) -> dict:
@@ -397,12 +414,12 @@ def test_garbage_signed_payload_rejected(monkeypatch, jwks_server):
 
 
 def test_issuer_unset_while_enabled_is_inert(monkeypatch, capsys):
-    """Enabled WITHOUT RAG_OIDC_ISSUER: the resolver is inert — ``None``
+    """Enabled WITHOUT OIDC_ISSUER: the resolver is inert — ``None``
     everywhere, no exception — and the misconfiguration screams once at
     startup (the implementation prints the warning via
     ``warn_if_misconfigured`` rather than logging it; the behaviour, not the
     log plumbing, is what is pinned)."""
-    monkeypatch.delenv("RAG_OIDC_ISSUER", raising=False)
+    monkeypatch.delenv("OIDC_ISSUER", raising=False)
     assert oidc.oidc_enabled() is False
     key = _generate_rsa()
     token = _mint(key, _claims())
@@ -411,7 +428,7 @@ def test_issuer_unset_while_enabled_is_inert(monkeypatch, capsys):
     assert cr.resolve_presented([token]) is None
     # The startup warning fires exactly for this state.
     assert oidc.warn_if_misconfigured("unit-test") is True
-    assert "RAG_OIDC_ISSUER" in capsys.readouterr().out
+    assert "OIDC_ISSUER" in capsys.readouterr().out
 
 
 # ===========================================================================
@@ -456,14 +473,14 @@ def test_resolve_jwt_unknown_user_empty_datasets_fail_closed(monkeypatch, jwks_s
 
 
 def test_resolve_jwt_disabled_is_none(monkeypatch, jwks_server):
-    monkeypatch.setenv("RAG_OIDC_ENABLED", "0")
+    monkeypatch.setenv("OIDC_ENABLED", "0")
     key = _setup_key(jwks_server)
     assert oidc.resolve_jwt(_mint(key, _claims())) is None
 
 
 def test_identity_claim_override_to_sub(monkeypatch, jwks_server):
     key = _setup_key(jwks_server)
-    monkeypatch.setenv("RAG_OIDC_IDENTITY_CLAIM", "sub")
+    monkeypatch.setenv("OIDC_IDENTITY_CLAIM", "sub")
     monkeypatch.setenv(cr.ACLS_ENV, "upstream-sub-123:ds9")
     token = _mint(key, _claims(sub="upstream-sub-123", preferred="andrew-bydlon"))
     ident = oidc.resolve_jwt(token)
@@ -571,16 +588,16 @@ def test_registry_configured_with_oidc_enabled_alone(monkeypatch):
 
 
 def test_registry_configured_all_disabled(monkeypatch):
-    monkeypatch.setenv("RAG_OIDC_ENABLED", "0")
+    monkeypatch.setenv("OIDC_ENABLED", "0")
     assert cr.registry_configured() is False
 
 
 def test_registry_configured_reads_env_per_request(monkeypatch):
-    monkeypatch.setenv("RAG_OIDC_ENABLED", "0")
+    monkeypatch.setenv("OIDC_ENABLED", "0")
     assert cr.registry_configured() is False
-    monkeypatch.setenv("RAG_OIDC_ENABLED", "1")
+    monkeypatch.setenv("OIDC_ENABLED", "1")
     assert cr.registry_configured() is True
-    monkeypatch.setenv("RAG_OIDC_ENABLED", "0")
+    monkeypatch.setenv("OIDC_ENABLED", "0")
     assert cr.registry_configured() is False
 
 
@@ -669,7 +686,7 @@ def test_observed_identities_recorded_on_success(monkeypatch, jwks_server):
 def test_observed_ttl_throttles_last_seen(monkeypatch, jwks_server):
     key = _setup_key(jwks_server)
     monkeypatch.setenv(cr.ACLS_ENV, "andrew-bydlon:ds1")
-    monkeypatch.setenv("RAG_OIDC_OBSERVED_TTL", "3600")
+    monkeypatch.setenv("OIDC_OBSERVED_TTL", "3600")
     token = _mint(key, _claims())
 
     def _entry():
@@ -682,7 +699,7 @@ def test_observed_ttl_throttles_last_seen(monkeypatch, jwks_server):
     oidc.resolve_jwt(token)
     second = _entry()
     assert second["last_seen"] == first["last_seen"], (
-        "within RAG_OIDC_OBSERVED_TTL an immediate re-resolution must not bump last_seen"
+        "within OIDC_OBSERVED_TTL an immediate re-resolution must not bump last_seen"
     )
 
 
@@ -835,7 +852,7 @@ def test_d20_anon_behaviour_unchanged_when_oidc_disabled(monkeypatch, rest_clien
     """With OIDC disabled and nothing else configured, the D20 fail-closed
     default is byte-identical: REST unconfigured anon (empty listing / 403 on
     dataset paths), MCP anonymous memory identity."""
-    monkeypatch.setenv("RAG_OIDC_ENABLED", "0")
+    monkeypatch.setenv("OIDC_ENABLED", "0")
     r = rest_client.get("/api/datasets")
     assert r.status_code == 200
     assert r.json()["datasets"] == []
@@ -898,8 +915,13 @@ def test_unknown_kid_refetches_within_cache_ttl(monkeypatch, jwks_server):
     JWKS must trigger a refetch — a rotated IdP signing key is honoured
     without waiting for the TTL."""
     cache_issuer = "https://oidc.test/realm-cache"
-    monkeypatch.setenv("RAG_OIDC_ISSUER", cache_issuer)
-    monkeypatch.setenv("RAG_OIDC_JWKS_REFRESH_SECONDS", "3600")
+    monkeypatch.setenv("OIDC_ISSUER", cache_issuer)
+    monkeypatch.setenv("OIDC_JWKS_REFRESH_SECONDS", "3600")
+    # This test isolates ROTATION LATENCY, so it disables the separate
+    # unknown-kid forced-refetch rate limit (60 s default): the first
+    # unknown kid below already spends the window.  The limit itself is
+    # pinned by test_unknown_kid_forced_refetch_is_rate_limited.
+    monkeypatch.setenv("JWKS_FORCE_MIN_INTERVAL", "0")
     stale = _generate_rsa("stale-kid")
     rotated = _generate_rsa("rotated-kid")
     jwks_server.set(_jwks_doc(stale))
@@ -911,6 +933,37 @@ def test_unknown_kid_refetches_within_cache_ttl(monkeypatch, jwks_server):
     # refetch and the same token now verifies WITHOUT the TTL expiring.
     jwks_server.set(_jwks_doc(rotated))
     assert oidc.verify_and_decode(token) is not None
+
+
+def test_unknown_kid_forced_refetch_is_rate_limited(monkeypatch, jwks_server):
+    """The unknown-kid force path is reachable with an UNAUTHENTICATED
+    garbage token, so it is rate-limited per JWKS URL (60 s default): five
+    bogus kids inside one window cost ONE extra fetch, not five."""
+    monkeypatch.setenv("OIDC_JWKS_REFRESH_SECONDS", "3600")
+    real = _setup_key(jwks_server)
+    assert oidc.verify_and_decode(_mint(real, _claims())) is not None
+    hits_warm = jwks_server.hits
+    for i in range(5):
+        bogus = _mint(_generate_rsa(f"bogus-{i}"), _claims())
+        assert oidc.verify_and_decode(bogus) is None
+    assert jwks_server.hits - hits_warm == 1, (
+        "the unknown-kid force path must cost ONE fetch per window, not one per token"
+    )
+
+
+def test_legacy_rag_env_names_still_activate_the_resolver(monkeypatch, jwks_server):
+    """Transitional compat: a pod still running the PRE-RENAME chart exports
+    RAG_OIDC_* — the shared module must keep honouring it until the chart
+    rolls.  Canonical names are unset here, so only the alias can match."""
+    monkeypatch.delenv("OIDC_ENABLED", raising=False)
+    monkeypatch.delenv("OIDC_ISSUER", raising=False)
+    monkeypatch.delenv("OIDC_JWKS_URL", raising=False)
+    monkeypatch.setenv("RAG_OIDC_ENABLED", "1")
+    monkeypatch.setenv("RAG_OIDC_ISSUER", ISSUER)
+    monkeypatch.setenv("RAG_OIDC_JWKS_URL", jwks_server.url)
+    key = _setup_key(jwks_server)
+    assert oidc.oidc_enabled() is True
+    assert oidc.verify_and_decode(_mint(key, _claims())) is not None
 
 
 # ===========================================================================
@@ -987,7 +1040,7 @@ def test_rest_oidc_session_whoami(rest_client, monkeypatch, jwks_server):
         "/api/oidc-session", headers={"Authorization": f"Bearer {_mint(key, _claims(exp=_now() - 9999))}"}
     )
     assert bad.json() == {"authenticated": False}
-    monkeypatch.setenv("RAG_OIDC_ENABLED", "0")
+    monkeypatch.setenv("OIDC_ENABLED", "0")
     off = rest_client.get("/api/oidc-session", headers={"Authorization": f"Bearer {_mint(key, _claims())}"})
     assert off.json() == {"authenticated": False}
 
@@ -1025,7 +1078,7 @@ def test_rest_index_embeds_key_only_in_legacy_mode(rest_client, monkeypatch, jwk
     Any registry configuration: suppressed (read per request, no restart)."""
     _setup_key(jwks_server)  # issuer wired so the whoami probe is inert-clean
     monkeypatch.setattr(api, "_RAG_API_KEY", "deployment-admin-key")
-    monkeypatch.setenv("RAG_OIDC_ISSUER", "")  # keep OIDC out of the picture
+    monkeypatch.setenv("OIDC_ISSUER", "")  # keep OIDC out of the picture
     # Legacy mode: registry NOT configured → historical embedded-key page.
     r = rest_client.get("/")
     assert r.status_code == 200
@@ -1044,7 +1097,7 @@ def test_rest_oidc_session_with_admin_key_stays_anonymous_shaped(rest_client, mo
     embedded key must look exactly like the anonymous probe)."""
     _setup_key(jwks_server)
     monkeypatch.setattr(api, "_RAG_API_KEY", "deployment-admin-key")
-    monkeypatch.setenv("RAG_OIDC_ISSUER", "")  # OIDC off: the simplest shape
+    monkeypatch.setenv("OIDC_ISSUER", "")  # OIDC off: the simplest shape
     r = rest_client.get("/api/oidc-session", headers={"X-RAG-Api-Key": "deployment-admin-key"})
     assert r.json() == {"authenticated": False}
 
@@ -1109,11 +1162,11 @@ def sso_idp(monkeypatch, jwks_server):
     server = HTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
-    monkeypatch.setenv("RAG_OIDC_SSO_ENABLED", "1")
-    monkeypatch.setenv("RAG_OIDC_SSO_CLIENT_ID", "ua")
-    monkeypatch.setenv("RAG_OIDC_SSO_CLIENT_SECRET", "sso-secret")
-    monkeypatch.setenv("RAG_OIDC_SSO_REDIRECT_URI", "https://rag.example/oauth/oidc/callback")
-    monkeypatch.setenv("RAG_OIDC_SSO_PROVIDER_URL", f"{base}/.well-known/openid-configuration")
+    monkeypatch.setenv("OIDC_SSO_ENABLED", "1")
+    monkeypatch.setenv("OIDC_SSO_CLIENT_ID", "ua")
+    monkeypatch.setenv("OIDC_SSO_CLIENT_SECRET", "sso-secret")
+    monkeypatch.setenv("OIDC_SSO_REDIRECT_URI", "https://rag.example/oauth/oidc/callback")
+    monkeypatch.setenv("OIDC_SSO_PROVIDER_URL", f"{base}/.well-known/openid-configuration")
     monkeypatch.setattr(oidc_sso_module, "_discovery_cache", {})
     monkeypatch.setattr(oidc_sso_module, "_discovery_negative", {})
     yield {"base": base, "minted": minted, "hits": hits}
@@ -1506,7 +1559,7 @@ def test_rest_index_embeds_no_key_in_d16_store_only_mode(rest_client, monkeypatc
     master key was served on the public page)."""
     _setup_key(jwks_server)
     monkeypatch.setattr(api, "_RAG_API_KEY", "deployment-admin-key")
-    monkeypatch.setenv("RAG_OIDC_ISSUER", "")
+    monkeypatch.setenv("OIDC_ISSUER", "")
     monkeypatch.setenv(cr.CLIENTS_ENV, "")  # no env registry
     monkeypatch.setenv("RAG_ACCESS_ADMIN_FILE", "")  # overlay follows the store
     monkeypatch.setenv("RAG_ACCESS_STORE", "1")  # D16 only
@@ -1523,7 +1576,7 @@ def test_rest_index_embeds_no_key_under_trust_proxy_identity(rest_client, monkey
     the embedded-key legacy fallback must not engage there either."""
     _setup_key(jwks_server)
     monkeypatch.setattr(api, "_RAG_API_KEY", "deployment-admin-key")
-    monkeypatch.setenv("RAG_OIDC_ISSUER", "")
+    monkeypatch.setenv("OIDC_ISSUER", "")
     monkeypatch.setenv(cr.CLIENTS_ENV, "")
     monkeypatch.setenv("RAG_ACCESS_STORE", "")
     monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")

@@ -63,7 +63,7 @@ def mcp_auth_warn_if_open() -> bool:
     from multimodal_rag.utils.mcp_auth import warn_if_open
 
     warn_if_open("multimodal-rag-mcp", AUTH_ENV_NAMES)
-    # D21: RAG_OIDC_ENABLED without RAG_OIDC_ISSUER leaves the resolver
+    # D21: OIDC_ENABLED without OIDC_ISSUER leaves the resolver
     # inert (every JWT 401s, fail-closed) — say so once, loudly.
     from multimodal_rag.utils import oidc_identity
 

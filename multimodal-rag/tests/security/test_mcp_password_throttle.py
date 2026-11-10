@@ -64,7 +64,7 @@ def _clean_state(monkeypatch):
     monkeypatch.delenv("RAG_API_KEY_CLIENTS", raising=False)
     monkeypatch.delenv("RAG_DATASET_ACLS", raising=False)
     monkeypatch.delenv("RAG_API_KEY", raising=False)
-    monkeypatch.delenv("RAG_OIDC_ENABLED", raising=False)
+    monkeypatch.delenv("OIDC_ENABLED", raising=False)
     monkeypatch.delenv("RAG_ACCESS_STORE", raising=False)
     mcp._unlocked.clear()
     mcp._mcp_pw_fail_buckets.clear()
