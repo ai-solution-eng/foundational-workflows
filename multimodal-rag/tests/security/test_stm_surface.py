@@ -560,6 +560,16 @@ class _McpDM:
         m = self.metas.get(name)
         return (m or {}).get("created_by")
 
+    def has_password(self, name):
+        # Wave-2: end_short_term_memory now carries the REST password gate, so
+        # the double has to answer the same two questions a real manager does.
+        # STM datasets are created passwordless — False unless a test plants a
+        # hash.
+        return bool((self.metas.get(name) or {}).get("password_hash"))
+
+    def verify_password(self, name, password):
+        return str((self.metas.get(name) or {}).get("password_hash") or "") == str(password)
+
     def delete_dataset(self, name):
         if name not in self.metas:
             raise FileNotFoundError(name)
@@ -616,8 +626,8 @@ def _mcp_create(call, session_id="mcp-sess", **extra):
     return call("create_short_term_memory", {"session_id": session_id, **extra})
 
 
-def _mcp_end(call, dataset_name):
-    return call("end_short_term_memory", {"dataset_name": dataset_name})
+def _mcp_end(call, dataset_name, **extra):
+    return call("end_short_term_memory", {"dataset_name": dataset_name, **extra})
 
 
 def test_mcp_create_mints_and_stamps_no_password(mcp_env):
@@ -700,7 +710,11 @@ def test_mcp_end_by_non_owner_refused(mcp_env, monkeypatch):
     try:
         status, text = _mcp_end(call, name)
         assert status == "error"
-        assert "owned by 'alice'" in text
+        # P1-5 (audit 2026-11-10): ONE nameless refusal for every non-owner
+        # outcome - the same body REST returns.  The old "owned by" text was
+        # an ownership + existence oracle for a stranger.
+        assert "not permitted" in text
+        assert "alice" not in text
     finally:
         cr.reset_current_identity(token)
     assert name in dm.metas  # still there
@@ -714,20 +728,43 @@ def test_mcp_end_by_non_owner_refused(mcp_env, monkeypatch):
     assert name not in dm.metas
 
 
-def test_mcp_end_nonexistent_says_not_found_not_pre_d23(mcp_env, monkeypatch):
-    """F4 (mutation M4 target): ending a NONEXISTENT dataset says "not
-    found" — never the false 'predates dataset ownership' claim."""
-    call, _ = mcp_env
-    monkeypatch.setenv(cr.CLIENTS_ENV, "bob:bob-key")
-    monkeypatch.setenv(cr.ACLS_ENV, "bob:some-other-ds")
+def test_mcp_end_non_owner_is_not_an_existence_oracle(mcp_env, monkeypatch):
+    """P1-5 (audit 2026-11-10): the MCP twin answers EVERY non-owner outcome
+    with ONE nameless refusal - the contract REST has had since its F3 fix.
+
+    Before this the tool read the meta FIRST and then branched, so a stranger
+    could tell "does not exist" from "exists but not mine" from "exists, no
+    creator stamp" from "exists, wrong kind" - an existence + ownership +
+    kind oracle over dataset names.  The F4 intent this replaces ("never the
+    false predates claim") is preserved by the message-equality check below,
+    which is strictly stronger."""
+    call, dm = mcp_env
+    monkeypatch.setenv(cr.CLIENTS_ENV, "alice:alice-key;bob:bob-key")
+    monkeypatch.setenv(cr.ACLS_ENV, "alice:*")
+    dm.metas["stm-alice"] = {"name": "stm-alice", "created_by": "alice", "kind": "short_term"}
     token = cr.set_current_identity(cr.resolve_presented(["bob-key"]))
     try:
-        status, text = _mcp_end(call, "stm-doesnotexist0")
-        assert status == "error"
-        assert "not found" in text
-        assert "predates" not in text
+        status_missing, text_missing = _mcp_end(call, "stm-doesnotexist0")
+        status_existing, text_existing = _mcp_end(call, "stm-alice")
     finally:
         cr.reset_current_identity(token)
+    assert status_missing == status_existing == "error"
+    # MESSAGE EQUALITY is the whole point: the ONLY variable may be the name
+    # the caller already typed (the ACL gate echoes its own input, which is
+    # not an oracle).  Everything else must be identical.
+    assert text_missing.replace("stm-doesnotexist0", "<name>") == text_existing.replace("stm-alice", "<name>")
+    for leak in ("not found", "owned by", "predates", "short-term-memory"):
+        assert leak not in text_missing, "non-owner denial leaks: " + text_missing
+    assert "not permitted" in text_missing
+    assert "stm-alice" in dm.metas  # never deleted
+    # An ADMIN still gets the specific 404 (an admin sees every dataset anyway).
+    token = cr.set_current_identity(cr.resolve_presented(["deployment-admin-key"]))
+    try:
+        status, text = _mcp_end(call, "stm-doesnotexist0")
+    finally:
+        cr.reset_current_identity(token)
+    assert status == "error"
+    assert "not found" in text
 
 
 def test_mcp_end_refuses_normal_dataset(mcp_env, monkeypatch):
@@ -772,7 +809,9 @@ def test_mcp_end_admin_can_end_any_stm_but_not_normal(mcp_env, monkeypatch):
 
 
 def test_mcp_end_pre_d23_stm_admin_only(mcp_env, monkeypatch):
-    """An STM dataset with no created_by stamp is admin-only on MCP too."""
+    """An STM dataset with no created_by stamp is admin-only on MCP too - and
+    a non-owner learns NOTHING about it (P1-5: one nameless refusal, so the
+    old "predates dataset ownership" wording is gone)."""
     call, dm = mcp_env
     dm.metas["stm-pre23"] = {"name": "stm-pre23", "kind": "short_term"}  # no stamp
     monkeypatch.setenv(cr.CLIENTS_ENV, "bob:bob-key")
@@ -781,9 +820,18 @@ def test_mcp_end_pre_d23_stm_admin_only(mcp_env, monkeypatch):
     try:
         status, text = _mcp_end(call, "stm-pre23")
         assert status == "error"
-        assert "predates dataset ownership" in text  # TRUE here: it exists
+        assert "not permitted" in text
+        assert "predates" not in text  # the old false claim is gone
     finally:
         cr.reset_current_identity(token)
+    assert "stm-pre23" in dm.metas
+    token = cr.set_current_identity(cr.resolve_presented(["deployment-admin-key"]))
+    try:
+        status, text = _mcp_end(call, "stm-pre23")
+        assert status == "ok", text
+    finally:
+        cr.reset_current_identity(token)
+    assert "stm-pre23" not in dm.metas
 
 
 def test_mcp_list_datasets_hides_short_term(mcp_env):
@@ -854,3 +902,59 @@ def test_mcp_create_collision_does_not_echo_the_minted_name(mcp_env):
     # ...and the original dataset is untouched.
     assert name in dm.metas
     _mcp_end(call, name)
+
+
+def test_mcp_end_consults_the_dataset_acl_first(mcp_env, monkeypatch):
+    """Wave-2 (cross-review): the ACL gate runs on this tool exactly like its
+    siblings.  The REST twin gets it from the auth middleware's
+    /api/datasets path check; this tool lives OUTSIDE that path, so without an
+    explicit call an ACL-rescoped key could still delete through MCP."""
+    import multimodal_rag.mcp_server as mcp
+
+    call, dm = mcp_env
+    dm.metas["stm-acl"] = {"name": "stm-acl", "kind": "short_term", "created_by": "own"}
+    monkeypatch.setenv(cr.CLIENTS_ENV, "own:own-key")
+    monkeypatch.setenv(cr.ACLS_ENV, "own:some-other-ds")
+    seen = []
+
+    def _deny(ident, name):
+        seen.append(name)
+        return False
+
+    monkeypatch.setattr(mcp._access, "dataset_allowed", _deny)
+    token = cr.set_current_identity(cr.resolve_presented(["own-key"]))
+    try:
+        status, text = _mcp_end(call, "stm-acl")
+    finally:
+        cr.reset_current_identity(token)
+    assert seen == ["stm-acl"], "the ACL gate must be consulted before anything else"
+    assert status == "error"
+    assert "not permitted" in text
+    assert "stm-acl" in dm.metas
+
+
+def test_mcp_end_requires_the_password_when_one_is_set(mcp_env, monkeypatch):
+    """Wave-2: invariant 7 — a hand-set password is proved on the MCP delete
+    exactly as REST demands it (api_server.api_end_short_term_memory calls
+    _require_dataset_password).  STM datasets are created without one, so the
+    gate is inert for the normal case and real for the hand-edited one."""
+    call, dm = mcp_env
+    monkeypatch.setenv(cr.CLIENTS_ENV, "own:own-key")
+    monkeypatch.setenv(cr.ACLS_ENV, "own:*")
+    dm.metas["stm-prot"] = {
+        "name": "stm-prot",
+        "kind": "short_term",
+        "created_by": "own",
+        "password_hash": "s3cret",
+    }
+    token = cr.set_current_identity(cr.resolve_presented(["own-key"]))
+    try:
+        status, text = _mcp_end(call, "stm-prot")
+        assert status == "error"
+        assert "assword" in text
+        assert "stm-prot" in dm.metas  # not deleted without the proof
+        status, text = _mcp_end(call, "stm-prot", password="s3cret")
+        assert status == "ok", text
+    finally:
+        cr.reset_current_identity(token)
+    assert "stm-prot" not in dm.metas

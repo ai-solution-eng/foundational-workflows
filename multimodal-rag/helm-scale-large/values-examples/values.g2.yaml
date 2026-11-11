@@ -35,7 +35,7 @@ replicaCount: 4
 
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v6.2.3
+  tag: v6.3.2
   pullPolicy: IfNotPresent
 
 qdrant:
@@ -217,8 +217,11 @@ security:
   mediaTokenSecret: ''
   mediaTokenTtl: 3600
 
-  # TRUE by choice (chart default is now false): this site's every path
-  # traverses the enforcing oauth2-proxy AuthorizationPolicy below.
+  # TRUE by choice (chart default is now false).  P3-9 (2026-11-10 audit):
+  # the AuthorizationPolicy below selects only the istio: ingressgateway
+  # pods, so a direct ClusterIP call never traverses it — the actual
+  # protection is the D21 forwarded-token assertion (fail-closed); enable
+  # networkPolicy for the full posture.
   trustProxyIdentity: true
   accessStore: true
   accessSelfMint: true

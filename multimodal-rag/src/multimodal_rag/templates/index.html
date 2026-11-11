@@ -821,12 +821,18 @@
     <div class="tab-content active" id="tab-upload">
       <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
         <div class="icon">📁</div>
-        <p>Drop files here or click to browse</p>
-        <p style="font-size:.8rem;margin-top:4px">PDF, images, videos, audio, text files supported</p>
+        <p>Drop files or a folder here, or click to browse</p>
+        <p style="font-size:.8rem;margin-top:4px">PDF, images, videos, audio, text files supported · a dropped folder uploads every file inside it</p>
         <input type="file" id="file-input" multiple hidden onchange="handleFiles(this.files)">
       </div>
+      <!-- Folder intake: webkitdirectory turns this dialog into a directory
+           picker, so one gesture adds a whole tree. Kept OUTSIDE #drop-zone:
+           its click handler opens the file dialog, and a programmatic click on
+           a child input would bubble back into that handler. -->
+      <input type="file" id="folder-input" webkitdirectory multiple hidden onchange="onFolderPicked(this)">
       <div id="upload-status" style="margin-top:12px"></div>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <button class="btn btn-outline btn-sm" id="pick-folder-btn" onclick="pickFolder()" title="Upload every file inside a folder, subfolders included (hidden entries such as .git are skipped)">📂 Upload Folder</button>
         <button id="clear-upload-btn" onclick="clearUploadList()" title="Clear the uploaded-file list below" style="display:none;font-size:.8rem;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer">✕ Clear List</button>
         <button id="retry-btn" onclick="retryFailed()" style="display:none;font-size:.8rem;padding:4px 12px;border-radius:4px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer">↻ Retry Failed</button>
       </div>
@@ -1532,8 +1538,129 @@ dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-ove
 dropZone.addEventListener('drop', e => {
   e.preventDefault();
   dropZone.classList.remove('drag-over');
-  handleFiles(e.dataTransfer.files);
+  // A dropped folder arrives as a zero-byte File that looks exactly like an
+  // empty file, so the entries API is the only way to reach its contents.
+  // The entries are resolved SYNCHRONOUSLY here — a DataTransfer is only
+  // readable during the drop — and their contents are read asynchronously.
+  const { entries, loose } = _droppedItems(e.dataTransfer);
+  if (entries.length === 0) { handleFiles(e.dataTransfer.files); return; }
+  handleDroppedEntries(entries, loose).catch(err => toast(`Folder read failed: ${(err && err.message) || err}`, 'error'));
 });
+
+// -----------------------------------------------------------------------
+// Folder intake
+// -----------------------------------------------------------------------
+// A folder is expanded into its files and then handed to the ordinary upload
+// pipeline: the files still travel in the same bounded multipart batches,
+// with the same per-file progress lines, retry bookkeeping and per-file size
+// cap. Only the INTAKE differs, so a folder cannot bypass any upload guard.
+//
+// Entries nobody wants ingested are skipped, the way a shell glob would: dot
+// entries (.git, .venv, .DS_Store), Office lock files (~$report.docx) and the
+// metadata files Windows/macOS leave in every folder.
+const _FOLDER_SKIP_NAMES = new Set(['thumbs.db', 'desktop.ini']);
+// One accidental drop of a project root can hold tens of thousands of files;
+// above this count the pick is confirmed first instead of silently queueing
+// hours of embedding work.
+const _FOLDER_CONFIRM_ABOVE = 1000;
+
+function _skipFolderName(name) {
+  const lower = name.toLowerCase();
+  return name.startsWith('.') || name.startsWith('~$') || _FOLDER_SKIP_NAMES.has(lower);
+}
+
+// A directory-picker path carries the whole tree, so skip when any segment
+// BELOW the picked root is a skipped entry: project/.git/objects/... must
+// never get through, while the root the user chose is taken as-is.
+function _skipRelativePath(relPath) {
+  return relPath.split('/').slice(1).some(seg => seg !== '' && _skipFolderName(seg));
+}
+
+// Split a drop into directory entries to walk and files to take as they are.
+// Some drag sources expose an item without an entry (an image dragged out of
+// another page), and the item/file lists can disagree in length, so every file
+// the item loop did not account for is kept instead of silently dropped.
+function _droppedItems(dataTransfer) {
+  const entries = [];
+  const loose = [];
+  if (!dataTransfer) return { entries, loose };
+  const files = dataTransfer.files ? Array.from(dataTransfer.files) : [];
+  if (!dataTransfer.items || dataTransfer.items.length === 0) return { entries, loose: files };
+  let fileIndex = 0;
+  for (const item of dataTransfer.items) {
+    if (item.kind !== 'file') continue;
+    const file = files[fileIndex++];
+    const entry = typeof item.webkitGetAsEntry === 'function' ? item.webkitGetAsEntry() : null;
+    if (entry) { entries.push(entry); continue; }
+    if (file) loose.push(file);
+  }
+  for (; fileIndex < files.length; fileIndex++) loose.push(files[fileIndex]);
+  return { entries, loose };
+}
+
+function _readFileEntry(entry) {
+  return new Promise(resolve => { entry.file(resolve, () => resolve(null)); });
+}
+
+function _readDirectoryBatch(reader) {
+  return new Promise((resolve, reject) => { reader.readEntries(resolve, reject); });
+}
+
+async function _walkDirectory(entry, out) {
+  const reader = entry.createReader();
+  for (;;) {
+    // readEntries answers ONE bounded batch per call; an empty batch is EOF.
+    const batch = await _readDirectoryBatch(reader);
+    if (batch.length === 0) return;
+    for (const child of batch) {
+      if (_skipFolderName(child.name)) continue;
+      if (child.isDirectory) { await _walkDirectory(child, out); continue; }
+      if (!child.isFile) continue;
+      const file = await _readFileEntry(child);
+      if (file) out.push(file);
+    }
+  }
+}
+
+async function handleDroppedEntries(entries, loose = []) {
+  if (!selectedDataset) { toast('Select a dataset first', 'error'); return; }
+  const files = [...loose];
+  for (const entry of entries) {
+    try {
+      if (entry.isDirectory) await _walkDirectory(entry, files);
+      else if (entry.isFile) {
+        const file = await _readFileEntry(entry);
+        if (file) files.push(file);
+      }
+    } catch (err) {
+      // One unreadable entry must not discard the rest of the drop.
+      console.warn('Skipping unreadable drop entry', entry.name, err);
+    }
+  }
+  await _queueUploads(files);
+}
+
+function onFolderPicked(input) {
+  const picked = Array.from(input.files || []);
+  input.value = '';   // re-picking the same folder must fire change again
+  if (!selectedDataset) { toast('Select a dataset first', 'error'); return; }
+  _queueUploads(picked.filter(f => !_skipRelativePath(f.webkitRelativePath || f.name)))
+    .catch(err => toast(`Folder upload failed: ${(err && err.message) || err}`, 'error'));
+}
+
+function pickFolder() {
+  if (!selectedDataset) { toast('Select a dataset first', 'error'); return; }
+  document.getElementById('folder-input').click();
+}
+
+async function _queueUploads(files) {
+  if (files.length === 0) { toast('Nothing to upload — no readable files were found', 'error'); return; }
+  if (files.length > _FOLDER_CONFIRM_ABOVE
+      && !confirm(`This selection holds ${files.length.toLocaleString()} files.\n\nQueue all of them for ingestion?`)) {
+    return;
+  }
+  await handleFiles(files);
+}
 
 // Track files for retry: [{name, file, done: bool, ok: bool}]
 let _retryFiles = [];

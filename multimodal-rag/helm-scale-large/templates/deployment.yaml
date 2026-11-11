@@ -31,6 +31,11 @@ spec:
       # tests/full_pipeline/test_kyverno_vendor_labels_render.py).
       labels:
         app: {{ .Values.deployment.appName }}
+        # M4 (wave-2 review): dedicated component label — the PDB for this
+        # Deployment selects on it, because CronJob pods carry the bare
+        # app=<appName> label and would otherwise zero the disruption budget
+        # while they wait out their qdrant readiness gate.
+        app.kubernetes.io/component: api
         hpe-ezua/type: vendor-service
         hpe-ezua/app: {{ .Chart.Name }}
     spec:
@@ -43,7 +48,7 @@ spec:
           # PINNED (audit 2026-10-16): busybox:latest is unpinned mutable
           # supply-chain surface for a root init container. resources keep the
           # chown walk from bursting node memory on large NFS trees.
-          image: busybox:1.37.0
+          image: "{{ .Values.initContainer.busybox.repository }}:{{ .Values.initContainer.busybox.tag }}{{ if .Values.initContainer.busybox.digest }}@{{ .Values.initContainer.busybox.digest }}{{ end }}"
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsUser: 0
@@ -82,7 +87,7 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: rag-api-server
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ end }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -330,7 +335,7 @@ spec:
 
         {{- if .Values.mcp.enabled }}
         - name: rag-mcp-server
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ end }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false

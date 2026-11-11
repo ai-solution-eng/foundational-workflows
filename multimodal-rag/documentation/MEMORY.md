@@ -36,6 +36,26 @@ Distinct from the long-term store above: **short-term memory** gives an agent se
 Long-term memory is never written to a short-term dataset: the ★ binding resolves to a durable dataset, and STM datasets are passwordless + hidden, so they can never become someone's long-term store by accident.
 ---
 
+## 1c. Playbook memory (procedural memory)
+
+The store above holds episodic ("what we did") and semantic ("decisions", "gotchas") memory. **Playbook memory** is the third kind: a reusable *procedure*, labelled with the class of task it applies to and with evidence of whether it worked.
+
+A playbook is an ordinary memory document with `memory_kind: "playbook"` plus a structured payload — task_signature, applies_when, steps, failure_modes, outcome, playbook_key, success_count, fail_count, last_validated. It is produced by the gateway's session distiller (an OPTIONAL "## Playbook" section) and stored as a SEPARATE document from the session summary, so recall returns the procedure without the project context around it.
+
+**The label is inferred, not self-assessed.** The distiller's emission gate is enforced server-side: a session qualifies only with at least 4 tool calls, no budget marker, no denied-tool storm and no repeated identical call, and the stored `outcome` is derived from trace signals (any denied result, a repeated call, a budget marker, a bad tool-error ratio) with the model's own claim discarded. `outcome_source` is always `inferred`.
+
+| Tool | What it does |
+|---|---|
+| `recall_playbooks(task, k=3)` | On-demand recall for a task class. Ranked by smoothed success rate (success+1)/(success+fail+2); an unproven playbook (0/0) sorts last and is labelled `evidence: unproven`. Conflicting playbooks for the same task signature are returned side by side with their counts — never collapsed. |
+| `record_playbook_outcome(memory_id, outcome)` | The write half of the decay loop: increments success/fail and stamps last_validated. A playbook that is recalled but never scored stays unproven forever. |
+| `consolidate_memories(dry_run=True)` | Plans decay scores, an archive set and contradiction pairs. Dry run writes nothing. Playbooks are a PROTECTED kind and are never auto-archived; contradictions are always report-only. |
+
+Supersession is keyed on `playbook_key` (sha256 of the normalized task signature), not on the session: re-emitting a playbook for the same task class replaces the old document and **inherits its counters**, so "worked 6 times, failed once" survives the rewrite. Counters merge with `max()`, so a replayed supersession can never inflate the evidence.
+
+Full reference (including the gateway overlay and why it ships as a patch): [PLAYBOOK-MEMORY.md](PLAYBOOK-MEMORY.md).
+
+---
+
 ## 2. Setup — opencode
 
 ### One-time (cluster side)

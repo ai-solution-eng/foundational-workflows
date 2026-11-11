@@ -42,7 +42,7 @@ replicaCount: 2
 image:
   # Packaged with the chart — leave as-is unless you built your own image.
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v6.2.3
+  tag: v6.3.2
   pullPolicy: IfNotPresent
 
 qdrant:
@@ -244,8 +244,11 @@ security:
   pwMaxFailures: 10
   pwFailWindow: 300
   # Trust X-Auth-Request-*/X-Email/X-User headers; keep true ONLY behind an enforcing auth proxy.
-  # TRUE by choice (chart default is now false): this site's every path
-  # traverses the enforcing oauth2-proxy AuthorizationPolicy below.
+  # TRUE by choice (chart default is now false).  P3-9 (2026-11-10 audit):
+  # the AuthorizationPolicy selects only the istio: ingressgateway pods, so a
+  # direct ClusterIP call never traverses it — the actual protection is the
+  # D21 forwarded-token assertion (fail-closed); enable networkPolicy for the
+  # full posture.
   trustProxyIdentity: true
 
   # Self-service dataset selection + ★ memory binding on /access; needs mcp.apiKeyClients.

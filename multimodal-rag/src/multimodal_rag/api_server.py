@@ -51,6 +51,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from multimodal_rag import __version__
+from multimodal_rag.agentic_retrieval import (
+    MAX_AGENTIC_ROUNDS,
+    AgenticConfig,
+    AgenticTrace,
+    build_chat_judge,
+    query_text,
+    run_agentic_entries,
+)
 from multimodal_rag.dataset_manager import (
     DatasetManager,
     EmbedderMismatchError,
@@ -413,6 +421,37 @@ _UNLOCK_CACHE: dict[tuple[str, str], tuple[float, str]] = {}
 _UNLOCK_CACHE_LOCK = threading.Lock()
 _UNLOCK_TTL = int(os.environ.get("UNLOCK_TTL", "1800"))  # seconds, default 30 min
 
+# P1-4 (audit 2026-11-10): hard upper bound on unlock-cache entries.  The key
+# is (dataset, caller id) and the caller id is DERIVED FROM THE REQUEST (D10),
+# so a caller rotating its identity could otherwise pin one plaintext-password
+# entry per request for the whole unlock TTL.  Mirrors the MCP server's
+# _MAX_UNLOCK_ENTRIES discipline, and deliberately reads the SAME env name so
+# one deployment knob (UNLOCK_CACHE_MAX) governs both surfaces.
+_MAX_UNLOCK_ENTRIES = max(1, int(os.environ.get("UNLOCK_CACHE_MAX", "4096")))
+
+
+def _evict_unlock_cache_locked() -> None:
+    """Keep ``_UNLOCK_CACHE`` bounded (caller holds ``_UNLOCK_CACHE_LOCK``).
+
+    Expired entries go first (dead weight), then the entries closest to
+    expiry — oldest-expiry-first, which for a fixed TTL is also
+    least-recently-inserted.  A no-expiry entry (the RAG_UNLOCK_MAX_TTL=0
+    opt-in, expiry = inf) is evicted only once nothing else is left, which is
+    the operator's own explicit trade-off.
+    """
+    over = len(_UNLOCK_CACHE) - _MAX_UNLOCK_ENTRIES
+    if over <= 0:
+        return
+    now = time.monotonic()
+    for key in [k for k, (exp, _pw) in _UNLOCK_CACHE.items() if exp <= now]:
+        _UNLOCK_CACHE.pop(key, None)
+        over -= 1
+        if over <= 0:
+            return
+    for key, _entry in sorted(_UNLOCK_CACHE.items(), key=lambda kv: kv[1][0])[:over]:
+        _UNLOCK_CACHE.pop(key, None)
+
+
 # Upper bound an explicit unlock TTL may take (the /unlock endpoint clamps
 # into this; default 86400 = 24 h, the historical hard cap).  The special
 # value 0 OPTS THE DEPLOYMENT INTO NO-EXPIRY UNLOCKS: a caller may then pass
@@ -489,9 +528,12 @@ def _request_identity(request: Request) -> str:
 
     1. **Provided identity** — the auth proxy's identity headers
        (``X-Auth-Request-Email`` / ``X-Auth-Request-User`` / ``X-Email`` /
-       ``X-User``), honoured only when ``RAG_TRUST_PROXY_IDENTITY`` confirms
-       an enforcing proxy sits in front of this server (client-spoofable
-       otherwise) — per-USER.
+       ``X-User``), honoured only when ``RAG_TRUST_PROXY_IDENTITY`` AND the
+       enforcing-proxy assertion (:func:`_enforcing_proxy_precondition`) both
+       hold — i.e. only when the operator has positively confirmed an
+       enforcing proxy fronts this server (client-spoofable otherwise) —
+       per-USER.  P1-4 (audit 2026-11-10): the flag alone is not enough for a
+       value that keys the password-failure throttle and the unlock cache.
     2. **Forwarded-for chain** — ``X-Forwarded-For``, under the same trust
        gate — per client IP behind a proxy that sets it.  The FULL
        normalized chain is the identity value, so a caller cannot
@@ -507,15 +549,34 @@ def _request_identity(request: Request) -> str:
     mirror comment in mcp_server: spoofable, and it would split a direct
     single user's unlock per conversation).
     """
-    if _TRUST_PROXY_IDENTITY:
+    # P1-4 (audit 2026-11-10): the flag alone is NOT a precondition for a
+    # CALLER-DERIVED BUCKET KEY either.  This id keys the password-failure
+    # throttle AND the unlock cache, both attacker-visible state: with only
+    # the flag, any caller that reaches the pod without traversing the edge
+    # (the P0-1 threat model) rotates X-Auth-Request-User to mint a fresh
+    # brute-force bucket per request and an unbounded set of unlock-cache
+    # keys.  Require the SAME positive enforcing-proxy assertion the
+    # proxy-identity CREDENTIAL already requires; without it the header and
+    # the XFF chain are ignored and the socket peer is used — the pre-P0-1
+    # behaviour, i.e. no worse than the flag being off.
+    #
+    # Wave-2 (cross-review): the assertion must VOUCH FOR THE VALUE IT ADMITS,
+    # not merely be present.  Calling the precondition with no claimed name let
+    # any caller who holds SOME valid realm token (their own) satisfy it and
+    # then rotate the header to arbitrary names — the rotation was back.  Each
+    # candidate is now checked against its own value (a token only ever
+    # vouches for the identity it names), and the forwarded-for chain — which
+    # carries no identity any token could vouch for — requires the operator
+    # signal (require_signal).
+    if _trust_proxy_flag():
         for header in ("X-Auth-Request-Email", "X-Auth-Request-User", "X-Email", "X-User"):
             val = request.headers.get(header)
-            if val and val.strip():
+            if val and val.strip() and _enforcing_proxy_precondition(request, val.strip()):
                 return val.strip()
         xff = request.headers.get("X-Forwarded-For")
         if xff:
             chain = ",".join(p.strip() for p in xff.split(",") if p.strip())
-            if chain:
+            if chain and _enforcing_proxy_precondition(request, None, require_signal=True):
                 return f"xff:{chain}"
     client = request.client
     return client.host if client else "unknown"
@@ -575,10 +636,24 @@ def _unlock_cache_get(dataset: str, cid: str) -> str | None:
 def _unlock_cache_set(dataset: str, cid: str, password: str, ttl: int | None = None) -> None:
     """Cache an unlock.  ``ttl=0`` means NO expiry (persists until revoked).
 
-    In-memory: the expiry is ``_UNLOCK_NO_EXPIRY`` (always in the future).
+    In-memory: the expiry is ``_UNLOCK_NO_EXPIRY`` (always in the future), and
+    the dict is capped at ``_MAX_UNLOCK_ENTRIES`` (``UNLOCK_CACHE_MAX``) —
+    expired entries first, then oldest-expiry-first (P1-4).
     Redis: the key is set WITHOUT ``ex`` — the operator is responsible for
     the store's own retention (``RAG_UNLOCK_MAX_TTL=0`` is the explicit
     opt-in for this; the /access page surfaces it as "No expiry (0)").
+
+    **Residual (Wave-2): the ``UNLOCK_CACHE_MAX`` cap covers the in-process
+    dict ONLY.**  With Redis configured there is no equivalent trim: the key
+    set is bounded by the TTL (default 30 min, ``RAG_UNLOCK_MAX_TTL`` ceiling)
+    and by ``maxmemory``/eviction policy on the Redis side, NOT by an entry
+    count.  A caller rotating its D10 identity can therefore create one
+    ``unlock:{dataset}:{cid}`` key per request for up to the TTL window.  A
+    SCAN-and-trim on every set was rejected as too expensive on the hot path;
+    operators who need a hard bound should set ``maxmemory`` +
+    ``maxmemory-policy allkeys-lru`` on the Redis instance.  The identity
+    rotation itself is gated by the enforcing-proxy assertion (P1-4), which is
+    what makes this residual small.
     """
     no_expiry = ttl is not None and ttl <= 0
     r = _get_redis()
@@ -594,6 +669,7 @@ def _unlock_cache_set(dataset: str, cid: str, password: str, ttl: int | None = N
     expiry = _UNLOCK_NO_EXPIRY if no_expiry else time.monotonic() + (ttl if ttl is not None else _UNLOCK_TTL)
     with _UNLOCK_CACHE_LOCK:
         _UNLOCK_CACHE[(dataset, cid)] = (expiry, password)
+        _evict_unlock_cache_locked()  # P1-4: bounded, see the helper
 
 
 def _unlock_cache_set_ttl(dataset: str, cid: str, password: str, ttl: int) -> None:
@@ -694,6 +770,41 @@ def _clear_selection_passwords(dataset: str) -> int:
         if hit["v"]:
             changed += 1
     return changed
+
+
+async def _revoke_password_grants(name: str) -> tuple[int, int]:
+    """Revoke every grant an OLD dataset password bought (P1-8 + P2-6).
+
+    Two grants survive a password CHANGE unless they are actively revoked:
+    every live unlock-cache entry for the dataset (not just the acting
+    identity's), and the D16 saved selection passwords, which act as implicit
+    unlocks (step 0 of :func:`_require_dataset_password`).
+
+    P2-6 (audit 2026-11-10): this used to be inlined in the admin
+    reset-password handler, so the OTHER password-writing route — the import
+    path, which can replace an existing dataset under the same name — left
+    both grants alive and kept serving the NEW content to callers who had
+    only ever proved the OLD password.  One helper, every writer.
+
+    Both legs are blocking I/O (a Redis SCAN / per-identity file rewrites
+    under fcntl), hence the thread pool.  Failures are logged and reported as
+    0 rather than raised: by the time this runs the password HAS changed, so
+    failing the request would only invite a retry that changes nothing.
+
+    Returns ``(unlocks_revoked, selection_passwords_cleared)``.
+    """
+    loop = asyncio.get_running_loop()
+    revoked = 0
+    try:
+        revoked = await loop.run_in_executor(sync_pool, _unlock_cache_del_all, name)
+    except Exception:
+        logger.warning("Unlock revocation failed for '%s' after a password change", name, exc_info=True)
+    cleared = 0
+    try:
+        cleared = await loop.run_in_executor(sync_pool, _clear_selection_passwords, name)
+    except Exception:
+        logger.warning("Selection-password purge failed for '%s' after a password change", name, exc_info=True)
+    return revoked, cleared
 
 
 # ---------------------------------------------------------------------------
@@ -931,7 +1042,29 @@ _RAG_API_KEY = os.environ.get("RAG_API_KEY", "")
 # security.trustProxyIdentity) — otherwise the socket peer is used, so a
 # caller cannot rotate fake identity headers to hijack another user's unlock
 # or bypass the brute-force throttle.
+#
+# P2-7 (audit 2026-11-10): the value is read PER CALL, never frozen.  This
+# module-level handle is the import-time DEFAULT for the unset case only (and
+# the seam the offline tests patch); every decision below goes through
+# _trust_proxy_flag(), so setting the env to "false"/"0" takes effect on the
+# NEXT REQUEST instead of the next restart — which is what the documented
+# no-restart remediation actually promises.
 _TRUST_PROXY_IDENTITY = os.environ.get("RAG_TRUST_PROXY_IDENTITY", "").lower() in ("1", "true", "yes")
+
+
+def _trust_proxy_flag() -> bool:
+    """``RAG_TRUST_PROXY_IDENTITY``, read PER CALL (the house convention).
+
+    P2-7: an UNSET env keeps the import-time default, so the offline tests'
+    module handle stays the seam they patch; a SET env always wins, so an
+    operator flipping the knob off closes the header-derived throttle/unlock
+    identity immediately instead of at the next pod restart.
+    """
+    raw = os.environ.get("RAG_TRUST_PROXY_IDENTITY")
+    if raw is None or not raw.strip():
+        return bool(_TRUST_PROXY_IDENTITY)
+    return raw.strip().lower() in ("1", "true", "yes")
+
 
 # P0-1 (audit 2026-10-16): the trust flag alone is NOT a precondition — the
 # proxy's identity headers are ordinary, attacker-settable headers on any
@@ -954,8 +1087,12 @@ _TRUST_PROXY_IDENTITY = os.environ.get("RAG_TRUST_PROXY_IDENTITY", "").lower() i
 #      (oidc_identity.verify_forwarded_proxy_assertion) — otherwise any
 #      caller could pair a garbage token with a spoofed name.
 #
-# The D10 unlock-cache / throttle identity (a bucket-scoping hint that
-# resolves no identity, grant, or credential) keeps the flag alone.
+# Wave-2 (cross-review): the D10 unlock-cache / throttle identity is NOT
+# exempt any more either.  It resolves no credential, but it KEYS the
+# password-failure bucket and the unlock cache, so it now requires the same
+# assertion — and, for the identity headers, one that VOUCHES FOR THE VALUE
+# IT ADMITS (see _request_identity).  The forwarded-for chain carries no
+# identity a token could vouch for, so only the operator signal admits it.
 _ENFORCING_PROXY_SIGNAL_ENV = "RAG_ENFORCING_PROXY_SIGNAL"
 #: The header the operator's ingress must inject with the signal value.
 _PROXY_ASSERTION_HEADER = "X-Enforcing-Proxy"
@@ -969,18 +1106,28 @@ def _trust_proxy_identity(request: "Request | None" = None) -> bool:
     P0-1: with *request* provided the flag alone is no longer sufficient —
     the proxy-identity CREDENTIAL additionally requires a positive
     enforcing-proxy assertion (:func:``_enforcing_proxy_precondition``).
-    Callers that only scope the D10 unlock cache / throttle by a header
-    value (``_request_identity``) keep the plain flag: that path resolves
-    no identity, grant, or credential.
+    P1-4 (audit 2026-11-10): the D10 unlock-cache / throttle identity
+    (``_request_identity``) is gated too.  It resolves no credential, but it
+    KEYS the password-failure bucket and the unlock cache, so the flag alone
+    let a caller rotate the header for a fresh brute-force bucket per
+    request.  That path therefore calls the precondition per candidate VALUE
+    (Wave-2: the assertion must vouch for the value it admits, not merely
+    exist — otherwise any caller holding some valid token of their own could
+    satisfy it and then rotate the header to arbitrary names).
     """
-    if os.environ.get("RAG_TRUST_PROXY_IDENTITY", "").strip().lower() not in ("1", "true", "yes"):
+    if not _trust_proxy_flag():  # P2-7: per call, never the frozen constant
         return False
     if request is None:
         return True
     return _enforcing_proxy_precondition(request)
 
 
-def _enforcing_proxy_precondition(request: "Request | None" = None, claimed_name: "str | None" = None) -> bool:
+def _enforcing_proxy_precondition(
+    request: "Request | None" = None,
+    claimed_name: "str | None" = None,
+    *,
+    require_signal: bool = False,
+) -> bool:
     """P0-1: is there a POSITIVE signal that an enforcing proxy fronts us?
 
     ``RAG_ENFORCING_PROXY_SIGNAL`` set → the request must carry it (the
@@ -991,6 +1138,16 @@ def _enforcing_proxy_precondition(request: "Request | None" = None, claimed_name
     token of their OWN cannot vouch for a spoofed victim name (the audited
     escalation paired exactly that pair).  Both branches fail closed, so a
     bare X-Auth-Request-User never resolves a credential.
+
+    Wave-2 (cross-review): *claimed_name* is REQUIRED for every caller that
+    admits a caller-supplied value — the bucket/throttle path now passes the
+    header value it is about to return, so a token can only ever vouch for
+    the identity it names.  Passing ``claimed_name=None`` means "any valid
+    token satisfies this", which is only correct for the D24 credential
+    candidate (where the name is compared again at the call site).
+    ``require_signal=True`` admits ONLY the operator signal: it is for a
+    value that names no identity at all (the forwarded-for chain), which no
+    credential the caller merely HOLDS can vouch for.
     """
     if request is None:
         return False
@@ -1000,6 +1157,10 @@ def _enforcing_proxy_precondition(request: "Request | None" = None, claimed_name
 
         presented = (request.headers.get(_PROXY_ASSERTION_HEADER) or "").strip()
         return bool(presented) and _hmac.compare_digest(presented, expected)
+    if require_signal:
+        # No operator signal configured, and the value being admitted names no
+        # identity — a token the caller holds proves nothing about it.
+        return False
     try:
         from multimodal_rag.utils import oidc_identity
 
@@ -1280,7 +1441,9 @@ def _rag_acl_path_denial(path: str, method: str, identity) -> "str | None":
             tail = path.rstrip("/")
             suffix = tail.rsplit("/", 1)[-1]
             if method == "POST":
-                is_write = suffix in ("documents", "files", "batch-files", "batch-urls")
+                # late-interaction (Feature D, wave 2026-11-10) mutates the
+                # dataset's retrieval config, so it is a write surface too.
+                is_write = suffix in ("documents", "files", "batch-files", "batch-urls", "late-interaction")
             elif method == "DELETE":
                 is_write = suffix == name or "/documents/" in tail
             else:  # PATCH/PUT — only the dataset root is a manage surface
@@ -2776,7 +2939,12 @@ def _sso_proof_for_identity(request: Request, identity: Any) -> "str | None":
     of one human; the mint still acts only on that identity's own entry.
     """
     pairs = _presented_pairs(request)
-    if _trust_proxy_identity():
+    # P3-4 (audit 2026-11-10): pass *request*.  The no-argument form returns
+    # True on the env flag alone; that is safe today only because
+    # _presented_pairs refuses to emit a "proxy-identity" candidate without
+    # the enforcing-proxy assertion.  An implicit coupling like that must not
+    # be the only thing between a flag flip and a mintable durable key.
+    if _trust_proxy_identity(request):
         for candidate, via in pairs:
             if via == "proxy-identity" and candidate == str(identity.name):
                 return "proxy-identity"
@@ -4036,6 +4204,58 @@ async def api_delete_dataset(
 # -- Documents ----------------------------------------------------------------
 
 
+@app.post("/api/datasets/{name}/late-interaction")
+async def api_set_late_interaction(
+    name: str,
+    request: Request,
+    body: Any = Body(None),
+    x_dataset_password: str | None = Header(None, alias="X-Dataset-Password"),
+):
+    """Enable/disable multi-vector late interaction (Feature D) for a dataset.
+
+    Body: '{"enabled": <bool>, "token_dim": <int | null>}'.
+
+    Enabling FAILS CLOSED (HTTP 400) when no token-level embedder is
+    configured - the deployment's document embedder is single-vector and
+    cannot produce token embeddings; token vectors are never faked from
+    pooled vectors.  The response carries the sidecar collection name, the
+    document count and 'reingest_required' when documents already exist
+    (re-ingest to backfill the sidecar's token matrices).  Disabling stops
+    writing/reading but retains the sidecar; the response names the delete
+    command that reclaims its space.
+    """
+    if not isinstance(body, dict):
+        raise HTTPException(422, 'Send JSON: {"enabled": <bool>, "token_dim": <int|null>}')
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(422, "'enabled' must be a boolean")
+    token_dim = body.get("token_dim")
+    if token_dim is not None and (isinstance(token_dim, bool) or not isinstance(token_dim, int)):
+        raise HTTPException(422, "'token_dim' must be an integer or null")
+
+    from multimodal_rag import late_interaction as late_interaction_mod
+    from multimodal_rag.vector_store import set_dataset_late_interaction
+
+    try:
+        dm = await get_manager_async()
+        await _require_dataset_password(dm, name, x_dataset_password, request)
+        result = await _submit_with_context(
+            sync_pool,
+            set_dataset_late_interaction,
+            dm,
+            name,
+            enabled=enabled,
+            token_dim=token_dim,
+        )
+        return result
+    except FileNotFoundError:
+        raise HTTPException(404, f"Dataset '{name}' not found")
+    except late_interaction_mod.LateInteractionUnavailable as exc:
+        raise HTTPException(400, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
 @app.post("/api/datasets/{name}/documents")
 async def api_add_documents(
     name: str,
@@ -4540,6 +4760,89 @@ async def api_search(
         raise HTTPException(404, f"Dataset '{name}' not found")
 
 
+def _agentic_request_params(body: dict[str, Any]) -> tuple[bool, int]:
+    """Read (agentic, agentic_max_rounds) from a search request body.
+
+    Both fields are optional and default to off / 2 rounds.  A non-boolean
+    'agentic' value is REJECTED rather than truthy-coerced: a client that sends
+    the string "false" must not silently switch on an LLM-driven retrieval
+    loop.  The round count is bounded to [1, MAX_AGENTIC_ROUNDS] so one request
+    cannot fan a search out into an arbitrary number of judge calls.
+    """
+    raw = body.get("agentic", False)
+    if not isinstance(raw, bool):
+        raise HTTPException(400, "Field 'agentic' must be a boolean")
+    rounds = body.get("agentic_max_rounds", 2)
+    if not isinstance(rounds, int) or isinstance(rounds, bool) or not 1 <= rounds <= MAX_AGENTIC_ROUNDS:
+        raise HTTPException(400, f"Field 'agentic_max_rounds' must be an integer between 1 and {MAX_AGENTIC_ROUNDS}")
+    return raw, rounds
+
+
+def _agentic_trace_block(trace: AgenticTrace) -> dict[str, Any]:
+    """The response-level 'agentic' block (mirrors the 'rrf' request block)."""
+    return trace.as_dict()
+
+
+async def _agentic_dataset_search(
+    dm: DatasetManager,
+    name: str,
+    query: "str | dict[str, Any]",
+    *,
+    top_k: int,
+    use_reranker: bool,
+    reranker_top_k: int,
+    filters: dict[str, Any] | None,
+    rrf: "RrfParams | None",
+    max_rounds: int,
+) -> tuple[list[dict[str, Any]], AgenticTrace]:
+    """Agentic loop over 'dm.search' for POST /api/datasets/{name}/search.
+
+    Each round is the EXACT sync 'dm.search' call the non-agentic endpoint makes
+    (same kwargs, same entry formatting), offloaded to 'sync_pool'.  The judge is
+    the dataset's configured chat model ('rag.vlm'); a deployment without one
+    degrades to a single plain search with stop_reason='judge_unavailable'
+    instead of failing the request.  Any unexpected loop failure falls back the
+    same way (stop_reason='error_fallback') -- an agentic request can never turn
+    a working search into an error.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _search(effective_query: "str | dict[str, Any]") -> list[dict[str, Any]]:
+        return dm.search(
+            name,
+            effective_query,
+            top_k=top_k,
+            use_reranker=use_reranker,
+            reranker_top_k=reranker_top_k,
+            filters=filters,
+            rrf=rrf,
+        )
+
+    async def _asearch(effective_query: "str | dict[str, Any]") -> list[dict[str, Any]]:
+        return await loop.run_in_executor(sync_pool, partial(_search, effective_query))
+
+    rag = await loop.run_in_executor(sync_pool, dm._get_rag, name)
+    judge_fn = build_chat_judge(getattr(rag, "vlm", None))
+    if judge_fn is None:
+        logger.warning(
+            "Agentic search requested for dataset %r but no judge chat model is configured -- "
+            "running a single plain search.",
+            name,
+        )
+        results = await _asearch(query)
+        return results, AgenticTrace(rounds=1, queries=[query_text(query)], stop_reason="judge_unavailable")
+    try:
+        return await run_agentic_entries(query, _asearch, judge_fn, AgenticConfig(max_rounds=max_rounds))
+    except Exception:
+        logger.warning(
+            "Agentic search failed for dataset %r -- falling back to a single plain search",
+            name,
+            exc_info=True,
+        )
+        results = await _asearch(query)
+        return results, AgenticTrace(rounds=1, queries=[query_text(query)], stop_reason="error_fallback")
+
+
 @app.post("/api/datasets/{name}/search")
 async def api_search_multimodal(
     name: str,
@@ -4593,6 +4896,13 @@ async def api_search_multimodal(
     block (``{dense, sparse, k, applied}``) — ``applied=false`` on
     dense-degraded searches rather than labelling dense results with weights.
 
+    Opt-in agentic retrieval (feature: agentic retrieval): "agentic": true runs
+    the retrieve -> judge -> rewrite loop (bounded by "agentic_max_rounds",
+    default 2) and returns the union of the rounds' results plus an agentic
+    block carrying the trace.  Omitted (or false) keeps the single-pass
+    behaviour exactly as before; a missing or failing judge degrades to that
+    single pass instead of erroring.
+
     Returns ranked results with content and similarity scores.
     """
     query = body.get("query")
@@ -4613,6 +4923,7 @@ async def api_search_multimodal(
         raise HTTPException(400, "Field 'reranker_top_k' must be an integer between 1 and 50")
     use_reranker = bool(body.get("use_reranker", False))
     rrf = _rrf_params_from_request(body.get("dense_weight"), body.get("sparse_weight"), body.get("k"))
+    agentic, agentic_max_rounds = _agentic_request_params(body)
 
     # Query-time SSRF guard: remote media URLs in the query are fetched
     # server-side by the embedder, so apply the same host policy as ingest
@@ -4641,6 +4952,27 @@ async def api_search_multimodal(
             build_payload_filter(raw_filters)  # validation pass (dates)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
+        if agentic:
+            agentic_results, trace = await _agentic_dataset_search(
+                dm,
+                name,
+                query,
+                top_k=top_k,
+                use_reranker=use_reranker,
+                reranker_top_k=reranker_top_k,
+                filters=raw_filters,
+                rrf=rrf,
+                max_rounds=agentic_max_rounds,
+            )
+            agentic_payload: dict[str, Any] = {
+                "query": query,
+                "filters": raw_filters,
+                "results": agentic_results,
+                "agentic": _agentic_trace_block(trace),
+            }
+            if rrf is not None:
+                agentic_payload["rrf"] = _rrf_response_block(rrf, agentic_results)
+            return agentic_payload
         loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(
             sync_pool,
@@ -4753,6 +5085,25 @@ async def _federated_rerank_rag(dm: DatasetManager, targets: list[str]) -> Any:
     return None
 
 
+async def _federated_judge(dm: DatasetManager, targets: list[str]) -> "Any":
+    """Judge for federated agentic search: the first target's chat model.
+
+    The chat model is server-wide (like the reranker), so any target's RAG
+    instance can judge a merged pool.  Returns None when no target has one --
+    the caller then runs a single plain round.
+    """
+    loop = asyncio.get_running_loop()
+    for name in targets:
+        try:
+            rag = await loop.run_in_executor(sync_pool, dm._get_rag, name)
+        except Exception:
+            continue
+        judge_fn = build_chat_judge(getattr(rag, "vlm", None))
+        if judge_fn is not None:
+            return judge_fn
+    return None
+
+
 async def _federated_rest_search(
     dm: DatasetManager,
     datasets: "str | list[Any] | tuple[Any, ...]",
@@ -4762,6 +5113,8 @@ async def _federated_rest_search(
     reranker_top_k: int = 3,
     filters: dict[str, Any] | None = None,
     is_unlocked: "Any" = None,
+    agentic: bool = False,
+    agentic_max_rounds: int = 2,
 ) -> dict[str, Any]:
     """Fan one query out over several datasets and merge the pools.
 
@@ -4781,6 +5134,11 @@ async def _federated_rest_search(
     skipped with a note — no password is accepted here, mirroring the MCP
     federated tool (v3.0.0: passwords stay out of request/tool signatures;
     use ``POST /api/datasets/{name}/unlock`` first).
+    *agentic* (feature: agentic retrieval) runs the retrieve -> judge -> rewrite
+    loop over that same fan-out (bounded by *agentic_max_rounds*), merging every
+    round's labelled entries by their dataset-qualified identity and returning an
+    extra agentic trace block.  Off by default; a deployment with no chat model to
+    judge with, or a judge that fails, degrades to the single plain round.
     """
     loop = asyncio.get_running_loop()
     # D15/D16: a registry-key identity's ACL ∪ self-selections restricts the
@@ -4809,104 +5167,178 @@ async def _federated_rest_search(
     if not targets:
         return {"query": q, "filters": filters, "results": [], "skipped": skipped, "errors": errors}
 
-    async def _search_one(name: str) -> list[dict[str, Any]]:
-        return await loop.run_in_executor(
-            sync_pool,
-            partial(
-                dm.search,
-                name,
-                q,
-                top_k=top_k,
-                use_reranker=False,  # one rerank pass over the merged pool instead
-                reranker_top_k=top_k,
-                filters=filters,
-            ),
+    def _add_errors(new_notes: list[dict[str, Any]]) -> None:
+        """Append per-dataset error notes, de-duplicated across agentic rounds."""
+        for note in new_notes:
+            if note not in errors:
+                errors.append(note)
+
+    async def _run_query(effective_query: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """One federated round: fan the query out, merge, rerank, format.
+
+        Returns (results, per-dataset error notes for THIS round).  Factored out
+        of the body so the agentic loop can run it once per rewritten query while
+        a single call still produces exactly the historical output.
+        """
+
+        async def _search_one(name: str) -> list[dict[str, Any]]:
+            return await loop.run_in_executor(
+                sync_pool,
+                partial(
+                    dm.search,
+                    name,
+                    effective_query,
+                    top_k=top_k,
+                    use_reranker=False,  # one rerank pass over the merged pool instead
+                    reranker_top_k=top_k,
+                    filters=filters,
+                ),
+            )
+
+        # Bounded (RAG_FEDERATED_CONCURRENCY, default 8) and timed
+        # (RAG_FEDERATED_TIMEOUT_SECONDS, default 60, 0=disabled) per dataset,
+        # exactly like the MCP twin: without both, N targets meant N concurrent
+        # searches and one hung dataset pinned the whole gather.  A deadline
+        # surfaces as ``TimeoutError("timed out after Ns")`` below and takes the
+        # same per-dataset error-note path as any other failure.
+        sem = asyncio.Semaphore(_federated_concurrency())
+        outcomes = await asyncio.gather(
+            *(_afederated_bounded_call(sem, _search_one, name) for name in targets), return_exceptions=True
         )
 
-    # Bounded (RAG_FEDERATED_CONCURRENCY, default 8) and timed
-    # (RAG_FEDERATED_TIMEOUT_SECONDS, default 60, 0=disabled) per dataset,
-    # exactly like the MCP twin: without both, N targets meant N concurrent
-    # searches and one hung dataset pinned the whole gather.  A deadline
-    # surfaces as ``TimeoutError("timed out after Ns")`` below and takes the
-    # same per-dataset error-note path as any other failure.
-    sem = asyncio.Semaphore(_federated_concurrency())
-    outcomes = await asyncio.gather(
-        *(_afederated_bounded_call(sem, _search_one, name) for name in targets), return_exceptions=True
-    )
+        entries: list[tuple[str, Any, float]] = []
+        extra_fields: dict[int, dict[str, Any]] = {}
+        round_errors: list[dict[str, Any]] = []
+        for name, outcome in zip(targets, outcomes):
+            if isinstance(outcome, BaseException):
+                round_errors.append({"dataset": name, "error": f"{type(outcome).__name__}: {outcome}"})
+                continue
+            for entry in outcome:
+                doc = entry.get("content")
+                extra = {k: v for k, v in entry.items() if k not in ("content", "score")}
+                # dm.search reports the retrieval lane as an entry field and
+                # strips the private stamp from content, but the lane-aware
+                # merge below (and the shared rerank helper) still read it.
+                if isinstance(doc, dict) and extra.get("score_kind") == "rrf" and "_score_kind" not in doc:
+                    doc["_score_kind"] = "rrf"
+                if extra:
+                    extra_fields[id(doc)] = extra
+                entries.append((name, doc, float(entry.get("score", 0.0))))
 
-    entries: list[tuple[str, Any, float]] = []
-    extra_fields: dict[int, dict[str, Any]] = {}
-    for name, outcome in zip(targets, outcomes):
-        if isinstance(outcome, BaseException):
-            errors.append({"dataset": name, "error": f"{type(outcome).__name__}: {outcome}"})
-            continue
-        for entry in outcome:
-            doc = entry.get("content")
-            extra = {k: v for k, v in entry.items() if k not in ("content", "score")}
-            # dm.search reports the retrieval lane as an entry field and
-            # strips the private stamp from content, but the lane-aware
-            # merge below (and the shared rerank helper) still read it.
-            if isinstance(doc, dict) and extra.get("score_kind") == "rrf" and "_score_kind" not in doc:
-                doc["_score_kind"] = "rrf"
-            if extra:
-                extra_fields[id(doc)] = extra
-            entries.append((name, doc, float(entry.get("score", 0.0))))
+        merged = merge_federated_results(entries)
 
-    merged = merge_federated_results(entries)
+        if use_reranker and merged:
+            rerank_rag = await _federated_rerank_rag(dm, targets)
+            if rerank_rag is None:
+                logger.warning(
+                    "Federated rerank requested but no target dataset has a reranker — keeping embedding order."
+                )
+            else:
+                labelled: list[tuple[Any, float]] = []
+                for name, doc, score in merged:
+                    d = dict(doc) if isinstance(doc, dict) else {"text": str(doc)}
+                    # The label rides on the doc through the sort/truncate; the
+                    # reranker input conversion reads only text + media keys, so
+                    # the private key never reaches the model.
+                    d["_federated_dataset"] = name
+                    labelled.append((d, score))
+                ranked = await _arerank_with(
+                    rerank_rag.rank, rerank_rag._extract_doc, effective_query, labelled, reranker_top_k
+                )
+                merged = [
+                    ((d.pop("_federated_dataset", "") if isinstance(d, dict) else ""), d, score) for d, score in ranked
+                ]
 
-    if use_reranker and merged:
-        rerank_rag = await _federated_rerank_rag(dm, targets)
-        if rerank_rag is None:
-            logger.warning("Federated rerank requested but no target dataset has a reranker — keeping embedding order.")
-        else:
-            labelled: list[tuple[Any, float]] = []
-            for name, doc, score in merged:
-                d = dict(doc) if isinstance(doc, dict) else {"text": str(doc)}
-                # The label rides on the doc through the sort/truncate; the
-                # reranker input conversion reads only text + media keys, so
-                # the private key never reaches the model.
-                d["_federated_dataset"] = name
-                labelled.append((d, score))
-            ranked = await _arerank_with(rerank_rag.rank, rerank_rag._extract_doc, q, labelled, reranker_top_k)
-            merged = [
-                ((d.pop("_federated_dataset", "") if isinstance(d, dict) else ""), d, score) for d, score in ranked
-            ]
-
-    results: list[dict[str, Any]] = []
-    for name, doc, score in merged:
-        entry_out: dict[str, Any] = {"dataset": name}
-        # "extra" above already names a rerank-path dict — distinct name here.
-        extra_meta = extra_fields.get(id(doc))
-        if extra_meta:
-            entry_out.update(extra_meta)
-        entry_out["content"] = doc
-        entry_out["score"] = round(float(score), 4)
-        if isinstance(doc, dict):
-            if "_embedding_score" in doc and "embedding_score" not in entry_out:
-                entry_out["embedding_score"] = doc["_embedding_score"]
-            if "_reranker_score" in doc and "reranker_score" not in entry_out:
-                entry_out["reranker_score"] = doc["_reranker_score"]
-            # Label WHAT the emitted score is, with the MCP contract precedence:
-            # reranker relevance > RRF rank arithmetic > cosine.  The fan-out
-            # entry already carries the label dm.search derived; the merged
-            # rerank copy re-stamps the private keys on the doc instead.
-            if "_reranker_score" in doc:
-                entry_out["score_kind"] = "reranker"
-            elif "_score_kind" in doc:
-                entry_out["score_kind"] = "rrf" if doc["_score_kind"] == "rrf" else "cosine"
+        results: list[dict[str, Any]] = []
+        for name, doc, score in merged:
+            entry_out: dict[str, Any] = {"dataset": name}
+            # "extra" above already names a rerank-path dict — distinct name here.
+            extra_meta = extra_fields.get(id(doc))
+            if extra_meta:
+                entry_out.update(extra_meta)
+            entry_out["content"] = doc
+            entry_out["score"] = round(float(score), 4)
+            if isinstance(doc, dict):
+                if "_embedding_score" in doc and "embedding_score" not in entry_out:
+                    entry_out["embedding_score"] = doc["_embedding_score"]
+                if "_reranker_score" in doc and "reranker_score" not in entry_out:
+                    entry_out["reranker_score"] = doc["_reranker_score"]
+                # Label WHAT the emitted score is, with the MCP contract precedence:
+                # reranker relevance > RRF rank arithmetic > cosine.  The fan-out
+                # entry already carries the label dm.search derived; the merged
+                # rerank copy re-stamps the private keys on the doc instead.
+                if "_reranker_score" in doc:
+                    entry_out["score_kind"] = "reranker"
+                elif "_score_kind" in doc:
+                    entry_out["score_kind"] = "rrf" if doc["_score_kind"] == "rrf" else "cosine"
+                else:
+                    entry_out.setdefault("score_kind", "cosine")
+                if "_retrieval_score" in doc:
+                    # Pre-rerank score, kept visible alongside the reranker one.
+                    entry_out["retrieval_score"] = doc["_retrieval_score"]
+                # Private lane stamps stay out of the public content payload.
+                doc.pop("_score_kind", None)
+                doc.pop("_retrieval_score", None)
             else:
                 entry_out.setdefault("score_kind", "cosine")
-            if "_retrieval_score" in doc:
-                # Pre-rerank score, kept visible alongside the reranker one.
-                entry_out["retrieval_score"] = doc["_retrieval_score"]
-            # Private lane stamps stay out of the public content payload.
-            doc.pop("_score_kind", None)
-            doc.pop("_retrieval_score", None)
-        else:
-            entry_out.setdefault("score_kind", "cosine")
-        results.append(entry_out)
+            results.append(entry_out)
 
-    return {"query": q, "filters": filters, "results": results, "skipped": skipped, "errors": errors}
+        return results, round_errors
+
+    if not agentic:
+        results, round_errors = await _run_query(q)
+        _add_errors(round_errors)
+        return {"query": q, "filters": filters, "results": results, "skipped": skipped, "errors": errors}
+
+    judge_fn = await _federated_judge(dm, targets)
+    if judge_fn is None:
+        logger.warning(
+            "Agentic federated search requested but no target dataset has a chat model to judge with -- "
+            "running a single plain search."
+        )
+        results, round_errors = await _run_query(q)
+        _add_errors(round_errors)
+        return {
+            "query": q,
+            "filters": filters,
+            "results": results,
+            "skipped": skipped,
+            "errors": errors,
+            "agentic": _agentic_trace_block(AgenticTrace(rounds=1, queries=[q], stop_reason="judge_unavailable")),
+        }
+
+    async def _asearch(effective_query: str) -> list[dict[str, Any]]:
+        round_results, round_errors = await _run_query(effective_query)
+        _add_errors(round_errors)
+        return round_results
+
+    try:
+        merged_entries, trace = await run_agentic_entries(
+            q, _asearch, judge_fn, AgenticConfig(max_rounds=agentic_max_rounds)
+        )
+    except Exception:
+        logger.warning(
+            "Agentic federated search failed -- falling back to a single plain search",
+            exc_info=True,
+        )
+        results, round_errors = await _run_query(q)
+        _add_errors(round_errors)
+        return {
+            "query": q,
+            "filters": filters,
+            "results": results,
+            "skipped": skipped,
+            "errors": errors,
+            "agentic": _agentic_trace_block(AgenticTrace(rounds=1, queries=[q], stop_reason="error_fallback")),
+        }
+    return {
+        "query": q,
+        "filters": filters,
+        "results": merged_entries,
+        "skipped": skipped,
+        "errors": errors,
+        "agentic": _agentic_trace_block(trace),
+    }
 
 
 @app.post("/api/search")
@@ -4945,6 +5377,12 @@ async def api_search_federated(
     skipped and reported under ``skipped`` (federated search never accepts a
     password — unlock the dataset first).  A dataset that fails to search is
     reported under ``errors``; the other datasets still contribute results.
+
+    Opt-in agentic retrieval (feature: agentic retrieval): "agentic": true runs
+    the retrieve -> judge -> rewrite loop over the same fan-out (bounded by
+    "agentic_max_rounds", default 2) and returns the union of the rounds plus an
+    agentic trace block.  Omitted keeps the single-round behaviour exactly as
+    before.
     """
     q = body.get("q")
     if not isinstance(q, str):
@@ -4964,6 +5402,7 @@ async def api_search_federated(
     if not isinstance(reranker_top_k, int) or isinstance(reranker_top_k, bool) or not 1 <= reranker_top_k <= 50:
         raise HTTPException(400, "Field 'reranker_top_k' must be an integer between 1 and 50")
     use_reranker = bool(body.get("use_reranker", False))
+    agentic, agentic_max_rounds = _agentic_request_params(body)
 
     raw_filters = body.get("filters")
     if raw_filters is not None and not isinstance(raw_filters, dict):
@@ -4987,6 +5426,8 @@ async def api_search_federated(
         reranker_top_k=reranker_top_k,
         filters=raw_filters,
         is_unlocked=lambda name: _unlock_cache_get(name, cid) is not None,
+        agentic=agentic,
+        agentic_max_rounds=agentic_max_rounds,
     )
 
 
@@ -6766,27 +7207,12 @@ async def api_admin_reset_dataset_password(
         dm._invalidate_has_password(name)
     except Exception:
         logger.debug("Suppressed exception", exc_info=True)
-    # P1-8 (audit 2026-10-16): a reset must actually REVOKE what the old
-    # password bought.  Two grants survived it before this:
-    #   * every live unlock-cache entry for this dataset — not just the acting
-    #     identity's (the handler used to delete exactly one client id, so a
-    #     third party's cached unlock kept serving reads);
-    #   * the D16 saved selection passwords, which act as implicit unlocks
-    #     (step 0 of _require_dataset_password).
-    # Both are blocking I/O (a Redis SCAN / per-identity file rewrites under
-    # fcntl) — off the event loop.  Failures are loud in the log but do not
-    # fail the reset: the password IS changed at that point, and reporting an
-    # error would invite a retry that changes nothing.
-    revoked = 0
-    try:
-        revoked = await loop.run_in_executor(sync_pool, _unlock_cache_del_all, name)
-    except Exception:
-        logger.warning("Unlock revocation failed for '%s' after a password reset", name, exc_info=True)
-    cleared = 0
-    try:
-        cleared = await loop.run_in_executor(sync_pool, _clear_selection_passwords, name)
-    except Exception:
-        logger.warning("Selection-password purge failed for '%s' after a password reset", name, exc_info=True)
+    # P1-8 (audit 2026-10-16) + P2-6 (audit 2026-11-10): a password CHANGE must
+    # actually revoke what the old password bought — every live unlock-cache
+    # entry for this dataset and every D16 saved selection password (an
+    # implicit unlock).  Shared with the import route via the helper so a
+    # future writer cannot forget one of the two legs.
+    revoked, cleared = await _revoke_password_grants(name)
     identity = _clients_registry.current_identity()
     actor = getattr(identity, "name", None) or "unknown"
     action = "SET" if new_password else "REMOVED"
@@ -7062,6 +7488,12 @@ async def api_import_dataset(request: Request) -> dict[str, Any]:
         target = plan["dataset"]
         if password:
             await loop.run_in_executor(sync_pool, dm.set_password, target, password)
+            # P2-6 (audit 2026-11-10): an import can REPLACE an existing
+            # dataset under the same name, so the new password must revoke the
+            # old grants exactly as the admin reset does — otherwise a caller
+            # who unlocked the previous dataset reads the imported content
+            # without ever proving the new password.
+            await _revoke_password_grants(target)
 
         expected = plan["file_count"] or plan["document_rows"] or 1
         job_id = _upload_jobs.create(target, expected, source="import")
@@ -7287,47 +7719,112 @@ async def api_oidc_session(request: Request):
 # ---------------------------------------------------------------------------
 
 
+_COOKIE_PREFIX_WARNED: set[str] = set()
+
+
+def _sso_cookie_name() -> str:
+    """The configured SSO session cookie name, with the P3-5 advisory.
+
+    P3-5 (audit 2026-11-10): a plain name is shadowable by a sibling
+    subdomain on a shared ingress host (cookie tossing).  The ``__Host-``
+    prefix binds the cookie to this exact origin — Path=/ , Secure and NO
+    Domain attribute, all of which this server already satisfies.  The
+    SHIPPED DEFAULT NAME IS DELIBERATELY UNCHANGED (the charts own it, and
+    renaming it would invalidate every live session); the operator opts in
+    via OIDC_SSO_COOKIE_NAME=__Host-<name>.  One advisory per process.
+    """
+    from multimodal_rag.utils import oidc_sso
+
+    name = oidc_sso.cookie_name()
+    if not name.startswith("__Host-") and name not in _COOKIE_PREFIX_WARNED:
+        _COOKIE_PREFIX_WARNED.add(name)
+        logger.warning(
+            "SSO session cookie is named '%s' (no __Host- prefix): a sibling subdomain on a shared "
+            "ingress host can shadow it. Set OIDC_SSO_COOKIE_NAME=__Host-%s to bind the cookie to "
+            "this origin (Secure is already required by the prefix).",
+            name,
+            name,
+        )
+    return name
+
+
+def _cookie_secure_for(name: str, secure: bool) -> bool:
+    """``Secure`` for *name* — forced ON for a ``__Host-`` cookie.
+
+    A ``__Host-`` cookie without ``Secure`` is REJECTED by every browser, so
+    honouring a ``OIDC_SSO_COOKIE_SECURE=0`` override there would silently
+    stop the session (and the logout) from ever persisting.  The prefix
+    itself mandates the attribute, so the prefix wins.
+    """
+    if name.startswith("__Host-"):
+        return True
+    return secure
+
+
 def _sso_cookie_headers(token: str, max_age: int, secure: bool) -> list[tuple[str, str]]:
     """Set-Cookie for the SSO session: HttpOnly (page JS never sees the
     token), SameSite=Lax (CSRF-hard default; the OIDC round trip is
-    top-level navigation so Lax works), Secure on https deployments."""
-    from multimodal_rag.utils import oidc_sso
+    top-level navigation so Lax works), Secure on https deployments.
 
+    P3-5: honours a ``__Host-`` prefixed name (see :func:`_sso_cookie_name`);
+    no Domain attribute is ever emitted, which is what the prefix requires."""
+    name = _sso_cookie_name()
     parts = [
-        f"{oidc_sso.cookie_name()}={token}",
+        f"{name}={token}",
         "Path=/",
         "HttpOnly",
         "SameSite=Lax",
         f"Max-Age={max_age}",
     ]
-    if secure:
+    if _cookie_secure_for(name, secure):
         parts.append("Secure")
     return [("set-cookie", "; ".join(parts))]
 
 
 def _sso_state_cookie_headers(state: str, secure: bool) -> list[tuple[str, str]]:
     """Set-Cookie for the login-attempt CSRF state (short-lived, HttpOnly,
-    SameSite=Lax — read back at the callback and cleared immediately)."""
+    SameSite=Lax — read back at the callback and cleared immediately).
+
+    P1-3: this is the ONLY place the state cookie value is built, so the
+    ``next`` target cannot reach a header unencoded again."""
     from multimodal_rag.utils import oidc_sso
 
+    name = oidc_sso.state_cookie_name()
     parts = [
-        f"{oidc_sso.state_cookie_name()}={state}",
+        f"{name}={state}",
         "Path=/",
         "HttpOnly",
         "SameSite=Lax",
         f"Max-Age={600}",
     ]
-    if secure:
+    if _cookie_secure_for(name, secure):
         parts.append("Secure")
     return [("set-cookie", "; ".join(parts))]
+
+
+def _sso_clear_cookie(name: str) -> str:
+    """The ``Set-Cookie`` VALUE that deletes *name*, with the same attributes
+    the setter used.
+
+    P3-5 / Wave-2: a ``__Host-``/Secure cookie is only cleared by a MATCHING
+    Secure ``Set-Cookie``.  The callback used to clear the state cookie with a
+    bare ``Max-Age=0``, so a Secure (or ``__Host-``) state cookie survived the
+    successful sign-in until its own Max-Age elapsed.
+    """
+    from multimodal_rag.utils import oidc_sso
+
+    attrs = f"{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+    if _cookie_secure_for(name, oidc_sso.cookie_secure()):
+        attrs += "; Secure"
+    return attrs
 
 
 def _sso_clear_cookie_headers() -> list[tuple[str, str]]:
     from multimodal_rag.utils import oidc_sso
 
     return [
-        ("set-cookie", f"{oidc_sso.cookie_name()}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
-        ("set-cookie", f"{oidc_sso.state_cookie_name()}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+        ("set-cookie", _sso_clear_cookie(oidc_sso.cookie_name())),
+        ("set-cookie", _sso_clear_cookie(oidc_sso.state_cookie_name())),
     ]
 
 
@@ -7342,25 +7839,32 @@ async def oauth_login(next: str = "/"):
 
     if not oidc_sso.sso_enabled():
         raise HTTPException(404, "SSO is not enabled on this deployment")
-    url = oidc_sso.build_authorization_url(oidc_sso.new_state())
+    # P3-3 (audit 2026-11-10): keep the value we generated.  This used to be
+    # recovered with url.split("state=")[-1], which works only while
+    # build_authorization_url happens to append `state` LAST — any future
+    # parameter after it would plant a wrong state cookie and fail every
+    # login with no diagnostic.
+    state = oidc_sso.new_state()
+    url = oidc_sso.build_authorization_url(state)
     if not url:
         raise HTTPException(503, "OIDC provider discovery unavailable — try again shortly")
-    # The state cookie value is "<state>|<safe-next>" — the callback splits
-    # it back (never trusting the query string for the redirect target).
-    state = url.split("state=")[-1]
-    target = oidc_sso.safe_next_path(next)
+    # The state cookie value is "<state>|<percent-encoded safe-next>" — the
+    # callback splits it back and decodes the target (never trusting the query
+    # string for the redirect target).
+    #
+    # P1-3 (audit 2026-11-10): the target is PERCENT-ENCODED here and decoded
+    # at the callback.  It rides inside a raw Set-Cookie header value, so a
+    # decoded CR/LF in `next` used to split the response headers, and a
+    # TAB/LF would be stripped by the browser and re-form the "//host"
+    # protocol-relative form safe_next_path exists to refuse.  The cookie is
+    # also built by _sso_state_cookie_headers() now (one definition of the
+    # attribute set) instead of being hand-rolled here.
+    from urllib.parse import quote
+
+    target = quote(oidc_sso.safe_next_path(next), safe="/")
     resp = RedirectResponse(url, status_code=302)
-    secure = oidc_sso.cookie_secure()
-    parts = [
-        f"{oidc_sso.state_cookie_name()}={state}|{target}",
-        "Path=/",
-        "HttpOnly",
-        "SameSite=Lax",
-        "Max-Age=600",
-    ]
-    if secure:
-        parts.append("Secure")
-    resp.headers.append("set-cookie", "; ".join(parts))
+    for header in _sso_state_cookie_headers(f"{state}|{target}", oidc_sso.cookie_secure()):
+        resp.headers.append(*header)
     return resp
 
 
@@ -7400,7 +7904,12 @@ async def oauth_callback(request: Request, code: str = "", state: str = ""):
     if ident is None:
         logger.warning("OIDC SSO callback: token did not resolve to an identity (verification failed)")
         return RedirectResponse("/?sso=error", status_code=302)
-    target = oidc_sso.safe_next_path(cookie_target or "/")
+    # P1-3: the target rode in the cookie percent-encoded (it must never reach
+    # a header value raw); safe_next_path is re-applied to the DECODED value,
+    # so a hand-set cookie still cannot open a redirect.
+    from urllib.parse import unquote
+
+    target = oidc_sso.safe_next_path(unquote(cookie_target or "/"))
     resp = RedirectResponse(target, status_code=302)
     for header in _sso_cookie_headers(
         token,
@@ -7408,11 +7917,10 @@ async def oauth_callback(request: Request, code: str = "", state: str = ""):
         oidc_sso.cookie_secure(),
     ):
         resp.headers.append(*header)
-    # Clear the state cookie (its one job is done).
-    resp.headers.append(
-        "set-cookie",
-        f"{oidc_sso.state_cookie_name()}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
-    )
+    # Clear the state cookie (its one job is done) — with the SAME attributes
+    # the set used, or a Secure/__Host- cookie would survive the callback
+    # until its Max-Age (Wave-2).
+    resp.headers.append("set-cookie", _sso_clear_cookie(oidc_sso.state_cookie_name()))
     logger.info("SSO sign-in: identity '%s' session established", ident.name)
     return resp
 

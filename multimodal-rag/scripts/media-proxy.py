@@ -40,7 +40,15 @@ Binds 127.0.0.1 only.  It reads exactly what the configured gateway key may
 already read -- it adds no authority of its own -- and it exposes no
 filesystem path: every byte is fetched by (dataset, filename) through the
 gateway.  It is a convenience shim for a human browser, not a service to
-deploy.
+deploy.  The proxy has NO authentication of its own, so a non-loopback
+--host is refused unless --allow-remote-host is passed explicitly (and even
+then it is warned about): a 0.0.0.0 bind would publish every dataset the
+gateway key can read to the network.
+
+Both caches are BOUNDED: the in-memory cache is a byte/item-capped LRU and
+the on-disk cache is pruned to RAG_MEDIA_PROXY_CACHE_MAX_MB (default 1024)
+at startup, oldest first.  A long-lived GUI session browsing video-heavy
+datasets must not grow without bound.
 """
 
 from __future__ import annotations
@@ -58,6 +66,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -65,6 +74,56 @@ from urllib.parse import unquote, urlsplit
 DEFAULT_GATEWAY = "https://pcai-llm-gateway.pcai-se-ai-application.hst.rdlabs.hpecorp.net/mcp"
 CA_BUNDLES = ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt")
 UUID_PREFIX = re.compile(r"^[0-9a-f]{32}_")
+
+# In-memory cache bounds: a handful of full-size files, never an unbounded dict.
+MEMORY_CACHE_MAX_ITEMS = 32
+MEMORY_CACHE_MAX_BYTES = 64 * 1024 * 1024
+# Loopback-only by default (see SECURITY POSTURE).
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int knob defensively: a malformed value falls back to *default*."""
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def is_loopback_host(host: str) -> bool:
+    """True when *host* binds a loopback interface only."""
+    h = (host or "").strip().lower()
+    return h in LOOPBACK_HOSTS or h.startswith("127.")
+
+
+def prune_cache_dir(cache_dir: Path, max_bytes: int) -> int:
+    """Delete the oldest files in *cache_dir* until it fits in *max_bytes*.
+
+    The disk cache was never pruned: a long-lived proxy accumulated every byte
+    it ever served.  Returns the number of files removed.
+    """
+    entries: list[tuple[float, int, Path]] = []
+    for path in cache_dir.glob("*"):
+        try:
+            if path.is_file():
+                info = path.stat()
+                entries.append((info.st_mtime, info.st_size, path))
+        except OSError:
+            continue
+    total = sum(size for _, size, _ in entries)
+    if total <= max_bytes:
+        return 0
+    removed = 0
+    for _, size, path in sorted(entries):
+        if total <= max_bytes:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size
+        removed += 1
+    return removed
 
 
 def _load_key() -> str:
@@ -106,9 +165,7 @@ class GatewayMCP:
         self._ready = False
 
     def _post(self, payload: dict) -> str:
-        request = urllib.request.Request(
-            self.url, data=json.dumps(payload).encode(), method="POST"
-        )
+        request = urllib.request.Request(self.url, data=json.dumps(payload).encode(), method="POST")
         request.add_header("Authorization", "Bearer " + self.key)
         request.add_header("Content-Type", "application/json")
         request.add_header("Accept", "application/json, text/event-stream")
@@ -205,9 +262,32 @@ class MediaStore:
         self.gateway = gateway
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._index = {}
+        self._index: dict[str, dict[str, str]] = {}
         self._index_lock = threading.Lock()
-        self._memory = {}
+        self._memory: OrderedDict[str, tuple[bytes, str]] = OrderedDict()
+        self._memory_lock = threading.Lock()
+        self._memory_bytes = 0
+
+    def _memory_get(self, key: str):
+        with self._memory_lock:
+            hit = self._memory.get(key)
+            if hit is not None:
+                self._memory.move_to_end(key)
+            return hit
+
+    def _memory_put(self, key: str, payload: tuple[bytes, str]) -> None:
+        # Insert into the LRU, evicting oldest entries past the caps.
+        with self._memory_lock:
+            if key in self._memory:
+                self._memory_bytes -= len(self._memory[key][0])
+                del self._memory[key]
+            self._memory[key] = payload
+            self._memory_bytes += len(payload[0])
+            while self._memory and (
+                len(self._memory) > MEMORY_CACHE_MAX_ITEMS or self._memory_bytes > MEMORY_CACHE_MAX_BYTES
+            ):
+                _, (evicted, _mime) = self._memory.popitem(last=False)
+                self._memory_bytes -= len(evicted)
 
     def _dataset_index(self, dataset: str) -> dict:
         """Map every known name for a dataset files to the stored name."""
@@ -249,7 +329,7 @@ class MediaStore:
     def fetch(self, dataset: str, filename: str):
         stored = self.resolve(dataset, filename)
         key = dataset + "/" + stored
-        hit = self._memory.get(key)
+        hit = self._memory_get(key)
         if hit is not None:
             return hit
         cached = self._cache_path(dataset, stored)
@@ -262,7 +342,7 @@ class MediaStore:
                 except (OSError, json.JSONDecodeError):
                     pass
             payload = (cached.read_bytes(), mime)
-            self._memory[key] = payload
+            self._memory_put(key, payload)
             return payload
 
         result = self.gateway.call(
@@ -279,11 +359,7 @@ class MediaStore:
                 raise MediaTooLarge(error)
             raise FileNotFoundError(error)
         raw = base64.b64decode(result["data"])
-        mime = (
-            result.get("mime_type")
-            or mimetypes.guess_type(stored)[0]
-            or "application/octet-stream"
-        )
+        mime = result.get("mime_type") or mimetypes.guess_type(stored)[0] or "application/octet-stream"
         try:
             cached.write_bytes(raw)
             cached.with_suffix(cached.suffix + ".meta").write_text(
@@ -291,7 +367,7 @@ class MediaStore:
             )
         except OSError:
             pass
-        self._memory[key] = (raw, mime)
+        self._memory_put(key, (raw, mime))
         return raw, mime
 
     def _cache_path(self, dataset: str, stored: str) -> Path:
@@ -368,15 +444,31 @@ def main(argv=None) -> int:
     parser.add_argument("--port", type=int, default=8788)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument(
-        "--gateway", default=os.environ.get("RAG_MEDIA_PROXY_GATEWAY", DEFAULT_GATEWAY)
+        "--allow-remote-host",
+        action="store_true",
+        help="Permit a non-loopback --host (the proxy has NO auth of its own: it exposes every "
+        "dataset the gateway key can read)",
     )
+    parser.add_argument("--gateway", default=os.environ.get("RAG_MEDIA_PROXY_GATEWAY", DEFAULT_GATEWAY))
     parser.add_argument(
         "--cache-dir",
-        default=os.environ.get(
-            "RAG_MEDIA_PROXY_CACHE", str(Path.home() / ".dsh" / "tmp-rag-media-proxy")
-        ),
+        default=os.environ.get("RAG_MEDIA_PROXY_CACHE", str(Path.home() / ".dsh" / "tmp-rag-media-proxy")),
     )
     args = parser.parse_args(argv)
+
+    if not is_loopback_host(args.host):
+        if not args.allow_remote_host:
+            print(
+                f"error: refusing --host {args.host}: this proxy has no authentication of its own, "
+                "so a non-loopback bind exposes every dataset the gateway key can read. "
+                "Pass --allow-remote-host if that is genuinely intended.",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"WARNING: binding {args.host} (NOT loopback) -- this proxy has no auth of its own.",
+            file=sys.stderr,
+        )
 
     key = _load_key()
     if not key:
@@ -396,6 +488,10 @@ def main(argv=None) -> int:
         fallback = Path(__file__).resolve().parent.parent / ".scratch" / "rag-media-proxy-cache"
         fallback.mkdir(parents=True, exist_ok=True)
         cache_dir = fallback
+
+    removed = prune_cache_dir(cache_dir, _env_int("RAG_MEDIA_PROXY_CACHE_MAX_MB", 1024) * 1024 * 1024)
+    if removed:
+        print(f"  cache:   pruned {removed} stale file(s) from {cache_dir}")
 
     store = MediaStore(GatewayMCP(args.gateway, key), cache_dir)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(store))

@@ -9,6 +9,13 @@
 #
 # Idempotent-ish: it will NOT add a duplicate redirect URI (checks first).
 #
+# TLS: these calls carry the Keycloak ADMIN password and the shared `ua` client
+# secret, so they verify the platform CA when one is available (RAG_CA_BUNDLE,
+# default ~/.config/opencode/pcai-aie-root-ca.crt).  Only when no bundle is
+# found does it fall back to `curl -k`, with a loud warning.
+# The admin password reaches curl on STDIN (--data-binary @-), never in argv --
+# argv is world-readable through /proc on a shared jump host.
+#
 # Requirements: kubectl (kubeconfig for the environment), curl, jq.
 
 set -euo pipefail
@@ -22,37 +29,50 @@ VIRTUAL_SERVICE_NAME="${VIRTUAL_SERVICE_NAME:-rag-mcp-server}"
 command -v jq >/dev/null || { echo "jq is required"; exit 1; }
 command -v kubectl >/dev/null || { echo "kubectl is required"; exit 1; }
 
+# --- TLS verification for every call that carries a credential ----------------
+CA_BUNDLE="${RAG_CA_BUNDLE:-${HOME}/.config/opencode/pcai-aie-root-ca.crt}"
+if [ -n "${CA_BUNDLE}" ] && [ -f "${CA_BUNDLE}" ]; then
+  CURL_TLS=(--cacert "${CA_BUNDLE}")
+  echo "TLS: verifying with CA bundle ${CA_BUNDLE}"
+else
+  CURL_TLS=(-k)
+  echo "WARNING: no CA bundle at '${CA_BUNDLE}' -- TLS verification is DISABLED" >&2
+  echo "         (-k) on the calls carrying the Keycloak admin password and the" >&2
+  echo "         shared ua client secret.  Set RAG_CA_BUNDLE=<pcai-aie-root-ca.crt>." >&2
+fi
+
 DOMAIN_NAME=$(kubectl get cm ezapp-manager-parameters -n ezapp-system -o jsonpath='{..DOMAIN_NAME}')
 KEYCLOAK_URL="https://keycloak.${DOMAIN_NAME}"
 echo "Keycloak: ${KEYCLOAK_URL}  realm: ${REALM}  client: ${CLIENT}"
 
 # --- admin token (master realm, admin-cli) ------------------------------------
 KEYCLOAK_ADMIN_PASSWORD=$(kubectl get secrets admin-pass -n keycloak -o template='{{.data.password | base64decode}}')
-ADMIN_TOKEN=$(curl -k -s -X POST "${KEYCLOAK_URL}/realms/master/protocol/openid-connect/token" \
-    -H "Content-Type: application/x-www-form-urlencoded" \
-    -d "username=admin" \
-    -d "password=${KEYCLOAK_ADMIN_PASSWORD}" \
-    -d "grant_type=password" \
-    -d "client_id=admin-cli" | jq -r '.access_token')
+# The password is URL-encoded and POSTed on STDIN (--data-binary @-): it must
+# never appear in curl's argv, which is world-readable through /proc.
+ADMIN_TOKEN=$(printf 'username=admin&password=%s&grant_type=password&client_id=admin-cli' \
+    "$(printf '%s' "${KEYCLOAK_ADMIN_PASSWORD}" | jq -sRr @uri)" \
+  | curl "${CURL_TLS[@]}" -s -X POST "${KEYCLOAK_URL}/realms/master/protocol/openid-connect/token" \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      --data-binary @- | jq -r '.access_token')
 [ -n "$ADMIN_TOKEN" ] && [ "$ADMIN_TOKEN" != "null" ] || { echo "FAILED to get an admin token"; exit 1; }
 
 # --- the ua client -------------------------------------------------------------
-CLIENT_ID=$(curl -k -s -X GET -H "Authorization: Bearer $ADMIN_TOKEN" \
+CLIENT_ID=$(curl "${CURL_TLS[@]}" -s -X GET -H "Authorization: Bearer $ADMIN_TOKEN" \
                  "${KEYCLOAK_URL}/admin/realms/${REALM}/clients?clientId=${CLIENT}" | jq -r '.[0].id')
 [ -n "$CLIENT_ID" ] && [ "$CLIENT_ID" != "null" ] || { echo "client '${CLIENT}' not found in realm ${REALM}"; exit 1; }
 
-CLIENT_SECRET=$(curl -k -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/clients/${CLIENT_ID}" \
+CLIENT_SECRET=$(curl "${CURL_TLS[@]}" -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/clients/${CLIENT_ID}" \
                      -H "Content-Type: application/json" -H "Authorization: Bearer ${ADMIN_TOKEN}" | jq -r '.secret')
 
 # --- register the callback URL (no duplicates) --------------------------------
 OIDC_CALLBACK_URL="https://${VIRTUAL_SERVICE_NAME}.${DOMAIN_NAME}/oauth/oidc/callback"
-CURRENT=$(curl -k -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/clients/${CLIENT_ID}" \
+CURRENT=$(curl "${CURL_TLS[@]}" -s -X GET "${KEYCLOAK_URL}/admin/realms/${REALM}/clients/${CLIENT_ID}" \
     -H "Content-Type: application/json" -H "Authorization: Bearer ${ADMIN_TOKEN}")
 if echo "$CURRENT" | jq -e --arg u "$OIDC_CALLBACK_URL" '.redirectUris | index($u)' >/dev/null; then
   echo "redirect URI already registered: ${OIDC_CALLBACK_URL}"
 else
   REDIRECT_URIS=$(echo "$CURRENT" | jq '.redirectUris' | jq ". += [\"${OIDC_CALLBACK_URL}\"]")
-  curl -k -s -o /dev/null -w "redirect-URI registration HTTP %{http_code}\n" -X PUT \
+  curl "${CURL_TLS[@]}" -s -o /dev/null -w "redirect-URI registration HTTP %{http_code}\n" -X PUT \
     "${KEYCLOAK_URL}/admin/realms/${REALM}/clients/${CLIENT_ID}" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer ${ADMIN_TOKEN}" \

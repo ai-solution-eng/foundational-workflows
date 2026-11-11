@@ -26,7 +26,7 @@ import os
 import sys
 import time
 import types
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import pytest
 
@@ -60,7 +60,7 @@ class _FakeClient:
     def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: object) -> bool:
+    def __exit__(self, *exc: object) -> Literal[False]:
         return False
 
     def get(self, url: str) -> _FakeResponse:

@@ -21,8 +21,8 @@ import asyncio
 import hashlib
 import os
 import threading
-import time
 from array import array
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -71,12 +71,45 @@ class _BatcherState:
 _state_lock = threading.Lock()
 _state = _BatcherState()
 
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float env knob defensively (a typo must never brick the service).
+
+    Every knob in this module is rendered from a ConfigMap, so a malformed
+    value is one operator typo away.  Import-time parsing with a bare
+    float()/int() would raise during module import — uvicorn never binds, the
+    Deployment CrashLoops, and every dataset's search degrades because the
+    shared batcher is gone.  Fall back to the documented default with a loud
+    warning instead.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Unknown %s=%r, using %s", name, raw, default)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int env knob defensively (see :func:`_env_float`)."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Unknown %s=%r, using %d", name, raw, default)
+        return default
+
+
 # Hard cap on a single flushed batch's model round-trip.  The batcher is
 # single-flight: if the embedding endpoint stalls, every query queued in that
 # batch would otherwise wait for it.  A healthy batch drains in ~1-4s, so this
 # is a tripwire for a stalled model call — timing out lets the caller fall
 # back to local batching instead of hanging the request for tens of seconds.
-_FLUSH_TIMEOUT = float(os.environ.get("EMBED_BATCH_FLUSH_TIMEOUT", "15"))
+_FLUSH_TIMEOUT = _env_float("EMBED_BATCH_FLUSH_TIMEOUT", 15.0)
 
 # ---------------------------------------------------------------------------
 # Query-vector cache
@@ -93,9 +126,11 @@ _FLUSH_TIMEOUT = float(os.environ.get("EMBED_BATCH_FLUSH_TIMEOUT", "15"))
 # anyway).  Values are packed array('f') — ~16KB per 4096-dim vector vs
 # ~130KB as a list of boxed floats (same trick as mcp_server's media-query
 # cache): 4096 entries cost ~65MB resident, not ~530MB.
-_EMBED_BATCH_CACHE_MAX = max(0, int(os.environ.get("EMBED_BATCH_CACHE_MAX", "4096")))
-_query_vec_cache: "dict[str, array]" = {}
-_query_vec_cache_order: "list[str]" = []
+_EMBED_BATCH_CACHE_MAX = max(0, _env_int("EMBED_BATCH_CACHE_MAX", 4096))
+# OrderedDict as the LRU: move_to_end()/popitem(last=False) are O(1), where the
+# previous list-of-keys touch was an O(n) scan + memmove on every cache HIT
+# (the fast path paying the most) while holding the lock embed() also takes.
+_query_vec_cache: "OrderedDict[str, array]" = OrderedDict()
 
 
 def _cache_key(model_name: str, text: str) -> str:
@@ -108,12 +143,8 @@ def _cache_get(key: str) -> "array | None":
     with _state_lock:
         vec = _query_vec_cache.get(key)
         if vec is not None:
-            # LRU touch: move the key to the back of the eviction order.
-            try:
-                _query_vec_cache_order.remove(key)
-                _query_vec_cache_order.append(key)
-            except ValueError:  # pragma: no cover - dict/order desync guard
-                _query_vec_cache_order.append(key)
+            # LRU touch: O(1) on an OrderedDict.
+            _query_vec_cache.move_to_end(key)
     return vec
 
 
@@ -121,12 +152,10 @@ def _cache_put(key: str, vector: "list[float]") -> None:
     if not _EMBED_BATCH_CACHE_MAX:
         return
     with _state_lock:
-        if key not in _query_vec_cache and len(_query_vec_cache_order) >= _EMBED_BATCH_CACHE_MAX:
-            for _ in range(len(_query_vec_cache_order) - _EMBED_BATCH_CACHE_MAX + 1):
-                _query_vec_cache.pop(_query_vec_cache_order.pop(0), None)
         _query_vec_cache[key] = array("f", vector)
-        if key not in _query_vec_cache_order:
-            _query_vec_cache_order.append(key)
+        _query_vec_cache.move_to_end(key)
+        while len(_query_vec_cache) > _EMBED_BATCH_CACHE_MAX:
+            _query_vec_cache.popitem(last=False)
 
 
 class EmbedRequest(BaseModel):
@@ -148,8 +177,11 @@ def _build_batcher() -> _QueryBatcher:
     if embedder is None:
         raise RuntimeError("No embedder model configured (MODEL_EMBEDDER_URL not set)")
     model = embedder.model  # MultiModalEmbeddings
-    max_size = int(os.environ.get("EMBEDDING_QUERY_BATCH_SIZE", "128"))
-    max_wait_ms = float(os.environ.get("EMBEDDING_QUERY_BATCH_WAIT_MS", "200"))
+    # Defensive: a malformed value here raises inside _reload's try/except and
+    # leaves the batcher permanently un-ready (every /embed answers 503), so
+    # parse with the same warn-and-default discipline as the module knobs.
+    max_size = max(1, _env_int("EMBEDDING_QUERY_BATCH_SIZE", 128))
+    max_wait_ms = max(0.0, _env_float("EMBEDDING_QUERY_BATCH_WAIT_MS", 200.0))
     return _QueryBatcher(
         embed_fn=model._embed_text_batch_async,
         max_batch_size=max_size,
@@ -171,7 +203,6 @@ def _reload() -> None:
             # (sha256 includes model_name), but a stale-while-clearing window is
             # not worth reasoning about: drop them all.
             _query_vec_cache.clear()
-            _query_vec_cache_order.clear()
     except Exception as exc:
         logger.exception("Failed to build embedder for batcher")
         with _state_lock:

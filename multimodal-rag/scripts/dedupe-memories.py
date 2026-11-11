@@ -28,6 +28,7 @@ writes it to <input>.dedupe.json. --apply performs the deletions over REST
 dataset is protected). Deleted ids are exactly the Qdrant point ids the
 export carries, so the manifest doubles as an audit record.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -44,6 +45,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
+
 
 def load_documents(path: str) -> list[dict[str, Any]]:
     docs: list[dict[str, Any]] = []
@@ -74,7 +76,7 @@ def parse_ts(ts: str) -> datetime:
     if not ts:
         return datetime.min.replace(tzinfo=UTC)
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return datetime.fromisoformat(ts)
     except ValueError:
         return datetime.min.replace(tzinfo=UTC)
 
@@ -192,8 +194,11 @@ def group_near_identical(
             (
                 dropped_docs,
                 kept["docs"][0],
-                "near-identical (Jaccard>=%.2f) across %d sessions; kept session %s @ %s"
-                % (threshold, len({e[1]["session"] for e in members}), kept["session"], kept["ts"]),
+                (
+                    f"near-identical (Jaccard>={threshold:.2f}) across "
+                    f"{len({e[1]['session'] for e in members})} sessions; "
+                    f"kept session {kept['session']} @ {kept['ts']}"
+                ),
             )
         )
     return out
@@ -203,9 +208,8 @@ def group_near_identical(
 # Apply (REST) + reporting
 # ---------------------------------------------------------------------------
 
-def apply_deletions(
-    api: str, dataset: str, ids: list[str], api_key: str, password: str
-) -> tuple[int, str]:
+
+def apply_deletions(api: str, dataset: str, ids: list[str], api_key: str, password: str) -> tuple[int, str]:
     """DELETE /api/datasets/{name}/documents with explicit point ids."""
     url = f"{api.rstrip('/')}/api/datasets/{dataset}/documents"
     headers = {"Content-Type": "application/json"}
@@ -213,9 +217,7 @@ def apply_deletions(
         headers["X-RAG-Api-Key"] = api_key
     if password:
         headers["X-Dataset-Password"] = password
-    req = urllib.request.Request(
-        url, method="DELETE", data=json.dumps({"doc_ids": ids}).encode(), headers=headers
-    )
+    req = urllib.request.Request(url, method="DELETE", data=json.dumps({"doc_ids": ids}).encode(), headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             return resp.status, resp.read().decode()[:500]

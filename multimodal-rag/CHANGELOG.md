@@ -3,9 +3,202 @@
 All notable changes to this project are tracked here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 
+## [Unreleased] — 2026-11-10 feature wave (retrieval quality + procedural memory)
+
+Five features, built as a zone-partitioned agent wave with two direction-matched cross-validation
+reviews. Suite: **1994 passed / 2 skipped / 0 failed** (baseline before the wave: 1705 passed).
+Everything here is OPT-IN and default-off; no existing call path changes behaviour.
+
+### Added — playbook memory (procedural memory across sessions)
+
+- **"## Playbook" — a fifth, OPTIONAL distiller section** carrying a structured procedure (task
+  signature, applies-when, steps, failure modes, outcome) as fenced JSON. Optional by design: making
+  it required would raise DistillTruncatedError on every legitimately short document and re-run the
+  whole map-reduce. PROMPT_VERSION -> dsh-2026-11-10. The gateway half ships as an overlay
+  (integrations/pcai_llm_playbook/) because the PCAI-LLM checkout is read-only from this workspace;
+  apply_playbook_patch.py is idempotent and was verified against the real gateway (103 tests before
+  and after).
+- **Server-side emission gate + inferred outcome.** A playbook is written only for sessions with
+  >=4 tool calls, no budget marker, no denied-tool storm and no repeated identical call; the
+  model's own "outcome" field is OVERRIDDEN by one inferred from trace signals, and outcome_source
+  is always "inferred". A model grading its own session is the failure mode this exists to avoid.
+  The playbook is a second memory document (kind "playbook") and the summary body is byte-identical.
+- **recall_playbooks(task, k=3)** MCP tool — on demand, never injected at session start. Ranks by
+  smoothed success rate, labels unproven records and sorts them last, and returns conflicting
+  playbooks side by side with their counts instead of collapsing them.
+- **record_playbook_outcome(memory_id, outcome)** — the write half of the decay loop; increments
+  success/fail and stamps last_validated.
+- **Store semantics**: playbook supersession by playbook_key (not session id) with counter
+  inheritance; counters merge with max() so a replayed supersession cannot inflate evidence.
+- **DatasetManager.update_memory_payload(name, ids, patch)** — the missing PATCH. Before this,
+  nothing in mm-rag could mutate a memory after write, which is why counters could be read and never
+  incremented. Refuses unknown ids and writes nothing on refusal.
+
+### Added — memory consolidation
+
+- **consolidate_memories(dry_run=True)** — decay (half-life 30 d, floor 0.15), importance from
+  access count + kind + recency, an archive set gated on "below floor AND never accessed AND not a
+  protected kind", and contradiction detection (near-duplicates at cosine >= 0.92 with opposing
+  advice markers). Dry run writes nothing; contradictions are ALWAYS report-only. "playbook" is a
+  protected kind and is never auto-archived.
+
+### Added — agentic iterative retrieval (opt-in)
+
+- **agentic_retrieval.py** — retrieve -> judge -> rewrite loop, bounded three ways (rounds, total
+  searches, repeated-rewrite guard). FAIL-OPEN by contract: a judge that raises, times out, returns
+  None/junk, or repeats a rewrite stops the loop and returns the results already collected; the loop
+  never raises and never spins. The judge is injectable, so the whole loop is testable offline.
+- Surfaces: search_dataset(agentic=True, agentic_max_rounds=2) on MCP, and the agentic /
+  agentic_max_rounds body fields on POST /api/datasets/{name}/search and POST /api/search. A
+  non-boolean "agentic" is rejected rather than truthy-coerced, and the round count is clamped.
+  The non-agentic path is unchanged.
+
+### Added — multi-vector late interaction (per-dataset opt-in)
+
+- **late_interaction.py** — real MaxSim machinery (comparator=MAX_SIM), a TokenEmbedder protocol, and
+  a sidecar collection "<dataset>__late" holding token matrices, so nothing is bolted onto the
+  dataset collection's schema.
+- **Honest gating, no faked quality.** The deployment's document embedder is single-vector and cannot
+  produce token embeddings, so there is no hashed-token or split-pooled-vector fallback: enabling
+  without a configured token embedder (RAG_TOKEN_EMBEDDER_URL / _MODEL / _API_KEY / _TIMEOUT_S) FAILS
+  CLOSED with a message naming the keys, and a search on a late-enabled dataset with no embedder
+  degrades to dense+BM25 stamped metadata["_late"]="unavailable". Storage cost is COMPUTED, not
+  asserted: one pooled vector per doc vs one per token (~512x at 512 tokens).
+- Surfaces: set_late_interaction(dataset_name, enabled) on MCP and POST
+  /api/datasets/{name}/late-interaction, persisted under meta "features" and mirrored to a
+  per-dataset state file the retrieval layer reads. Enabling on a dataset with documents reports the
+  re-ingest requirement and the document count. Sidecar points are dropped on document delete,
+  dataset delete and recreate. The new POST suffix joined the D26 read-only grant gate.
+
+### Added — CI-gated faithfulness eval
+
+- **faithfulness.py** — deterministic, offline lexical grounding (content-token coverage at 0.7, a
+  numeric contradiction guard, a negation guard) plus an optional LLM judge that the gate never uses.
+  The numeric guard is what makes it usable: without it a contradictory answer ("euclidean distance,
+  4096-dimensional vectors") scored 1.0, which is a green light that means nothing.
+- **scripts/ci_eval_gate.py** — compares fresh results against a committed baseline, fails on a
+  per-case regression (default tolerance 0.02), a mean below 0.80, or ANY growth in the aggregate
+  unsupported-claim count (--max-unsupported-growth, default 0), exits 2 on malformed input. The
+  faithful/partial labels are taken from the BASELINE, not from the results file — a producer cannot
+  launder a bad case by relabelling it. 30 golden cases including a "plausible-contradiction"
+  category that reuses the context vocabulary and a negation-marker family.
+- **tests/evaluations/test_faithfulness_gate.py** runs the gate inside the normal pytest suite, so
+  the existing suite IS the CI gate today; .github/workflows/faithfulness-gate.yml is there for when
+  CI exists.
+
+### Changed
+
+- **documentation/MCP.md §2** regenerated: 25 tools (was 21). documentation/deployment_flow.dot label
+  updated to 25 tools; scripts/gen_mcp_docs.py gained NEEDS_COLUMNS entries for the four new tools.
+- **dataset_manager.py update_dataset** gained a namespaced "features" passthrough (per-feature
+  opt-in blocks in meta.json, so they survive export/backup) and the cached-RAG invalidation path now
+  CLOSES the evicted client like the LRU path — on the local embedded backend the old path transiently
+  double-locked the storage folder.
+- **documentation/PLAYBOOK-MEMORY.md** added — the end-to-end reference for the feature above.
+
+## [Unreleased] — 2026-11-10 audit remediation wave (W3: charts, cronjobs, PDB, digest)
+
+### Fixed (charts/cronjobs — zone W3)
+- **Backup CronJob now carries the `wait-for-qdrant` readiness gate** (P2-8): the init
+  container added to watched-sources/stm-reaper in `737c686` was missing from the backup cron
+  in all three charts, so a 03:00 tick during a cold STS restart drove exports (reads) against
+  a half-joined cluster — the exact orphaned-shard/leader-panic scenario the gate exists for.
+- **Backup + watched-sources ticks fail on ANY dataset/source failure** (P2-9): the exit was
+  `1 if failed and not exported else 0` (backup) / `1 if failed and not ok else 0` (watched), so
+  a 3/10 backup or a 9/10 sync reported Job Succeeded — no Kubernetes failure signal, nothing
+  for a CronJobFailed alert to see. Both now exit `1 if failed else 0`; retries are idempotent
+  (per-dataset ETag skip / stamped, never-overwritten export keys).
+- **Backup + stm-reaper CronJobs keep their failed pod readable** (P2-10): `restartPolicy:
+  OnFailure` let the job controller DELETE the pod at backoffLimit (the 2026-09 pcai-se
+  log-loss incident watched-sources already fixed) — now `Never` +
+  `ttlSecondsAfterFinished: 3600`, matching the watched-sources contract.
+- **extraEnv now reaches every CronJob** (P2-14): backup, watched-sources and stm-reaper render
+  the same `extraEnv` range the API/MCP containers get — a `MODEL_*`/proxy override no longer
+  diverges between serving pods and the reaper (which builds the same model pack).
+
+### Added (charts — zone W3)
+- **PodDisruptionBudget per workload** (P2-12): new `poddisruptionbudget.yaml` template +
+  `podDisruptionBudget.*` values in all three charts (API, qdrant, and Redis in the scale
+  charts where the workload exists), `maxUnavailable: 1` each — a node drain/upgrade can no
+  longer evict the whole serving tier or a qdrant quorum at once (the rejoin is documented as
+  slow: a cold join replays the raft log over NFS under a 20-minute startup budget). Default
+  `enabled: true`; opt out with `podDisruptionBudget.enabled=false`.
+- **`security.requirePinnedKeys` (default false)** (P2-13): the GitOps residual — an OFFLINE
+  render (`helm template` / a CI apply) has no cluster lookup, so with no pinned key it minted
+  a NEW `RAG_API_KEY`/`MEDIA_TOKEN_SECRET` per apply SILENTLY (every client 401s, every signed
+  media URL dies). The new value fails that render loudly; the default keeps offline CI renders
+  working; NOTES.txt (added to the scale charts, which shipped none) warns whenever the
+  generated-key path was taken.
+- **`rag.prefetchFloor` → `RAG_PREFETCH_FLOOR`** (P1-2c): the per-lane Qdrant prefetch floor is
+  now an operator knob in all three charts (code default 200; the app clamps above 1000).
+  `EMBED_BATCH_CACHE_MAX` stays large-chart-only by design — the embed-batcher singleton is its
+  only consumer, and the gated-feature rule keeps the key out of charts without the workload.
+- **Optional `image.digest` / `qdrant.image.digest` / `redis.image.digest`** (P3-7): when set,
+  every workload renders `repository:tag@sha256:...` — the tag stays readable, the pull becomes
+  immutable. Default `''` = unchanged tag-only pulls.
+- **qdrant now runs `readOnlyRootFilesystem: true`** (P3-8) with an emptyDir at /tmp — the last
+  container in the fleet without it.
+
+### Changed (charts — zone W3)
+- The G2 site values' `trustProxyIdentity` comment no longer claims "every path traverses the
+  enforcing AuthorizationPolicy" (P3-9: that policy selects only the `istio: ingressgateway`
+  pods; the real protection is the D21 forwarded-token assertion) and points at
+  `networkPolicy` for the full posture.
+- CHANGELOG D25 self-mint entry corrected (P1-6): the default-on ruling was superseded — all
+  three charts ship `security.accessSelfMint: false` (opt-in), pinned by
+  `tests/full_pipeline/test_access_store_render.py::test_self_mint_is_opt_in`.
+- New render tests: `tests/full_pipeline/test_zone_c_render_remediation.py` pins the gate
+  presence, strict exit codes, Never+TTL, the PDB trio, requirePinnedKeys fail/pass, extraEnv
+  reach, prefetchFloor, digest wiring and the qdrant rootfs hardening.
+
+
+### Fixed (charts — zone W3 wave-2, execution-completeness review)
+- **qdrant snapshot dir under the read-only rootfs (B1)**: the P3-8 hardening left
+  `/qdrant/snapshots` (SNAPSHOTS_PATH's default) unwritable — snapshot creation failed (and
+  could fail at startup). All three charts mount an emptyDir there (and keep the /tmp one);
+  snapshots stay volatile by design — point the mount at a real PVC to keep them.
+- **PDB topology rules (M2/M3/M5)**: a PDB below 2 replicas is inert AND falsely reassuring
+  (disruptionsAllowed = healthy - (replicas - maxUnavailable) >= 1 for one pod) — no PDB renders
+  below 2 replicas, so the base chart (1 API replica, 1 qdrant node) and the single-replica Redis
+  ship none; qdrant maxUnavailable is FORCED to 0 below 3 peers (a 2-peer raft loses quorum on
+  any single eviction) and clamped to peers-2 above; qdrant PDB gains
+  `unhealthyPodEvictionPolicy: AlwaysAllow` so a NOT-Ready peer (20-min cold-join budget) never
+  makes a drain impossible.
+- **The API PDB no longer matches CronJob pods (M4)**: the API pod template gains
+  `app.kubernetes.io/component: api` and the PDB selects on it — the bare `app=` label also
+  matched every cron pod, whose 30-minute qdrant readiness gate would drop disruptionsAllowed to
+  0 and block kubectl drain.
+- **`podDisruptionBudget=null` renders (M7)**: `--reuse-values` produces exactly that on the
+  first upgrade; the template is now nil-guarded instead of nil-pointer-failing.
+- **The GitOps key warning covers BOTH REST keys (M6)**: pinning only `security.apiKey` left
+  `MEDIA_TOKEN_SECRET` minted fresh per render with NO warning (proven: two renders differed);
+  the NOTES warning now fires unless BOTH are pinned, and `security.requirePinnedKeys` already
+  refuses the half-pinned render.
+- **The P3-9 rewording extended to the remaining five example/site values files (M8)** (the g2
+  values ×3, medium local g2, omnilife): the AuthorizationPolicy selects only the gateway pods;
+  the D21 forwarded-token assertion is the actual control.
+- **The busybox init image joins the digest discipline (m9)**: new
+  `initContainer.busybox.{repository,tag,digest}` values render
+  `busybox:1.37.0@sha256:...` when set.
+- CHANGELOG self-mint correction cites values.g2.yaml:270 (m10 — the line moved with the wave-1
+  comment fix); the wave-1 impl report's "format-only" wording corrected (m11 — the watched-sources
+  test file also carries a pre-wave semantic assertion change from the protected-passwords work).
+
 ## [Unreleased] — Qdrant memory-tier migration (v1.19)
 
 ### Added
+- **Folder uploads in the upload tab.** Drag a folder onto the drop zone, or
+  use the new **📂 Upload Folder** button (`webkitdirectory`), and every file
+  inside it is queued through the SAME batch pipeline as a file pick: the same
+  bounded 5-file multipart batches, per-file progress lines, Retry-Failed
+  bookkeeping and per-file `MAX_UPLOAD_BYTES` cap. Nested folders are walked
+  with the entries API (its `readEntries` batches are drained to EOF), dot
+  entries (`.git`, `.venv`, `.DS_Store`), Office lock files (`~$…`) and
+  `Thumbs.db`/`desktop.ini` are skipped, an unreadable member never discards
+  the rest of the folder, and a pick above 1000 files asks for confirmation
+  before queueing. Folders are flattened onto the existing storage layout: the
+  stored `files/` name is the same `uuid_<stem><suffix>` the single-file path
+  produces, so a subfolder path does not become part of a citation `source`.
 - **Backup CronJob can now back up password-protected datasets** via
   `backups.protectedPasswords.existingSecret`: name a user-owned Secret whose
   keys are dataset names and values the matching dataset passwords; it is
@@ -201,7 +394,7 @@ All notable changes to this project are tracked here. Format loosely follows [Ke
 
 ### Changed (D25 self-mint — chart-default OFF since the 2026-10-16 audit remediation)
 
-- **`security.accessSelfMint` now defaults to `true` in all three charts (fleet-owner ruling, 2026-10): an SSO-authenticated identity gets the "Your API key" self-mint/rotate card on the Access page out of the box — no admin round-trip and no values edit.** Rationale: the minted key carries EXACTLY the identity's existing access (never widens grants — a fresh SSO identity holds only the read-only public datasets), API-key callers can never mint (the D17 invariant), and the whole surface is inert without an SSO identity source — so default-on is safe everywhere and does the one useful thing exactly where SSO is on (G2's ezaf-gateway proxy identities, OIDC deployments). The knob semantics are unchanged: the env `RAG_ACCESS_SELF_MINT` still reads per request (flip without a restart), a bare-env deployment still defaults unset (byte-identical), and `security.accessSelfMint: false` in values restores the pre-D25 render (no env, mint 409s, flag false). The feature additionally requires the access overlay (`accessStore: true`, itself chart-default true since 2026-09-24) — nowhere to write the minted entry, no feature; the hosted-trial example profiles keep `accessStore: false`, so the knob stays inert there and their comments now say so. The G2 example values pin `accessSelfMint: true` explicitly (the live G2 site values need no change — they carry no override and inherit the default). Render contract pinned by new assertions in `tests/full_pipeline/test_access_store_render.py` (default render carries `RAG_ACCESS_SELF_MINT: "true"`; `--set security.accessSelfMint=false` removes it entirely).
+- **[CORRECTED 2026-11-10 — P1-6: the default-on ruling below was SUPERSEDED; see the correction at the end of this entry.]** Historical entry (2026-10 fleet ruling, later reversed): an SSO-authenticated identity gets the "Your API key" self-mint/rotate card on the Access page out of the box — no admin round-trip and no values edit — WHEN `security.accessSelfMint: true` is set. Rationale: the minted key carries EXACTLY the identity's existing access (never widens grants — a fresh SSO identity holds only the read-only public datasets), API-key callers can never mint (the D17 invariant), and the whole surface is inert without an SSO identity source — so default-on is safe everywhere and does the one useful thing exactly where SSO is on (G2's ezaf-gateway proxy identities, OIDC deployments). The knob semantics are unchanged: the env `RAG_ACCESS_SELF_MINT` still reads per request (flip without a restart), a bare-env deployment still defaults unset (byte-identical), and `security.accessSelfMint: false` in values restores the pre-D25 render (no env, mint 409s, flag false). The feature additionally requires the access overlay (`accessStore: true`, itself chart-default true since 2026-09-24) — nowhere to write the minted entry, no feature; the hosted-trial example profiles keep `accessStore: false`, so the knob stays inert there and their comments now say so. The G2 example values pin `accessSelfMint: true` explicitly (helm-scale-large/local/values.g2.yaml:270 — the live site values set it too; they never "inherit the default", which was false either way). **CORRECTION (2026-11-10 audit, P1-6): this entry is WRONG about the default and was superseded — all three charts ship `security.accessSelfMint: false` (opt-in) since the 2026-10-16 remediation; the default render carries NO `RAG_ACCESS_SELF_MINT` and the mint endpoints stay inert (409) until an operator sets `security.accessSelfMint: true`. Pinned by `tests/full_pipeline/test_access_store_render.py::test_self_mint_is_opt_in`; DEPLOYMENT.md §5b and API.md document the opt-in default correctly.**
 
 ### Added (D27 — MCP Inspector tab: test MCP tool calls from the browser, as your session)
 

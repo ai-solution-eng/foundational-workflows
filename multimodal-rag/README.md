@@ -19,8 +19,13 @@ End-to-end multimodal retrieval-augmented generation: ingest documents in 17+ fo
 - **Modality conversion** — retrieved media the LLM doesn't support is auto-converted (images/video → VLM description, audio → ASR transcript)
 - **Dataset management** — password-protected datasets, per-dataset Qdrant collections, dedup (cosine ≥ 0.995), S3/HTTP URL ingestion with sync reconciliation
 - **Watched S3 sources** (opt-in) — a reconciler CronJob keeps datasets in sync with S3/MinIO prefixes on a schedule: new/changed objects ingest, objects deleted upstream are pruned, unchanged objects are skipped via a per-dataset ETag/Size state (no re-download)
-- **MCP server** — 21 tools (search, federated search, list, document management add/delete/replace, file listing + bounded base64 bytes, self-service dataset selection + ★ memory binding, short-term session datasets, memory-writer capability probe, recall + memory management, media inspection — VLM description / ASR transcript) over streamable-http / stdio / sse
+- **MCP server** — 25 tools (search, federated search, list, document management add/delete/replace, file listing + bounded base64 bytes, self-service dataset selection + ★ memory binding, short-term session datasets, memory-writer capability probe, recall + memory management, playbook recall/scoring + memory consolidation, per-dataset late-interaction opt-in, media inspection — VLM description / ASR transcript) over streamable-http / stdio / sse
 - **Long-term memory** — per-user LLM-curated memory store for opencode and Open WebUI, with SSO-backed isolation
+- **Playbook memory (procedural)** — the distiller's OPTIONAL fifth section captures a reusable procedure with a task signature and an outcome **inferred from trace signals** (never self-assessed); `recall_playbooks` ranks by empirical success rate and `record_playbook_outcome` closes the decay loop. See [documentation/PLAYBOOK-MEMORY.md](documentation/PLAYBOOK-MEMORY.md)
+- **Memory consolidation** — on-demand decay/importance/contradiction pass (`consolidate_memories`, dry-run by default): archive only what is below the floor AND never accessed AND not a protected kind; contradictions are report-only
+- **Agentic iterative retrieval (opt-in)** — bounded retrieve → judge → rewrite loop that **fails open**: a judge that raises, times out or returns junk stops the loop and returns what was already found
+- **Multi-vector late interaction (opt-in per dataset)** — real MaxSim over token matrices in a sidecar collection, with computed (not asserted) storage math. **Fails closed** without a token-level embedder: no hashed-token or split-vector pretending
+- **CI-gated faithfulness eval** — deterministic offline scorer (content-token coverage + numeric-contradiction and negation guards) with a committed golden set and a regression gate wired into the test suite
 - **Open WebUI extension** — filter that routes unsupported modalities to the RAG MCP tool, plus inlet/outlet memory hooks
 - **Helm chart** — 2-container pod (API + MCP sidecar), Qdrant StatefulSet, Istio/EZUA ingress with oauth2-proxy
 
@@ -351,7 +356,8 @@ are. Unauthenticated visitors get a minimal 401 "Sign in required" page (with a
 **The tab map** — the tabs render from the public whoami
 (`GET /api/oidc-session` → `{authenticated, identity, is_admin, flags, …}`):
 
-- **Datasets** — the existing homepage workspace (upload, search, ingest),
+- **Datasets** — the existing homepage workspace (upload — single files or a
+  whole folder — search, ingest),
   identity-scoped: a user sees only their own datasets plus the globals.
 - **Access** — the `/access` page absorbed: per-identity dataset checkboxes
   (D15/D16), the unlock/TTL panel, and the ★ memory-dataset binding.

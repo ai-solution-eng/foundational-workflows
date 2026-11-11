@@ -1,0 +1,26 @@
+{{- $name := .Values.deployment.name -}}
+{{- $ns := .Release.Namespace -}}
+{{- /* P2-13 (2026-11-10 audit): the offline-render key-mint warning (the
+       base chart carries the full NOTES; the scale charts render only this
+       conditional warning). The condition mirrors secret.yaml's generation
+       path: no existingSecret, no inline value, and no stored release Secret
+       found => this install GENERATED the key, and any OFFLINE re-render
+       (GitOps) would mint a DIFFERENT one per apply. */ -}}
+{{- $storedSecret := lookup "v1" "Secret" $ns (printf "%s-model-keys" $name) -}}
+{{- /* M6 (wave-2 review): the mint risk is PER KEY — pinning only
+       security.apiKey still leaves MEDIA_TOKEN_SECRET generated per render,
+       so the condition fires unless BOTH are pinned inline. */ -}}
+{{- $restKeysPinned := and .Values.security.apiKey .Values.security.mediaTokenSecret -}}
+{{- if and (not .Values.security.existingSecret) (not $storedSecret) (not $restKeysPinned) }}
+⚠  GITOPS / OFFLINE-RENDER WARNING (P2-13) — rag-mcp-server {{ .Chart.Version }}:
+REST key material is NOT fully pinned (need BOTH security.apiKey AND
+security.mediaTokenSecret inline, or a security.existingSecret).  Every
+UNPINNED key of the pair was GENERATED for this install, and an OFFLINE
+re-render (helm template / a GitOps apply) mints a NEW value for it per
+apply — clients 401 and every signed media URL dies.  Pick one:
+  a) pin BOTH keys: --set security.apiKey=... --set security.mediaTokenSecret=...
+     (or a values file — never commit them);
+  b) own the Secret: --set security.existingSecret=<your-secret>;
+  c) fail fast instead of rotating: --set security.requirePinnedKeys=true.
+In-cluster upgrades are safe either way (the stored Secret wins).
+{{- end }}

@@ -3,6 +3,13 @@
 Status: proposal, not committed scope. Authored 2026-08-31, after the v3.0.0 security round and v3.2.0 performance/hardening round. The security and performance surfaces are deliberately left alone here — these items extend retrieval quality, operability, and the MCP/memory product surface, in preference order. Effort: S (≤1 day), M (2–4 days), L (a week+).
 
 > **Status (2026-11):** all eight items below have shipped — see CHANGELOG.md and MCP.md § 2; the sections below are the original design record.
+>
+> **Wave 2026-11-10 (beyond this list):** playbook memory (procedural), memory consolidation, agentic
+> iterative retrieval, per-dataset multi-vector late interaction, and a CI-gated faithfulness eval shipped as
+> opt-in features — see CHANGELOG.md and [PLAYBOOK-MEMORY.md](PLAYBOOK-MEMORY.md). Two items a deeper research
+> pass considered and **withdrew** are recorded here so they are not re-proposed: swapping the embedder
+> (Qwen3-VL-Embedding-8B stays) and swapping the reranker (the 2B candidate loses ~5.9 nDCG, and the small
+> listwise model is text-only and CC BY-NC).
 
 | # | Feature | Effort | Impact |
 |---|---------|--------|--------|

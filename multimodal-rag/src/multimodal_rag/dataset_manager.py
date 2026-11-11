@@ -59,7 +59,7 @@ from multimodal_rag.rag_system import MultimodalRAG, _record_ingest_warning, _st
 from multimodal_rag.stm_lifetime import validate_lifetime, validate_stored_lifetime
 from multimodal_rag.utils.general_tools import retry_call
 from multimodal_rag.utils.logging_utils import logging
-from multimodal_rag.vector_store import RrfParams
+from multimodal_rag.vector_store import QdrantVectorStore, RrfParams
 
 # Per-dataset weighted-RRF defaults (feature: weighted RRF, dataset-defaults
 # slice).  Stored in meta.json as ``meta["rrf"] = {"dense_weight": …,
@@ -342,6 +342,14 @@ def _record_upload_history(dataset_name: str, files: list[dict[str, Any]], sourc
 # request, no latency.  Bulk replays (dataset restore/import) are muted.
 
 
+def _int_or_zero(value: Any) -> int:
+    """Non-negative int from a stored counter; garbage reads as 0 (never raises)."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _stored_points_count(files: list[dict[str, Any]] | None) -> int:
     """Points added by a batch ingest result (failed and dedup-skipped
     files add 0; legacy shapes without stored_ids fall back to chunks)."""
@@ -355,6 +363,55 @@ def _stored_points_count(files: list[dict[str, Any]] | None) -> int:
         else:
             total += f.get("chunks") or 0
     return total
+
+
+def _ingest_retry_call(
+    func: Callable[..., Any],
+    *,
+    max_attempts: int = 3,
+    base_delay: float = 2.0,
+    connection_delay: float = 10.0,
+) -> Any:
+    """retry_call for ingest, with Feature D's fail-closed error NOT retried.
+
+    Same policy as multimodal_rag.utils.general_tools.retry_call — linear
+    backoff, a longer floor for connection-shaped errors, the last exception
+    re-raised — with exactly one exception class excluded from retrying.
+
+    WHY THIS EXISTS (Feature D cross-validation finding F4, 2026-11-10).
+    LateInteractionUnavailable is the CONTRACTED fail-closed error for
+    "late-enabled dataset, no token embedder".  The shared retry_call retries
+    ANY exception, and for an ingest that is actively harmful rather than
+    merely wasteful: the first attempt can already have upserted the main
+    points before the sidecar write raised, so the retry hits content-hash /
+    vector dedup, stores nothing and returns an empty list.  The caller then
+    reports the file "complete, 0 chunks" — the ingest SUCCEEDS while its
+    points have no token matrices, which is precisely the state the
+    fail-closed contract exists to prevent.  A missing token embedder is a
+    configuration error, so there is nothing to wait for: catch it BEFORE the
+    generic handler and re-raise immediately (never a "give up and continue"
+    outcome).
+
+    The shared util lives in a fleet-hardlinked module, so the exclusion is
+    implemented here rather than by widening that signature.
+    """
+    from multimodal_rag.late_interaction import LateInteractionUnavailable
+
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return func()
+        except LateInteractionUnavailable:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                delay = base_delay * (attempt + 1)
+                if "connection" in str(exc).lower():
+                    delay = max(delay, connection_delay)
+                time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 def _notify_ingest_hook(dataset_name: str, doc_count: int, status: str = "ok") -> None:
@@ -427,7 +484,16 @@ def _write_hash_index(hashes_path: Path, index: dict[str, str]) -> None:
 # index under the cross-process lock once per batch.  If the process dies
 # before the flush the files are still on disk — only the dedup entries are
 # missing, so a retry re-copies them (benign duplicates, never corruption).
-_hash_index_dirty: dict[Path, dict[str, str]] = {}
+#
+# A value of None is a DELETE sentinel (the entry must be removed, not set):
+# dropping a tier-1 original with keep_originals=False deletes the stored
+# file, so its hash entry has to go too — and because that hash entry may
+# still be PENDING here from _store_file's deferred write, a direct
+# read-modify-write of the index would be resurrected by the flush at the end
+# of the batch.  Staging the delete in this same dict makes last-write-wins
+# do the right thing (the delete is always staged after the store) and keeps
+# the batch at one index write.
+_hash_index_dirty: dict[Path, dict[str, str | None]] = {}
 _hash_index_dirty_lock = threading.Lock()
 
 
@@ -436,6 +502,17 @@ def _flush_hash_index_writes() -> None:
 
     Re-reads the on-disk index under the dataset's cross-process lock so
     entries written by another pod during our batch survive.
+
+    That merge guarantee is honest for ADDS only.  A staged DELETE is a
+    key-blind ``pop``: if another pod re-added the SAME hash after we read the
+    index, the flush drops that fresh entry too.  The consequence is a lost
+    dedup entry for content that still exists on disk - the next upload of it
+    re-copies the bytes and stores a benign duplicate (the ``existing.exists()``
+    guard in _store_file cannot help, the entry is gone), never corruption.
+    Closing that window would need a compare-and-delete under the same lock
+    (read the value, delete only if it still equals the deleted path); the
+    single-writer-per-dataset assumption every batch path already makes is
+    what we rely on instead.
     """
     with _hash_index_dirty_lock:
         dirty = dict(_hash_index_dirty)
@@ -445,8 +522,39 @@ def _flush_hash_index_writes() -> None:
             continue
         with _cross_process_lock(hashes_path.parent / ".hashes.lock"):
             fresh = _load_hash_index(hashes_path)
-            fresh.update(updates)
+            for key, value in updates.items():
+                if value is None:
+                    # Delete sentinel (see _hash_index_dirty).
+                    fresh.pop(key, None)
+                else:
+                    fresh[key] = value
             _write_hash_index(hashes_path, fresh)
+
+
+def _stage_hash_index_delete(hashes_path: Path, path_to_forget: str) -> bool:
+    """Stage removal of every entry pointing at *path_to_forget*.
+
+    Returns True when at least one entry matched (i.e. there is something to
+    flush).  Reads the index through the mtime cache and stages the delete in
+    the deferred dirty set, so the actual write happens once per batch instead
+    of once per dropped original (the O(n²) pattern _store_file's defer_write
+    exists to avoid).  The read is unlocked on purpose: _write_hash_index
+    publishes with os.replace(), so a reader always sees a whole index, and
+    the mutation itself happens under the cross-process lock at flush time.
+    """
+    try:
+        hash_index = _load_hash_index(hashes_path)
+    except Exception:
+        logger.debug("Failed to read %s for a delete", hashes_path, exc_info=True)
+        return False
+    stale = [k for k, v in hash_index.items() if v == path_to_forget]
+    if not stale:
+        return False
+    with _hash_index_dirty_lock:
+        bucket = _hash_index_dirty.setdefault(hashes_path, {})
+        for key in stale:
+            bucket[key] = None
+    return True
 
 
 # ── Source-only payload projections (perf quick-win #3, audit perf P1-5) ──
@@ -2308,6 +2416,21 @@ class DatasetManager:
             assert vs is not None and not isinstance(vs, dict)
             client = vs._client  # type: ignore[attr-defined]
             client.delete_collection(vs.collection_name)  # type: ignore[attr-defined]
+            # Late-interaction sidecar (feature D follow-up, 2026-11-10): the
+            # token vectors live in a SEPARATE '<collection>__late' collection,
+            # so a deleted dataset would otherwise leak it forever.  No-op when
+            # the dataset was never late-enabled; best-effort, because the main
+            # collection is already gone.
+            try:
+                from multimodal_rag import late_interaction as late_lane
+
+                late_lane.delete_late_sidecar(client, vs.collection_name)  # type: ignore[attr-defined]
+            except Exception:
+                logger.warning(
+                    "late-interaction sidecar drop failed for %s",
+                    vs.collection_name,  # type: ignore[attr-defined]
+                    exc_info=True,
+                )
         except Exception:
             logger.debug("Suppressed exception", exc_info=True)
         if name in self._rag_cache:
@@ -2404,6 +2527,23 @@ class DatasetManager:
             if vs is not None and not isinstance(vs, dict):
                 client = vs._client  # type: ignore[attr-defined]
                 client.delete_collection(vs.collection_name)  # type: ignore[attr-defined]
+                # Late-interaction sidecar (feature D follow-up, 2026-11-10):
+                # the token vectors live in '<collection>__late', a SEPARATE
+                # collection, so dropping only the main one leaves a sidecar
+                # whose point ids belong to the OLD collection — a recreated
+                # dataset would then carry stale token matrices.  No-op when
+                # the dataset was never late-enabled; best-effort, because the
+                # main drop already succeeded.
+                try:
+                    from multimodal_rag import late_interaction as late_lane
+
+                    late_lane.delete_late_sidecar(client, vs.collection_name)  # type: ignore[attr-defined]
+                except Exception:
+                    logger.warning(
+                        "late-interaction sidecar drop failed for %s",
+                        vs.collection_name,  # type: ignore[attr-defined]
+                        exc_info=True,
+                    )
         except Exception:
             logger.debug("Suppressed exception while dropping collection", exc_info=True)
         self._rag_cache.pop(dataset_name, None)
@@ -2844,6 +2984,14 @@ class DatasetManager:
         they are read per search, so no RAG rebuild or re-ingest is needed;
         the change takes effect on the next search of this dataset from any
         replica (meta.json is re-read per query).
+
+        Per-feature opt-in blocks ride the generic ``{"features": {…}}`` PATCH
+        (2026-11-10): the value is an object of feature name -> config, merged
+        into the stored block so independent features cannot clobber each
+        other.  The block lives in meta.json, so it survives export / backup /
+        restore; flipping it invalidates the cached RAG exactly like the
+        caption flags (a feature flag is baked into the MultimodalRAG
+        instance).  An empty object or null removes the block.
         """
         with self._get_meta_lock(name):
             meta = self._read_meta(name)
@@ -2899,24 +3047,77 @@ class DatasetManager:
             # processors built from these values.  Affects NEW ingests only
             # - Recreate is the adoption path for existing files.
             if "chunk" in updates:
-                chunk_meta = self._sanitize_chunk_meta(updates["chunk"])
+                payload = updates["chunk"]
+                # Raises TypeError for a non-dict (the REST boundary maps it to
+                # HTTP 400), so everything below can assume a dict.
+                chunk_meta = self._sanitize_chunk_meta(payload)
+                # An EMPTY payload -- {} or one carrying only keys we do not
+                # recognise -- is the documented "clear the override, inherit
+                # the embedder model" gesture, and must be honoured even when
+                # the dataset already HAS a stored block.  The previous code
+                # only cleared when the MERGED result happened to be empty, so
+                # {} was a silent no-op on any dataset with overrides.
+                # A payload carrying an explicit null is NOT this gesture: it
+                # clears only the named keys (so {"chunk_size": null} leaves a
+                # stored code override in place).
+                has_explicit_null = any(key in payload and payload[key] is None for key in self._CHUNK_META_KEYS)
                 merged = dict(meta.get("chunk") or {})
-                for key in self._CHUNK_META_KEYS:
-                    if not isinstance(updates["chunk"], dict):
-                        break
-                    if key in updates["chunk"] and updates["chunk"][key] is None:
-                        merged.pop(key, None)
-                merged.update(chunk_meta)
+                if not chunk_meta and not has_explicit_null:
+                    merged = {}
+                else:
+                    for key in self._CHUNK_META_KEYS:
+                        if key in payload and payload[key] is None:
+                            merged.pop(key, None)
+                    merged.update(chunk_meta)
                 if merged:
                     meta["chunk"] = merged
                 else:
                     meta.pop("chunk", None)
                 caption_changed = True
+            # Per-feature opt-in blocks (2026-11-10): a feature owns the SHAPE of
+            # its own block; the manager only guarantees it is a JSON-serialisable
+            # dict, that it survives export/backup/restore (it lives in
+            # meta.json), and that flipping it invalidates the cached RAG so the
+            # next ingest/search sees it.  MERGED, not replaced, so independent
+            # features can each PATCH their own key without clobbering the rest;
+            # an empty object (or None) removes the whole block.
+            if "features" in updates:
+                feats = updates["features"]
+                if feats is None or (isinstance(feats, dict) and not feats):
+                    meta.pop("features", None)
+                    caption_changed = True
+                elif not isinstance(feats, dict):
+                    raise ValueError("'features' must be an object of feature -> config")
+                else:
+                    try:
+                        json.dumps(feats)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"'features' must be JSON-serialisable: {exc}") from exc
+                    merged_features = dict(meta.get("features") or {})
+                    merged_features.update(feats)
+                    meta["features"] = merged_features
+                    caption_changed = True
             self._write_meta(name, meta)
         # Rebuild the cached RAG so the new caption flags take effect now.
         if caption_changed:
             with self._rag_cache_lock:
-                self._rag_cache.pop(name, None)
+                evicted = self._rag_cache.pop(name, None)
+                # CLOSE the evicted RAG's Qdrant client — the same discipline
+                # the LRU-eviction path in _get_rag already applies.  A cached
+                # RAG holds an open client; on the LOCAL embedded backend an
+                # unclosed client keeps the storage folder locked, so the next
+                # _get_rag() for this dataset fails with portalocker
+                # AlreadyLocked (feature D hit exactly this after a features
+                # flip).  Guarded for a None / missing close() so a store
+                # without one (or a test double) can never make a settings
+                # change fail.
+                try:
+                    evicted_vs = getattr(evicted, "vector_store", None)
+                    evicted_client = getattr(evicted_vs, "_client", None)
+                    if evicted_client is not None:
+                        evicted_client.close()
+                except Exception:
+                    logger.debug("Invalidated RAG client close failed", exc_info=True)
             logger.info("Dataset '%s' caption settings updated; RAG cache invalidated", name)
 
     # ------------------------------------------------------------------
@@ -3170,7 +3371,13 @@ class DatasetManager:
                             file_docs = docs[offset : offset + count]
                             offset += count
                             try:
-                                ids = retry_call(
+                                # _ingest_retry_call, not the shared
+                                # retry_call: Feature D's fail-closed
+                                # LateInteractionUnavailable must propagate on
+                                # the FIRST attempt — a retry would hit dedup
+                                # and return 0 ids, reporting the file
+                                # "complete, 0 chunks" with no token matrices.
+                                ids = _ingest_retry_call(
                                     lambda fd=file_docs: rag.add_to_vector_store(fd, dataset_lifetime=dataset_lifetime),
                                     max_attempts=3,
                                     base_delay=2.0,
@@ -3391,7 +3598,9 @@ class DatasetManager:
                         # Delete original if keep_originals=False (mutates only
                         # this worker's own doc — emitted afterwards).
                         if dst_str != original_dst and not self._get_keep_originals(dataset_name):
-                            self._delete_original_file(dataset_name, original_dst, [], "original_image")
+                            self._delete_original_file(
+                                dataset_name, original_dst, [], "original_image", defer_hash_write=True
+                            )
                             doc.pop("original_image", None)
 
                         evq.put(
@@ -3464,7 +3673,9 @@ class DatasetManager:
                                 )
                             )
                         if delete_original:
-                            self._delete_original_file(dataset_name, original_dst, [], "original_video")
+                            self._delete_original_file(
+                                dataset_name, original_dst, [], "original_video", defer_hash_write=True
+                            )
                         file_total = vid_chunk_count
 
                     elif file_type == "audio":
@@ -3995,6 +4206,11 @@ class DatasetManager:
             else:
                 archive_path = str(self._store_file(dataset_name, file_path, original_name=fname))
 
+            # Feature D fail-closed (cross-validation F4): see _process_member.
+            from multimodal_rag.late_interaction import LateInteractionUnavailable
+
+            late_abort: list[BaseException] = []
+
             def _process_member(member_path: str, member_name: str) -> list[str]:
                 try:
                     result = self._add_file_processed(
@@ -4009,6 +4225,14 @@ class DatasetManager:
                         dataset_lifetime=dataset_lifetime,
                     )
                     return list(result.get("stored_ids") or [])
+                except LateInteractionUnavailable as exc:
+                    # Feature D fail-closed, same rule as the batch retry
+                    # wrapper: a member that cannot store its token matrices
+                    # must FAIL the archive, not be skipped into a "0 chunks"
+                    # success.  ArchiveProcessor.process swallows member
+                    # exceptions, so record it here and re-raise after process().
+                    late_abort.append(exc)
+                    raise
                 except ValueError as exc:
                     # Unsupported member type — skip it, matching the old
                     # behaviour of silently ignoring such files.
@@ -4020,6 +4244,11 @@ class DatasetManager:
 
             archive_proc = ArchiveProcessor(process_member=_process_member)
             ids = archive_proc.process(archive_path)
+            # process() catches member exceptions and returns [] — re-raise the
+            # fail-closed one here so the archive is reported FAILED, never as a
+            # silent "0 chunks" success.
+            if late_abort:
+                raise late_abort[0]
             return {"type": "archive", "chunks": len(ids), "stored_ids": ids}
 
         file_type = _classify_file(file_path)
@@ -4862,6 +5091,7 @@ class DatasetManager:
         original_path: str,
         doc_ids: list[str],
         tier1_key: str,
+        defer_hash_write: bool = False,
     ) -> None:
         """Delete a tier-1 original file and remove its Qdrant reference.
 
@@ -4870,6 +5100,10 @@ class DatasetManager:
         preprocessed copy.  Also removes the ``original_image`` /
         ``original_video`` key from the Qdrant payloads and updates
         the dedup hash index.
+
+        *defer_hash_write* is for callers already inside a deferred batch:
+        the dedup-index removal is staged and flushed with the batch's other
+        hash writes instead of rewriting the whole index here.
         """
         p = Path(original_path)
         if not p.exists():
@@ -4883,20 +5117,19 @@ class DatasetManager:
             logger.debug("Failed to delete original file %s", original_path, exc_info=True)
             return
 
-        # Remove from dedup hash index
+        # Remove from dedup hash index.  Staged in the deferred dirty set (see
+        # _hash_index_dirty) so a batch performs ONE index write instead of a
+        # full rewrite per dropped original, and so the removal cannot be
+        # resurrected by the batch's flush re-adding the entry _store_file
+        # deferred for this very path.  No match = no write at all.
         files_dir = self._dataset_dir(dataset_name) / "files"
         hashes_path = files_dir / ".hashes.json"
         if hashes_path.exists():
-            with _cross_process_lock(files_dir / ".hashes.lock"):
-                try:
-                    hash_index = _load_hash_index(hashes_path)
-                    # Remove any entry pointing at this file
-                    stale = [k for k, v in hash_index.items() if v == original_path]
-                    for k in stale:
-                        del hash_index[k]
-                    _write_hash_index(hashes_path, hash_index)
-                except Exception:
-                    logger.debug("Failed to update .hashes.json", exc_info=True)
+            try:
+                if _stage_hash_index_delete(hashes_path, original_path) and not defer_hash_write:
+                    _flush_hash_index_writes()
+            except Exception:
+                logger.debug("Failed to update .hashes.json", exc_info=True)
 
         # Remove original_* key from Qdrant payloads
         try:
@@ -5322,28 +5555,70 @@ class DatasetManager:
             )
             return len(ids)
 
+    def _existing_point_ids(self, client: Any, collection: str, ids: list[Any]) -> list[str] | None:
+        """Which of *ids* actually exist in *collection* (as strings); None on probe failure.
+
+        Companion to :meth:``_existing_point_count``, for callers that need the
+        SET of ids rather than just the count: the late-interaction lane lives
+        in a SEPARATE sidecar collection (feature D), so a main-collection
+        delete must tell it exactly which points disappeared.  A probe failure
+        returns None — the caller keeps the historical counter behaviour and
+        SKIPS the sidecar cleanup rather than guessing ids that may not exist.
+        """
+        try:
+            points = client.retrieve(
+                collection_name=collection,
+                ids=ids,
+                with_payload=False,
+                with_vectors=False,
+            )
+            return [str(point.id) for point in points]
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("existing-point id probe failed for %s (%d ids)", collection, len(ids), exc_info=True)
+            return None
+
     def delete_document(self, dataset_name: str, doc_id: str) -> None:
         """Delete a single document from a dataset by its point ID."""
         rag = self._get_rag(dataset_name)
         vs = rag.vector_store
         assert vs is not None and not isinstance(vs, dict)
-        client = vs._client  # type: ignore[attr-defined]
+        # Honest narrowing (mypy): every caller below needs the Qdrant-only
+        # surface (``_client`` / ``collection_name``), which the minimal base
+        # class deliberately does not declare.  The runtime check above already
+        # guarantees a Qdrant store here.
+        qvs = cast("QdrantVectorStore", vs)
+        client = qvs._client
         from qdrant_client.models import PointIdsList
 
         # Charge the counter only if the point is really there.
-        existing = self._existing_point_count(
-            client,
-            vs.collection_name,
-            [doc_id],  # type: ignore[attr-defined]
-        )
+        existing = self._existing_point_count(client, qvs.collection_name, [doc_id])
         # Fetch the point's terms for the BM25 df decrement BEFORE deletion.
         self.forget_bm25_documents(dataset_name, [doc_id])
         client.delete(
-            collection_name=vs.collection_name,  # type: ignore[attr-defined]
+            collection_name=qvs.collection_name,
             points_selector=PointIdsList(points=[doc_id]),
             wait=True,
         )
         self._decrement_count(dataset_name, existing)
+        # Late-interaction sidecar cleanup (feature D follow-up, 2026-11-10):
+        # token vectors live in '<collection>__late', a SEPARATE collection
+        # mirroring main point ids, so a main delete must drop the mirror too.
+        # No-op when the dataset was never late-enabled (the helper probes the
+        # sidecar and returns).  Best-effort: the main delete already
+        # succeeded, so a sidecar failure is logged and never raised — an
+        # orphan token vector costs space, not correctness, and a delete that
+        # reports failure after removing the document is worse.
+        if existing:
+            try:
+                from multimodal_rag import late_interaction as late_lane
+
+                late_lane.delete_late_sidecar_points(client, qvs.collection_name, [str(doc_id)])
+            except Exception:
+                logger.warning(
+                    "late-interaction sidecar cleanup failed for %s; the main delete already succeeded",
+                    qvs.collection_name,
+                    exc_info=True,
+                )
 
     def delete_session_memories(
         self,
@@ -5443,6 +5718,307 @@ class DatasetManager:
         """
         return self.delete_session_memories(dataset_name, session_id, ("session_history",))
 
+    # ------------------------------------------------------------------
+    # Memory payload PATCH (the memory-lifecycle primitive, 2026-11-10)
+    # ------------------------------------------------------------------
+
+    def _memory_payloads(self, dataset_name: str, point_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Fetch (string id -> payload) for existing points; unknown ids are absent.
+
+        Payload-only retrieve (``with_vectors=False``): memory payloads are
+        small, and the lifecycle path must never pull the multi-MB media values
+        a search result can carry.  Keys are STRINGS because Qdrant hands back
+        whatever id type was stored (uuid or int) and every caller compares
+        against the id strings the MCP tools expose.
+        """
+        ids = [str(pid).strip() for pid in (point_ids or []) if str(pid).strip()]
+        if not ids:
+            return {}
+        rag = self._get_rag(dataset_name)
+        vs = rag.vector_store
+        if vs is None or isinstance(vs, dict):
+            return {}
+        client = vs._client  # type: ignore[attr-defined]
+        coll = vs.collection_name  # type: ignore[attr-defined]
+        found: dict[str, dict[str, Any]] = {}
+        for point in client.retrieve(coll, ids=ids, with_payload=True, with_vectors=False):
+            found[str(point.id)] = dict(point.payload or {})
+        return found
+
+    def get_memory_payloads(self, dataset_name: str, point_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Public payload read for the memory lifecycle: id -> stored payload.
+
+        The counter loop must READ a memory's current success/fail counts
+        before it can increment them — ``set_payload`` merges but cannot do
+        arithmetic.  Unknown ids are simply absent; callers that must refuse
+        them (:meth:``update_memory_payload``) check the key set.
+        """
+        return self._memory_payloads(dataset_name, point_ids)
+
+    def update_memory_payload(self, name: str, point_ids: Sequence[str], patch: dict[str, Any]) -> int:
+        """Merge *patch* into the METADATA payload of existing memory points.
+
+        THE MISSING PATCH (2026-11-10).  Every memory field — ``memory_kind``,
+        ``session_id``, ``success_count``, ``last_validated``, ``decay_score`` —
+        lives under ``payload["metadata"]`` (MultimodalRAG._to_documents turns
+        every non-"text" document key into metadata), so that is where the
+        patch is applied.  Before this method existed nothing could change a
+        memory after write: ``update_dataset``'s allowlist does not reach
+        payloads and the only other mutation was delete.  That is exactly why
+        the playbook decay loop could never close — counters could be read and
+        never incremented, so no record ever acquired the evidence a demotion
+        or a ranking decision needs.
+
+        Semantics, all deliberate:
+
+        * REFUSES unknown ids: if any requested id is absent the call raises
+          ``ValueError`` and writes NOTHING.  A partial patch is worse than no
+          patch, because the caller cannot tell which half landed.
+        * MERGE, not replace: the existing metadata is read first and the patch
+          is layered over it, so unrelated fields survive.  A patch value of
+          ``None`` REMOVES that key (the same "null clears" convention
+          ``update_dataset`` uses for per-dataset chunk overrides).
+        * Returns the number of ids touched (== ``len(point_ids)`` after the
+          unknown-id refusal).
+        * One ``set_payload`` per id: a lifecycle patch is per-record (its decay
+          score differs), so batching would buy nothing and hide which write
+          failed.
+        """
+        ids = [str(pid).strip() for pid in (point_ids or []) if str(pid).strip()]
+        if not ids:
+            return 0
+        if not isinstance(patch, dict):
+            raise TypeError("patch must be a dict of payload field -> value")
+        existing = self._memory_payloads(name, ids)
+        unknown = [pid for pid in ids if pid not in existing]
+        if unknown:
+            raise ValueError(f"unknown memory point id(s) in '{name}': {', '.join(unknown[:10])}")
+        rag = self._get_rag(name)
+        vs = rag.vector_store
+        if vs is None or isinstance(vs, dict):
+            raise ValueError(f"dataset '{name}' has no vector store")
+        client = vs._client  # type: ignore[attr-defined]
+        coll = vs.collection_name  # type: ignore[attr-defined]
+        from qdrant_client.models import PointIdsList
+
+        touched = 0
+        for pid in ids:
+            meta = dict(existing[pid].get("metadata") or {})
+            for key, value in patch.items():
+                if value is None:
+                    meta.pop(key, None)
+                else:
+                    meta[key] = value
+            client.set_payload(
+                collection_name=coll,
+                payload={"metadata": meta},
+                points=PointIdsList(points=[pid]),
+                wait=True,
+            )
+            touched += 1
+        return touched
+
+    # ------------------------------------------------------------------
+    # Playbook supersession (feature B, 2026-11-10)
+    # ------------------------------------------------------------------
+
+    def find_playbook_memories(
+        self,
+        dataset_name: str,
+        playbook_key: str,
+        limit: int = 100,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Every stored playbook document carrying this ``playbook_key``.
+
+        One server-side filter on ``metadata.memory_kind == "playbook"`` AND
+        ``metadata.playbook_key``, scrolled through the existing
+        :meth:``scroll_documents`` helper — no second scan implementation to
+        drift from the memory region's conventions.
+        """
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        if not playbook_key:
+            return []
+        scroll_filter = Filter(
+            must=[
+                FieldCondition(key="metadata.memory_kind", match=MatchValue(value="playbook")),
+                FieldCondition(key="metadata.playbook_key", match=MatchValue(value=str(playbook_key))),
+            ]
+        )
+        return self.scroll_documents(dataset_name, scroll_filter, limit=limit)
+
+    def supersede_playbook_memory(
+        self,
+        dataset_name: str,
+        playbook_key: str,
+        new_counts: dict[str, Any] | None = None,
+        new_steps: Any = None,
+    ) -> dict[str, Any]:
+        """Supersede a re-emission of the SAME procedure; keep divergent variants.
+
+        TWO identities, and the difference is the whole point (feature B
+        cross-validation findings F9/F10, 2026-11-10):
+
+        * ``playbook_key`` identifies the class of TASK;
+        * the steps fingerprint (``multimodal_rag.playbook.steps_fingerprint``)
+          identifies the PROCEDURE used to solve it.
+
+        Only a re-emission of the same procedure — same key AND same steps
+        fingerprint — replaces the prior record and inherits its counters.  Two
+        sessions can attack one task signature with genuinely different
+        procedures; the design note requires BOTH to be kept and surfaced as a
+        disagreement, so a divergent variant is stored as a SECOND record with
+        the same ``playbook_key`` and fresh 0/0 counters (inheriting across a
+        disagreement would launder evidence).  Superseding on the key alone
+        collapsed the disagreement at write time and made ``detect_conflicts``
+        unreachable on a real store.
+
+        Delete-then-write is still the ORDER (a write-first re-emission would be
+        skipped by near-dup suppression while the old copy is present), which is
+        why the removed documents are returned IN FULL in ``snapshot``: the
+        caller MUST re-add that snapshot if its own write raises, otherwise a
+        failed write permanently destroys the prior procedure and its counters
+        (finding F9).  ``restore_memory_snapshot`` is the compensating write.
+
+        Returns a dict with:
+
+        * ``deleted`` / ``replaced`` — how many prior documents were removed and
+          their point ids;
+        * ``inherited`` — the lifecycle patch for the new document
+          (``merge_counts``: success/fail/last_validated/last_note);
+        * ``snapshot`` — ``[{"memory_id", "payload"}]`` with the full payload
+          (page_content + metadata) of every removed document;
+        * ``diverged`` — True when prior variants exist but none matches the new
+          procedure (nothing was deleted, nothing is inherited);
+        * ``variants`` — one summary per prior variant
+          (``memory_id``, ``steps_fingerprint``, counts).
+
+        Aggregating counters across several prior documents uses ``max()``, not
+        sum: a long memory is split into chunks that each repeat the SAME
+        counter values, so summing would multiply the evidence by chunk count.
+        """
+        from multimodal_rag.playbook import merge_counts, steps_fingerprint
+
+        new_fp = steps_fingerprint(new_steps)
+        empty = {
+            "deleted": 0,
+            "replaced": [],
+            "inherited": merge_counts({}, new_counts or {}),
+            "snapshot": [],
+            "diverged": False,
+            "variants": [],
+        }
+        if not playbook_key:
+            return empty
+        prior = self.find_playbook_memories(dataset_name, playbook_key)
+        if not prior:
+            return empty
+
+        variants: list[dict[str, Any]] = []
+        matching: list[tuple[str, dict[str, Any]]] = []
+        for pid, payload in prior:
+            meta = payload.get("metadata") or {}
+            stored_fp = str(meta.get("steps_fingerprint") or "").strip()
+            if not stored_fp:
+                # Legacy record: derive the fingerprint from the stored steps.
+                # A record with no steps cannot prove it is the same procedure
+                # (it hashes the empty list), so a new record that does carry
+                # steps is treated as a divergent variant, never as a rewrite.
+                stored_fp = steps_fingerprint(meta.get("steps"))
+            variants.append(
+                {
+                    "memory_id": pid,
+                    "steps_fingerprint": stored_fp,
+                    "success_count": _int_or_zero(meta.get("success_count")),
+                    "fail_count": _int_or_zero(meta.get("fail_count")),
+                }
+            )
+            if stored_fp == new_fp:
+                matching.append((pid, payload))
+
+        if not matching:
+            return {
+                "deleted": 0,
+                "replaced": [],
+                "inherited": {},
+                "snapshot": [],
+                "diverged": True,
+                "variants": variants,
+            }
+
+        best_success = 0
+        best_fail = 0
+        validated: list[str] = []
+        newest_note = ""
+        newest_validated = ""
+        for _pid, payload in matching:
+            meta = payload.get("metadata") or {}
+            best_success = max(best_success, _int_or_zero(meta.get("success_count")))
+            best_fail = max(best_fail, _int_or_zero(meta.get("fail_count")))
+            last_validated = str(meta.get("last_validated") or "").strip()
+            if last_validated:
+                validated.append(last_validated)
+                if last_validated >= newest_validated:
+                    newest_validated = last_validated
+                    newest_note = str(meta.get("last_note") or "")
+        old_counts: dict[str, Any] = {
+            "success_count": best_success,
+            "fail_count": best_fail,
+            "last_note": newest_note,
+        }
+        if validated:
+            old_counts["last_validated"] = max(validated)
+
+        snapshot = [{"memory_id": pid, "payload": dict(payload)} for pid, payload in matching]
+        replaced = [pid for pid, _payload in matching]
+        deleted = self.delete_documents(dataset_name, replaced)
+        return {
+            "deleted": deleted,
+            "replaced": replaced,
+            "inherited": merge_counts(old_counts, new_counts or {}),
+            "snapshot": snapshot,
+            "diverged": False,
+            "variants": variants,
+        }
+
+    def restore_memory_snapshot(self, dataset_name: str, snapshot: Sequence[dict[str, Any]]) -> list[str]:
+        """Re-add memory documents from a supersession snapshot (compensating write).
+
+        The counterpart of ``supersede_playbook_memory``'s delete-then-write:
+        when the write that follows a supersession raises, the caller re-adds
+        this snapshot so the prior record (text AND counters) survives.  The
+        re-add is not dedup-skipped, because the delete already removed the
+        near-duplicate it would otherwise match.
+
+        Each snapshot entry is ``{"memory_id", "payload"}`` where the payload is
+        the stored Qdrant payload (``page_content`` + ``metadata``); the payload
+        is converted back into the document-dict shape ``add_documents`` takes
+        (metadata keys at the top level, body under ``text``), so the restored
+        point keeps every field it had, counters included.
+
+        Returns the stored point ids (empty when the snapshot carries nothing
+        usable).  Best-effort by contract: the caller decides what to do when
+        the restore itself fails — it must still surface the ORIGINAL write
+        error, never the restore's.
+        """
+        docs: list[dict[str, Any]] = []
+        for entry in snapshot or []:
+            if not isinstance(entry, dict):
+                continue
+            payload = entry.get("payload")
+            if not isinstance(payload, dict):
+                payload = entry
+            meta = dict(payload.get("metadata") or {})
+            text = payload.get("page_content")
+            if not isinstance(text, str):
+                text = str(meta.pop("text", "") or "")
+            doc = dict(meta)
+            doc["text"] = text
+            docs.append(doc)
+        if not docs:
+            return []
+        return self.add_documents(dataset_name, docs)
+
     def delete_documents(self, dataset_name: str, doc_ids: list[str]) -> int:
         """Delete multiple documents by Qdrant point ID in one batched call.
 
@@ -5459,26 +6035,45 @@ class DatasetManager:
         rag = self._get_rag(dataset_name)
         vs = rag.vector_store
         assert vs is not None and not isinstance(vs, dict)
-        client = vs._client  # type: ignore[attr-defined]
+        # Honest narrowing (mypy) - see delete_document.
+        qvs = cast("QdrantVectorStore", vs)
+        client = qvs._client
         from qdrant_client.models import PointIdsList
 
         # Charge the counter only for points that actually exist. Re-submitting
         # ids used to decrement the stored count for points that were already
         # gone, which is how an idempotent dedupe re-run silently corrupted
-        # document_count (2026-11-04).
-        existing = self._existing_point_count(
-            client,
-            vs.collection_name,
-            clean,  # type: ignore[attr-defined]
-        )
+        # document_count (2026-11-04).  The SAME probe yields the ids the
+        # late-interaction sidecar must forget (feature D follow-up): only the
+        # points that really existed, never a guessed id.
+        existing_ids = self._existing_point_ids(client, qvs.collection_name, clean)
+        existing = len(clean) if existing_ids is None else len(existing_ids)
         # Fetch terms for the BM25 df decrement BEFORE deletion.
         self.forget_bm25_documents(dataset_name, clean)
         client.delete(
-            collection_name=vs.collection_name,  # type: ignore[attr-defined]
+            collection_name=qvs.collection_name,
             points_selector=PointIdsList(points=clean),
             wait=True,
         )
         self._decrement_count(dataset_name, existing)
+        # Late-interaction sidecar cleanup (feature D follow-up, 2026-11-10):
+        # '<collection>__late' is a SEPARATE collection mirroring main point
+        # ids, so its points outlive the documents unless dropped here.  No-op
+        # when the dataset is not late-enabled.  Best-effort by contract: the
+        # main delete already succeeded, so a sidecar failure is logged and
+        # never raised — an orphan token vector costs space, not correctness.
+        if existing_ids:
+            try:
+                from multimodal_rag import late_interaction as late_lane
+
+                late_lane.delete_late_sidecar_points(client, qvs.collection_name, existing_ids)
+            except Exception:
+                logger.warning(
+                    "late-interaction sidecar cleanup failed for %s (%d ids); the main delete already succeeded",
+                    qvs.collection_name,
+                    len(existing_ids),
+                    exc_info=True,
+                )
         return len(clean)
 
     def scroll_documents(

@@ -17,7 +17,7 @@ the function docstring (mcp/server/mcpserver/tools/base.py:
 and checks the RENDERED description — not the source text. A source grep would
 pass on a docstring that never reaches the wire.
 
-Cheap by construction: no cluster, no network. 7 tool names pinned:
+Cheap by construction: no cluster, no network. 8 tool names pinned:
 search_dataset, search_datasets, search_memory, list_memories, get_dataset_files,
 inspect_media, dataset_add_documents.
 """
@@ -49,6 +49,11 @@ CONTENT_TOOLS = (
     # Write tool, but its response echoes files[].file for caller-supplied
     # http(s)/s3 URLs — an externally-chosen string that lands in context.
     "dataset_add_documents",
+    # 2026-11-10 (feature B): playbooks are distilled from session transcripts
+    # by the gateway and stored in the same memory dataset, so a recalled
+    # playbook's steps are externally-written text landing in context — the
+    # notice belongs on the recall tool exactly like search_memory.
+    "recall_playbooks",
 )
 
 

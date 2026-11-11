@@ -37,7 +37,7 @@ replicaCount: 1
 image:
   # Packaged with the chart — leave as-is unless you built your own image.
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v6.2.3
+  tag: v6.3.2
   pullPolicy: IfNotPresent
 
 # Single-replica chart: the API mounts the Qdrant PVC read-only for disk reporting.
@@ -191,8 +191,12 @@ security:
   pwMaxFailures: 10
   pwFailWindow: 300
   # Trust X-Auth-Request-*/X-Email/X-User headers. TRUE here BY CHOICE (chart
-  # default is now false): this site's every path traverses the enforcing
-  # oauth2-proxy AuthorizationPolicy below. Never set it true without that.
+  # default is now false).  P3-9 (2026-11-10 audit): network position is NOT
+  # the guarantee — the AuthorizationPolicy below selects only the
+  # istio: ingressgateway pods, so a direct ClusterIP call never traverses
+  # it; the actual protection is the D21 forwarded-token assertion
+  # (fail-closed).  Never set it true without that; enable networkPolicy for
+  # the full posture.
   trustProxyIdentity: true
 
   # Self-service dataset selection + ★ memory binding on /access — ON this site.

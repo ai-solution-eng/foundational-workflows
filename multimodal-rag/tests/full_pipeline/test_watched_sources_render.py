@@ -366,7 +366,9 @@ def test_backup_cron_sends_the_api_key(chart: str):
     # the export stream derives export_headers from it (dict(headers)) and may
     # add X-Dataset-Password for protected datasets (2026-10).
     assert script.count("headers=headers or None") == 1, "the datasets list must send the key"
-    assert "export_headers = dict(headers)" in script, "the export stream must derive its headers from the API-key headers"
+    assert "export_headers = dict(headers)" in script, (
+        "the export stream must derive its headers from the API-key headers"
+    )
 
 
 # ---------------------------------------------------------------------------

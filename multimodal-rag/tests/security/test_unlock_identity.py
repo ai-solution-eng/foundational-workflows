@@ -252,18 +252,66 @@ def test_rest_direct_peer_identity_unchanged():
     assert api._unlock_client_id(_req(client=("203.0.113.7", 5))) == "203.0.113.7"
 
 
-def test_rest_identity_precedence_chain():
+def test_rest_identity_precedence_chain(monkeypatch):
+    """Provided identity -> forwarded-for chain -> socket peer.
+
+    P1-4 (audit 2026-11-10): every source is now gated on the
+    ENFORCING-PROXY ASSERTION, not the flag alone — a bare header keys the
+    password-failure throttle and the unlock cache, so an attacker who reaches
+    the pod without traversing the edge could rotate it for a fresh bucket per
+    request (unlimited password guessing).  The chain below therefore presents
+    the assertion the operator has to configure; the negative half of the
+    contract is the next test.
+    """
+    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    monkeypatch.setenv("RAG_ENFORCING_PROXY_SIGNAL", "sig")
     api._TRUST_PROXY_IDENTITY = True
+    proof = [(b"x-enforcing-proxy", b"sig")]
     try:
         # provided identity wins
-        assert api._unlock_client_id(_req([(b"x-auth-request-email", b"alice@x")])) == "alice@x"
+        assert api._unlock_client_id(_req(proof + [(b"x-auth-request-email", b"alice@x")])) == "alice@x"
         # then the forwarded-for chain
         assert (
-            api._unlock_client_id(_req([(b"x-forwarded-for", b"198.51.100.2 , 10.0.0.1")]))
+            api._unlock_client_id(_req(proof + [(b"x-forwarded-for", b"198.51.100.2 , 10.0.0.1")]))
             == "xff:198.51.100.2,10.0.0.1"
         )
         # then the socket peer
-        assert api._unlock_client_id(_req()) == "10.9.0.1"
+        assert api._unlock_client_id(_req(proof)) == "10.9.0.1"
+    finally:
+        api._TRUST_PROXY_IDENTITY = False
+
+
+def test_rest_identity_headers_need_the_enforcing_proxy_assertion(monkeypatch):
+    """P1-4, NEGATIVE half: the flag ALONE must never make a caller-supplied
+    header the throttle/unlock bucket key.  That is the defect — rotating
+    X-Auth-Request-User would otherwise mint a fresh brute-force bucket per
+    request and an unbounded set of unlock-cache keys.
+
+    This half cannot be re-weakened by accident: it fails the moment the
+    assertion stops being required.
+    """
+    monkeypatch.setenv("RAG_TRUST_PROXY_IDENTITY", "1")
+    monkeypatch.delenv("RAG_ENFORCING_PROXY_SIGNAL", raising=False)
+    api._TRUST_PROXY_IDENTITY = True
+    try:
+        # identity header AND forwarded-for chain are both ignored -> the peer
+        assert (
+            api._unlock_client_id(
+                _req(
+                    [
+                        (b"x-auth-request-email", b"alice@x"),
+                        (b"x-forwarded-for", b"1.2.3.4"),
+                    ]
+                )
+            )
+            == "10.9.0.1"
+        )
+        # a WRONG assertion is not an assertion either
+        monkeypatch.setenv("RAG_ENFORCING_PROXY_SIGNAL", "sig")
+        assert (
+            api._unlock_client_id(_req([(b"x-auth-request-email", b"alice@x"), (b"x-enforcing-proxy", b"guess")]))
+            == "10.9.0.1"
+        )
     finally:
         api._TRUST_PROXY_IDENTITY = False
 

@@ -1,2 +1,18 @@
 # Exclude hardcoded model definitions with PCAI internal API keys
 src/multimodal_rag/utils/pcai_models.py
+
+# Build context.  docker/Dockerfile only needs src/ and docker/requirements.txt,
+# so everything below is dead weight (~400 MB per release build) -- and the
+# untracked helm*/local secret files would otherwise be shipped to whatever
+# builder is in use (docker buildx --push can be a remote/k8s driver, where the
+# context persists).  Keep in sync with docker/Dockerfile's COPY/ADD lines.
+.git
+.scratch
+.venv
+.venvs
+**/__pycache__
+tests
+documentation
+helm*/local
+uploads_for_test_dataset
+qdrant_storage

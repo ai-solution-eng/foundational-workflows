@@ -157,9 +157,10 @@ def reflow(text: str, width: int) -> str:
             continue
         if QUOTE_RE.match(line):
             flush()
-            pref = QUOTE_PREF_RE.match(line).group(0)
+            pref_match = QUOTE_PREF_RE.match(line)
+            pref = pref_match.group(0) if pref_match is not None else ""
             group = [line]
-            fences = 1 if re.match(r"^\s*(```|~~~)", line[len(pref):]) else 0
+            fences = 1 if re.match(r"^\s*(```|~~~)", line[len(pref) :]) else 0
             j = i + 1
             while j < n and lines[j].strip():
                 if FENCE_RE.match(lines[j]) or HARD_BREAK_RE.search(lines[j]):
@@ -167,7 +168,7 @@ def reflow(text: str, width: int) -> str:
                 m = QUOTE_PREF_RE.match(lines[j])
                 if not m or m.group(0) != pref:
                     break
-                if re.match(r"^\s*(```|~~~)", lines[j][len(pref):]):
+                if re.match(r"^\s*(```|~~~)", lines[j][len(pref) :]):
                     fences += 1
                 group.append(lines[j])
                 j += 1
@@ -177,7 +178,7 @@ def reflow(text: str, width: int) -> str:
                 out.extend(group)  # quote containing a fence: emit verbatim
                 i = j
                 continue
-            inner = [ln[len(pref):] for ln in group]
+            inner = [ln[len(pref) :] for ln in group]
             if any(LIST_RE.match(s) for s in inner):
                 out.extend(lines[i:j])  # quoted list: markers must survive
                 i = j
@@ -209,10 +210,7 @@ def reflow(text: str, width: int) -> str:
                 j += 1
             joined = " ".join(p.strip() for p in pieces)
             first = indent + marker + sp
-            out.extend(
-                _wrap(joined, width, initial_indent=first, subsequent_indent=hang)
-                or [first.rstrip()]
-            )
+            out.extend(_wrap(joined, width, initial_indent=first, subsequent_indent=hang) or [first.rstrip()])
             i = j
             continue
         para.append(line)
@@ -258,7 +256,7 @@ def main() -> int:
     rel = args.paths or DEFAULT_PATHS
     rc = 0
     for r in rel:
-        p = r if r.startswith("/") else REPO / r
+        p = Path(r) if str(r).startswith("/") else REPO / Path(r)
         if not p.is_file():
             print(f"MISSING: {p}")
             rc = 1

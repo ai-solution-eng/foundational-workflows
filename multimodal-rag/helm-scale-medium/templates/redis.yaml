@@ -34,7 +34,7 @@ spec:
         fsGroup: 999
       containers:
         - name: redis
-          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}{{ if .Values.redis.image.digest }}@{{ .Values.redis.image.digest }}{{ end }}"
           imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false

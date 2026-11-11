@@ -1,0 +1,278 @@
+{
+  "method": "lexical",
+  "scorer_version": 3,
+  "n_cases": 30,
+  "cases": [
+    {
+      "id": "fs-001",
+      "category": "fully-supported",
+      "should_be_faithful": true,
+      "score": 1.0,
+      "n_claims": 1,
+      "n_supported_claims": 1
+    },
+    {
+      "id": "fs-002",
+      "category": "fully-supported",
+      "should_be_faithful": true,
+      "score": 1.0,
+      "n_claims": 1,
+      "n_supported_claims": 1
+    },
+    {
+      "id": "fs-003",
+      "category": "fully-supported",
+      "should_be_faithful": true,
+      "score": 1.0,
+      "n_claims": 2,
+      "n_supported_claims": 2
+    },
+    {
+      "id": "fs-004",
+      "category": "fully-supported",
+      "should_be_faithful": true,
+      "score": 1.0,
+      "n_claims": 1,
+      "n_supported_claims": 1
+    },
+    {
+      "id": "fs-005",
+      "category": "fully-supported",
+      "should_be_faithful": true,
+      "score": 1.0,
+      "n_claims": 1,
+      "n_supported_claims": 1
+    },
+    {
+      "id": "fs-006",
+      "category": "fully-supported",
+      "should_be_faithful": true,
+      "score": 1.0,
+      "n_claims": 1,
+      "n_supported_claims": 1
+    },
+    {
+      "id": "fs-008",
+      "category": "fully-supported",
+      "should_be_faithful": true,
+      "score": 1.0,
+      "n_claims": 1,
+      "n_supported_claims": 1
+    },
+    {
+      "id": "mc-001",
+      "category": "fully-supported",
+      "should_be_faithful": true,
+      "score": 1.0,
+      "n_claims": 1,
+      "n_supported_claims": 1
+    },
+    {
+      "id": "ps-001",
+      "category": "partially-supported",
+      "should_be_faithful": true,
+      "score": 0.5,
+      "n_claims": 2,
+      "n_supported_claims": 1
+    },
+    {
+      "id": "ps-002",
+      "category": "partially-supported",
+      "should_be_faithful": true,
+      "score": 0.6666666666666666,
+      "n_claims": 3,
+      "n_supported_claims": 2
+    },
+    {
+      "id": "hh-001",
+      "category": "hallucinated",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "hh-002",
+      "category": "hallucinated",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "hh-003",
+      "category": "hallucinated",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 2,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "nf-001",
+      "category": "negation-flipped",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "nf-002",
+      "category": "negation-flipped",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "ec-001",
+      "category": "empty-context",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "pc-001",
+      "category": "plausible-contradiction",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "pc-002",
+      "category": "plausible-contradiction",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "pc-003",
+      "category": "plausible-contradiction",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "pc-004",
+      "category": "plausible-contradiction",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "pc-005",
+      "category": "plausible-contradiction",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "nf-003",
+      "category": "negation-flipped",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "nf-004",
+      "category": "negation-flipped",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "nf-005",
+      "category": "negation-flipped",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "nf-006",
+      "category": "negation-flipped",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "nf-007",
+      "category": "negation-flipped",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "nf-008",
+      "category": "negation-flipped",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "nf-009",
+      "category": "negation-flipped",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "nf-010",
+      "category": "negation-flipped",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    },
+    {
+      "id": "nf-011",
+      "category": "negation-flipped",
+      "should_be_faithful": false,
+      "score": 0.0,
+      "n_claims": 1,
+      "n_supported_claims": 0
+    }
+  ],
+  "aggregate": {
+    "mean_score": 0.3055555555555555,
+    "faithful_set_mean": 0.9166666666666666,
+    "min_case_score": 0.0,
+    "per_category": {
+      "empty-context": {
+        "n_cases": 1,
+        "mean_score": 0.0
+      },
+      "fully-supported": {
+        "n_cases": 8,
+        "mean_score": 1.0
+      },
+      "hallucinated": {
+        "n_cases": 3,
+        "mean_score": 0.0
+      },
+      "negation-flipped": {
+        "n_cases": 11,
+        "mean_score": 0.0
+      },
+      "partially-supported": {
+        "n_cases": 2,
+        "mean_score": 0.5833333333333333
+      },
+      "plausible-contradiction": {
+        "n_cases": 5,
+        "mean_score": 0.0
+      }
+    }
+  }
+}

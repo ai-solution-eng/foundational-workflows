@@ -51,6 +51,15 @@ NEEDS_COLUMNS: dict[str, tuple[str, str]] = {
     "delete_memory": ("optional¹", "optional¹"),
     "list_memories": ("optional¹", "optional¹"),
     "forget_session": ("optional¹", "optional¹"),
+    # Wave 2026-11-10 — playbook memory (Feature B) and late interaction (Feature D).
+    # recall_playbooks / record_playbook_outcome / consolidate_memories are memory-store
+    # tools: the dataset resolves server-side exactly like the other memory tools.
+    # set_late_interaction names its dataset explicitly and is a WRITE surface (it
+    # mutates the dataset's retrieval config), so it takes the password like a write.
+    "recall_playbooks": ("optional¹", "optional¹"),
+    "record_playbook_outcome": ("optional¹", "optional¹"),
+    "consolidate_memories": ("optional¹", "optional¹"),
+    "set_late_interaction": ("yes", "if protected"),
 }
 
 SENTENCE_END = re.compile(r"[.!?](?=\s)")

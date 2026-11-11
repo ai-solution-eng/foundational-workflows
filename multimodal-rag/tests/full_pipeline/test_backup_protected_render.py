@@ -52,7 +52,11 @@ def _render_ok(chart: str, *set_args: str) -> str:
 
 
 def _backup_cron(rendered: str) -> dict:
-    crons = [d for d in yaml.safe_load_all(rendered) if d and d.get("kind") == "CronJob" and "backups" in d["metadata"]["name"]]
+    crons = [
+        d
+        for d in yaml.safe_load_all(rendered)
+        if d and d.get("kind") == "CronJob" and "backups" in d["metadata"]["name"]
+    ]
     assert len(crons) == 1, f"expected exactly one backup CronJob, got {len(crons)}"
     return crons[0]
 
@@ -67,8 +71,7 @@ def test_default_render_has_no_passwords_mount(chart):
     """Default values: the password Secret wiring must render nothing."""
     out = _render_ok(chart)
     assert not _has_passwords_artifacts(out), (
-        f"{chart}: default render carries dataset-passwords artifacts — "
-        "the feature must be fully opt-in"
+        f"{chart}: default render carries dataset-passwords artifacts — the feature must be fully opt-in"
     )
 
 
@@ -90,14 +93,16 @@ def test_default_render_byte_identical_without_key(chart, tmp_path):
             while i < len(lines) and lines[i].startswith("    "):
                 i += 1
         else:
-            out_lines.append(lines[i]); i += 1
+            out_lines.append(lines[i])
+            i += 1
     stripped.write_text("".join(out_lines))
     out_with = _render_ok(chart)
     out_without = _render_ok(chart, "-f", str(stripped))
 
     def norm(text: str) -> list[str]:
-        return [re.sub(r'(RAG_API_KEY|MEDIA_TOKEN_SECRET): ".*"', r"\1: <generated>", line)
-                for line in text.splitlines()]
+        return [
+            re.sub(r'(RAG_API_KEY|MEDIA_TOKEN_SECRET): ".*"', r"\1: <generated>", line) for line in text.splitlines()
+        ]
 
     assert norm(out_with) == norm(out_without)
 
@@ -105,9 +110,15 @@ def test_default_render_byte_identical_without_key(chart, tmp_path):
 @pytest.mark.skipif(not _helm_available(), reason="helm binary not available")
 @pytest.mark.parametrize("chart", CHARTS)
 def test_enabled_secret_renders_volume_and_mount(chart):
-    out = _render_ok(chart, "--set", "backups.enabled=true",
-                     "--set", "backups.bucket=backup-bkt",
-                     "--set", "backups.protectedPasswords.existingSecret=rag-dataset-passwords")
+    out = _render_ok(
+        chart,
+        "--set",
+        "backups.enabled=true",
+        "--set",
+        "backups.bucket=backup-bkt",
+        "--set",
+        "backups.protectedPasswords.existingSecret=rag-dataset-passwords",
+    )
     cron = _backup_cron(out)
     container = cron["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
     mounts = {m["name"]: m for m in container.get("volumeMounts", [])}

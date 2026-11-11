@@ -31,10 +31,15 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: qdrant
-          image: "{{ .Values.qdrant.image.repository }}:{{ .Values.qdrant.image.tag }}"
+          image: "{{ .Values.qdrant.image.repository }}:{{ .Values.qdrant.image.tag }}{{ if .Values.qdrant.image.digest }}@{{ .Values.qdrant.image.digest }}{{ end }}"
           imagePullPolicy: {{ .Values.qdrant.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
+            # P3-8 (2026-11-10 audit): every other container in every chart
+            # runs readOnlyRootFilesystem; qdrant was the outlier.  Its writes
+            # go to /qdrant/storage (the PVC); /tmp gets an emptyDir for any
+            # scratch the binary needs.
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           command:
@@ -77,6 +82,16 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /qdrant/storage
+            - name: snapshots
+              # B1 (wave-2 review): qdrant writes snapshots to SNAPSHOTS_PATH
+              # (default /qdrant/snapshots).  Under the P3-8 read-only root
+              # filesystem the directory must exist writable or snapshot
+              # creation fails (and can fail at startup).  emptyDir keeps
+              # snapshots volatile by design — they are export artifacts, not
+              # durable state; point this at a real PVC if you keep them.
+              mountPath: /qdrant/snapshots
+            - name: tmp
+              mountPath: /tmp
           resources: {{ toYaml .Values.resources.qdrant | nindent 12 }}
           startupProbe:
             httpGet:
@@ -101,6 +116,14 @@ spec:
               port: {{ .Values.qdrant.httpPort }}
             initialDelaySeconds: 0
             periodSeconds: 10
+      volumes:
+        # P3-8 (2026-11-10 audit): scratch for the readOnlyRootFilesystem
+        # qdrant container (the real writes go to the data volumeClaimTemplate).
+        - name: tmp
+          emptyDir: {}
+        # B1 (wave-2 review): writable snapshots dir (SNAPSHOTS_PATH default).
+        - name: snapshots
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data

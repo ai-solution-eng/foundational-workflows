@@ -58,7 +58,7 @@ If the cluster ingress uses `oauth2-proxy` (EZUA), include a bearer token in the
 
 ---
 
-## 2. Available tools (21)
+## 2. Available tools (25)
 
 | Tool | Purpose | Needs `dataset_name`? | Needs `password`? |
 |------|---------|----------------------|-------------------|
@@ -67,13 +67,17 @@ If the cluster ingress uses `oauth2-proxy` (EZUA), include a bearer token in the
 | `select_dataset(dataset_name, password=None)` | Add a dataset to YOUR key's accessible set: a protected dataset's CORRECT password is verified and saved server-side — other tools need no password argument. | yes | if protected |
 | `deselect_dataset(dataset_name)` | Remove a dataset from YOUR key's accessible set. | yes | — |
 | `create_short_term_memory(session_id, ttl_seconds=None, name=None)` | Create a short-term-memory dataset for one agent session: a NON-GUESSABLE name is minted and HIDDEN from the catalog — KEEP the returned name, the only handle. | no | never |
-| `end_short_term_memory(dataset_name)` | Explicitly tear down (delete) a short-term-memory dataset. | no | — |
+| `end_short_term_memory(dataset_name, password=None)` | Explicitly tear down (delete) a short-term-memory dataset. | no | — |
 | `set_memory_dataset(dataset_name=None)` | Mark which dataset is YOUR long-term memory store (the /access page's ★). | no | — |
-| `search_dataset(dataset_name, query='', image=None, video=None, audio=None, top_k=10, use_reranker=False, reranker_top_k=3, base_llm_modalities=None, password=None, media_base_url=None, file_types=None, severities=None, source_prefix=None, date_from=None, date_to=None, dense_weight=None, sparse_weight=None, k=None)` | Search ONE multimodal RAG dataset by MEANING: images/videos match what they show (captions + image↔text embeddings — text queries DO find pictures), audio its transcript, documents their text. | yes | if protected |
+| `search_dataset(dataset_name, query='', image=None, video=None, audio=None, top_k=10, use_reranker=False, reranker_top_k=3, base_llm_modalities=None, password=None, media_base_url=None, file_types=None, severities=None, source_prefix=None, date_from=None, date_to=None, dense_weight=None, sparse_weight=None, k=None, agentic=False, agentic_max_rounds=2)` | Search ONE multimodal RAG dataset by MEANING: images/videos match what they show (captions + image↔text embeddings — text queries DO find pictures), audio its transcript, documents their text. | yes | if protected |
 | `search_datasets(datasets, query='', image=None, video=None, audio=None, top_k=5, use_reranker=False, reranker_top_k=3, base_llm_modalities=None, file_types=None, severities=None, source_prefix=None, date_from=None, date_to=None)` | Search SEVERAL datasets with ONE query and merge the ranked results. | no | never |
+| `set_late_interaction(dataset_name, enabled, token_dim=None, password=None)` | Per-dataset opt-in to multi-vector late interaction (Feature D): MaxSim rerank over token-level vectors stored in a '<dataset>__late' sidecar collection. | yes | if protected |
 | `memory_status()` | Report the calling key's memory-write capability. | no | — |
 | `add_memory(text, image=None, video=None, audio=None, metadata=None, dataset_name=None, password=None)` | Store a memory (durable fact / decision / preference) for recall via search_memory; distil a concise, self-contained record. | optional¹ | optional¹ |
 | `search_memory(query, image=None, video=None, audio=None, top_k=5, use_reranker=False, reranker_top_k=3, base_llm_modalities=None, dataset_name=None, password=None)` | Recall relevant memories from your personal long-term memory store. | optional¹ | optional¹ |
+| `recall_playbooks(task, k=3, dataset_name=None, password=None)` | Recall stored playbooks (reusable procedures) for a task, ranked by empirical success rate. | optional¹ | optional¹ |
+| `record_playbook_outcome(memory_id, outcome, note='', dataset_name=None, password=None)` | Record how a playbook actually performed: increment its success/fail counter and stamp last_validated. | optional¹ | optional¹ |
+| `consolidate_memories(dry_run=True, limit=500, dataset_name=None, password=None)` | Plan (and only on request apply) memory consolidation: decay scores, archive set, contradictions. | optional¹ | optional¹ |
 | `delete_memory(memory_ids, dataset_name=None, password=None)` | Delete memories from your personal long-term memory store by point ID — pass memory_id values from search_memory / list_memories. | optional¹ | optional¹ |
 | `list_memories(limit=20, kind=None, tags=None, include_session_history=False, dataset_name=None, password=None)` | List stored memories — newest first, with memory_id (→ delete_memory), kind, timestamp, tags, preview; session histories hidden unless requested. | optional¹ | optional¹ |
 | `forget_session(session_id, dataset_name=None, password=None)` | Delete the stored session-history memory for one session. | optional¹ | optional¹ |
@@ -89,7 +93,7 @@ If the cluster ingress uses `oauth2-proxy` (EZUA), include a bearer token in the
 > `python scripts/gen_mcp_docs.py` after any `@mcp.tool()` signature or docstring change;
 > do not edit the table by hand.
 
-> **Read-only grants (D26):** when the caller's key carries mode ACLs (`RAG_DATASET_ACLS` token form `name:ds1:ro` or an overlay `{"name": …, "mode": "ro"}`), the write tools — `dataset_add_documents`, `dataset_delete_documents`, `dataset_replace_document`, `add_memory`, `delete_memory`, `forget_session` — require an **rw** grant for the target dataset: an ro (or ro-only) dataset refuses with a clear `ToolError`; read tools are unchanged.
+> **Read-only grants (D26):** when the caller's key carries mode ACLs (`RAG_DATASET_ACLS` token form `name:ds1:ro` or an overlay `{"name": …, "mode": "ro"}`), the write tools — `dataset_add_documents`, `dataset_delete_documents`, `dataset_replace_document`, `add_memory`, `delete_memory`, `forget_session`, `record_playbook_outcome`, `consolidate_memories` (only when applying), `set_late_interaction` — require an **rw** grant for the target dataset: an ro (or ro-only) dataset refuses with a clear `ToolError`; read tools are unchanged.
 
 ¹ The memory tools resolve `dataset_name` from the `X-Memory-Dataset` header → the caller's ★ binding → `RAG_MEMORY_DEFAULT` → `MEMORY_DATASET` (an explicit `dataset_name` argument is honoured only when nothing was bound — a disagreeing one is refused), and `password` from an explicit argument → the `X-Dataset-Password` header → the saved selection → `RAG_MEMORY_PASSWORD` — see [MEMORY.md](MEMORY.md).
 

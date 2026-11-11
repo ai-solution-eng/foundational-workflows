@@ -25,6 +25,13 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 1
+      # Keep the finished Job (and its failed pod) around long enough to
+      # read the logs: the TTL controller deletes the Job cascadingly
+      # (pods included) after this many seconds.  failedJobsHistoryLimit
+      # above is what evicts the JOB after 3 later ticks; this bounds the
+      # pod lifetime WITHIN that window so a failing tick is debuggable.
+      # (Same contract watched-sources ships.)
+      ttlSecondsAfterFinished: 3600
       template:
         metadata:
           # Deliberately NO hpe-ezua vendor labels on cron pods: the platform's
@@ -36,10 +43,49 @@ spec:
             app: {{ .Values.deployment.appName }}
         spec:
           automountServiceAccountToken: false
-          restartPolicy: OnFailure
+          # ── qdrant readiness gate (2026-10-17 incident; P2-8 2026-11-10) ──
+          # A cron tick must NOT touch qdrant while the cluster is still
+          # forming: after a cold STS restart a node can answer 503 for
+          # minutes, and a read that lands on an orphaned shard panics the
+          # leader (min > max).  Wait for /readyz, bounded by
+          # cronQdrantReadyTimeoutSeconds (default 1800 = 30 min); on
+          # timeout this tick FAILS loudly (the next tick retries) rather
+          # than hammering a half-joined cluster.  (Copied from the
+          # watched-sources cron, which got the gate first.)
+          initContainers:
+            - name: wait-for-qdrant
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ end }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - python
+                - -c
+                - |
+                  import sys, time, urllib.request
+                  url = "http://{{ .Values.deployment.name }}-qdrant:{{ .Values.qdrant.httpPort }}/readyz"
+                  budget = int("{{ .Values.cronQdrantReadyTimeoutSeconds | default 1800 }}")
+                  deadline = time.time() + budget
+                  while True:
+                      try:
+                          with urllib.request.urlopen(url, timeout=5) as r:
+                              if r.status == 200:
+                                  print("qdrant /readyz OK"); sys.exit(0)
+                      except Exception:
+                          pass
+                      if time.time() >= deadline:
+                          print("qdrant not ready after " + str(budget) + "s - failing this tick (next tick retries)"); sys.exit(1)
+                      time.sleep(10)
+          # Never (not OnFailure): with OnFailure the job controller DELETES
+          # the pod the moment backoffLimit is reached - the failed tick's
+          # output was unreachable (2026-09 pcai-se, the same loss
+          # watched-sources fixed).  With Never the failed pod stays in
+          # place as a terminated pod owned by the (TTL-retained) Job, so
+          # kubectl logs <pod> still works after the failure.  The export is
+          # idempotent (dataset/<stamp>.tar.gz keys never overwrite), so a
+          # fresh pod on retry costs nothing.
+          restartPolicy: Never
           containers:
             - name: backup
-              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ end }}"
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               command:
                 - python
@@ -137,7 +183,11 @@ spec:
                       except Exception as exc:
                           print(f"[backup] retention prune failed (non-fatal): {exc}")
                   print(f"[backup] done: {exported} exported, {skipped} skipped (protected), {failed} failed")
-                  raise SystemExit(1 if failed and not exported else 0)
+                  # P2-9 (2026-11-10 audit): ANY failed dataset fails the tick -
+                  # a 3/10 backup must not report Job Succeeded.  The next tick
+                  # retries every dataset; exports are idempotent
+                  # (dataset/<stamp>.tar.gz keys never overwrite).
+                  raise SystemExit(1 if failed else 0)
               envFrom:
                 - configMapRef:
                     name: {{ .Values.deployment.name }}-config
@@ -173,6 +223,10 @@ spec:
                     secretKeyRef:
                       name: {{ .Values.security.existingSecret }}
                       key: {{ .Values.security.existingSecretMediaTokenKey }}
+                {{- end }}
+                {{- range $key, $val := .Values.extraEnv }}
+                - name: {{ $key }}
+                  value: {{ $val | quote }}
                 {{- end }}
               securityContext:
                 allowPrivilegeEscalation: false

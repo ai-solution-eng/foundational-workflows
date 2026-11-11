@@ -96,7 +96,7 @@ spec:
           # than hammering a half-joined cluster.
           initContainers:
             - name: wait-for-qdrant
-              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ end }}"
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               command:
                 - python
@@ -127,7 +127,7 @@ spec:
           restartPolicy: Never
           containers:
             - name: watched-sources
-              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ end }}"
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               command:
                 - python
@@ -240,7 +240,12 @@ spec:
                                     f"create it (or fix the prefix in watchedSources.sources)")
                           failed += 1
                   print(f"[watched] done: {ok} ok, {failed} failed, {skipped} skipped")
-                  raise SystemExit(1 if failed and not ok else 0)
+                  # P2-9 (2026-11-10 audit): ANY failed source fails the tick -
+                  # a 9/10 sync must not report Job Succeeded (the backup twin
+                  # got the same contract).  The next tick retries every source;
+                  # the per-dataset ETag state makes re-ingest a no-op for
+                  # unchanged objects.
+                  raise SystemExit(1 if failed else 0)
               envFrom:
                 - configMapRef:
                     name: {{ .Values.deployment.name }}-config
@@ -274,6 +279,10 @@ spec:
                     secretKeyRef:
                       name: {{ .Values.security.existingSecret }}
                       key: {{ .Values.security.existingSecretMediaTokenKey }}
+                {{- end }}
+                {{- range $key, $val := .Values.extraEnv }}
+                - name: {{ $key }}
+                  value: {{ $val | quote }}
                 {{- end }}
               securityContext:
                 allowPrivilegeEscalation: false

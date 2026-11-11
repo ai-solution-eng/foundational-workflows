@@ -15,6 +15,14 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import numpy as np
 
 import multimodal_rag.utils.bm25 as bm25_lane
+from multimodal_rag.agentic_retrieval import (
+    AgenticConfig,
+    AgenticTrace,
+    build_chat_judge,
+    coerce_agentic_config,
+    query_text,
+    run_agentic_retrieval,
+)
 from multimodal_rag.stm_lifetime import stamp_point_times
 from multimodal_rag.utils import contextualizer
 from multimodal_rag.utils.general_tools import (
@@ -48,6 +56,7 @@ from multimodal_rag.vector_store import (
     VectorStore,
     ensure_search_payload_indexes,
     filters_to_predicate,
+    write_late_sidecar_for_docs,
 )
 
 if TYPE_CHECKING:
@@ -3185,6 +3194,31 @@ class MultimodalRAG:
 
                 await loop.run_in_executor(_QDRANT_IO_POOL, _upsert)
 
+                # ── 3c. Late-interaction sidecar (feature D) ────────────────
+                # The sidecar's container lives in vector_store, but the ONLY
+                # main-collection upsert in the codebase is the one directly
+                # above — so this is the one ingest hook it exposes, called
+                # with the SAME point ids (and the exact texts) the upsert just
+                # wrote, once per sub-batch.  It is a no-op unless the dataset's
+                # late-interaction state file is enabled (the helper reads that
+                # itself; there is deliberately no second gate here), and it is
+                # NOT wrapped in a try/except: an enabled dataset with no token
+                # embedder must FAIL the ingest (contract: fail closed) instead
+                # of silently storing points the late lane can never score.
+                # Offloaded like every other Qdrant-adjacent write on this path
+                # — token embedding and the sidecar upsert are both blocking.
+                _late_guard = _store_write_guard(vs)
+
+                def _write_late_sidecar() -> None:
+                    with _late_guard:
+                        write_late_sidecar_for_docs(
+                            vs,
+                            [str(p.id) for p in points],
+                            [d.page_content for d in sub_docs],
+                        )
+
+                await loop.run_in_executor(_QDRANT_IO_POOL, _write_late_sidecar)
+
             t_store_total += time.monotonic() - t2
             # sub_embs / sub_docs fall out of scope here — released before the
             # next sub-batch starts.
@@ -3373,6 +3407,43 @@ class MultimodalRAG:
             deduped.append(best_by_text[text_hash])
         return deduped
 
+    # -- agentic iterative retrieval (feature: agentic retrieval) --------------
+
+    @staticmethod
+    def _agentic_with_query_text(query: Any, text: str) -> Any:
+        """Fold a rewritten query STRING back into the caller's query form.
+
+        A text query becomes the rewrite itself; a multimodal query dict keeps
+        its media keys and only its `text` field is replaced.  The rewritten
+        query is re-embedded (no stale query vector is reused).
+        """
+        if isinstance(query, dict):
+            rewritten = dict(query)
+            rewritten["text"] = text
+            return rewritten
+        return text
+
+    @staticmethod
+    def _attach_agentic_trace(results: list[tuple[Any, float]], trace: AgenticTrace) -> None:
+        """Attach `metadata["_agentic"]` = trace dict on the first attachable result.
+
+        Dict results are shallow-copied first, so a caller's own document
+        objects (the `documents=` in-memory path) are never mutated.  Plain
+        string results cannot carry metadata; when every result is a string the
+        trace is simply not attached.
+        """
+        payload = trace.as_dict()
+        for index, (doc, score) in enumerate(results):
+            if isinstance(doc, dict):
+                enriched = dict(doc)
+                enriched["_agentic"] = payload
+                results[index] = (enriched, score)
+                return
+            metadata = getattr(doc, "metadata", None)
+            if isinstance(metadata, dict):
+                metadata["_agentic"] = payload
+                return
+
     async def _arerank_results(
         self,
         query: str | dict[str, Any],
@@ -3397,6 +3468,8 @@ class MultimodalRAG:
         need_media: bool | None = None,
         filters: dict[str, Any] | None = None,
         rrf: "RrfParams | None" = None,
+        agentic: bool = False,
+        agentic_config: dict[str, Any] | None = None,
     ) -> list[tuple[Any, float]]:
         """Sync wrapper around :meth:`aretrieve`."""
         return sync_wrapper_safe(
@@ -3411,10 +3484,101 @@ class MultimodalRAG:
                 "need_media": need_media,
                 "filters": filters,
                 "rrf": rrf,
+                "agentic": agentic,
+                "agentic_config": agentic_config,
             },
         )
 
     async def aretrieve(
+        self,
+        query: str | dict[str, Any],
+        documents: Sequence[str | dict[str, Any]] | None = None,
+        top_k: int = 10,
+        use_reranker: bool = False,
+        reranker_top_k: int = 3,
+        query_vector: list[float] | None = None,
+        need_media: bool | None = None,
+        filters: dict[str, Any] | None = None,
+        rrf: "RrfParams | None" = None,
+        agentic: bool = False,
+        agentic_config: dict[str, Any] | None = None,
+    ) -> list[tuple[Any, float]]:
+        """Retrieve documents for *query*, optionally with the agentic loop.
+
+        With `agentic=False` (the default) this is exactly the historical
+        single-pass retrieval -- see :meth:`_aretrieve_once`; not one argument,
+        branch or result changes.
+
+        With `agentic=True` the retrieve -> judge -> rewrite loop from the
+        agentic_retrieval module wraps that same single pass: the judge is the
+        configured chat model (self.vlm) unless `agentic_config["judge_fn"]`
+        injects one, it is asked whether the collected hits answer the query, and
+        a rewritten query is searched again -- bounded by `max_rounds` /
+        `max_total_searches`.  Results keep their shape and the accumulated list
+        carries `metadata["_agentic"]` (the trace dict) on the first attachable
+        result.  A judge that is missing, raises, times out or returns garbage
+        STOPS the loop and returns what was collected: never an exception, never
+        a repeated-rewrite spin.  The trace's `stop_reason` records which case
+        happened.
+        """
+        common: dict[str, Any] = {
+            "documents": documents,
+            "top_k": top_k,
+            "use_reranker": use_reranker,
+            "reranker_top_k": reranker_top_k,
+            "need_media": need_media,
+            "filters": filters,
+            "rrf": rrf,
+        }
+        if not agentic:
+            return await self._aretrieve_once(query, query_vector=query_vector, **common)
+
+        config = coerce_agentic_config(agentic_config)
+        injected = agentic_config.get("judge_fn") if isinstance(agentic_config, dict) else None
+        judge_fn = injected if callable(injected) else build_chat_judge(getattr(self, "vlm", None))
+
+        if judge_fn is None:
+            # Opted in, but this deployment has no chat model to judge with: run
+            # the plain single pass and SAY SO in the trace instead of failing
+            # the search (same posture as contextualize without a VLM).
+            logger.warning(
+                "Agentic retrieval requested but no judge chat model is configured and no "
+                "judge_fn was injected -- running a single retrieval pass."
+            )
+            results = await self._aretrieve_once(query, query_vector=query_vector, **common)
+            trace = AgenticTrace(
+                rounds=1,
+                queries=[query_text(query)],
+                stop_reason="judge_unavailable",
+            )
+            self._attach_agentic_trace(results, trace)
+            return results
+
+        async def _search(effective: Any) -> list[tuple[Any, float]]:
+            if effective is query:
+                return await self._aretrieve_once(query, query_vector=query_vector, **common)
+            # A rewrite is a new text query: re-embed it rather than reusing the
+            # original query's vector.
+            rewritten = self._agentic_with_query_text(query, effective)
+            return await self._aretrieve_once(rewritten, query_vector=None, **common)
+
+        try:
+            results, trace = await run_agentic_retrieval(query, _search, judge_fn, config)
+        except Exception:
+            logger.warning(
+                "Agentic retrieval failed -- falling back to a single retrieval pass",
+                exc_info=True,
+            )
+            results = await self._aretrieve_once(query, query_vector=query_vector, **common)
+            trace = AgenticTrace(
+                rounds=1,
+                queries=[query_text(query)],
+                stop_reason="error_fallback",
+            )
+        self._attach_agentic_trace(results, trace)
+        return results
+
+    async def _aretrieve_once(
         self,
         query: str | dict[str, Any],
         documents: Sequence[str | dict[str, Any]] | None = None,
@@ -3954,18 +4118,74 @@ class MultiModalRAGSystem:
     async def aadd_to_vector_store(self, documents, **kwargs):
         return await self._rag.aadd_to_vector_store(documents, **kwargs)
 
+    def _agentic_kwargs(self, agentic: bool, agentic_config: "dict[str, Any] | AgenticConfig | None") -> dict:
+        """Build the agentic kwargs forwarded to the inner MultimodalRAG.
+
+        The system facade owns the generation chat model (self.llm) while a bare
+        MultimodalRAG only has the VLM, which may be unset -- so when the caller
+        opted in and did not inject a judge, the generation model becomes the
+        judge here.  An injected judge_fn always wins.
+        """
+        if not agentic:
+            return {"agentic": False, "agentic_config": agentic_config}
+        config: dict[str, Any] = {}
+        if isinstance(agentic_config, AgenticConfig):
+            config = {
+                "max_rounds": agentic_config.max_rounds,
+                "max_total_searches": agentic_config.max_total_searches,
+                "min_round_gain": agentic_config.min_round_gain,
+                "judge_timeout_s": agentic_config.judge_timeout_s,
+            }
+        elif isinstance(agentic_config, dict):
+            config = dict(agentic_config)
+        if not callable(config.get("judge_fn")):
+            config["judge_fn"] = build_chat_judge(self.llm)
+        return {"agentic": True, "agentic_config": config}
+
     def retrieve(
-        self, query, documents=None, top_k=10, use_reranker=True, reranker_top_k=3, query_vector=None, rrf=None
+        self,
+        query,
+        documents=None,
+        top_k=10,
+        use_reranker=True,
+        reranker_top_k=3,
+        query_vector=None,
+        rrf=None,
+        agentic: bool = False,
+        agentic_config: "dict[str, Any] | AgenticConfig | None" = None,
     ):
         return self._rag.retrieve(
-            query, documents, top_k, use_reranker, reranker_top_k, query_vector=query_vector, rrf=rrf
+            query,
+            documents,
+            top_k,
+            use_reranker,
+            reranker_top_k,
+            query_vector=query_vector,
+            rrf=rrf,
+            **self._agentic_kwargs(agentic, agentic_config),
         )
 
     async def aretrieve(
-        self, query, documents=None, top_k=10, use_reranker=False, reranker_top_k=3, query_vector=None, rrf=None
+        self,
+        query,
+        documents=None,
+        top_k=10,
+        use_reranker=False,
+        reranker_top_k=3,
+        query_vector=None,
+        rrf=None,
+        agentic: bool = False,
+        agentic_config: "dict[str, Any] | AgenticConfig | None" = None,
     ):
         return await self._rag.aretrieve(
-            query, documents, top_k, use_reranker, reranker_top_k, query_vector=query_vector, rrf=rrf
+            query,
+            documents,
+            top_k,
+            use_reranker,
+            reranker_top_k,
+            query_vector=query_vector,
+            rrf=rrf,
+            **self._agentic_kwargs(agentic, agentic_config),
         )
 
     def list_documents(self, limit=50):

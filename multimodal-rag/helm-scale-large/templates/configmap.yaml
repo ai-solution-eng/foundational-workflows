@@ -37,6 +37,12 @@ data:
   RAG_CAPTION_WITH_VLM: {{ .Values.rag.captionWithVlm | quote }}
   RAG_REMOTE: {{ .Values.rag.remote | quote }}
   RAG_DEDUP_THRESHOLD: {{ .Values.rag.dedupThreshold | quote }}
+  # Per-lane Qdrant prefetch floor (vector_store._prefetch_floor; P1-2c,
+  # 2026-11-10 audit).  Code default 200; RAG_PREFETCH_FLOOR above ~1000 is
+  # clamped by the app (_MAX_PREFETCH_FLOOR) because a huge Prefetch limit
+  # is sent verbatim and can OOM the node.  Operator knob — raise only to
+  # trade page-cache for recall stability.
+  RAG_PREFETCH_FLOOR: {{ int (.Values.rag.prefetchFloor | default 200) | quote }}
   {{- $unlockMaxTtl := 86400 }}
   {{- if hasKey .Values.rag "unlockMaxTtl" }}{{- $unlockMaxTtl = int .Values.rag.unlockMaxTtl }}{{- end }}
   RAG_UNLOCK_MAX_TTL: {{ $unlockMaxTtl | quote }}

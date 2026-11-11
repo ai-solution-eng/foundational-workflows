@@ -28,6 +28,10 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 1
+      # Keep the finished Job (and its failed pod) around long enough to
+      # read the logs; failedJobsHistoryLimit (3 ticks) stays the outer
+      # bound.  (Same contract watched-sources and the backup cron ship.)
+      ttlSecondsAfterFinished: 3600
       template:
         metadata:
           # Deliberately NO hpe-ezua vendor labels on cron pods: the platform's
@@ -49,7 +53,7 @@ spec:
           # than hammering a half-joined cluster.
           initContainers:
             - name: wait-for-qdrant
-              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ end }}"
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               command:
                 - python
@@ -69,10 +73,18 @@ spec:
                       if time.time() >= deadline:
                           print(f"qdrant not ready after {budget}s - failing this tick (next tick retries)"); sys.exit(1)
                       time.sleep(10)
-          restartPolicy: OnFailure
+          # Never (not OnFailure): with OnFailure the job controller DELETES
+          # the pod the moment backoffLimit is reached — the failed tick's
+          # output was unreachable (2026-09 pcai-se, the same loss
+          # watched-sources fixed).  With Never the failed pod stays in place
+          # as a terminated pod owned by the (TTL-retained) Job, so
+          # kubectl logs <pod> still works after the failure — which matters
+          # double here: the wait-for-qdrant gate above FAILS the tick
+          # loudly, and that message is the operator's only diagnostic.
+          restartPolicy: Never
           containers:
             - name: stm-reaper
-              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ end }}"
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               command:
                 - python
@@ -106,6 +118,10 @@ spec:
                   value: {{ .Values.qdrant.httpPort | quote }}
                 - name: RAG_REMOTE
                   value: {{ .Values.rag.remote | quote }}
+                {{- range $key, $val := .Values.extraEnv }}
+                - name: {{ $key }}
+                  value: {{ $val | quote }}
+                {{- end }}
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true

@@ -484,6 +484,27 @@ Dense and lexical retrieval both degrade on isolated chunks — a mid-document p
 
 ---
 
+### Agentic iterative retrieval (opt-in)
+
+One search with one query is the default and stays the default. Agentic retrieval wraps an OPT-IN loop around it: **retrieve → judge → rewrite → retrieve**, bounded three ways so it cannot run away.
+
+- **Bounding**: `max_rounds` (default 2, hard cap `MAX_AGENTIC_ROUNDS = 8`), `max_total_searches` (default 4, cap 16), and a repeated-rewrite guard — a judge that proposes the same rewrite twice ends the loop. A round that adds no NEW document id also ends it.
+- **FAIL-OPEN is the contract**: a judge that raises, times out (`judge_timeout_s`, default 10 s), returns None, returns a string, or returns a dict with the wrong keys **stops the loop and returns the results already collected**, with a `stop_reason` naming what happened. The loop never raises into retrieval and never spins. A judge failure can therefore cost latency, never availability.
+- **Injectable judge**: `run_agentic_retrieval(query, search_fn, judge_fn, config)` takes plain callables (sync or async), so the whole loop is testable offline with fakes. `build_chat_judge` is the only place that touches a model.
+- **Trace**: every response carries `metadata["_agentic"]` — rounds, queries, new doc ids, judge verdicts, stop_reason, elapsed. MCP/REST responses expose the same block next to the existing `rrf` block.
+- **Surfaces**: MCP `search_dataset(..., agentic=True, agentic_max_rounds=2)`; REST body fields `agentic` / `agentic_max_rounds` on `POST /api/datasets/{name}/search` and `POST /api/search`. A non-boolean `agentic` is REJECTED (400) rather than truthy-coerced — a client sending the string "false" must not silently switch on an LLM-driven loop. The round count is clamped to [1, 8].
+- **Cost note**: an agentic request performs up to `max_rounds` searches plus one judge call per round. It is for hard, low-volume queries — not for bulk search.
+
+### Multi-vector late interaction (opt-in, per dataset)
+
+Late interaction (ColBERT-style) keeps one vector per TOKEN instead of one pooled vector per document, and scores a pair as `maxsim(q, d) = (1/|Q|) · Σ_i max_j (q_i · d_j)`. It preserves term-level alignment at a storage cost that is easy to underestimate: one pooled vector per document becomes one vector per token.
+
+- **Storage is computed, not asserted**: 512 tokens at dim 4096 is 512 × 4096 × 4 B = 8,388,608 B per document versus 16,384 B for the pooled vector — 512×. The module exports the arithmetic (`STORAGE_MULTIPLIER_NOTE`) and a test pins that it stays computed.
+- **Storage layout**: a SIDECAR collection `<dataset>__late` holding the token matrices, not a new named vector on the dataset collection. The main collection's schema is untouched, so enabling late interaction never requires recreating a dataset.
+- **Honest gating — nothing is faked**: the deployment's document embedder is a single-vector OpenAI-style endpoint and cannot produce token embeddings, and this feature refuses to pretend otherwise. There is no hashed-token projection and no splitting of a pooled vector into pseudo-tokens. Enabling requires a token-level embedder (`RAG_TOKEN_EMBEDDER_URL`, `_MODEL`, optional `_API_KEY`, `_TIMEOUT_S`); without one, **enabling fails closed** with a message naming the keys, and an ingest into an enabled dataset fails rather than storing points the late lane could never score. A SEARCH on a late-enabled dataset whose embedder has gone away degrades to dense+BM25 and stamps `metadata["_late"] = "unavailable"` — never silently wrong, never a crash.
+- **Scoring**: exact in-process MaxSim over the candidate set (token matrices fetched by candidate id from the sidecar), not an ANN approximation. Bounded by the candidate count, deterministic, and unit-testable with a fake client.
+- **Enabling**: MCP `set_late_interaction(dataset_name, enabled, token_dim=None)` or `POST /api/datasets/{name}/late-interaction`. The opt-in is persisted in `meta.json` under `features.late_interaction` (so it survives export/backup/restore) and mirrored to a per-dataset state file the retrieval layer reads. Enabling on a dataset that already has documents reports the **re-ingest requirement** and the document count — the flag cannot retro-fit token matrices onto documents that were never tokenized. The endpoint is a write surface and joined the D26 read-only grant gate; sidecar points are dropped on document delete, dataset delete and recreate.
+
 ## Reranker (Separate Model Class)
 
 The reranker is now a **first-class model role** (`RerankerModel`) cleanly separated from `EmbeddingModel`. It no longer carries embedding-specific fields (`embedding_dim`, `chunk_size`, `tokenizer_name`).
@@ -838,6 +859,21 @@ For a typical PDF sub-batch (~60 text + ~4 image docs): **~5 HTTP requests** ins
 ## Upload UX
 
 **Batched upload with progress**: Files go out in batches of 5 (a same-named file gets a solo batch) — ONE multipart `fetch` POST to `/api/datasets/{name}/batch-files` per batch → ONE job → ONE status poller (3 batches in flight), not one request + poller per file. Progress state (`📤` → `📦` → `⚙` → `◐` → spinner → `✓`) is driven by the job's event stream.
+
+**Folder uploads**: the drop zone accepts a FOLDER as well as files, and the
+**📂 Upload Folder** button opens a directory picker (`webkitdirectory`). The
+folder is expanded into its files client-side — dropped directories are walked
+with the entries API (`readEntries` answers one bounded batch per call and is
+drained to EOF), picked ones read `webkitRelativePath` — and the files then
+enter the SAME batched pipeline described above, so the per-file
+`MAX_UPLOAD_BYTES` cap, the per-file progress lines and Retry-Failed are
+unchanged. Dot entries (`.git`, `.venv`, `.DS_Store`), Office lock files
+(`~$…`) and `Thumbs.db`/`desktop.ini` are skipped (an explicitly dropped root
+is taken as-is); one unreadable member never discards the rest of the folder;
+and a pick above 1000 files asks for confirmation before queueing. Folders are
+FLATTENED: the stored `files/` name stays the per-file
+`uuid_<stem><suffix>` the single-file path already produces, so a subfolder
+path is not carried into a citation `source`.
 
 **Chunk count accumulation**: Per-file chunk counts are accumulated across sub-batches via `_fileChunkTotal` map. A file split across multiple sub-batches shows its total chunk count (e.g., `✓ 2,048 chunk(s)`) instead of just the last sub-batch's count.
 

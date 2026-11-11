@@ -1970,7 +1970,7 @@ def test_twin_collapse_per_lane_keeps_higher_similarity():
 
     parent = h("p-par", 0.40, False, page=23)
     twin = h("p-twi", 0.58, True, page=23)
-    other = h("p-o", 0.50, False, page=26)   # distinct document
+    other = h("p-o", 0.50, False, page=26)  # distinct document
 
     got = [x[0] for x in collapse_lane_by_twin([parent, twin, other])]
     assert got == ["p-twi", "p-o"], "higher similarity must win, order preserved"
@@ -1994,7 +1994,7 @@ def test_twin_collapse_merges_cross_lane_representations():
 
     parent = h("p-par", 0.40, False, page=23)
     twin = h("p-twi", 0.58, True, page=23)
-    other = h("p-o", 0.50, False, page=26)   # distinct document
+    other = h("p-o", 0.50, False, page=26)  # distinct document
 
     fused = fuse_lanes_with_twin_collapse([parent, other], [twin], limit=10)
     assert len(fused) == 2, f"parent+twin must collapse to one doc, got {len(fused)}"
@@ -2014,7 +2014,7 @@ def test_twin_collapse_score_is_representation_independent():
     def h(pid, sim, twin, page=23):
         return (pid, {"source": "M.pdf", "page": page, "chunk_index": None, "_twin": twin}, sim)
 
-    other = h("p-o", 0.50, False, page=26)   # distinct document
+    other = h("p-o", 0.50, False, page=26)  # distinct document
     twin = h("p-twi", 0.58, True, page=23)
     parent = h("p-par", 0.40, False, page=23)
 

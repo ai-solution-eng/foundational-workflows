@@ -42,8 +42,14 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/ai-solution-eng/multimodal-rag-mcp
-  tag: v6.2.3
+  tag: v6.3.2
   pullPolicy: IfNotPresent
+  # Optional content pin (P3-7, 2026-11-10 audit): when set, EVERY workload
+  # (API, MCP sidecar, embed-batcher, all cron jobs) renders
+  # repository:tag@sha256:... — the tag stays readable, the digest makes the
+  # pull immutable.  Get it: docker buildx imagetools inspect <repo>:<tag>
+  # (or crane digest).  Leave '' for the tag-only default.
+  digest: ''
 
 qdrant:
   # Startup-probe budget for a qdrant node: failureThreshold x periodSeconds(5).
@@ -55,6 +61,9 @@ qdrant:
     repository: qdrant/qdrant
     tag: v1.19.2
     pullPolicy: IfNotPresent
+    # Optional content pin (P3-7, 2026-11-10 audit): renders
+    # qdrant/qdrant:v1.19.2@sha256:... when set (immutable pull).
+    digest: ''
   grpcPort: 6334
   httpPort: 6333
   telemetryDisabled: true
@@ -76,6 +85,37 @@ resources:
   qdrant:
     requests: {cpu: '4', memory: 16Gi}
     limits: {cpu: '8', memory: 32Gi}
+
+# Voluntary-disruption floor (P2-12, 2026-11-10 audit; M2/M3/M5 wave-2): one
+# PodDisruptionBudget per HA workload, so a node drain / upgrade can never
+# evict the whole serving tier — or a qdrant quorum (read-only cluster until
+# the slow NFS rejoin) — at once.  The TEMPLATE enforces the topology rules:
+#   * no PDB below 2 replicas (a 1-pod PDB is inert but falsely reassuring —
+#     disruptionsAllowed = healthy - (replicas - maxUnavailable) >= 1), so
+#     the base chart (1 API replica, 1 qdrant node) renders NO PDB and the
+#     single-replica Redis ships none;
+#   * qdrant maxUnavailable FORCED to 0 below 3 peers (a 2-peer raft loses
+#     quorum on any single eviction) and clamped to peers - 2 above — these
+#     values express the intent, the topology bounds it;
+#   * unhealthyPodEvictionPolicy: AlwaysAllow, so a NOT-Ready peer (20-min
+#     cold-join startup budget) never makes a drain impossible;
+#   * the API PDB selects on a dedicated app.kubernetes.io/component: api
+#     label so CronJob pods (which share app=<appName>) never zero the budget.
+# The ROOT INIT container's image (fix-pvc-permissions chown walk; the only
+# pod in the chart running as uid 0).  Pinned tag since the 2026-10-16 audit
+# (busybox:latest was unpinned mutable supply-chain surface); m9 (wave-2):
+# wired to the same optional digest discipline as image/qdrant/redis — set
+# digest to render repository:tag@sha256:... for an immutable pull.
+initContainer:
+  busybox:
+    repository: busybox
+    tag: "1.37.0"
+    digest: ''
+
+podDisruptionBudget:
+  enabled: true
+  api: {maxUnavailable: 1}
+  qdrant: {maxUnavailable: 1}
 
 persistence:
   data:
@@ -160,6 +200,11 @@ rag:
   # Caps explicit unlock TTLs at 60..N s (default 86400 = 24h). 0 = no-expiry
   # unlocks (the /access page's "No expiry (0)" option becomes meaningful).
   unlockMaxTtl: 86400
+  # Per-lane Qdrant prefetch floor (P1-2c, 2026-11-10 audit): the minimum
+  # per-lane Prefetch limit the hybrid search sends.  Code default 200 —
+  # lowering it trades recall stability for page-cache; the app clamps
+  # anything above 1000 (RAG_PREFETCH_FLOOR env under the hood).
+  prefetchFloor: 200
 
 mcp:
   enabled: true
@@ -244,6 +289,13 @@ security:
   # Secret pipeline (modelSecrets.existingSecret style) over a committed
   # values file if your tooling allows it.
   enforcingProxySignal: ''
+  # P2-13 (2026-11-10 audit): fail the render when NO REST-key source exists
+  # (no inline value, no stored release key).  Default false keeps offline
+  # `helm template` renders working (they generate a per-render key — fine
+  # for CI); set true in GITOPS pipelines, where an unpinned key means a NEW
+  # key is minted on every apply (all clients 401, every signed media URL
+  # dies).  In-cluster upgrades always find the stored key and are unaffected.
+  requirePinnedKeys: false
   # Self-service dataset selection: registry-key users manage their own dataset
   # set on /access (passwords saved per identity). Useful only with apiKeyClients.
   accessStore: true

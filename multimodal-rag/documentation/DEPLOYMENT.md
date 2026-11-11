@@ -190,6 +190,19 @@ in `values.yaml` (both examples in `helm/values-examples/` set them too):
 | `security.pwFailWindow` | `300` | Window (seconds) those failures are counted over |
 | `security.trustProxyIdentity` | `false` | **D24** — trust the auth proxy's identity headers (`X-Auth-Request-*`) as a presented credential (one of the three D25 mint sources). Correct `true` behind an ENFORCING proxy that overwrites these headers on every request (the ezaf-gateway / oauth2-proxy — both site examples keep it); `false` (the raw-env default) for direct unmeshed callers, which could otherwise spoof the headers — with D25 on, a spoofed identity could mint keys. |
 | `security.metricsAuth` | `false` | Require an API key on `/metrics` (`X-RAG-Api-Key`/`X-API-Key`/Bearer); pair with `metrics.serviceMonitorBearerSecret` |
+| `security.requirePinnedKeys` | `false` | **GitOps guard** — fail the render when neither a stored value nor a values key provides `RAG_API_KEY`/`MEDIA_TOKEN_SECRET`. See "GitOps: pin the keys" below. |
+
+**`security.ingestAllowHosts` and `MEDIA_BASE_URL` interact — list your own host.**
+Since the 2026-11-10 audit remediation the allowlist is authoritative for *media*
+URLs too (`inspect_media`, search previews, media refs inside documents), not just
+for ingest downloads. The charts always render `MEDIA_BASE_URL` from the
+VirtualService endpoint, so a deployment that sets `security.ingestAllowHosts`
+must ALSO list its own endpoint host — e.g.
+`ingestAllowHosts: "rag-mcp-server.<your-domain>,.minio.svc.cluster.local"` —
+otherwise the server refuses to fetch back the very media URLs it issued and
+`inspect_media` / chat previews stop working. The server logs a one-time
+`INGEST_ALLOW_HOSTS=… does not list this deployment's own media host …` warning
+naming both values; that warning is the diagnosis, not a bug.
 
 ### Multi-user access knobs (D15/D16/D17 — opt-in)
 
@@ -376,6 +389,17 @@ ezua:
 >
 > The chart itself ships **no key material** (`security.apiKey` / `security.mediaTokenSecret` are empty by default — P0-7, 2026-09): keys are sourced from `security.existingSecret` (a Secret you own; key names `security.existingSecretApiKey` / `security.existingSecretMediaTokenKey`), inline values (back-compat), the release Secret from a previous install (reused on upgrade), or fresh auto-generation on first install — in that precedence order. See `helm/ROTATION.md` for the full runbook.
 
+> **GitOps: pin the keys, or every apply rotates them.** The "reuse the previous
+> install's Secret" step reads it with Helm's `lookup`, which only works against a live
+> cluster. A pipeline that renders with `helm template` (Argo CD with client-side
+> rendering, Flux, CI dry-runs) gets no stored value, falls through to
+> `randAlphaNum`, and **every apply rotates `RAG_API_KEY` and `MEDIA_TOKEN_SECRET`** —
+> every client 401s and every signed media URL dies. Pin them in the GitOps source of
+> truth (`security.apiKey` / `security.mediaTokenSecret`, or better
+> `security.existingSecret`), and set `security.requirePinnedKeys: true` so an unpinned
+> render fails loudly instead of silently minting new keys. The default (`false`) keeps
+> plain `helm template` renders and first installs working.
+
 ---
 
 ## 4. Verify the deployment
@@ -412,7 +436,10 @@ kubectl port-forward deployment/rag-mcp-server 8000:8000
 
 The UI lets you:
 - **Create datasets** with optional video captioning toggle
-- **Upload files** (PDF, images, videos, audio, text) via drag-and-drop
+- **Upload files or a whole folder** (PDF, images, videos, audio, text) via
+  drag-and-drop or the **📂 Upload Folder** picker — a folder queues every file
+  inside it (subfolders included; dot entries such as `.git` and Office lock
+  files are skipped) through the same batch pipeline and per-file caps
 - **Add text** in the standardized multimodal format
 - **Search** with configurable `top_k` and reranker toggle
 - **Browse stored documents** in each dataset

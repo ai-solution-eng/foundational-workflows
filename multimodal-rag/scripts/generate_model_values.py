@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Any
 
 # Allow running from the repo root without installing the package.
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -76,10 +77,10 @@ def _model_candidates() -> dict[str, object]:
     }
 
 
-def _cls_name(obj: object) -> str:
-    return getattr(obj, "model_instantiation_class", None) and getattr(
-        getattr(obj, "model_instantiation_class"), "__name__", ""
-    ) or ""
+def _cls_name(obj: Any) -> str:
+    return (
+        getattr(obj, "model_instantiation_class", None) and getattr(obj.model_instantiation_class, "__name__", "") or ""
+    )
 
 
 def _resolve(role: str, choice: str | None) -> object:
@@ -87,14 +88,10 @@ def _resolve(role: str, choice: str | None) -> object:
     default = ROLES[role][0]
     name = choice or default
     if name not in candidates:
-        raise SystemExit(
-            f"Unknown model '{name}' for role '{role}'. "
-            f"Available: {', '.join(sorted(candidates))}"
-        )
+        raise SystemExit(f"Unknown model '{name}' for role '{role}'. Available: {', '.join(sorted(candidates))}")
     obj = candidates[name]
     if not getattr(obj, "currently_deployed", True):
-        print(f"# NOTE: {name} has currently_deployed=False — endpoint may reject requests.",
-              file=sys.stderr)
+        print(f"# NOTE: {name} has currently_deployed=False — endpoint may reject requests.", file=sys.stderr)
     return obj
 
 
@@ -122,10 +119,13 @@ def build_values(opts: argparse.Namespace) -> dict[str, object]:
         entry["url"] = getattr(obj, "url_remote", "") or ""
 
         if role in ("embedder", "reranker"):
-            entry["className"] = _cls_name(obj) or {
-                "embedder": "MultiModalEmbeddings",
-                "reranker": "MultiModalReranker",
-            }[role]
+            entry["className"] = (
+                _cls_name(obj)
+                or {
+                    "embedder": "MultiModalEmbeddings",
+                    "reranker": "MultiModalReranker",
+                }[role]
+            )
 
         if role == "embedder":
             entry["extra"] = _embedder_extra(obj)
@@ -140,15 +140,17 @@ def build_values(opts: argparse.Namespace) -> dict[str, object]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--list-models", action="store_true",
-                        help="print the available model variables from pcai_models.py and exit")
-    parser.add_argument("--skip-secrets", action="store_true",
-                        help="emit blank modelSecrets (secrets live in the Kubernetes Secret)")
-    parser.add_argument("--out", type=str, default="",
-                        help="write YAML to this file instead of stdout")
+    parser.add_argument(
+        "--list-models", action="store_true", help="print the available model variables from pcai_models.py and exit"
+    )
+    parser.add_argument(
+        "--skip-secrets", action="store_true", help="emit blank modelSecrets (secrets live in the Kubernetes Secret)"
+    )
+    parser.add_argument("--out", type=str, default="", help="write YAML to this file instead of stdout")
     for role in ROLES:
-        parser.add_argument(f"--{role}", type=str, default=None,
-                            help=f"model variable for role '{role}' (default: {ROLES[role][0]})")
+        parser.add_argument(
+            f"--{role}", type=str, default=None, help=f"model variable for role '{role}' (default: {ROLES[role][0]})"
+        )
     opts = parser.parse_args()
 
     if opts.list_models:
