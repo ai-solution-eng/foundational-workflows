@@ -1,6 +1,8 @@
-# Multimodal RAG — Supported Formats & Processing Details
+# Multimodal RAG — features, and the reasoning behind them
 
-## Overview
+## What this system is
+
+This is the deep reference for the package. Every capability is described twice: **what it does**, and **why it is shaped that way** — because the second half is what lets you predict how it will behave on a corpus that is not the one it was designed on. Deployment mechanics live in [DEPLOYMENT.md](DEPLOYMENT.md); the knob-by-knob reference is [CONFIGURATION.md](CONFIGURATION.md).
 
 <div align="center"><img src="./rag_system_flow-1.png" width="700" alt="Data pipeline: dataset building (top) feeding a shared vector store, queried at query time (bottom, left to right)"></div>
 
@@ -12,6 +14,29 @@ This system ingests documents in **17+ file formats**, processes each with a for
 Modalities the embedder doesn't support natively (audio) are converted to text via ASR **before** embedding (Preprocessor). Modalities the downstream LLM doesn't support are converted **after** retrieval (Postprocessor).
 
 Chunk sizes are **dynamic** — sourced from the embedder model config, with a dual-budget system: general text uses `chunk_size=2048` / `chunk_overlap=256`, while structured types (code/json/xml/yaml) use `code_chunk_size=8192` / `code_chunk_overlap=512`. When a HuggingFace tokenizer is available, chunking is **token-aware** rather than character-based.
+
+---
+
+## Design principles
+
+Six decisions explain almost every behaviour in this package. When a feature below surprises you, one of these is why.
+
+1. **Fail closed where a mistake is unrecoverable, fail open where it costs only quality.** A late-interaction index that cannot score honestly refuses to be created; a judge that times out returns the results already found. The dividing line is whether a degraded result can be *detected later*. A wrong vector cannot; a missing rerank can.
+2. **Never fake a signal.** There is no hashed-token projection standing in for token embeddings, no "success" outcome self-assessed by the model that produced it, and no faithfulness score that ignores numbers. Where the honest answer is "unavailable", the system says so in the response metadata rather than substituting something plausible.
+3. **The embedding model is the contract.** Chunk sizes come from the model's config, not from constants; every dataset records an embedder fingerprint so a mismatch warns instead of silently mixing spaces; an alias keeps old dataset ids resolvable across an FP8 swap. Change the embedder and you change the unit everything else is measured in.
+4. **Expensive things are opt-in and previewable.** Contextual retrieval, agentic retrieval, late interaction, watched sources, backups, the SSO stack — all default off, all render nothing when off (so an untouched deployment is byte-identical to one that never had the feature), and the ones that cost LLM calls expose a cost estimate before you flip them.
+5. **One identity path.** Every credential — API key, per-user registry key, OIDC JWT, SSO session cookie, trusted proxy header — is an *envelope* that resolves through the same fail-closed registry lookup. No credential type creates a second path to a dataset, and none can escalate by presenting itself.
+6. **The deployment is a values file.** Nothing site-specific is compiled in, patched in, or edited after render. If a decision cannot be expressed as a value, it is documented as a prerequisite instead (see [DEPLOYMENT.md § 2](DEPLOYMENT.md#2-prerequisites)).
+
+| Theme | Where it is explained |
+|---|---|
+| Formats, chunking, media tiers | [Format-by-Format Processing](#format-by-format-processing), [Token-Based Chunking](#token-based-chunking), [Three-Tier Media Schema](#three-tier-media-schema) |
+| Retrieval: hybrid, filters, contextual, agentic, late interaction | [Retrieval](#retrieval) |
+| Models: embedding, reranking, generation | [Embedding](#embedding), [Reranker](#reranker-separate-model-class), [LLM Generation](#llm-generation) |
+| Memory: long-term, procedural, lifecycle, short-term | [Long-term memory and the memory lifecycle](#long-term-memory-procedural-memory-and-the-memory-lifecycle), [Short-Term Memory](#short-term-memory-session-scoped-ephemeral-datasets-opt-in) |
+| Identity and access | [Security](#security) |
+| Grounding measurement | [Faithfulness evaluation](#faithfulness-evaluation) |
+| Surfaces: REST, MCP, UI, metrics | [API Server](#api-server), [MCP Server](#mcp-server), [Observability](#observability-prometheus-metrics), [Upload UX](#upload-ux) |
 
 ---
 
@@ -665,6 +690,115 @@ Labels are strictly bounded (route templates, op names, outcome sets) — never 
 
 ---
 
+## Long-term memory, procedural memory, and the memory lifecycle
+
+The package is also the memory backend for agents (opencode, Open WebUI, the PCAI
+LLM gateway's distiller). Three mechanisms share one substrate — a dataset whose
+documents are memories — and each exists because the previous one was not enough.
+
+### Long-term memory — facts, per user
+
+A memory is a document in a **per-user memory dataset**, written through
+`add_memory` and read through `search_memory`, so recall uses the same
+hybrid retrieval, reranking and postprocessing as any other search. The dataset and
+its password are resolved **server-side from the caller's identity** (argument →
+request header → the caller's ★ binding → `RAG_MEMORY_DEFAULT` →
+`MEMORY_DATASET`), which is why an agent never passes them and why one user's
+memory cannot be reached with another user's credential.
+
+- **Provenance is part of the record.** Every memory carries `source`,
+  `memory_kind`, `memory_ts`, `memory_tags` and `session_id` in its
+  payload, so a later curation pass can answer "where did this come from" without
+  re-reading the transcript.
+- **Supersede in place, not append.** A re-written memory of the **same kind for the
+  same session** deletes the prior chunks first. This is not cosmetic: the gateway
+  distiller re-distils a session on every resume, and appending produced ~87
+  duplicate pairs before the 2026-10-14 fix. Only the same kind supersedes;
+  memories without a `session_id` are never touched.
+- **Long memories are chunked, and the header rides every chunk.** Text is split at
+  `MEMORY_MAX_TOKENS` (default 8192) with the provenance block prepended to
+  **every** chunk, so any retrieved fragment is attributable
+  (`memory_chunks` / `chunk_index` / `chunk_total` / `memory_truncated`).
+- **Deletion is explicit.** `delete_memory` takes point ids from a prior listing —
+  there is no query-directed deletion, so an agent can only remove what it has seen.
+  `forget_session` touches only one session's history, never curated memories.
+- **A write-capability probe exists for automated writers.** `memory_status()`
+  reports `{memory_available, dataset, writable, unlocked}` for the current
+  caller with no side effects — no unlock-cache write, no throttle consumption, no
+  dataset mutation — so a distiller can decide whether to attempt a write without
+  burning a password attempt to find out.
+
+### Procedural memory — procedures, with an evidence counter
+
+Facts do not tell an agent *how* a class of task was solved. A **playbook** is the
+distiller's optional fifth section: a task signature, an "applies when", ordered
+steps, failure modes, and an outcome — stored as a second memory document of kind
+`playbook`, with the human-readable summary body byte-identical to before.
+
+The design decisions are the feature:
+
+- **The outcome is inferred from trace signals, never self-assessed.** The model's
+  own `outcome` field is overridden from the tool-call trace (a denied-tool
+  storm, a budget marker, a repeated identical call). Where the trace is structurally
+  absent — the conversation-store distill sites carry no tool rows — the record is
+  stamped `outcome_source: "unverified"` rather than guessed. A model grading its
+  own session is exactly the failure mode this prevents.
+- **The emission gate is server-side.** A playbook is written only for sessions with
+  at least 4 tool calls, no budget marker, no denied-tool storm and no repeated
+  identical call — the shape of a session that actually did something.
+- **Ranking uses the counter, not the prose.** `recall_playbooks(task, k=3)`
+  orders by smoothed success rate, labels records with no evidence
+  (`evidence: "unproven"`) and sorts them last, and returns **conflicting
+  playbooks side by side with their counts** instead of collapsing them. On-demand
+  only: nothing is injected at session start, because a stuffed preamble is paid on
+  every request.
+- **The decay loop needs a write half.** `record_playbook_outcome(memory_id,
+  "success"|"fail")` increments the counters and stamps `last_validated`. A
+  playbook that is recalled but never scored stays unproven and sorts last forever.
+  This is why the store gained `DatasetManager.update_memory_payload` — before it,
+  nothing could mutate a memory after write, so counters could be read and never
+  incremented.
+- **Supersession is by `playbook_key`, not session id**, with counter inheritance
+  and `max()` merging so a replayed supersession cannot inflate evidence. A
+  `steps_fingerprint` restricts supersession to the **same** procedure, so
+  genuinely divergent variants survive and recall reports the conflict.
+- **Snapshot before destructive supersession.** Delete-then-write is not atomic; a
+  failed write after the delete would destroy the prior playbook's text and counters,
+  so the store snapshots first and restores on failure before re-raising.
+
+The gateway half (the distiller that *emits* the section) ships as an overlay in
+`integrations/pcai_llm_playbook/` with an idempotent patcher, because the
+gateway tree is a separate package. Until that patch is applied, emission does not
+exist in production; the store, recall, counters and consolidation are live.
+End-to-end reference: [PLAYBOOK-MEMORY.md](PLAYBOOK-MEMORY.md).
+
+### Consolidation — the lifecycle pass
+
+Memory that only grows degrades recall: stale facts compete with current ones and
+every listing costs more. `consolidate_memories(dry_run=True)` plans (and, only
+on request, applies) three things:
+
+- **Decay** — a half-life of 30 days against a floor of 0.15.
+- **Importance** — from access count, kind and recency.
+- **An archive set** — gated on *below the floor* **AND** *never accessed* **AND**
+  *not a protected kind*. All three, because any one alone archives something
+  valuable. `playbook` is a protected kind and is never auto-archived.
+- **Contradictions** — near-duplicates at cosine ≥ 0.92 carrying opposing advice
+  markers. These are **report-only, always**: a wrong automatic merge is
+  unrecoverable, so the tool reports the pair and leaves the decision to a human.
+
+Dry run is the default and writes nothing. There is deliberately **no scheduled
+consolidation job** — it is an operator action, not a background mutation.
+
+### Short-term memory — the scratchpad
+
+Session-scoped, auto-expiring, passwordless, hidden from listings: see
+[Short-Term Memory](#short-term-memory-session-scoped-ephemeral-datasets-opt-in)
+below. It exists so a multi-agent run has a shared working set that cannot leak into
+the catalog and cannot outlive the run.
+
+---
+
 ## Short-Term Memory (session-scoped ephemeral datasets, opt-in)
 
 An agent session (or any short-lived writer) can rent a **private, auto-expiring working dataset** without touching the shared catalog. Opt-in: `shortTermMemory.enabled: true` in the chart (all three variants render an `stm-reaper` CronJob when enabled).
@@ -692,6 +826,51 @@ An agent session (or any short-lived writer) can rent a **private, auto-expiring
 
 ---
 
+## Faithfulness evaluation
+
+Retrieval quality and answer quality are different problems, and only one of them is
+visible in a latency graph. A retrieval change can look neutral while the generated
+answer drifts away from its sources — the classic failure being a *plausible*
+contradiction: right vocabulary, wrong number. This package therefore ships a
+**deterministic, offline grounding scorer with a committed golden set**, wired into
+the normal test suite so a regression fails a test rather than a customer.
+
+**What the scorer measures.** Content-token coverage of the answer against the
+retrieved contexts (0.7 threshold), plus two guards that exist because coverage
+alone is not grounding:
+
+- a **numeric-contradiction guard** — without it, an answer that swapped
+  "euclidean distance" for "cosine" while keeping the context's vocabulary scored
+  **1.0**, a green light that means nothing;
+- a **negation guard** (two-token patterns, so "fails to" and "unable to" count) —
+  an answer that inverts a claim reuses every content token of it.
+
+**What it deliberately does not measure.** Fluency, completeness, usefulness, or
+whether the answer is *right* about the world — only whether it is supported by the
+contexts it was given. A lexical scorer cannot see paraphrase, so a faithful answer
+phrased entirely in synonyms scores low; that limitation is stated in the reference
+rather than papered over.
+
+**The gate.** `scripts/ci_eval_gate.py` compares fresh results against the
+committed baseline and fails on a per-case regression (default tolerance 0.02), a
+faithful-set mean below 0.80, or **any** growth in the aggregate unsupported-claim
+count (`--max-unsupported-growth`, default 0). Two properties make it a gate
+rather than a report:
+
+- the faithful/partial labels come from the **baseline**, not from the results file,
+  so a producer cannot launder a bad case by relabelling it; an unknown case id is
+  exit 2;
+- malformed input is exit 2, not a pass — a gate that passes when it cannot read its
+  input is worse than no gate.
+
+The golden set is 30 hand-written cases including a "plausible-contradiction"
+category that reuses the context vocabulary, and a negation-marker family. An
+optional LLM judge exists for out-of-band analysis and is **never** used by the gate
+(non-determinism in a gate is a bug). Commands, the baseline refresh procedure and
+how to add cases: [FAITHFULNESS-EVAL.md](FAITHFULNESS-EVAL.md).
+
+---
+
 ## Security
 
 **Dataset password protection:**
@@ -706,15 +885,15 @@ An agent session (or any short-lived writer) can rent a **private, auto-expiring
 
 **Fail-closed default (D20, 2026-09-24):** a deployment with NO `RAG_API_KEY` and no key registry no longer runs open — unauthenticated requests bind an anonymous registry-client identity whose ONLY grant is the deployment's memory dataset (`MEMORY_DATASET` env, when set): dataset paths 403 (401 at the memory dataset's own password gate), `/api/admin/*` 403, dataset creation 403, while the memory tools keep working. Public surfaces (`/`, `/manage`, `/access`, `/healthz`, `/readyz`, `/metrics`, self-authorizing media/staged serving) are unchanged. Any configured key (REST, MCP keyset, registry, overlay) restores the normal resolution.
 
-**Multi-user registry keys (D15/D16/D17):** `RAG_API_KEY_CLIENTS` / `RAG_DATASET_ACLS` mint per-user keys with per-dataset ACLs (fail-closed; admin surfaces denied to registry keys; **D19**: through the PCAI LLM gateway the explicit `X-API-Key` delegated identity wins over the co-forwarded admin `Authorization: Bearer`, so per-user ACLs work behind the gateway). With the D16 access store on (`RAG_ACCESS_STORE=1`, chart default `security.accessStore: true`), keys self-select datasets (ACL ∪ selections) and bind a ★ memory dataset; an admin key can mint/grant/rotate/revoke per-user keys from the `/access` **User keys** panel (D17, file-backed overlay at `{DATA_PATH}/access/clients.json` merged with the env registry). **Since D26 (2026-10) every grant carries a mode — `rw` (default) or `ro`** (`RAG_DATASET_ACLS` token form `name:ds1:ro,ds2`, or overlay objects `{"name": "reports", "mode": "ro"}`; plain strings and the legacy ACL form mean rw — byte-compatible, no new env var): on an ro dataset the read surfaces (list/read/search/unlock/select/★-bind) are unchanged, but the write tools — `add_memory`, `delete_memory`, `forget_session`, `dataset_add_documents`, `dataset_delete_documents`, `dataset_replace_document` — and the REST document-ingest/delete plus dataset-manage endpoints refuse without an rw grant (admin identities and store-off/identity-less deployments exempt); 🌐 globals are included for every authenticated identity at mode ro by default, `set_memory_dataset` refuses an ro-only dataset (the one-writable-memory-dataset invariant is unchanged), and precedence across sources is strongest-restriction-wins (env rw ∪ overlay ro ⇒ ro; an explicit per-dataset ro in any source overrides a `*` rw). Full semantics: README § Security hardening (D26), API.md § 1.
+**Multi-user registry keys (D15/D16/D17):** `RAG_API_KEY_CLIENTS` / `RAG_DATASET_ACLS` mint per-user keys with per-dataset ACLs (fail-closed; admin surfaces denied to registry keys; **D19**: through the PCAI LLM gateway the explicit `X-API-Key` delegated identity wins over the co-forwarded admin `Authorization: Bearer`, so per-user ACLs work behind the gateway). With the D16 access store on (`RAG_ACCESS_STORE=1`, chart default `security.accessStore: true`), keys self-select datasets (ACL ∪ selections) and bind a ★ memory dataset; an admin key can mint/grant/rotate/revoke per-user keys from the `/access` **User keys** panel (D17, file-backed overlay at `{DATA_PATH}/access/clients.json` merged with the env registry). **Since D26 (2026-10) every grant carries a mode — `rw` (default) or `ro`** (`RAG_DATASET_ACLS` token form `name:ds1:ro,ds2`, or overlay objects `{"name": "reports", "mode": "ro"}`; plain strings and the legacy ACL form mean rw — byte-compatible, no new env var): on an ro dataset the read surfaces (list/read/search/unlock/select/★-bind) are unchanged, but the write tools — `add_memory`, `delete_memory`, `forget_session`, `dataset_add_documents`, `dataset_delete_documents`, `dataset_replace_document` — and the REST document-ingest/delete plus dataset-manage endpoints refuse without an rw grant (admin identities and store-off/identity-less deployments exempt); 🌐 globals are included for every authenticated identity at mode ro by default, `set_memory_dataset` refuses an ro-only dataset (the one-writable-memory-dataset invariant is unchanged), and precedence across sources is strongest-restriction-wins (env rw ∪ overlay ro ⇒ ro; an explicit per-dataset ro in any source overrides a `*` rw). Full semantics: this section (D26), [API.md § 1](API.md).
 
-**OIDC JWT as a second credential (D21):** with `OIDC_ENABLED=true` (+ required `OIDC_ISSUER`), a verified `Authorization: Bearer <jwt>` (RS256 against the realm JWKS; `iss`/`aud`-as-`azp`/`exp` validated, no discovery — JWKS URL is `OIDC_JWKS_URL` or `<issuer>/protocol/openid-connect/certs`) resolves to the SAME per-user registry identity as the user's minted API key — join key = the `OIDC_IDENTITY_CLAIM` (default `preferred_username`, fallback `sub`) or an explicit `"oidc": "<alias>"` overlay field. API keys stay sufficient alone and valid indefinitely; JWT-only sign-in works (fail-closed zero-dataset identity, then self-select via D16 — chart default `RAG_ACCESS_STORE=1`); JWT identities are never admin (realm `groups` are UA roles, not RAG grants); operator ACL grants apply to key and JWT alike; key and JWT rotation/revocation are independent in both directions; a `"blocked": true` overlay entry kills the JWT path (401); D19 delegation precedence is unchanged (a JWT is honored as the delegated identity only when it arrives via `X-API-Key` behind the gateway); observed JWT-only users surface in `GET /api/admin/clients` as `{"source": "observed"}` entries. Chart wiring: `security.oidc.*` (all three charts, rendered only when enabled). Full semantics: README § Security hardening (D21).
+**OIDC JWT as a second credential (D21):** with `OIDC_ENABLED=true` (+ required `OIDC_ISSUER`), a verified `Authorization: Bearer <jwt>` (RS256 against the realm JWKS; `iss`/`aud`-as-`azp`/`exp` validated, no discovery — JWKS URL is `OIDC_JWKS_URL` or `<issuer>/protocol/openid-connect/certs`) resolves to the SAME per-user registry identity as the user's minted API key — join key = the `OIDC_IDENTITY_CLAIM` (default `preferred_username`, fallback `sub`) or an explicit `"oidc": "<alias>"` overlay field. API keys stay sufficient alone and valid indefinitely; JWT-only sign-in works (fail-closed zero-dataset identity, then self-select via D16 — chart default `RAG_ACCESS_STORE=1`); JWT identities are never admin (realm `groups` are UA roles, not RAG grants); operator ACL grants apply to key and JWT alike; key and JWT rotation/revocation are independent in both directions; a `"blocked": true` overlay entry kills the JWT path (401); D19 delegation precedence is unchanged (a JWT is honored as the delegated identity only when it arrives via `X-API-Key` behind the gateway); observed JWT-only users surface in `GET /api/admin/clients` as `{"source": "observed"}` entries. Chart wiring: `security.oidc.*` (all three charts, rendered only when enabled). Full semantics: this section (D21); deployment wiring in [DEPLOYMENT.md](DEPLOYMENT.md).
 
-**Browser SSO (D22 — the app is an OIDC client, the Open WebUI pattern):** no gateway configuration needed — the app itself runs the authorization-code flow: `GET /oauth/login` redirects to the realm with a CSRF `state` cookie (constant-time compared at the callback), `GET /oauth/oidc/callback` exchanges the code (form POST to the token endpoint) and verifies the token through the EXACT D21 machinery (RS256/JWKS, iss/aud/exp — no new trust), then plants an HttpOnly `SameSite=Lax` session cookie (`Secure` on https; max-age capped by the token's own `exp`) that page scripts never see. The cookie is one more presented-credential envelope at the LOWEST priority — an explicit `X-API-Key` always wins, never delegation, never admin — so SSO sessions resolve through the identical fail-closed registry machinery (same identity as the user's minted key, zero datasets by default, never admin); `GET /oauth/logout` clears it and the whoami gains `source: "sso-cookie"`. Inert by default: without `security.oidc.sso.enabled` + the client secret + the redirect URI + the D21 issuer, every `/oauth/*` route 404s (a loud startup warning when the flag is set but the rest is missing); the `providerUrl` points at the IN-CLUSTER Keycloak over plain HTTP (sidestepping the platform-CA TLS gap — the external `issuer` stays claim-compared only), and `.well-known` discovery is TTL-cached with a negative cache (the D21 JWKS pattern). Setup is once per deployment: `scripts/configure-oidc-rag.sh` registers `https://<endpoint>/oauth/oidc/callback` in the `ua` client's redirect URIs (idempotent) and prints the ready-to-paste values block (`clientSecret` is KEY MATERIAL — prefer `clientExistingSecret`). Chart wiring: `security.oidc.sso.*` in all three charts, rendered ONLY when `sso.enabled: true` (default render byte-identical). Covered by tests in `tests/security/test_oidc_identity.py` (inert-by-default 404s, state-cookie CSRF rejection, cookie-lowest-priority envelope ordering, open-redirect guard). Full semantics: README § Security hardening (D22).
+**Browser SSO (D22 — the app is an OIDC client, the Open WebUI pattern):** no gateway configuration needed — the app itself runs the authorization-code flow: `GET /oauth/login` redirects to the realm with a CSRF `state` cookie (constant-time compared at the callback), `GET /oauth/oidc/callback` exchanges the code (form POST to the token endpoint) and verifies the token through the EXACT D21 machinery (RS256/JWKS, iss/aud/exp — no new trust), then plants an HttpOnly `SameSite=Lax` session cookie (`Secure` on https; max-age capped by the token's own `exp`) that page scripts never see. The cookie is one more presented-credential envelope at the LOWEST priority — an explicit `X-API-Key` always wins, never delegation, never admin — so SSO sessions resolve through the identical fail-closed registry machinery (same identity as the user's minted key, zero datasets by default, never admin); `GET /oauth/logout` clears it and the whoami gains `source: "sso-cookie"`. Inert by default: without `security.oidc.sso.enabled` + the client secret + the redirect URI + the D21 issuer, every `/oauth/*` route 404s (a loud startup warning when the flag is set but the rest is missing); the `providerUrl` points at the IN-CLUSTER Keycloak over plain HTTP (sidestepping the platform-CA TLS gap — the external `issuer` stays claim-compared only), and `.well-known` discovery is TTL-cached with a negative cache (the D21 JWKS pattern). Setup is once per deployment: `scripts/configure-oidc-rag.sh` registers `https://<endpoint>/oauth/oidc/callback` in the `ua` client's redirect URIs (idempotent) and prints the ready-to-paste values block (`clientSecret` is KEY MATERIAL — prefer `clientExistingSecret`). Chart wiring: `security.oidc.sso.*` in all three charts, rendered ONLY when `sso.enabled: true` (default render byte-identical). Covered by tests in `tests/security/test_oidc_identity.py` (inert-by-default 404s, state-cookie CSRF rejection, cookie-lowest-priority envelope ordering, open-redirect guard). Full semantics: this section (D22); the ordered enablement in [DEPLOYMENT.md](DEPLOYMENT.md).
 
-**Identity-gated unified frontend (D23):** `RAG_SSO_GATE=true` (chart `security.ssoGate`, read per request — no restart to flip) folds the three HTML pages into ONE identity-gated shell: the homepage re-glasses into a five-tab app — Datasets (identity-scoped upload/search workspace), Access (D15/D16 checkboxes + unlock/TTL + ★ memory binding), Admin (the operator dashboard, only for `is_admin` identities), Stats (read-only for everyone) and the D27 MCP Inspector (direct tool calls as the session credential) — with `/manage` and `/access` redirecting into their tabs; anonymous visitors get a minimal 401 "Sign in required" page (a `/oauth/login` link when D22 SSO is configured; probes/health, `/oauth/*` and media bytes stay exempt; disabled = byte-identical public pages). Sign-in: SSO button first, key-paste fallback, embedded admin key only in key-unconfigured legacy mode. The ratified semantics: the gate comes first (SSO + admin keys are the accepted credentials); the admin mints named keys (D17 panel, now in the Admin tab); users see only their datasets including globals (identity-filtered listings); a per-user homepage with memory ★ + TTL unlocks; admin full power (all datasets, user management, delete anything); creator-owned delete (`created_by` stamped at create — identity name, `admin` for admin-key creators; DELETE is owner-or-admin on REST and MCP identically; pre-D23 datasets have no owner and are admin-delete-only, never backfilled); creator publish-global (a creator may toggle their own dataset public, non-creators denied, pre-D23 datasets admin-only); and the Stats tab is read-only for everyone (`GET /api/stats`: identity-filtered `datasets.total` / `visible_to_you` / `documents` / `storage_bytes` + `models[]` + `jobs` + `generated_at` — a user sees their own footprint, an admin the deployment). List rows gain `created_by` + `owned_by_me`; the whoami gains `is_admin` + `flags` (`can_create_datasets` / `sso_enabled` / `memory_dataset`). Chart wiring: `security.ssoGate` (all three charts, rendered only when `true` — default render byte-identical). Full semantics: README § Security hardening (D23).
+**Identity-gated unified frontend (D23):** `RAG_SSO_GATE=true` (chart `security.ssoGate`, read per request — no restart to flip) folds the three HTML pages into ONE identity-gated shell: the homepage re-glasses into a five-tab app — Datasets (identity-scoped upload/search workspace), Access (D15/D16 checkboxes + unlock/TTL + ★ memory binding), Admin (the operator dashboard, only for `is_admin` identities), Stats (read-only for everyone) and the D27 MCP Inspector (direct tool calls as the session credential) — with `/manage` and `/access` redirecting into their tabs; anonymous visitors get a minimal 401 "Sign in required" page (a `/oauth/login` link when D22 SSO is configured; probes/health, `/oauth/*` and media bytes stay exempt; disabled = byte-identical public pages). Sign-in: SSO button first, key-paste fallback, embedded admin key only in key-unconfigured legacy mode. The ratified semantics: the gate comes first (SSO + admin keys are the accepted credentials); the admin mints named keys (D17 panel, now in the Admin tab); users see only their datasets including globals (identity-filtered listings); a per-user homepage with memory ★ + TTL unlocks; admin full power (all datasets, user management, delete anything); creator-owned delete (`created_by` stamped at create — identity name, `admin` for admin-key creators; DELETE is owner-or-admin on REST and MCP identically; pre-D23 datasets have no owner and are admin-delete-only, never backfilled); creator publish-global (a creator may toggle their own dataset public, non-creators denied, pre-D23 datasets admin-only); and the Stats tab is read-only for everyone (`GET /api/stats`: identity-filtered `datasets.total` / `visible_to_you` / `documents` / `storage_bytes` + `models[]` + `jobs` + `generated_at` — a user sees their own footprint, an admin the deployment). List rows gain `created_by` + `owned_by_me`; the whoami gains `is_admin` + `flags` (`can_create_datasets` / `sso_enabled` / `memory_dataset`). Chart wiring: `security.ssoGate` (all three charts, rendered only when `true` — default render byte-identical). Full semantics: this section (D23).
 
-**SSO self-mint (D25):** with `RAG_ACCESS_SELF_MINT` truthy (chart `security.accessSelfMint`, read per request — no restart to flip), an SSO-authenticated identity — a verified D21 Bearer JWT, a D22 SSO session cookie, or a D24 trusted-proxy identity header — may mint, and deliberately rotate, a long-lived API key for its OWN registry identity from the Access page: the bridge between the D17 admin-mint panel and SSO sign-in (D21 made JWT-only sign-in work, but the long-lived key still required an admin round-trip — D25 closes the loop). The guarantees are the point: the minted key carries exactly the identity's existing access — self-mint never creates or widens dataset grants (the name comes from the verified identity, never user input); an API-key-authenticated caller is always 403 (a registry key can never mint — the D17 invariant survives); env-authoritative and `blocked` names are refused; the key is shown exactly once and rotation kills the old key immediately. Surface: `GET /api/access/key` (owner-safe masked view: `{enabled, source, identity, has_key, key_masked, datasets, created, oidc, blocked}`) and `POST /api/access/mint-key` (optional `{"rotate": true}`; the FULL key returned exactly once; 409 when a key exists without rotate); the whoami `flags` gains `self_mint` while the anonymous shape stays exactly `{"authenticated": false}`. Bare-env default unset = byte-identical behaviour (mint 409s, flag false); it only ever activates with `security.oidc.enabled` (or `trustProxyIdentity` on G2) and the access overlay on — no SSO identity / nowhere to write the minted entry otherwise. Chart wiring: `security.accessSelfMint` (all three charts, rendered only when `true` — opt-in since the 2026-10-16 audit remediation (`security.accessSelfMint: true`; default render is inert); `false` restores the inert render). Full semantics: README § Security hardening (D25).
+**SSO self-mint (D25):** with `RAG_ACCESS_SELF_MINT` truthy (chart `security.accessSelfMint`, read per request — no restart to flip), an SSO-authenticated identity — a verified D21 Bearer JWT, a D22 SSO session cookie, or a D24 trusted-proxy identity header — may mint, and deliberately rotate, a long-lived API key for its OWN registry identity from the Access page: the bridge between the D17 admin-mint panel and SSO sign-in (D21 made JWT-only sign-in work, but the long-lived key still required an admin round-trip — D25 closes the loop). The guarantees are the point: the minted key carries exactly the identity's existing access — self-mint never creates or widens dataset grants (the name comes from the verified identity, never user input); an API-key-authenticated caller is always 403 (a registry key can never mint — the D17 invariant survives); env-authoritative and `blocked` names are refused; the key is shown exactly once and rotation kills the old key immediately. Surface: `GET /api/access/key` (owner-safe masked view: `{enabled, source, identity, has_key, key_masked, datasets, created, oidc, blocked}`) and `POST /api/access/mint-key` (optional `{"rotate": true}`; the FULL key returned exactly once; 409 when a key exists without rotate); the whoami `flags` gains `self_mint` while the anonymous shape stays exactly `{"authenticated": false}`. Bare-env default unset = byte-identical behaviour (mint 409s, flag false); it only ever activates with `security.oidc.enabled` (or `trustProxyIdentity` on G2) and the access overlay on — no SSO identity / nowhere to write the minted entry otherwise. Chart wiring: `security.accessSelfMint` (all three charts, rendered only when `true` — opt-in since the 2026-10-16 audit remediation (`security.accessSelfMint: true`; default render is inert); `false` restores the inert render). Full semantics: this section (D25); wiring in [DEPLOYMENT.md](DEPLOYMENT.md).
 
 **Media tokens (required):** both servers refuse to start without `MEDIA_TOKEN_SECRET` (helm: `security.mediaTokenSecret`). Media URLs emitted by the MCP server always carry a short-lived HMAC `?token=` (scoped to `{dataset}:{relpath}`, TTL `MEDIA_TOKEN_TTL`, default 1 h) — the legacy `?password=` suffix was removed so the dataset password never appears in MCP output, URLs, or logs. The HTML
 frontend also uses tokens: it mints a dataset-scoped token (`POST /api/datasets/{name}/media-token`, wildcard `*` path) and appends it to media URLs, so the password only ever travels in the `X-Dataset-Password` request header, never in a URL.

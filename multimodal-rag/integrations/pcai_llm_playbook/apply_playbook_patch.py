@@ -44,6 +44,13 @@ force its way in.
 document_is_complete() needs NO edit: it checks REQUIRED_SECTIONS only, so
 a document that carries the optional "## Playbook" section already passes
 completeness unchanged (verified against the real gateway module).
+
+Lint contract: the generated code must pass the gateway's release gate
+(`ruff check src/ tests/ scripts/`). Hence the sentinel blocks below carry no
+redundant `noqa` (RUF100), use the `datetime.UTC` alias (UP017), and the import
+block is separated from the sentinel comment by a blank line (I001) - that
+blank line lives outside the span, so _ensure_import_separation() repairs it
+on every pass rather than baking it into the block constant.
 """
 
 from __future__ import annotations
@@ -84,7 +91,7 @@ DISTILLER_IMPORT_BLOCK = (
     + "# copied next to this file by apply_playbook_patch.py; if it is ever\n"
     + "# removed, the stubs below degrade the distiller to its stock behaviour.\n"
     + "try:\n"
-    + "    from .playbook import OPTIONAL_SECTIONS, PLAYBOOK_PROMPT  # noqa: F401\n"
+    + "    from .playbook import OPTIONAL_SECTIONS, PLAYBOOK_PROMPT\n"
     + "except ImportError:  # pragma: no cover - overlay module removed: stock behaviour\n"
     + "    OPTIONAL_SECTIONS = ()  # type: ignore[assignment]\n"
     + '    PLAYBOOK_PROMPT = ""\n'
@@ -140,7 +147,7 @@ MEMORY_WRITE_BLOCK = (
     + '    outcome may be stored but is stamped outcome_source="unverified" -\n'
     + '    "inferred" is reserved for labels derived from trace signals.\n'
     + '    """\n'
-    + "    from datetime import datetime, timezone\n"
+    + "    from datetime import UTC, datetime\n"
     + "\n"
     + "    try:\n"
     + "        from .playbook import (\n"
@@ -203,7 +210,7 @@ MEMORY_WRITE_BLOCK = (
     + '                "failure_modes": list(playbook.get("failure_modes") or []),\n'
     + '                "outcome": outcome,\n'
     + '                "outcome_source": outcome_source,\n'
-    + '                "last_validated": datetime.now(timezone.utc).isoformat(timespec="seconds"),\n'
+    + '                "last_validated": datetime.now(UTC).isoformat(timespec="seconds"),\n'
     + '                "success_count": 0,\n'
     + '                "fail_count": 0,\n'
     + '                "evidence_thread": session_id,\n'
@@ -374,6 +381,20 @@ def _replace_block_span(text: str, block: str) -> str:
     e = text.index(END_MARK)
     return text[:b] + block + text[e + len(END_MARK) :]
 
+def _ensure_import_separation(text: str) -> str:
+    """Keep one blank line between the sorted imports and the sentinel.
+
+    ruff's isort (I001) parses the sentinel's leading comment as part of the
+    import section, so a comment glued to the last import reads as an
+    un-sorted block. The blank line sits OUTSIDE the sentinel span, so it
+    cannot ride along in DISTILLER_IMPORT_BLOCK: it is normalised here on
+    every pass instead, which also repairs an older application.
+    """
+    b = text.index(BEGIN_MARK)
+    if text[:b].endswith("\n\n"):
+        return text
+    return text[:b] + "\n" + text[b:]
+
 
 def _unified(old: str, new: str) -> str:
     diff = difflib.unified_diff(
@@ -443,14 +464,26 @@ def _edit_import_block(text: str | None) -> tuple[Edit, str | None]:
             edit.status = "broken"
             edit.detail = "anchor 'from typing import Any, cast' not found"
             return edit, None
-        edit.new_text = text[: m.end()] + "\n" + DISTILLER_IMPORT_BLOCK + text[m.end() :]
+        edit.new_text = _ensure_import_separation(
+            text[: m.end()] + "\n\n" + DISTILLER_IMPORT_BLOCK + text[m.end() :]
+        )
         edit.detail = "would insert after the typing import"
         return edit, edit.new_text
     edit.status = status
+    if status == "broken":
+        edit.detail = "sentinel marks mangled (BEGIN/END missing or duplicated)"
+        return edit, text
+    candidate = text
     if status == "update":
-        edit.new_text = _replace_block_span(text, DISTILLER_IMPORT_BLOCK)
+        candidate = _replace_block_span(text, DISTILLER_IMPORT_BLOCK)
         edit.detail = "sentinel block drifted - will refresh"
-        return edit, edit.new_text
+    candidate = _ensure_import_separation(candidate)
+    if candidate != text:
+        edit.status = "update"
+        edit.new_text = candidate
+        if status == "applied":
+            edit.detail = "block current; inserting the blank line ruff's isort requires"
+        return edit, candidate
     edit.detail = "sentinel block already present and identical"
     return edit, text
 

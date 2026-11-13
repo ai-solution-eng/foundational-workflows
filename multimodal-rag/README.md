@@ -1,547 +1,184 @@
 # Multimodal RAG
 
-End-to-end multimodal retrieval-augmented generation: ingest documents in 17+ formats (text, PDF, images, video, audio, code, tables, office docs, and more), embed them into a joint multimodal vector space, and retrieve at query time with optional cross-encoder reranking — all exposed via a REST API, an HTML frontend, and an MCP server.
+An **MCP server, REST API and web frontend that ingest documents, images, video and audio into one joint multimodal vector index and retrieve over them** — shipped as three Helm charts for HPE Private Cloud AI: `rag-mcp-server` 6.3.2 (single replica, the default), `rag-mcp-scale-medium` 6.3.2 and `rag-mcp-scale-large` 6.3.2.
 
-[Video Demonstration](https://storage.googleapis.com/ai-solution-engineering-videos/public/MultimodalRag.mkv) with chapters and subtitles. Highlights models, dataset ingestion, open webui integration, and the opencode longterm memory implementation.
+<div align="center"><img src="./documentation/rag_system_flow-1.png" width="700" alt="RAG system flow: dataset building (top) feeding a shared vector store, queried by the query-time retrieval flow (bottom, left to right)"></div>
 
-<div align="center"><img src="./documentation/rag_system_flow-1.png" width="700" alt="RAG system flow: dataset building (top) feeding a shared vector store, queried by the query-time retrieval flow (bottom, left to right), with dynamic batching annotations"></div>
+## What it is
 
----
+**RAG** (retrieval-augmented generation) means answering a question from documents you supply rather than from the model's training data: search a corpus for the passages that matter, put them in the prompt, generate. This package is the search-and-store half of that loop, plus the tool surface an LLM agent uses to drive it.
 
-## Features
+It is an **MCP server** — a Model Context Protocol endpoint, i.e. a standard way to expose tools to an LLM agent — with 25 tools (search, federated search, dataset and document management, long-term memory, short-term session datasets, media inspection). The same process group also serves a **REST API** (40 endpoints), an **HTML frontend**, and an **Open WebUI filter**.
 
-- **Joint multimodal embedding** (text, image, video) via Qwen3-VL-Embedding-8B — search with any combination of modalities
-- **Dual-embedding "twins"** — PDFs get a text-only twin so text queries match; images/videos/audio get a caption twin (media + caption) so caption wording is searchable alongside the raw-media embedding; unsupported media degrades to caption-only or is skipped
-- **Contextual retrieval (opt-in per dataset)** — ingest-time LLM context injection: one small call per text chunk writes 1–2 sentences of document-level context prepended before embedding (with cost preview + fail-open degradation; affects new ingests — Recreate adopts existing content)
-- **Audio support** via ASR transcription (Cohere Transcribe) — audio is converted to text before embedding
-- **17+ file formats** with format-specific chunking: PDF (page-by-page + image extraction), images, video (overlapping segments), audio, text/markdown, JSON, XML, YAML, CSV/Excel, code (16 languages), HTML, Office docs, Jupyter notebooks, EPUB, log files, archives
-- **Cross-encoder reranking** via Qwen3-VL-Reranker-8B for improved precision at the cost of latency
-- **Modality conversion** — retrieved media the LLM doesn't support is auto-converted (images/video → VLM description, audio → ASR transcript)
-- **Dataset management** — password-protected datasets, per-dataset Qdrant collections, dedup (cosine ≥ 0.995), S3/HTTP URL ingestion with sync reconciliation
-- **Watched S3 sources** (opt-in) — a reconciler CronJob keeps datasets in sync with S3/MinIO prefixes on a schedule: new/changed objects ingest, objects deleted upstream are pruned, unchanged objects are skipped via a per-dataset ETag/Size state (no re-download)
-- **MCP server** — 25 tools (search, federated search, list, document management add/delete/replace, file listing + bounded base64 bytes, self-service dataset selection + ★ memory binding, short-term session datasets, memory-writer capability probe, recall + memory management, playbook recall/scoring + memory consolidation, per-dataset late-interaction opt-in, media inspection — VLM description / ASR transcript) over streamable-http / stdio / sse
-- **Long-term memory** — per-user LLM-curated memory store for opencode and Open WebUI, with SSO-backed isolation
-- **Playbook memory (procedural)** — the distiller's OPTIONAL fifth section captures a reusable procedure with a task signature and an outcome **inferred from trace signals** (never self-assessed); `recall_playbooks` ranks by empirical success rate and `record_playbook_outcome` closes the decay loop. See [documentation/PLAYBOOK-MEMORY.md](documentation/PLAYBOOK-MEMORY.md)
-- **Memory consolidation** — on-demand decay/importance/contradiction pass (`consolidate_memories`, dry-run by default): archive only what is below the floor AND never accessed AND not a protected kind; contradictions are report-only
-- **Agentic iterative retrieval (opt-in)** — bounded retrieve → judge → rewrite loop that **fails open**: a judge that raises, times out or returns junk stops the loop and returns what was already found
-- **Multi-vector late interaction (opt-in per dataset)** — real MaxSim over token matrices in a sidecar collection, with computed (not asserted) storage math. **Fails closed** without a token-level embedder: no hashed-token or split-vector pretending
-- **CI-gated faithfulness eval** — deterministic offline scorer (content-token coverage + numeric-contradiction and negation guards) with a committed golden set and a regression gate wired into the test suite
-- **Open WebUI extension** — filter that routes unsupported modalities to the RAG MCP tool, plus inlet/outlet memory hooks
-- **Helm chart** — 2-container pod (API + MCP sidecar), Qdrant StatefulSet, Istio/EZUA ingress with oauth2-proxy
+The word *multimodal* is load-bearing: text, images, video and audio are embedded into **one vector space** by a single model (Qwen3-VL-Embedding-8B), so a screenshot can be found by a text query and a paragraph can be found by an image. Audio is the exception — it is transcribed to text before embedding, because the embedder has no audio tower.
 
----
+A recorded walkthrough with chapters and subtitles (models, dataset ingestion, Open WebUI integration, the opencode long-term-memory implementation): [Video demonstration](https://storage.googleapis.com/ai-solution-engineering-videos/public/MultimodalRag.mkv).
 
-## Architecture
+The deployment is one pod with two containers (REST API + web UI on port 8000, MCP server on port 9090) sharing one ReadWriteMany PVC, plus a Qdrant vector-database StatefulSet. Both containers see the same Qdrant and the same `/data`, so a dataset uploaded in the browser is immediately searchable through MCP and vice versa.
 
-```
-┌─────────────────────────────────────────────────────┐
-│  Pod                                                 │
-│                                                      │
-│  ┌──────────────────┐   ┌──────────────────┐        │
-│  │  API Server       │   │  MCP Server       │       │
-│  │  port 8000        │   │  port 9090        │       │
-│  │  (REST + Web UI)  │   │  (MCP tools)      │       │
-│  └──────┬───────────┘   └──────┬───────────┘        │
-│         │                      │                     │
-│         └──────────┬───────────┘                     │
-│                    │                                 │
-│             ┌──────┴──────┐                          │
-│             │   PVC /data  │  ← datasets + files    │
-│             └─────────────┘                          │
-└──────────────────────┬──────────────────────────────┘
-                       │
-              ┌────────┴────────┐
-              │  Qdrant          │  ← StatefulSet
-              │  (port 6333)     │
-              └──────────────────┘
-```
+## The problem it solves
 
-Both the API server and MCP server connect to the same Qdrant instance and share the same PVC, so datasets created through the web UI are immediately searchable via MCP tools and vice versa.
+- **Your corpus is not text.** Scanned PDFs with charts, screenshots, screen recordings, call audio. Most RAG stacks flatten all of that to text and lose the page. This one keeps a three-tier media schema (raw file, display copy, model-ready copy) and embeds the media itself, so the answer can return the frame that proves it.
+- **You cannot search media with words, or text with pictures.** Captions are the usual workaround and they are lossy. Here every PDF gets a text-only *twin* and every image/video gets a caption twin, so the same document is reachable through both the pixel embedding and the words a human would use.
+- **Dense similarity is weakest exactly where a technical corpus is densest** — error codes, function names, JSON keys, version strings. Every new collection therefore carries a BM25 sparse lane beside the dense vector, fused server-side with RRF in one Qdrant round-trip.
+- **An agent that cannot remember repeats its mistakes.** The package is also the memory backend for opencode and Open WebUI: per-user long-term memory, plus **procedural** memory (a reusable playbook with an outcome inferred from trace signals, ranked by empirical success rate rather than by the model's opinion of itself).
+- **"The retrieval got worse" is not measurable.** A deterministic, offline faithfulness scorer with a committed golden set runs inside the normal test suite, so a retrieval or prompt change that degrades grounding fails a test instead of shipping.
+- **You cannot run `helm` on PCAI.** The charts are packaged for PCAI import; every site decision is a values key, and everything that cannot be a value is an explicit prerequisite — see [Prerequisites at a glance](#prerequisites-at-a-glance).
 
----
+## How it fits in PCAI
 
-## Documentation
+| Layer | Component | This package's part |
+|---|---|---|
+| Ingress | Istio `ezaf-gateway` + oauth2-proxy | Renders the `VirtualService` and the oauth2-proxy `AuthorizationPolicy` — which authenticates **gateway** traffic only; a direct ClusterIP call bypasses it, and `networkPolicy` is what closes that path |
+| Model serving | MLIS endpoints (embedder, reranker, VLM, ASR) | A **client** of them: `models.*.url` + `modelSecrets.*ApiKey`. The image bundles no model weights |
+| Storage | RWX PVC + Qdrant StatefulSet | Owns both: `persistence.data` (files + metadata) and `persistence.qdrant` (vectors) |
+| Identity | Keycloak / UA realm, the gateway's proxy headers | Optional OIDC **client** (D21/D22) resolving to the same per-user registry identity as an API key |
+| Object store | MinIO / S3 | Optional: batch URL ingest, watched-source sync, scheduled backups |
+| MCP fleet | Agents, the PCAI LLM gateway relay, opencode, Open WebUI | Provides the `rag` tool surface; consumed by them |
 
-| Document | What it covers |
+**Depends on:** a reachable embedder endpoint (the only required model — startup aborts without it), an RWX storage class, and a PCAI namespace. **Depended on by:** any agent or client configured against its MCP endpoint; in a fleet deployment the PCAI LLM gateway relay and the Open WebUI filter are the usual callers.
+
+## Capabilities, by theme
+
+Each line carries the design decision, because the decision is the feature. Depth — every format, every knob, every failure mode — is in [documentation/FEATURES.md](documentation/FEATURES.md).
+
+### Ingestion and modality
+
+- **17+ formats, one pipeline** — PDF (page-by-page with chart/figure extraction), images, video (overlapping segments), audio, text/markdown, JSON, XML, YAML, CSV/Excel, code (16 languages), HTML, Office, notebooks, EPUB, logs, archives. *Why:* a corpus is never one format, and per-format chunking beats one generic splitter — code splits on function boundaries, logs on timestamp/severity, tables one row per document. See [FEATURES.md § Format-by-Format](documentation/FEATURES.md#format-by-format-processing).
+- **Three-tier media schema** — raw file, display copy (1920×1080 / 720p24), model-ready copy (720×720, base64 in the vector payload). *Why:* fidelity for the human, cheap bytes for the model; the reranker and VLM consume the tier-3 copy directly, so no per-query resizing. See [FEATURES.md § Three-Tier Media Schema](documentation/FEATURES.md#three-tier-media-schema).
+- **Dual-embedding "twins"** — a text-only twin for PDFs, a caption twin for media. *Why:* one document must be reachable by both its pixels and its words; unsupported media degrades to caption-only rather than silently vanishing.
+- **Token-count-aware chunking** — chunk by the unit the model actually bills and truncates on, with a character-based fallback when no tokenizer is bundled. *Why:* character chunking silently overflows the embedder's window on code and CJK text. See [FEATURES.md § Token-Based Chunking](documentation/FEATURES.md#token-based-chunking).
+- **Dedup and content hashing** — cosine ≥ 0.995 at ingest, plus a per-dataset content-hash sidecar. *Why:* re-uploading a folder must not double the index.
+- **S3/HTTP ingest and watched sources** — an opt-in reconciler CronJob keeps datasets in sync with bucket prefixes; unchanged objects are skipped on ETag+Size before any download. See [FEATURES.md § Ingestion Sources](documentation/FEATURES.md#ingestion-sources).
+
+### Retrieval
+
+- **Hybrid dense + BM25 with server-side RRF**, per-dataset lane weights. *Why:* lexical recall for identifiers, semantic recall for paraphrase, one round-trip, and rank-space weights that cannot be mistaken for score multipliers. See [FEATURES.md § Hybrid dense + BM25](documentation/FEATURES.md#hybrid-dense--bm25-rrf-fusion).
+- **Cross-encoder reranking** (Qwen3-VL-Reranker-8B) with over-fetch and media-lite scoring. *Why:* precision at the top of the list, without shipping every candidate's base64 payload to the reranker. See [FEATURES.md § Reranker](documentation/FEATURES.md#reranker-separate-model-class).
+- **Metadata filters applied before ranking** — file type, severity, source prefix, date range. *Why:* filtering after ranking throws away the result you wanted.
+- **Contextual retrieval (opt-in per dataset)** — one small LLM call per chunk writes a document-level context line before embedding, with a cost preview. *Why:* an isolated chunk cannot say which document it came from. **Fail-open:** an LLM error stores the plain chunk. See [FEATURES.md § Contextual retrieval](documentation/FEATURES.md#contextual-retrieval-ingest-time-document-context).
+- **Agentic iterative retrieval (opt-in)** — a bounded retrieve → judge → rewrite loop that **fails open**: a judge that raises, times out or returns junk stops the loop and returns what was already found. *Why:* a judge outage may cost latency, never availability. See [FEATURES.md § Agentic iterative retrieval](documentation/FEATURES.md#agentic-iterative-retrieval-opt-in).
+- **Multi-vector late interaction (opt-in per dataset)** — real MaxSim over token matrices in a sidecar collection. *Why:* **fails closed** without a token-level embedder — no hashed-token or split-vector pretending, because a fake late-interaction score is worse than none. See [FEATURES.md § Late interaction](documentation/FEATURES.md#multi-vector-late-interaction-opt-in-per-dataset).
+
+### Memory
+
+- **Long-term memory** — a per-user, LLM-curated store behind `add_memory` / `search_memory`, with provenance metadata and supersede-in-place so a re-distilled session replaces its predecessor instead of appending. *Why:* memory that only ever grows degrades recall. See [MEMORY.md](documentation/MEMORY.md).
+- **Procedural memory (playbooks)** — the distiller's optional fifth section captures a procedure with a task signature and an outcome **inferred from trace signals, never self-assessed**; `recall_playbooks` ranks by smoothed success rate and returns conflicting playbooks side by side. *Why:* a model grading its own session is the failure mode the feature exists to avoid. See [PLAYBOOK-MEMORY.md](documentation/PLAYBOOK-MEMORY.md).
+- **Memory consolidation** — an on-demand, dry-run-by-default decay/importance/contradiction pass. *Why:* archive only what is below the floor **and** never accessed **and** not a protected kind; contradictions are report-only, because a wrong merge is unrecoverable. See [FEATURES.md § Memory lifecycle](documentation/FEATURES.md#long-term-memory-procedural-memory-and-the-memory-lifecycle).
+- **Short-term memory** — a private, auto-expiring session dataset with a non-guessable name, passwordless so it stays reapable. *Why:* an agent swarm needs a scratchpad that cannot leak into the catalog. See [FEATURES.md § Short-Term Memory](documentation/FEATURES.md#short-term-memory-session-scoped-ephemeral-datasets-opt-in).
+
+### Identity and access
+
+- **Fail-closed by default (D20)** — with no key configured anywhere, an anonymous caller reaches only the deployment's memory dataset. *Why:* a deployment that forgets its key must not run open. See [FEATURES.md § Security](documentation/FEATURES.md#security).
+- **Per-user keys → dataset ACLs with read/write modes (D15/D26)** — `name:key` keys, per-dataset grants, and an `ro` mode so read access never travels with write access. *Why:* handing a colleague read access to a dataset should not hand them ingest and delete.
+- **SSO as one more credential envelope (D21/D22/D24/D25)** — a verified JWT, an OIDC session cookie, or an enforcing proxy's identity header resolves through the **same** fail-closed registry lookup as an API key; the app is an OIDC **client**, never a proxy, so SSO creates no second identity path and no privilege shortcut. Self-mint (D25) lets an SSO user mint a key for their **own** identity only. See [FEATURES.md § Security](documentation/FEATURES.md#security).
+- **Identity-gated frontend (D23)** — one shell, five tabs, every listing filtered by who you are; creator-owned delete and creator publish-global. See [FEATURES.md § Security](documentation/FEATURES.md#security).
+
+### Evaluation and observability
+
+- **CI-gated faithfulness eval** — a deterministic offline scorer (content-token coverage, numeric-contradiction and negation guards) with a committed golden set; the gate fails on a per-case regression, a mean below 0.80, or any growth in unsupported claims. *Why:* a lexical score without a numeric guard once rated a contradictory answer 1.0. See [FAITHFULNESS-EVAL.md](documentation/FAITHFULNESS-EVAL.md).
+- **Prometheus metrics, health endpoints, and a report-only capability probe** — `/metrics`, `/healthz` / `/readyz` (deliberately not gated on the remote embedder: a model outage is not fixed by restarting the pod), and `memory_status` for automated memory writers. See [FEATURES.md § Observability](documentation/FEATURES.md#observability-prometheus-metrics).
+
+### Operations and clients
+
+- **Three chart sizes** — the decision is in [Which chart](#which-chart) below.
+- **Scheduled backups, watched-source sync, STM reaper** — each CronJob carries a Qdrant readiness gate and a pod that stays readable after failure.
+- **PodDisruptionBudgets and optional image digests** — a node drain cannot evict the whole serving tier or a Qdrant quorum.
+- **25 MCP tools / 40 REST endpoints / an HTML frontend / an Open WebUI filter** — see [MCP.md](documentation/MCP.md), [API.md](documentation/API.md), [openwebui_extension/README.md](openwebui_extension/README.md).
+
+## Which chart
+
+The three charts share the same templates and the same values surface for everything site-specific (models, security, S3, identity, backups). They differ in replica counts, worker model, Qdrant topology and PVC layout — and **you pick one at import time, not later**: the Qdrant StatefulSet's volume-claim template is immutable, so moving between chart sizes means deleting the StatefulSet and re-indexing the vectors.
+
+| | `helm/` (base) | `helm-scale-medium/` | `helm-scale-large/` |
+|---|---|---|---|
+| API replicas / workers | 1 × uvicorn | 2 × gunicorn (2 workers) | 4 × gunicorn (4 workers) |
+| Qdrant | 1 instance (HTTP) | 2-node cluster (gRPC, sharded) | 3-node cluster (gRPC, sharded) |
+| Unlock cache | in-process dict | Redis, cross-pod | Redis, cross-pod |
+| Embed-batcher singleton | — | — | yes |
+| Default request footprint | 20 Gi / 8 cpu | 24 Gi / 8 cpu | 45 Gi / 20 cpu |
+
+**Choose the base chart** for a single team, a pilot, or any deployment where one replica is enough — it is the simplest thing that works and needs no Redis. **Choose medium** to run the scale architecture (workers, sharded Qdrant, cross-pod unlock) on a cluster sized for the base chart. **Choose large** for many concurrent users or a corpus that needs three Qdrant nodes. The measured comparison, the resource arithmetic and the per-chart benchmarks are in [SCALE.md](documentation/SCALE.md#summary-table).
+
+## Deploy on PCAI (one screen)
+
+Deployment is a **values** problem: the chart is packaged and imported into PCAI once, and the operator's only surface afterwards is the chart's values in the PCAI *Helm Values* editor.
+
+1. **Create the platform Secret** you own, carrying both keys the containers refuse to start without (see [Prerequisites](#prerequisites-at-a-glance)).
+2. **Import** the packaged chart for the size you chose (`rag-mcp-server-6.3.2.tar.gz`, `rag-mcp-scale-medium-6.3.2.tar.gz` or `rag-mcp-scale-large-6.3.2.tar.gz`) into PCAI AI Essentials.
+3. **Paste and edit the values**: pick a profile from `helm/values-examples/`, set `models.embedder.url` and the model API keys, set `ezua.virtualService.endpoint`, point `security.existingSecret` at the Secret from step 1.
+4. **Apply.** PCAI substitutes the domain placeholder, creates the namespace objects, and installs the release.
+5. **Verify**: the release reaches Ready, `/healthz` answers `{"status":"ok"}`, and the VirtualService endpoint serves the UI behind the gateway's auth.
+
+Full procedure, failure modes and the ordered SSO enablement: **[documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md)**.
+
+## Prerequisites at a glance
+
+Everything here is either a Secret you create or a cluster object that must already exist. None of it can be a chart value; all of it is a hard failure if missing. Failure modes, verification commands and the full tables are in [DEPLOYMENT.md § Prerequisites](documentation/DEPLOYMENT.md#2-prerequisites).
+
+**Secrets**
+
+| Secret | Keys | Required? | If missing |
+|---|---|---|---|
+| `security.existingSecret` (e.g. `rag-platform-keys`) | `RAG_API_KEY`, `MEDIA_TOKEN_SECRET` | recommended; otherwise the chart auto-generates into `<deployment.name>-model-keys` | no media secret → **both containers refuse to start** |
+| `modelSecrets.existingSecret` (optional) | `MODEL_<ROLE>_API_KEY`, `MODEL_<ROLE>_URL`, `S3_*`, `REDIS_PASSWORD` | optional (values seeds are the alternative) | missing Secret = `CreateContainerConfigError` |
+| `mcp.apiKey.existingSecret` | `api-keys` (comma-separated) | optional — without it MCP runs open | no MCP auth (REST-side fail-closed still applies) |
+| `backups.protectedPasswords.existingSecret` | dataset name → password | only if backing up password-protected datasets | those datasets are skipped with a `SKIP-PROTECTED` log line |
+
+**Cluster objects and platform dependencies**
+
+| Object | Why it must exist | If missing |
+|---|---|---|
+| Namespace + RWX StorageClass (`gl4f-filesystem` default) | the shared `/data` PVC and the Qdrant claims | PVCs stay `Pending` |
+| Istio gateway `istio-system/ezaf-gateway` | the rendered `VirtualService` attaches to it | endpoint unreachable |
+| oauth2-proxy provider (or platform SSO at the edge) | the rendered `AuthorizationPolicy` names it | `AuthorizationPolicy` ineffective; 401/302 behaviour wrong |
+| Kyverno (EzAF) | the pre-install hook creates the `hpe-ezua` vendor-label ClusterPolicy the catalog discovers services by | app card shows Unknown / 404 at the endpoint |
+| MinIO/S3 bucket | only for batch URL ingest, watched sources or backups — buckets are **not** auto-created | ingest/backup job fails on the missing bucket |
+
+**External dependencies.** Model endpoints must be reachable **from the pod**, not from your laptop — the embedder is probed at startup and an unreachable one aborts it. Reachability checks run from a cluster pod; see [DEPLOYMENT.md § External dependencies](documentation/DEPLOYMENT.md#23-external-dependencies).
+
+## Day-2
+
+- **Upgrade** — edit values and re-apply, or import the new chart version and keep the values. REST/media keys are reused across upgrades; model/S3/Redis keys are **sticky** (the stored value wins, values only seed). See [DEPLOYMENT.md § Upgrade](documentation/DEPLOYMENT.md#6-upgrade-rollback-uninstall).
+- **Health** — `/healthz`, `/readyz`, `/api/admin/health` (model endpoints, Qdrant status, PVC), `/metrics`.
+- **Logs** — `kubectl logs -l app=rag-mcp-server -c rag-api-server` (or `-c rag-mcp-server`) from the PCAI workload view.
+- **Uninstall** — delete the release in PCAI. The data PVC is annotated `helm.sh/resource-policy: keep` and survives; Qdrant PVCs do not.
+- **Troubleshooting** — symptom → cause → fix table in [DEPLOYMENT.md § Troubleshooting](documentation/DEPLOYMENT.md#7-troubleshooting).
+
+## Documentation map
+
+| File | The question it answers |
 |---|---|
-| **[USAGE.md](USAGE.md)** | HTML frontend usage + programmatic Python API |
-| **[documentation/API.md](documentation/API.md)** | REST API reference with `curl`/Python examples — create datasets, add/delete files |
-| **[documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md)** | Import the chart, set values in the PCAI *Helm Values* editor (G2 vs hosted-trial profiles, the ordered SSO stack), verify, troubleshoot |
-| **[documentation/MCP.md](documentation/MCP.md)** | All 21 MCP tools + connection configs for opencode, Claude Desktop, OWUI, stdio |
-| **[documentation/MEMORY.md](documentation/MEMORY.md)** | Long-term memory setup per client (opencode + Open WebUI), multi-user isolation, operations |
-| **[documentation/FEATURES.md](documentation/FEATURES.md)** | Deep technical reference: every format, chunking strategy, embedding, reranking, storage |
-| **[documentation/AGENTS.md](documentation/AGENTS.md)** | opencode agent policy: when to recall / write memories |
-| **[documentation/opencode.jsonc](documentation/opencode.jsonc)** | opencode MCP config template (two-connection memory pattern) |
-| **[documentation/DEVELOPMENT_NOTES.md](documentation/DEVELOPMENT_NOTES.md)** | Embedding/reranker validation, pipeline benchmarks, model setup debugging |
-| **[openwebui_extension/README.md](openwebui_extension/README.md)** | Open WebUI filter: media routing, memory valves, per-user HMAC isolation |
+| [documentation/FEATURES.md](documentation/FEATURES.md) | What does each capability do, and why is it built that way? Every format, chunking strategy, retrieval lane, memory kind. |
+| [documentation/DEPLOYMENT.md](documentation/DEPLOYMENT.md) | How do I deploy, upgrade and fix it on PCAI? The deployment contract, prerequisites, values, troubleshooting. |
+| [documentation/CONFIGURATION.md](documentation/CONFIGURATION.md) | What is this knob, what is its default, and what does changing it do? The complete environment/values reference. |
+| [documentation/MCP.md](documentation/MCP.md) | How do I connect an MCP client, and what do the 25 tools do? |
+| [documentation/API.md](documentation/API.md) | How do I drive it over REST? Endpoint reference with `curl` and Python. |
+| [documentation/MEMORY.md](documentation/MEMORY.md) | How does long-term memory work, and how do I set it up per client? |
+| [documentation/PLAYBOOK-MEMORY.md](documentation/PLAYBOOK-MEMORY.md) | How does procedural memory work end to end? |
+| [documentation/SCALE.md](documentation/SCALE.md) | Which chart size, and what does each scaling layer cost? |
+| [documentation/FAITHFULNESS-EVAL.md](documentation/FAITHFULNESS-EVAL.md) | How is answer grounding measured and gated? |
+| [documentation/VERIFICATION.md](documentation/VERIFICATION.md) | How do I prove a deployment actually works? |
+| [documentation/BENCHMARKS.md](documentation/BENCHMARKS.md) | What throughput and latency has this been measured at? |
+| [documentation/ROADMAP.md](documentation/ROADMAP.md) | What is deliberately not built yet? |
+| [documentation/AGENTS.md](documentation/AGENTS.md) | What memory behaviour should an agent adopt? |
+| [documentation/DEVELOPMENT_NOTES.md](documentation/DEVELOPMENT_NOTES.md) | Model validation, pipeline debugging, why a design was chosen. |
+| [documentation/AUDIT-2026-11-10.md](documentation/AUDIT-2026-11-10.md) | What did the last audit find? (history, not current truth) |
+| [helm/ROTATION.md](helm/ROTATION.md) | How do I rotate a key without breaking signed media URLs? |
+| [helm/local/README.md](helm/local/README.md) | Where do real site values live, and what must never be committed? |
+| [helm/values-examples/README.md](helm/values-examples/README.md) | Which paste-ready profile do I start from? |
+| [openwebui_extension/README.md](openwebui_extension/README.md) | How does the Open WebUI filter route media and memory? |
+| [stmem/README.md](stmem/README.md) | What is the short-term-memory service contract for agent swarms? |
 
----
+## Developing locally
 
-## Quick start
-
-> **PCAI is a Helm wrapper — you never run `helm` or `kubectl`.** Import the packaged chart into PCAI once, then drive the deployment by setting the chart's **`values.yaml`** in the PCAI *Helm Values*
-> editor (or via the PCAI API). Every `--set` in the upstream docs maps 1:1 to a key in `values.yaml`.
-
-To deploy on PCAI:
-1. Pick the chart variant you need and import it into PCAI. a. There are 3 variants: `helm/` (single replica), `helm-scale-medium/`, `helm-scale-large/`. b. Scale variants use multiple API and Qdrant replicas to improve throughput. Requests are still routed jointly (for text) to a single request to improve performance.
-2. Set the model endpoints (deployed through MLIS) as `models.*` values: a. The embedder (`models.embedder.url`) is the only required endpoint. b. A VLM/ASR model is often recommended to give images/videos or audios (including video-embedded audio) respectively to the base LLM. c. A reranker can be helpful as well, but often the LLM will just call `top_k` with sufficient performance. I have once
-   seen it fail to retrieve with only `top_k`; increase the value to 100 with reranking and it succeeds.
-3. **Required secrets — front and center.** The chart ships NO key material (P0-7): set `security.existingSecret` to a Secret you own carrying BOTH `RAG_API_KEY` and `MEDIA_TOKEN_SECRET` (the containers refuse to start without the media secret) —
-   ```bash
-   kubectl -n <ns> create secret generic rag-platform-keys \
-     --from-literal=RAG_API_KEY="$(openssl rand -hex 16)" \
-     --from-literal=MEDIA_TOKEN_SECRET="$(openssl rand -hex 32)"
-   ```
-   — or leave the `security` block empty and let the chart auto-generate both keys into `<deployment.name>-model-keys` on first install (retrieve the API key with `kubectl -n <ns> get secret <deployment.name>-model-keys -o jsonpath='{.data.RAG_API_KEY}' | base64 -d`). Inline `security.apiKey` / `security.mediaTokenSecret` still work as back-compat. Model API tokens go to `modelSecrets.*ApiKey` (values → the model-keys Secret on first install; afterwards the stored value wins on every upgrade — values edits to seeded keys are inert, delete the Secret to reseed). Precedence chain and the optional rotation runbook: `helm/ROTATION.md`.
-
-The image does not bundle any ML models — it connects to remote model endpoints (embedder, reranker, VLM, ASR) configured at runtime via the chart's values. See `documentation/DEPLOYMENT.md` for details.
-
----
-
-## Security hardening
-
-The charts ship auth **on by default** (`security.apiKey` / `mediaTokenSecret` are wired to a Secret — see the Quick start) and the deployment sits behind an ingress auth proxy (Istio + oauth2-proxy). Since D20 (2026-09-24), an unconfigured deployment is **fail-closed**: unauthenticated callers bind an anonymous identity whose only grant is the deployment's memory dataset — dataset paths, `/api/admin/*` and dataset creation answer 403. Setting any key below (or the MCP keyset) restores the normal full-access resolution. Per-process env vars, or first-class Helm `security` values, control the rest:
-
-| Env var | Purpose | Default |
-|---|---|---|
-| `RAG_API_KEY` | Require `Authorization: Bearer <key>` (or `X-RAG-Api-Key`) on all `/api/*` routes. Exempt: health/probes, the HTML pages (the served page embeds the key so the browser UI keeps working), dataset media serving, and staged media. Chart wiring: `security.apiKey` / `security.existingSecret` — the chart generates a key on first install when nothing is set; direct/scripted callers must send the header, and the Open WebUI filter takes it via its `RAG_API_KEY` valve. **With NO key configured anywhere the D20 fail-closed posture applies (anonymous = memory-dataset-only).** | charts: auto-generated (auth on) |
-| `RAG_API_KEYS` (or fleet-universal `MCP_API_KEYS`) | **MCP endpoints** (streamable-http/SSE): comma-separated key list; when EITHER var is set, every `/mcp` request needs `X-API-Key` or `Bearer`. OPTIONAL per fleet decision 2026-09 — unset → MCP runs open (loud startup warning; REST-side D20 fail-closed still applies). Rotation: append the new key, move clients, drop the old — env re-read per request, no restart. Chart wiring: `mcp.apiKey.existingSecret` (empty default = not wired). | unset → MCP open |
-| `MEDIA_TOKEN_SECRET` | **Required.** Secret shared by API + MCP; returned media URLs carry short-lived HMAC `?token=` (expiry `MEDIA_TOKEN_TTL`) — the legacy clear `?password=` suffix was removed. Both servers refuse to start without it. | unset → startup refused |
-| `INGEST_ALLOW_HOSTS` | Comma-separated host allowlist for `/batch-urls` http(s) ingestion (`.example.com` matches subdomains). | unset (all hosts) |
-| `INGEST_BLOCK_PRIVATE_HOSTS` | Reject http(s) URLs (ingest **and query-time media**) that resolve to private/link-local ranges (query-time still allows loopback — clients pass the server's own media URLs back). Every fetch — ingest downloads and media refs, redirect hops included — connects to the IP the policy validated (DNS-rebinding pin: check-time DNS = fetch-time DNS; a redirect into private/metadata space is refused). When an HTTP(S) proxy env is set the pin is skipped (the proxy performs egress DNS — the check-time denylist still ran). | `true` |
-| `MAX_REMOTE_DOWNLOAD_BYTES` | Cap per remote/S3 download (streamed, aborted past this). | 536870912 |
-| `ARCHIVE_MAX_TOTAL_BYTES` / `ARCHIVE_MAX_MEMBER_BYTES` / `ARCHIVE_MAX_ENTRIES` | Zip/tar/rar unpacked-size caps (incl. nested archives). | 2 GiB / 1 GiB / 10000 |
-| `MEDIA_ALLOW_PATH_PREFIXES` | Allowlist of `file://` prefixes the MCP `inspect_media`/audio-query tools may read (`:`-separated). | `DATA_PATH/datasets:DATA_PATH/staging` (fail-closed when unset) |
-| `PW_MAX_FAILURES` / `PW_FAIL_WINDOW` | Password-failure throttle (returns 429 per identity). | 10 / 300 s |
-| `RAG_MCP_SHARED_UNLOCK` | Opt OUT of per-caller unlock scoping (fleet decision D10): one shared unlock cache + throttle bucket for every caller. Only for gateway-fronted SINGLE-USER deployments. Unset (default) = per-caller: provided identity → `X-Forwarded-For` chain → socket peer, so one caller's `unlock_dataset` never opens a dataset for other callers. | unset (per-caller) |
-| `MODEL_HEALTH_INTERVAL` / `MODEL_HEALTH_FAIL_THRESHOLD` | Background embedder probe: interval in seconds, and consecutive failures before a warning is logged. The result surfaces in `/api/admin/health` and the manage page — `/healthz` and `/readyz` deliberately do **not** gate on the embedder (a remote-model outage is not fixed by restarting this pod). | 60 / 3 |
-| `CONFIG_DIR` | `:`-separated dirs of mounted ConfigMap/Secret files (one file per env key). When set, model config is **live-reloaded** on file change — no rollout needed (charts mount `-config` and `-model-keys` at `/etc/rag/config:/etc/rag/secrets`). The new embedder is verified before swap; an unreachable one is rejected and the old config is kept. | unset (env-only, rollout required) |
-| `QUERY_EMB_CACHE_MAX`, `FILE_HASH_CACHE_MAX`, `ASR_TRANSCRIPT_CACHE_MAX`, `UNLOCK_CACHE_MAX` | Bounded sizes for the in-process caches (query vectors are stored packed — `array('f')`). | 4096 / 4096 / 512 / 4096 |
-| `RAG_TRUST_PROXY_IDENTITY` | Trust the auth proxy's identity headers (`X-Auth-Request-*`/`X-Email`/`X-User`) — and, when no identity header is present, the `X-Forwarded-For` chain — as the per-caller unlock-cache/throttle identity (decision D10). Keep **off** unless an enforcing auth proxy overwrites these headers on every request — otherwise clients can spoof them to hijack unlocks or rotate identities past the throttle. Direct (no proxy) deployments don't need it: the socket peer is the identity. | `false` (socket peer; charts default `true`) |
-| `RAG_METRICS_AUTH` | Require an API key on `/metrics` (accepted: `X-RAG-Api-Key` / `X-API-Key` / `Authorization: Bearer`, validated against `RAG_API_KEY` + the MCP key set). For in-cluster scrapers pair with the chart's `metrics.serviceMonitorBearerSecret`. | `false` (public in-cluster exposition, unchanged) |
-| `RAG_INSPECTOR_MCP_URL` | **Decision D27 — the SPA's Inspector tab.** MCP endpoint the browser tab proxies tool calls through (default `http://127.0.0.1:9090/mcp` — the chart's sidecar topology; no chart changes needed). The proxy forwards the session's own credential envelope re-expressed for the MCP surface (`X-API-Key` / `Authorization: Bearer` / `X-Auth-Request-Access-Token`); trusted-proxy identity sessions have no forwardable secret. | sidecar `http://127.0.0.1:9090/mcp` |
-| `RAG_INSPECTOR_TIMEOUT_S` | Per-call timeout for the Inspector's proxied MCP request (tool calls embed and search). Read per request. | `300` |
-| `QDRANT_CLIENT_TIMEOUT` | Hard timeout (s) for sync Qdrant calls, so a hung Qdrant cannot pin `sync_pool`/`qdrant-io` threads forever. | unset (no timeout; charts set 30) |
-| `QDRANT_POOL_SIZE` / `MEDIA_POOL_SIZE` | Dedicated thread-pool sizes for Qdrant I/O (batched searches, upserts) and ffmpeg/media work — kept off the event loop and out of the default executor. Size `QDRANT_POOL_SIZE` comfortably above the concurrent searches a single process serves — it is the Qdrant-side bottleneck under saturation. | 4 / 2 (charts wire 16) |
-| `EMBEDDING_QUERY_IDLE_WAIT_MS` (+ `EMBEDDING_QUERY_IDLE_MAX_BATCH`) | Opt-in idle early-flush for the embedding query batchers: a **small, stalled** queue (≤ `IDLE_MAX_BATCH`, default 2) flushes after `IDLE_WAIT_MS` instead of the full `EMBEDDING_QUERY_BATCH_WAIT_MS` window, cutting interactive-search latency ~4x. A growing queue (any burst) always waits for the window/cap — burst batching is structurally untouched. **Default 0 (disabled)** — the unguarded v1 (10ms, no batch guard) was benchmark-convicted: it shattered batches at load and collapsed throughput. Enable only after a benchmark pass. | 0 (disabled) |
-| `RAG_EMBED_BATCH_URL` | Optional URL of a shared (cross-process) embedding query batcher: text-only queries are POSTed there instead of the per-process local batcher, so batch size is independent of worker/pod count. Falls back to local batching when unreachable. | unset (local batching) |
-| `MODEL_EMBED_MAX_CONCURRENCY` | Per-event-loop bound on concurrent multimodal embedding POSTs (one request per converted doc; concurrent ingests multiply this). `0` disables the bound. | 32 |
-| `RAG_DEFER_COUNT_SYNC` | **Decision D12 (Wave-4, default flipped ON).** `list_datasets`/`get_dataset` skip the per-request Qdrant count sync — previously N sequential round-trips (plus a meta.json write) on the hottest endpoint per list call. Counts are still maintained incrementally on every ingest/delete, so they are exact for in-band changes; they may lag by the defer window after out-of-band point changes (direct Qdrant writes or another replica). Set `false` to restore live counting (exact counts, N sequential round-trips per call). The scale charts already pinned `true`. | `true` (deferred; `false` = live counting) |
-| `RAG_INGEST_CONCURRENCY` | Wave-4: how many files inside one batch ingest (`add_files_batch`) are preprocessed concurrently (store/copy/hash/classify/PDF/image/video/audio extraction) before embedding. Document order, batch composition and per-file results are deterministic regardless of completion order (an ordered sequencer absorbs each file's output). `1` restores the strictly sequential pre-Wave-4 behaviour. | 4 |
-| `RAG_CONTEXTUAL_DEFAULT` | **Contextual retrieval (feature: DECISIONS 2026-09) — create-time default, disabled by default.** When `true`, NEW datasets are created with ingest-time contextual retrieval on: one small LLM call per real-text chunk writes 1–2 sentences of document-level context, prepended as a `[Document context]:` line before embedding (better chunk retrieval for large documents; the line also enters the BM25 lane and the stored payload, visibly labeled). An explicit `contextual` in the `POST /api/datasets` body always wins; per-dataset flip later via `PATCH /api/datasets/{name}`. Affects NEW ingests only — Recreate re-contextualizes existing files (content-hash dedup would skip a plain re-upload). Preview the cost first: `POST /api/admin/datasets/{name}/contextual-preview` (labeled estimate: point count ×2 for hybrid collections, token math, configured VLM). No-op without a VLM model. Chart: `rag.contextual` (gated rendering — a disabled deployment renders no config key). | `false` |
-| `RAG_CONTEXTUAL_CONCURRENCY` | Max in-flight context LLM calls during a contextualized ingest (per-loop semaphore, the `MODEL_EMBED_MAX_CONCURRENCY` pattern). `0` disables the bound. Only read when a dataset has contextual retrieval enabled. | 8 |
-| `RAG_CONTEXTUAL_DIGEST_CHARS` | Size of the document excerpt (chars) in the shared prompt preamble — stable per document so the serving engine's prefix cache absorbs it across a document's chunks. | 512 |
-| `RAG_RERANK_MEDIA_LITE` | Wave-4 media-lite rerank: the reranker scores candidates on their text/caption representation — the candidate pool is fetched WITHOUT the heavy tier-3 base64 `image`/`video` payloads, and the full payloads are back-filled onto the surviving top_k docs only (one point-retrieve after scoring). Combined with the rerank over-fetch (`max(top_k, 4 × reranker_top_k)` candidates scored instead of `top_k`; output size unchanged). Set `false` to restore full-media scoring (every fetched candidate carries its base64 to the reranker — pre-Wave-4, much heavier transfer for media-heavy datasets). | `true` (media-lite) |
-| `RAG_WEBHOOK_URL` (+ `RAG_WEBHOOK_SECRET` / `RAG_WEBHOOK_TIMEOUT`) | **Ingest webhooks (opt-in, Wave-5).** When set, every completed ingest (REST or MCP: raw documents, single file, batch files, URL/S3 batches) POSTs one small JSON event to the URL — `{"dataset", "doc_count", "status", "timestamp"}` with header `X-RAG-Webhook-Secret` when `RAG_WEBHOOK_SECRET` is set. The POST is timeout-capped (`RAG_WEBHOOK_TIMEOUT`, default 5.0 s, clamped ≥ 0.1) and **failures are logged, never fatal** — a dead receiver cannot fail an ingest that already succeeded. Dataset restore/import replays are muted (one logical ingest, not one event per batch). Unset (default) = zero behaviour: no request, no latency, no log line. For the chart, pass via `extraEnv` (the values are not secrets, but treat the webhook URL as semi-sensitive). | unset (off) |
-| `RAG_API_KEY_CLIENTS` (+ `RAG_DATASET_ACLS`) | **Decision D15 — multi-user API keys → dataset ACLs (explicitly OPT-IN; enabling changes the auth model).** `RAG_API_KEY_CLIENTS="name:key;name:key"` (parsed like `K8S_MCP_CLIENTS`; keys must not contain `:` or `;`) mints per-user keys accepted by BOTH the REST and MCP surfaces; `RAG_DATASET_ACLS="name:ds1,ds2;name2:*"` binds each name to its datasets (`*` = all). **Since D26 (2026-10) the ACL also carries per-dataset write modes:** the token form `name:ds1:ro,ds2:rw,ds3` grants `ds1` read-only (the token after the second colon pair is `ro`/`rw`; a bare token = rw, and the legacy `name:ds1,ds2` form means rw everywhere — existing values are byte-compatible, no migration); on an ro dataset the read surfaces work but every write path (MCP `dataset_add_documents`/`dataset_delete_documents`/`dataset_replace_document`/`add_memory`/`delete_memory`/`forget_session`, REST document ingest/delete and the dataset-manage endpoints) is refused; malformed entries still raise `ClientConfigError` at import (fail-loud). Precedence across sources is strongest-restriction-wins (env rw ∪ overlay ro ⇒ ro; an explicit per-dataset ro in any source overrides a `*` rw; `*` is rw-all unless a `*:ro` token downgrades it) — see the D26 subsection below. A registry key matching NO ACL entry gets **NO datasets (fail-closed)**; dataset access (list/read/search/unlock/manage) is enforced per identity on both surfaces, per-key unlock caches and password-throttle buckets ride the D10 per-identity machinery (`key:<name>`), federated search restricts its fan-out to granted datasets, and ACL'd keys cannot reach `/api/admin/*` nor create datasets (unless granted `*`). The plain deployment keys — `RAG_API_KEY` plus the MCP key set (`MCP_API_KEYS` / `RAG_API_KEYS`) — keep FULL (admin) access. **Default (registry unset): today's single-key behaviour, byte-identical.** Env re-read per request (rotation without restart). Chart wiring: `mcp.apiKeyClients` / `mcp.datasetAcls` — rendered ONLY when set; the values are key material, pass them from a Secret pipeline. | unset (single-key, unchanged) |
-| `RAG_ACCESS_STORE` (+ `RAG_ACCESS_DENY_SELECT` / `RAG_MEMORY_DEFAULT`) | **Decision D16 — self-service dataset selection + per-identity access store (OPT-IN; requires D15 registry keys to be useful).** `RAG_ACCESS_STORE=1` enables the /access page's checkbox model: registry keys SELECT their own datasets — public ones freely, protected ones only with the correct password, which is then saved per identity (`{DATA_PATH}/access/<name>.json`, 0600, shared PVC) so every REST/MCP call works password-free; `list_datasets` shows only a key's EFFECTIVE datasets (grants ∪ selections — access isolation, no name discovery). Effective access = operator ACL ∪ selections (the ACL is a floor). `RAG_ACCESS_DENY_SELECT="ds1,ds2"` datasets refuse self-selection outright; `RAG_MEMORY_DEFAULT` is the deployment-wide fallback memory dataset (resolution order: arg → header → the caller's ★ binding → this → `MEMORY_DATASET`). MCP tools: `select_dataset` / `deselect_dataset` / `set_memory_dataset`. **Default (off): byte-identical D15 behaviour** — ACL'd names only, fail-closed, selection endpoints 409. Env re-read per request. Chart wiring: `security.accessStore` (chart default `true` — the base-chart render always carries the key; set `false` to opt out) / `security.accessDenySelect` / `security.memoryDefault` — the latter two rendered ONLY when set. | chart default: on (`accessStore: true`); raw env default off |
-| `RAG_ACCESS_SELF_MINT` | **Decision D25 — SSO self-mint (chart-default OFF since the 2026-10-16 audit remediation; opt in with `security.accessSelfMint: true`).** When truthy, an SSO-authenticated identity (a verified D21 Bearer JWT, a D22 SSO session cookie, or a D24 trusted-proxy identity header) may mint — and deliberately rotate — a long-lived API key for **its own** registry identity from the /access page, closing the loop D21 left open: JWT-only sign-in worked but the key still required the D17 admin panel. Hard guarantees: the minted key carries exactly the identity's existing access (self-mint **never** creates or widens dataset grants — the name comes from the verified identity, never user input); minting stays impossible for API-key-authenticated callers (403 — a registry key can never mint, the D17 invariant); env-authoritative and `blocked` names are refused; the key is shown exactly once and rotation kills the old key immediately. Endpoints: `GET /api/access/key` (owner-safe masked view) and `POST /api/access/mint-key` (optional `{"rotate": true}`); the whoami `flags` gains `self_mint` (the anonymous shape is unchanged). Enabling only makes sense with `security.oidc.enabled` (or `trustProxyIdentity` on G2) — there is no SSO identity to mint for otherwise. Read per request: flip without restart. **Default unset: byte-identical behaviour** (the mint endpoint 409s, the flag reads false). Chart wiring: `security.accessSelfMint` in all three charts — rendered ONLY when `true`, which is opt-in since the 2026-10-16 audit remediation: `security.accessSelfMint: true` renders the env; the default render is the inert pre-D25 shape (mint endpoint 409s). See the D25 subsection below. | chart default: enabled (bare env: unset = disabled) |
-| `RAG_UNLOCK_MAX_TTL` | Upper bound for explicit unlock TTLs on BOTH surfaces (REST `POST /unlock`, MCP `unlock_dataset(ttl=…)`; default 86400 = the historical 24 h cap). The special value `0` opts the deployment into **no-expiry unlocks** (`ttl=0` lasts until an explicit `POST /lock` on REST / until process restart on MCP) — the /access page's "No expiry (0)" option becomes meaningful only then. Read per request (rotation without restart). Chart wiring: `rag.unlockMaxTtl` (always rendered; the chart default equals the built-in default, so behaviour is unchanged). | `86400` |
-| `OIDC_ENABLED` (+ `OIDC_ISSUER` / `OIDC_AUDIENCE` / `OIDC_IDENTITY_CLAIM` / `OIDC_JWKS_URL` / `OIDC_JWKS_REFRESH_SECONDS` / `OIDC_OBSERVED_TTL` / `OIDC_FETCH_TIMEOUT_SECONDS` / `OIDC_CLOCK_SKEW_SECONDS`) | **Decision D21 — OIDC JWT as a SECOND credential for the same per-user registry identity (opt-in).** With `OIDC_ENABLED=true`, a verified `Authorization: Bearer <jwt>` (RS256 against the realm JWKS; `iss` / `aud`-as-`azp` / `exp` validated, `OIDC_CLOCK_SKEW_SECONDS` tolerance) resolves to the SAME identity as that user's minted API key — join key = the `OIDC_IDENTITY_CLAIM` (default `preferred_username`, fallback `sub`), or an explicit `"oidc": "<alias>"` field on the user's overlay client entry in `{DATA_PATH}/access/clients.json`. No OIDC discovery in v1: the JWKS URL is `OIDC_JWKS_URL` or `<issuer>/protocol/openid-connect/certs` (the Keycloak/UA-realm location), cached and refreshed every `OIDC_JWKS_REFRESH_SECONDS`; `OIDC_FETCH_TIMEOUT_SECONDS` bounds the fetch; observed JWT-only users are remembered for `OIDC_OBSERVED_TTL` and appear in `GET /api/admin/clients` as `{"source": "observed"}` entries so admins can grant them before they ask. **Issuer is REQUIRED when enabled** (loud startup warning without it). All vars are read per request — flip without restart. Chart wiring: `security.oidc.*` — rendered ONLY when `enabled: true` (default render byte-identical). See the D21 subsection below for the full semantics. | disabled (`OIDC_ENABLED` unset) |
-| `RAG_SSO_GATE` | **Decision D23 — the identity-gated unified frontend (opt-in).** When `true`, the served HTML pages (`/`, `/manage`, `/access`) require an authenticated identity (an SSO session cookie, a Bearer JWT, or an API key); anonymous visitors get a minimal 401 "Sign in required" page — with a link to `/oauth/login` when browser SSO (D22) is enabled. Health probes, the `/oauth/*` flow itself and media bytes stay exempt. When disabled (default), public-pages behavior is byte-identical to today. Enabling ONLY makes sense when `security.oidc.enabled` (or API keys) are configured — an empty deployment gates to nothing. Read per request: flip the value, no restart. Chart wiring: `security.ssoGate` — rendered ONLY when `true` (default render byte-identical). See the D23 subsection below for the full semantics (dataset ownership, the four-tab shell, `/api/stats`). | disabled — public pages |
-
-Some defaults have deliberately shifted from permissive to strict since v1.9 (`MEDIA_TOKEN_SECRET` now required, private-host ingest blocking on, media path allowlist fail-closed). `helm/`, `helm-scale-large/` and `helm-scale-medium/` ship a `security:` values block wired to these flags. In PCAI you set them in `values.yaml` (the *Helm Values* editor) — the charts ship no key material, so point at a Secret you own (see Quick start step 3) or let the chart auto-generate:
-
-```yaml
-# values.yaml
-security:
-  existingSecret: "rag-platform-keys"   # Secret carrying RAG_API_KEY + MEDIA_TOKEN_SECRET
-  blockPrivateHosts: true
-```
-
-### MCP document-management tools (Wave-5, memory-write capability probe)
-
-The dataset **write** path is no longer REST-only — the MCP server exposes the same
-operations as thin tools over the identical `DatasetManager` logic (same validation, the
-same password gate, the same upload-history events, the same 404 semantics):
-
-| Tool | REST twin | What it does |
-|---|---|---|
-| `dataset_add_documents(dataset_name, paths, texts?, password?)` | `POST /api/datasets/{name}/batch-urls` · `POST …/batch-files` · `POST …/documents` | Ingests local file paths, `http(s)://`/`s3://` URLs (S3 prefixes expanded per object) and/or raw text documents into an existing dataset. Local paths must sit inside `MEDIA_ALLOW_PATH_PREFIXES` (default `DATA_PATH/datasets` + `DATA_PATH/staging` — the SQL-export staging hook), so an MCP caller cannot ingest arbitrary server files and read them back via search. Returns the REST twins' result shapes (batch: `{"status","file_count","files":[…]}`; texts: `{"status","stored_ids","count"}`). |
-| `dataset_delete_documents(dataset_name, doc_ids?, filter?, limit?, password?)` | `DELETE /api/datasets/{name}/documents/{doc_id}` | Deletes by point ID(s) or by `{"source_prefix": …}` filter (the S3-sync prune semantic, server-side `MatchPrefix` scroll, `limit`-capped). Returns `{"status","deleted":[…],"count"}` — the REST twin's shape extended to the batch. Exactly one of `doc_ids`/`filter`. |
-| `dataset_replace_document(dataset_name, doc_id, path, password?)` | `POST …/files` + `DELETE …/documents/{id}` composed | Ingests the replacement FIRST (a failed ingest leaves the old document untouched — no data loss), then deletes the old point; a failed delete returns an honest `"status": "partial"` with both versions present. The old point ID must exist (no silent degrade into a plain add). |
-
-All three are dataset-auth gated exactly like the read tools: the dataset must exist
-(the REST 404 message as a `ToolError`), password-protected datasets need `password` (or
-a cached `unlock_dataset`), and — when D15 is enabled — the caller's registry key must
-have the dataset in its ACL.
-
-### Multi-user API keys → dataset ACLs (D15 — opt-in)
+**This is not the deployment path.** PCAI operators never run these commands; they exist for changing the package.
 
 ```bash
-# mint per-user keys + bind datasets (one env each, re-read per request)
-RAG_API_KEY_CLIENTS="alice:key-a;bob:key-b"
-RAG_DATASET_ACLS="alice:reports,notes;bob:*"
-
-# helm (values rendered only when set; default render byte-identical)
-helm upgrade ... --set-string mcp.apiKeyClients="alice:key-a;bob:key-b" \
-                  --set-string mcp.datasetAcls="alice:reports,notes;bob:*"
+python -m pytest tests/ -x -q          # the suite, including the faithfulness gate
+ruff check . && ruff format --check .  # lint (never run the formatter without a path)
+docker build -f docker/Dockerfile -t multimodal-rag-mcp:dev .   # image, repo root as context
+helm template rag . -f helm/values-examples/values.hosted-trial.yaml  # render check, no install
 ```
 
-Registry keys authenticate on BOTH surfaces and are ACL-enforced per request; the plain
-`RAG_API_KEY` / `MCP_API_KEYS` keys keep full (admin) access; a key with no ACL entry
-sees no datasets. See the `RAG_API_KEY_CLIENTS` row above for the full semantics.
-
-> **Behind the PCAI LLM gateway (D19):** the gateway authenticates itself upstream with an
-> admin `Authorization: Bearer` token and forwards the caller's delegated key via
-> `X-API-Key` — the explicit `X-API-Key` wins (de-escalation-only), so per-user identity,
-> ACL filtering and ★ memory binding work through the gateway unchanged.
-
-> Keep deployment secret material (e.g. `helm*/local/values.*.yaml`, which contain model-serving API keys and site credentials) out of version control — `.gitignore` covers `helm*/local/*` except `README.md` and `values.example.yaml`.
-
-### Watched S3 sources (opt-in)
-
-A values-gated reconciler CronJob keeps datasets continuously synced with S3/MinIO prefixes:
-
-```yaml
-# values.yaml (all three charts; default renders NOTHING — deployments without S3 are untouched)
-watchedSources:
-  enabled: true
-  schedule: "*/30 * * * *"     # cron schedule
-  sources:
-    - dataset: reports
-      prefixes:
-        - s3://mm-rag-drop/reports/
-    - dataset: logs
-      prefixes:
-        - s3://mm-rag-drop/logs/
-        - s3://mm-rag-drop/trace-exports/
-```
-
-Each tick, serially per source, the job POSTs the prefixes to
-`POST /api/datasets/{dataset}/batch-urls` with `{"urls": [...], "sync": true}` (header
-`X-RAG-Api-Key` from the model-keys Secret) and polls the job to completion — so the full
-sync semantics apply: new/changed objects are ingested, objects deleted upstream are pruned
-(points deleted, counter decremented), and **unchanged objects are skipped before any
-download** via the per-dataset ETag/Size state (`files/.watched_state.json`): an object whose
-ETag+Size still matches its last successful ingest costs zero I/O. Config is validated at
-`helm template` time — every prefix must be an `s3://` directory URL (single-object and
-http(s) URLs fail the render, not the 3 a.m. cron log); a `type:` field is reserved for
-future sources. The bucket allowlist `INGEST_ALLOW_S3_BUCKETS` still applies server-side as
-the multi-tenant guard (env-only — set via `extraEnv` in values when multi-tenant MinIO
-makes it relevant), `concurrencyPolicy: Forbid` prevents pile-up, and one failing source
-never kills the run. Delete the dataset (or Recreate it) and the state resets with it.
-
-### Self-service dataset selection (D16 — opt-in)
-
-The `/access` page's checkbox model — chart default ON (`security.accessStore: true`), raw-env default OFF. With `RAG_ACCESS_STORE=1` (chart:
-`security.accessStore: true`), registry-key users manage their own dataset set: every key
-SELECTS the datasets it needs (a listing shows only a key's effective datasets — isolation, no name discovery) — public datasets freely,
-password-protected ones only with their correct password, which is then saved per identity
-(`{DATA_PATH}/access/<name>.json`, 0600, on the shared PVC) so every REST/MCP call works
-without sending it again. Effective access = **operator ACL ∪ selections** (the ACL is a
-guaranteed floor; deselect removes only self-added widening). D26 revises the inclusion
-side: 🌐 global (public) datasets are included for every authenticated key at read-only
-mode — the selection store still governs what the key adds itself, and deselecting still
-excludes. `security.accessDenySelect`
-(`RAG_ACCESS_DENY_SELECT`) names datasets that can never be self-selected, and
-`security.memoryDefault` (`RAG_MEMORY_DEFAULT`) is the deployment-wide fallback memory
-dataset for callers without a personal ★ binding. MCP gains `select_dataset` /
-`deselect_dataset` / `set_memory_dataset`; the memory resolution order becomes arg →
-header → the caller's ★ binding → `RAG_MEMORY_DEFAULT` → `MEMORY_DATASET` — so an opencode
-user needs only their API key: select your memory dataset once (password once), star it,
-done. Since D26, a 🌐 global dataset is also **included** for every authenticated
-identity by default — at read-only mode (only the creator, an explicit `rw` grant, or
-an admin can write it); see "Read-only dataset grants (D26)" below.
-
-```yaml
-# values.yaml (all three charts; denylist/memoryDefault render only when set)
-security:
-  accessStore: true
-  accessDenySelect: ""          # e.g. "hr-data,payroll" — never self-selectable
-  memoryDefault: ""             # e.g. "team-knowledge" — fallback ★ for callers without one
-rag:
-  unlockMaxTtl: 86400           # cap for explicit unlock TTLs; 0 = allow no-expiry unlocks
-```
-
-Requires per-user keys to be useful (`mcp.apiKeyClients` — see D15 above). The store file
-is a sibling of `datasets/` on the same PVC and is included in existing PVC backups;
-dataset passwords in it are stored as-provided (same posture as the unlock caches).
-
-**Minting keys from the page (admin key registry).** With the store on, an ADMIN key on
-`/access` gets a "User keys" panel: mint a per-user key (shown once — copy it), set the
-user's dataset grants (`*` = all), rotate, or revoke — against
-`{DATA_PATH}/access/clients.json` (0600, atomic, cross-process-locked). Effective
-registry = `RAG_API_KEY_CLIENTS` env ∪ overlay (env authoritative on conflicts; grants
-union per name), and everything applies on the next request — no restart. Registry keys
-can never reach the panel (the D15 admin-surface gate denies `/api/admin/*` to them).
-
-### OIDC JWT as a second credential (D21 — opt-in)
-
-A verified Keycloak/UA-realm JWT presented as `Authorization: Bearer <jwt>` resolves to
-the **SAME per-user registry identity** as that user's minted API key — the join key is
-the token's `preferred_username` claim (`OIDC_IDENTITY_CLAIM`, fallback `sub`), or an
-explicit `"oidc": "<alias>"` field on the user's overlay client entry in
-`{DATA_PATH}/access/clients.json`. Verification is RS256 against the realm JWKS with
-`iss` / `aud` (the `azp` claim, default `"ua"` on PCAI G2) / `exp` all validated; no OIDC
-discovery in v1 — the JWKS URL is `OIDC_JWKS_URL` or
-`<issuer>/protocol/openid-connect/certs`. The semantics, exactly:
-
-- **API keys are unchanged** — sufficient alone, valid indefinitely, rotation stays on
-  the /access mint panel. The JWT is a second door to the same room, not a replacement.
-  When D25 self-mint is enabled, an SSO-sign-in user can mint/rotate their own key from
-  the Access page — the no-admin rotation path.
-- **JWT-only sign-in WORKS**: the user gets a valid registry identity with **zero
-  datasets (fail-closed)** and can then self-select public datasets password-free,
-  select password-protected ones with their password (saved per identity — the D16
-  model, chart default `RAG_ACCESS_STORE=1`), and bind their ★ memory dataset.
-- **JWT identities are NEVER admin** — not even when the realm token carries
-  `groups: ["admin"]` (a UA-realm role, not a RAG grant).
-- **Operator ACL grants apply to key and JWT alike** (same name, same grants).
-- **Revoking/rotating a user's key never affects their JWT path, and vice versa** — the
-  two credentials are independent; only the identity they resolve to is shared.
-- **A `"blocked": true` overlay entry kills the JWT path (401)** while the key entry
-  semantics stay as today.
-- **D19 delegation precedence is unchanged**: through the LLM gateway, an explicit
-  `X-API-Key` still outranks a co-forwarded `Authorization: Bearer` — a JWT is honored
-  as the delegated identity only when it arrives via `X-API-Key` in that mode.
-- **Observed JWT-only users appear in `GET /api/admin/clients` as `{"source":
-  "observed"}` entries** so admins can grant them without waiting for them to ask.
-
-Chart wiring: `security.oidc.*` in all three charts — rendered ONLY when
-`oidc.enabled: true` (the default render is byte-identical). `issuer` is REQUIRED when
-enabled (recommend the Keycloak realm URL pattern
-`https://keycloak.<your-domain>/realms/UA`; the app warns loudly without it), `audience`
-is the token's azp claim, and all `OIDC_*` envs are read per request — no restart to
-flip. Values examples ship a commented-out `oidc` block (g2 and hosted-trial profiles).
-
-**Browser SSO (automatic homepage sign-in).** When the ingress auth proxy forwards the
-OIDC access token upstream (oauth2-proxy `pass_access_token` / `set_authorization_header`
-— platform-side configuration), every browser request arrives with the JWT in the
-`X-Auth-Request-Access-Token` envelope, which the REST and MCP middlewares accept as a
-presented credential (D21: an ENVELOPE, not a trust grant — the JWT inside is fully
-signature-verified, so a forged header gains nothing, and the envelope can never outrank
-an explicit `X-API-Key`). The homepage then signs users in automatically: the served page
-carries a "Signed in as `<identity>`" banner, and — critically — the embedded admin-key
-meta tag is **suppressed for requests that themselves present a resolvable JWT** (the
-page's auth header would otherwise outrank the forwarded JWT and escalate every SSO
-visitor to admin; visitors without a JWT get today's embedded-key page unchanged). The
-browser queries `GET /api/oidc-session` (public whoami: `{authenticated, identity,
-source: "oidc" | "sso-cookie", datasets[]}`, identical anonymous shape on every failure mode — not an
-oracle). If the gateway does not forward access tokens, MCP/REST clients keep the D21
-`Authorization: Bearer` path, and the browser keeps the embedded-key mode — no breakage,
-just no banner.
-
-**Browser SSO, self-contained (D22 — the app is an OIDC client, the Open WebUI pattern).**
-No gateway configuration needed at all: the app itself runs the OIDC authorization-code
-flow. `GET /oauth/login` redirects to the realm's authorization endpoint with a CSRF
-`state` cookie; `GET /oauth/oidc/callback` exchanges the code (form POST to the token
-endpoint), verifies the access token with the SAME D21 machinery (RS256/JWKS,
-iss/aud/exp — no new trust), and plants an **HttpOnly `SameSite=Lax` session cookie**
-carrying the token — page scripts never see it. The cookie is one more presented
-credential envelope (lowest priority: an explicit key always wins), so SSO sessions
-resolve through the identical fail-closed registry machinery — same identity as the
-user's minted key, zero datasets by default, never admin. `GET /oauth/logout` clears it.
-Setup (once per deployment, the `configure_oidc.sh` recipe): run
-`scripts/configure-oidc-rag.sh` — it registers `https://<endpoint>/oauth/oidc/callback`
-in the `ua` client's redirect URIs (idempotent — no duplicates) and prints the ready-to-
-paste `security.oidc.sso` values block (client secret is KEY MATERIAL: put it in a
-Secret, `clientExistingSecret`). Chart wiring: `security.oidc.sso.*` in all three
-charts, rendered ONLY when `sso.enabled: true` (default render byte-identical); the
-provider URL points at the in-cluster Keycloak (plain HTTP — the external issuer stays
-claim-compared only, sidestepping the platform-CA TLS gap). The `/access` page shows a
-"Sign in with SSO" button whenever the flow is served (it probes the whoami first — an
-inert deployment keeps the key-only card). Inert by default: without the flag + secret +
-D21 issuer, every `/oauth/*` route 404s and no cookie is ever accepted.
-
-### The identity-gated unified frontend (D23)
-
-D23 is the capstone that turns the accumulation of D15–D22 into a single coherent
-product: when `RAG_SSO_GATE` is enabled, the three HTML pages fuse into ONE
-identity-gated shell — the homepage (`/`) re-glasses into a tabbed app, `/manage`
-and `/access` redirect into its tabs, and everything you see is scoped to who you
-are. Unauthenticated visitors get a minimal 401 "Sign in required" page (with a
-"Sign in with SSO" link when D22 is configured) instead of the old open pages.
-
-**The tab map** — the tabs render from the public whoami
-(`GET /api/oidc-session` → `{authenticated, identity, is_admin, flags, …}`):
-
-- **Datasets** — the existing homepage workspace (upload — single files or a
-  whole folder — search, ingest),
-  identity-scoped: a user sees only their own datasets plus the globals.
-- **Access** — the `/access` page absorbed: per-identity dataset checkboxes
-  (D15/D16), the unlock/TTL panel, and the ★ memory-dataset binding.
-- **Admin** — the `/manage` operator dashboard absorbed; renders ONLY when the
-  whoami says `is_admin: true`.
-- **Stats** — a read-only dashboard for EVERYONE (see `/api/stats` below): the
-  caller's own dataset/document/storage numbers, model-endpoint health, and job
-  queue state — filtered exactly like the listings, so it leaks nothing.
-- **Inspector (D27)** — a browser playground for the MCP tool calls: pick a tool
-  from the live `tools/list` catalog, edit JSON arguments seeded from the tool's
-  `inputSchema`, and run it as YOUR session credential, proxied server-side to
-  the MCP endpoint (see MCP.md § 5; env `RAG_INSPECTOR_MCP_URL` /
-  `RAG_INSPECTOR_TIMEOUT_S`).
-
-**Sign-in flow** — the SSO button comes first (it probes the whoami; an inert
-D22 deployment simply never shows it), the API-key paste is the fallback for
-key-only deployments, and the embedded admin key is used ONLY in the
-key-unconfigured legacy mode (the D20 fail-closed posture otherwise binds
-anonymous visitors to a memory-dataset-only identity). One sign-in serves all
-tabs; credentials never cross tabs.
-
-**The 8 ratified semantics** (decision D23, 2026-10 — the contract the backend,
-frontend, charts and docs all implement):
-
-1. **The gate comes first — SSO + admin keys.** `RAG_SSO_GATE=true` demands an
-   authenticated identity for `/`, `/manage`, `/access`; the accepted credentials
-   are the D22 session cookie, a verified D21 Bearer JWT, and an API key.
-2. **Admin mints named keys** — the D17 User keys panel (mint per-user keys with
-   dataset grants, rotate, revoke) stays THE onboarding path; the admin panel
-   lands in the Admin tab, unchanged in behavior.
-3. **Users see only their datasets, including globals** — listings stay
-   identity-filtered (D15/D16: grants ∪ self-selections), and datasets a creator
-   published global appear in everyone's world without an admin action.
-4. **A per-user homepage with memory ★ + TTL unlocks** — each signed-in user gets
-   their own workspace; the ★ memory binding and per-identity unlock TTLs (D16)
-   work unchanged inside the shell.
-5. **Admin full power** — the admin identity sees ALL datasets, manages users
-   (mint/grant/rotate/revoke), and can delete anything.
-6. **Creator-owned delete** — a dataset stamps `created_by` at create time
-   (identity name; admin-key creators stamp `admin`); DELETE is owner-or-admin.
-   Datasets created before D23 have no owner recorded — admins delete them; no
-   ownership is backfilled.
-7. **Creator publish-global** — the creator of a dataset may toggle it public
-   (visible to every identity, per the availability semantics (D26: included at
-   read-only mode)); non-creators are
-   denied. Pre-D23 datasets (no `created_by`) can only be made global by an admin.
-8. **The Stats tab is read-only for everyone** — `GET /api/stats` never mutates;
-   a user sees their own footprint, an admin sees the deployment's.
-
-**The stats endpoint** — `GET /api/stats` is a read-only, identity-filtered
-summary: `{"datasets": {"total", "visible_to_you", "documents",
-"storage_bytes"}, "models": [...], "jobs": {"active_uploads",
-"recent_failures"}, "generated_at"}`. A user's numbers cover exactly their
-visible world (own + global); an admin's cover the deployment. Listing rows gain
-`created_by` and `owned_by_me` so the UI (and scripts) can render ownership
-without guessing, and the whoami's `flags` object carries
-`can_create_datasets` / `sso_enabled` / `memory_dataset` (the caller's ★ binding
-or null) so the shell renders itself without a second probe.
-
-Chart wiring: `security.ssoGate` in all three charts (see the `RAG_SSO_GATE` row
-above) — rendered ONLY when `true`, default render byte-identical; values
-examples ship a commented `ssoGate: true` line in both profiles.
-
-### SSO self-mint (D25 — chart-default off since the 2026-10-16 audit remediation)
-
-D21 made JWT-only sign-in work — a verified realm token resolves to the user's
-registry identity with zero datasets, and D16 self-selection grows the world from
-there. But the LONG-LIVED credential still had a gap: minting or rotating the API
-key that opencode/MCP clients paste once and keep forever required the D17 admin
-panel, so a JWT-only user still needed an admin round-trip for their first key.
-**D25 closes the loop**: with `RAG_ACCESS_SELF_MINT` truthy (read per request —
-flip without a restart), an SSO-authenticated identity may mint — and deliberately
-rotate — a long-lived API key for ITS OWN registry identity directly from the
-Access page, no admin round-trip.
-
-**Who may mint — SSO-sourced identities only.** The three accepted sources are the
-verified D21 Bearer JWT, the D22 SSO session cookie, and the D24 trusted-proxy
-identity header. An API-key-authenticated caller is ALWAYS refused (403): minting
-stays a power keys never have — the D17 invariant that a registry key can never be
-a path to another key survives D25 untouched.
-
-**What self-mint can and cannot do.** It mints or rotates the caller's OWN key
-only — the key name comes from the verified identity, never from user input, so a
-caller cannot mint for someone else. The grants NEVER change: the minted key
-carries exactly the identity's current access (operator ACL ∪ selections), and
-self-mint never creates or widens dataset grants. Env-authoritative names
-(governed by `RAG_API_KEY_CLIENTS`) and `blocked: true` overlay entries are
-refused. The key is shown exactly once (the same copy-once discipline as the D17
-panel); rotation kills the old key immediately.
-
-**The surface.** Two REST endpoints: `GET /api/access/key` — the owner-safe view
-(`{"enabled", "source": "jwt" | "proxy-identity", "identity", "has_key",
-"key_masked", "datasets", "created", "oidc", "blocked"}`; masks the key like every
-other surface) — and `POST /api/access/mint-key` (body optional `{"rotate": true}`)
-returning the FULL key exactly once: `{"status", "name", "key", "rotated",
-"created", "message"}`; a `409` when a key already exists without `rotate`. The
-whoami (`GET /api/oidc-session`) authenticated shape gains
-`flags.self_mint: true|false` so the Access page can render the panel without a
-probe; the anonymous whoami shape stays exactly `{"authenticated": false}`.
-
-**Knob and wiring.** Env `RAG_ACCESS_SELF_MINT`, chart `security.accessSelfMint`
-(bool, chart default `true` — the same default-on, explicit-opt-out posture as
-`accessStore`) in all three charts — rendered ONLY when `true`; `false` restores
-the inert pre-D25 render, and a bare-env (non-chart) deployment still defaults
-unset. Default unset: the mint endpoint 409s and `flags.self_mint` reads false —
-byte-identical behaviour. The feature only ever ACTIVATES for SSO-sourced
-sessions: it makes sense when `security.oidc.enabled` (or `trustProxyIdentity`
-on G2) is on — there is no SSO identity to mint for otherwise — and it needs the
-access overlay (`accessStore: true`, itself chart-default on) so the minted
-entry has somewhere to live. Inert by construction everywhere else: no SSO
-identity source means no session can ever carry the mint proof, so the card
-never renders and the endpoints refuse — defaulting the knob on is safe
-precisely because a fresh SSO identity holds only the read-only public datasets
-until an operator widens it.
-
-### Read-only dataset grants (D26)
-
-Fleet decision D26 (ratified 2026-10) attaches a **mode** to every D15 dataset
-grant — `rw` (the default) or `ro` — because until now the write path travelled
-inseparably with every grant: handing a colleague read access to `reports` also
-handed them ingest, delete and replace. Read surfaces (list, read, search,
-unlock, select, ★-bind) are unchanged for ro datasets; every **write** surface
-now requires an rw-mode grant — the MCP document/memory mutators
-(`dataset_add_documents`, `dataset_delete_documents`, `dataset_replace_document`,
-`add_memory`, `delete_memory`, `forget_session`), the REST ingest/delete
-endpoints (`POST /api/datasets/{name}/documents|/files|/batch-files|/batch-urls`,
-`DELETE /api/datasets/{name}/documents/{doc_id}`), and the dataset-manage
-surfaces already restricted to `*`/owner-or-admin (PATCH/DELETE the dataset, the
-public toggles). Admin identities — and store-off/identity-less deployments —
-are exempt, so single-key deployments are byte-identical.
-
-The three wire forms: the D17 overlay `clients.json` takes each `datasets`
-element as either a plain string (`"reports"` = rw) or an object
-`{"name": "reports", "mode": "ro"}`; the env ACL `RAG_DATASET_ACLS` gains the
-token form `name:ds1:ro,ds2:rw,ds3` (the legacy `name:ds1,ds2` form means rw —
-existing values need no migration; malformed entries still raise
-`ClientConfigError` at import); the admin REST PATCH body accepts strings or
-`{name, mode}` objects and reports the normalized grants. **No new env var is
-introduced** — modes ride the existing `RAG_DATASET_ACLS` and the overlay.
-
-Two ratified rulings ride along:
-
-- **Globals are read-only by default.** A 🌐 public dataset
-  (`public: true` in meta.json) is now INCLUDED for every authenticated
-  registry/SSO identity — no checkbox needed — but at mode ro: every key can
-  list, read and search it; only the creator, an explicit `rw` grant, or an
-  admin can write it. Self-selecting a global records ro; deselecting still
-  excludes it. This deliberately revisions the D16 "public = availability, not
-  inclusion" ruling for inclusion (the D16 selection store still works, and
-  `RAG_ACCESS_DENY_SELECT` still blocks selection outright).
-- **One writable memory dataset per identity (unchanged invariant).**
-  `set_memory_dataset` (the ★ binding) now REFUSES a dataset the identity can
-  only reach ro ("…read-only for your key — bind a dataset you can write"); the
-  single-binding resolution order is untouched (header → ★ →
-  `RAG_MEMORY_DEFAULT` → `MEMORY_DATASET`).
-
-Precedence is **strongest-restriction-wins** across sources: env rw ∪ overlay ro
-⇒ ro, and env ro ∪ overlay rw ⇒ ro; `*` behaves as rw-all unless a `*:ro` env
-token or an overlay `{"name": "*", "mode": "ro"}` downgrades it, and an explicit
-per-dataset ro in ANY source overrides a `*` rw. Exclusions (deselect) still
-hide a dataset entirely. Fail-closed: a write against an ro dataset is refused,
-never degraded.
-
-In the Admin tab, the User keys grants editor is now a searchable checkbox
-dropdown per key — one row per dataset with ro/rw toggles, 🌐 global and 🔒
-password badges, and a pinned "All datasets (*)" row (the mint form is
-unchanged). Test coverage: see `tests/security/test_grant_modes.py`.
-
-## Enabling the network zone
-
-The chart ships an optional ingress NetworkPolicy (`networkPolicy.enabled`,
-default **false** — the default render is byte-identical to the baseline).
-When on, only the allowlisted callers reach the service: the authorized client
-namespaces (plus same-namespace pods, the node IPs in `probeCidrs` for kubelet
-probes, and the edge-gateway pods — the browser path stays open by default via
-`allowEzafGatewayIngress: true`, so the VirtualService keeps working).
-Six steps: (1) `kubectl get ns` to find your callers' namespaces; (2) append
-any extra caller namespaces to `networkPolicy.authorizedClients.namespaces`
-(keep `monitoring` — Prometheus scrapes `/metrics` on the same port, and an
-unlisted scrape namespace dies **silently**); (3) put your cluster's pod CIDR
-into `networkPolicy.probeExceptCidrs` (or real node IPs in `probeCidrs`);
-(4) leave `ezua.virtualService.enabled: true` — the browser path is a feature
-here, not a break-glass; (5) apply via the PCAI values editor (`helm upgrade`
-for operators); (6) verify — an allowed namespace gets HTTP 200 from
-`service:port/mcp`, any other namespace times out (browsers keep working via
-the gateway). See `values-examples/values-hardened-g2.yaml` for the full
-hardened profile.
+The image bundles no model weights — a local run still needs the model endpoints from values. Local Qdrant is supported (`qdrant_storage/`), and a dev checkout without the bundled tokenizer falls back to character chunking. Per-site real values live in `helm*/local/` (gitignored, never packaged); see [helm/local/README.md](helm/local/README.md). Design history and validation notes: [documentation/DEVELOPMENT_NOTES.md](documentation/DEVELOPMENT_NOTES.md).

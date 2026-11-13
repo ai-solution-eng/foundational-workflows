@@ -260,4 +260,4 @@ Release flow (per image):
 Rotation notes: a digest pin is NOT a rotation (the kubelet re-pulls only on pod
 recreation); change the digest + tag together in the same upgrade, and keep
 `security.requirePinnedKeys: true` on GitOps pipelines so the key material follows the same
-immutability discipline (see DEPLOYMENT.md §2 — P2-13).
+immutability discipline (see [DEPLOYMENT.md § 3.10](../documentation/DEPLOYMENT.md) — P2-13).
