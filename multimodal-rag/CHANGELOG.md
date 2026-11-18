@@ -3,6 +3,25 @@
 All notable changes to this project are tracked here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 
+## [Unreleased] — 2026-11-18 — vLLM 0.31 compatibility: per-request mm_processor_kwargs are opt-in
+
+### Fixed
+
+- **Multimodal ingest no longer 400s against a hardened vLLM.** vLLM >= 0.31 rejects any request that
+  carries `mm_processor_kwargs` unless the server runs with `--trust-request-mm-kwargs`
+  (`400 ... Per-request mm_processor_kwargs are disabled by default ...`). The three sites that put the
+  field on the wire — `/embeddings` (messages form), `/score` and `/rerank` — now OMIT the key unless
+  `MODEL_SEND_MM_PROCESSOR_KWARGS` is truthy, so the client works against hardened and unhardened
+  endpoints alike. Text-only and PDF-text paths were already unaffected; image-bearing PDFs, scanned
+  pages and reranked media were the visible failures.
+- **The field is reduced when it is sent.** For media this process already normalized — tier-3 `data:`
+  images (capped at 720x720 at ingest) and client-sampled video frames — the keys the client enforced
+  itself (`max_pixels`, `total_pixels`, `fps`, `max_frames`) are dropped; only `min_pixels` survives,
+  because the client never upscales. Requests with a remote image or a `video_url` still send the full
+  set: the server fetches/samples those itself. Text-only requests send nothing at all.
+- Behaviour is unchanged for deployments that opt in: set `MODEL_SEND_MM_PROCESSOR_KWARGS=1` (via
+  `extraEnv`) when the endpoint is yours and started with `--trust-request-mm-kwargs`.
+
 ## [Unreleased] — 2026-11-10 feature wave (retrieval quality + procedural memory)
 
 Five features, built as a zone-partitioned agent wave with two direction-matched cross-validation

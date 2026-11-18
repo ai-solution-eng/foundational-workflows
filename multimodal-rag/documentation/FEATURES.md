@@ -72,7 +72,7 @@ Media files are stored at three quality tiers to balance fidelity, storage, and 
 
 **Tier 2** is produced by `_preprocess_image_file()` / `_preprocess_video_file()` which create a `*_preprocessed` sibling on PVC. Images are downscaled (LANCZOS, aspect-preserving) via PIL; videos are transcoded via ffmpeg (libx264 CRF 28, AAC 128k, `+faststart`). Files within the limits are returned unchanged (tier 1 = tier 2).
 
-**Tier 3** is produced by `ImageProcessor` / `VideoProcessor` at ingest time and stored directly as a base64 data URL in the Qdrant payload. The reranker and VLM consume these data URLs directly — no file I/O, no client-side re-resizing. The embedding endpoint's server-side `mm_processor_kwargs` (max_pixels=720×720) is a no-op on data that is already at tier 3.
+**Tier 3** is produced by `ImageProcessor` / `VideoProcessor` at ingest time and stored directly as a base64 data URL in the Qdrant payload. The reranker and VLM consume these data URLs directly — no file I/O, no client-side re-resizing. The embedding endpoint's server-side `mm_processor_kwargs` (max_pixels=720×720) is a no-op on data that is already at tier 3 — which is why the client stops sending the field at all unless `MODEL_SEND_MM_PROCESSOR_KWARGS` opts in, and even then sends only the keys it did not already enforce (`min_pixels`; the pixel and frame budgets are dropped — see [CONFIGURATION.md](CONFIGURATION.md)).
 
 `_strip_media_payloads()` intentionally **does not** strip tier-3 `image`/`video` keys — the data URLs stay in Qdrant. Only `audio` and tier-1/2 `preprocessed_*`/`original_*` keys are stripped (as a safety net, since they should already be `file://` refs).
 
